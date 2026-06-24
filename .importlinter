@@ -1,0 +1,24 @@
+; import-linter configuration (M8 / DoD-P0-04) — boundary enforcement.
+;
+; Phase 0 layer rule: ``cv_infra.contract`` is the foundational (lowest) layer.
+; Every other sub-package may depend on the contract, but the contract must NOT
+; depend on any of them. Encoded as a ``forbidden`` contract so siblings stay
+; free to evolve their own dependency order (only the contract-is-lowest
+; boundary is enforced — the precise rule the gate requires, nothing more).
+;
+; This file is the seed for the cross-repo boundary enforcement that grows in
+; later Phases (consumer must not import platform sources, etc.).
+
+[importlinter]
+root_package = cv_infra
+
+[importlinter:contract:contract-is-foundational]
+name = cv_infra.contract is the foundational layer (imports no sibling package)
+type = forbidden
+source_modules =
+    cv_infra.contract
+forbidden_modules =
+    cv_infra.orchestrator
+    cv_infra.runner
+    cv_infra.report
+    cv_infra.cli
