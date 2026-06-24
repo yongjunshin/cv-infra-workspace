@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Virtualenv (uv.lock is the reproducibility source of truth; .venv is not tracked) ---
+.venv/
+
+# --- Tool caches ---
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# --- Local env / secrets (.env.example IS tracked — only the live .env is ignored) ---
+.env
+
+# --- Verification run outputs & caches (stateless: results/cache are mounted, not committed) ---
+results/
+*.mcap
+*.mp4
+*.log
