@@ -22,3 +22,5 @@ forbidden_modules =
     cv_infra.runner
     cv_infra.report
     cv_infra.cli
+    cv_infra.oracles
+    cv_infra.adapter
