@@ -1,0 +1,57 @@
+# Platform CI — `ubuntu-latest` boundary-enforcement tier (M8 / DoD-P0-04).
+#
+# Phase 0 scope: lint + format + import-lint boundary enforcement. Runs with no
+# GPU and no consumer-repo dependency (NFR-SELFTEST-001 spirit: the platform CI
+# passes standalone). The `[self-hosted, cv-infra-gpu]` self-test tier is added
+# in a later Phase (M8 Sec.3.8); this file is single-tier for now.
+#
+# Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:`
+# action is version-pinned (no mutable / floating-major tags), the uv binary is
+# pinned, and deps come from the committed `uv.lock` via `uv sync --frozen`.
+# NOTE: action tags below are full-semver pins; before the first real push they
+# should be re-pinned to immutable commit SHAs (CLAUDE.md §2-7 ideal) and the
+# exact patch versions confirmed against the marketplace.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the lint tier only reads the checked-out tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint + import-boundary (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@v5.4.2
+        with:
+          version: "0.11.13"
+
+      - name: Sync environment (frozen — honor committed uv.lock)
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Format check (black)
+        run: uv run black --check .
+
+      - name: Import-boundary enforcement (import-linter)
+        run: uv run lint-imports --config .importlinter
