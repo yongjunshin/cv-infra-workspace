@@ -9,11 +9,12 @@
 # Reproducibility (CLAUDE.md §2-7; decision 2026-06-24-env-reproducibility-pinning):
 #   - ALL version/image pins live HERE — single source of truth, no per-script drift.
 #   - A pin that cannot be satisfied is a HARD, LOUD failure (no silent fallback).
-#   - Items marked [VERIFY] are concrete *starting* pins whose exact apt patch / image
-#     @sha256 digest is locked at the EXECUTION stage against the live registries
-#     (this author-stage CPU box cannot reach download.docker.com / nvcr.io). The
-#     apt madison guard (require_apt_pkg_version) turns any wrong guess into an
-#     actionable failure that lists the versions the repo actually offers.
+#   - The apt patch versions + image @sha256 digests below were CONFIRMED/LOCKED at the
+#     EXECUTION stage (2026-06-26, host etri6000) against the live download.docker.com /
+#     nvidia.github.io / nvcr.io registries — every author-stage guess matched exactly,
+#     no correction was needed. The apt madison guard (require_apt_pkg_version) still
+#     turns any wrong/unavailable pin into an actionable failure (listing the offered
+#     versions) when re-provisioning a different host.
 
 # Idempotent source guard (readonly pins must not be re-declared on re-source).
 # This file is only ever sourced; bare top-level `return` is valid in that context.
@@ -34,27 +35,29 @@ readonly CV_REQUIRE_ARCH="amd64"
 # Provisioning NEVER installs or upgrades the driver — it ASSERTS this floor only.
 readonly CV_DRIVER_FLOOR="580.65.06"
 
-# Docker CE (official apt repo). Exact apt version strings. [VERIFY] the exact patch
-# at execution via `apt-cache madison docker-ce`; require_apt_pkg_version fails loud.
-readonly CV_DOCKER_CE_VERSION="5:28.3.3-1~ubuntu.24.04~noble"          # [VERIFY]
-readonly CV_CONTAINERD_VERSION="1.7.27-1"                             # [VERIFY]
-readonly CV_DOCKER_BUILDX_VERSION="0.26.1-1~ubuntu.24.04~noble"       # [VERIFY]
-readonly CV_DOCKER_COMPOSE_VERSION="2.39.2-1~ubuntu.24.04~noble"      # [VERIFY]
+# Docker CE (official apt repo). Exact apt version strings, CONFIRMED 2026-06-26 against
+# the live download.docker.com noble repo via the madison guard (installed cleanly, no drift).
+readonly CV_DOCKER_CE_VERSION="5:28.3.3-1~ubuntu.24.04~noble"          # confirmed 2026-06-26
+readonly CV_CONTAINERD_VERSION="1.7.27-1"                             # confirmed 2026-06-26
+readonly CV_DOCKER_BUILDX_VERSION="0.26.1-1~ubuntu.24.04~noble"       # confirmed 2026-06-26
+readonly CV_DOCKER_COMPOSE_VERSION="2.39.2-1~ubuntu.24.04~noble"      # confirmed 2026-06-26
 
 # NVIDIA Container Toolkit (official libnvidia-container apt repo). All four packages
-# are pinned to the same version (NVIDIA-recommended). [VERIFY] patch via madison guard.
-readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # [VERIFY]
+# are pinned to the same version (NVIDIA-recommended). CONFIRMED 2026-06-26 via madison guard.
+readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # confirmed 2026-06-26
 
 # GPU-passthrough smoke image (DoD-P1-02). CUDA 12.8+ covers Blackwell; the in-container
 # nvidia-smi is injected from the HOST driver, so any recent CUDA base suffices for the
-# smoke. Tag-pinned now; lock the @sha256 digest at first pull via CV_CUDA_TEST_DIGEST.
-readonly CV_CUDA_TEST_IMAGE="nvidia/cuda:12.8.1-base-ubuntu24.04"     # [VERIFY digest]
-readonly CV_CUDA_TEST_DIGEST="${CV_CUDA_TEST_DIGEST:-}"              # e.g. sha256:<64hex>
+# smoke. Tag + @sha256 digest LOCKED 2026-06-26 at first pull (RepoDigest of the manifest
+# list; resolves to the amd64 platform on this host). Env-overridable for a re-lock.
+readonly CV_CUDA_TEST_IMAGE="nvidia/cuda:12.8.1-base-ubuntu24.04"
+readonly CV_CUDA_TEST_DIGEST="${CV_CUDA_TEST_DIGEST:-sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2}"
 
 # Isaac Sim base (LOCKED — CLAUDE.md §5, REQ-DEPLOY-005). The 5.1.0 tag IS the locked
-# pin; the @sha256 digest is additional hardening locked at first pull (DoD-P1-03).
+# pin; the @sha256 digest is additional hardening LOCKED 2026-06-26 at first anonymous
+# NGC pull (DoD-P1-03; RepoDigest of the manifest list). Env-overridable for a re-lock.
 readonly CV_ISAAC_IMAGE="nvcr.io/nvidia/isaac-sim:5.1.0"
-readonly CV_ISAAC_DIGEST="${CV_ISAAC_DIGEST:-}"                      # e.g. sha256:<64hex>
+readonly CV_ISAAC_DIGEST="${CV_ISAAC_DIGEST:-sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54}"
 
 # Isaac host-side cache scaffold (DoD-P1-03 "cache mount dirs"). Lives under $HOME
 # (no sudo). The exact in-container mount targets are finalized with the runner image

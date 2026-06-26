@@ -79,29 +79,37 @@ All version/image pins live in `common.sh`. A pin that the repo does not offer i
 | Pin | Value | Rationale |
 |---|---|---|
 | Driver floor | `580.65.06` (asserted) | R580 branch, Isaac 5.1 floor (NFR-DEPLOY-005). Open kernel module. |
-| Docker CE | `5:28.3.3-1~ubuntu.24.04~noble` `[VERIFY]` | Official apt pin; exact patch confirmed via `apt-cache madison`. |
-| containerd.io | `1.7.27-1` `[VERIFY]` | Pinned alongside Docker CE. |
-| docker-buildx-plugin | `0.26.1-1~ubuntu.24.04~noble` `[VERIFY]` | Pinned (needed for image builds, Phase 2). |
-| docker-compose-plugin | `2.39.2-1~ubuntu.24.04~noble` `[VERIFY]` | Pinned (control plane `compose`, Phase 4). |
-| NVIDIA Container Toolkit | `1.17.8-1` `[VERIFY]` | All 4 toolkit pkgs pinned to one version (NVIDIA-recommended). |
-| CUDA smoke image | `nvidia/cuda:12.8.1-base-ubuntu24.04` `[VERIFY digest]` | CUDA 12.8+ covers Blackwell; `nvidia-smi` comes from the host driver. |
-| Isaac Sim base | `nvcr.io/nvidia/isaac-sim:5.1.0` (LOCKED) | CLAUDE.md §5, REQ-DEPLOY-005. Tag is the locked pin. |
+| Docker CE | `5:28.3.3-1~ubuntu.24.04~noble` (confirmed 2026-06-26) | Official apt pin; exact patch confirmed via `apt-cache madison`. |
+| containerd.io | `1.7.27-1` (confirmed 2026-06-26) | Pinned alongside Docker CE. |
+| docker-buildx-plugin | `0.26.1-1~ubuntu.24.04~noble` (confirmed 2026-06-26) | Pinned (needed for image builds, Phase 2). |
+| docker-compose-plugin | `2.39.2-1~ubuntu.24.04~noble` (confirmed 2026-06-26) | Pinned (control plane `compose`, Phase 4). |
+| NVIDIA Container Toolkit | `1.17.8-1` (confirmed 2026-06-26) | All 4 toolkit pkgs pinned to one version (NVIDIA-recommended). |
+| CUDA smoke image | `nvidia/cuda:12.8.1-base-ubuntu24.04` @ digest (locked 2026-06-26) | CUDA 12.8+ covers Blackwell; `nvidia-smi` comes from the host driver. |
+| Isaac Sim base | `nvcr.io/nvidia/isaac-sim:5.1.0` @ digest (LOCKED tag; digest locked 2026-06-26) | CLAUDE.md §5, REQ-DEPLOY-005. Tag is the locked pin; digest is extra hardening. |
 
-### `[VERIFY]` — what it means
+### Pin confirmation (execution stage, 2026-06-26 on `etri6000`)
 
-This author-stage box has no network to the package/image registries, so exact apt
-**patch** numbers and image **digests** are concrete *starting* pins. They are
-confirmed/locked at the execution stage:
+The apt **patch** numbers and image **digests** were concrete *starting* pins authored
+on a CPU box with no registry network. They are now **confirmed/locked** against the live
+registries — every author-stage guess matched exactly, **no correction was needed**:
 
 - **apt versions** — `require_apt_pkg_version` (in `common.sh`) checks each pin against
-  `apt-cache madison` after `apt-get update`. A wrong guess fails loud and prints the
-  versions the repo actually offers; lock `common.sh` to one of those and re-run.
-- **image digests** — see below.
+  `apt-cache madison` after `apt-get update`. All 5 Docker pins + the toolkit pin were on
+  offer and installed without drift. (A wrong guess would fail loud and print the offered
+  versions; lock `common.sh` to one of those and re-run.)
+- **image digests** — locked from the first-pull `RepoDigests` (see below).
 
-### Locking digests (optional hardening, do after first pull)
+### Locked digests (set as defaults in `common.sh`, 2026-06-26)
 
-The image **tags** are valid pins today. To additionally pin by `@sha256` digest,
-resolve the digest after the first pull and feed it back:
+Both image pins now carry their `@sha256` digest as the default (still env-overridable for
+a future re-lock). Resolved from the first pull's `RepoDigests` (manifest-list digest):
+
+```
+CV_CUDA_TEST_DIGEST = sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2
+CV_ISAAC_DIGEST     = sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54
+```
+
+To re-resolve/re-lock a digest after a future pull, feed it back:
 
 ```bash
 # CUDA smoke image
