@@ -33,15 +33,20 @@ preflight() {
   [[ "$arch" == "$CV_REQUIRE_ARCH" ]] \
     || die "Unsupported arch '$arch' (these scripts target $CV_REQUIRE_ARCH)"
 
-  # Driver floor — assert only (NFR-DEPLOY-005, DoD-P1-01).
+  # Driver floor + branch — assert only (NFR-DEPLOY-005, DoD-P1-01; decision
+  # 2026-07-03-driver-r580-realignment). Floor alone admitted R595, which
+  # segfaults the Isaac 5.1.0 RTX renderer — the branch must ALSO match.
   local drv
   drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d '[:space:]')"
   [[ -n "$drv" ]] || die "Could not read NVIDIA driver version (nvidia-smi)"
   if ! dpkg --compare-versions "$drv" ge "$CV_DRIVER_FLOOR"; then
-    die "Driver $drv is below the floor $CV_DRIVER_FLOOR (NFR-DEPLOY-005). Provisioning does NOT touch the driver — upgrade it out-of-band, then re-run."
+    die "Driver $drv is below the floor $CV_DRIVER_FLOOR (NFR-DEPLOY-005). Provisioning does NOT touch the driver — realign it out-of-band (realign_driver_r580.sh), then re-run."
+  fi
+  if [[ "${drv%%.*}" != "$CV_DRIVER_BRANCH" ]]; then
+    die "Driver $drv is not on the R${CV_DRIVER_BRANCH} branch (Isaac Sim 5.1.0 certified branch; R595+ segfaults the RTX renderer — decision 2026-07-03-driver-r580-realignment). Run scripts/workstation_setup/realign_driver_r580.sh, then re-run."
   fi
 
-  log "OK: $ID/$VERSION_CODENAME arch=$arch driver=$drv (>= $CV_DRIVER_FLOOR)"
+  log "OK: $ID/$VERSION_CODENAME arch=$arch driver=$drv (>= $CV_DRIVER_FLOOR, R$CV_DRIVER_BRANCH branch)"
 }
 
 main() {
