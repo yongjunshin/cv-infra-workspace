@@ -70,11 +70,10 @@ PROFILE_IN_CTR="/cv/smoke/fastdds_udp_profile.xml"
 ROS_ENV=(-e RMW_IMPLEMENTATION=rmw_fastrtps_cpp -e ROS_DOMAIN_ID="$CV_SMOKE_DOMAIN_ID"
          -e FASTRTPS_DEFAULT_PROFILES_FILE="$PROFILE_IN_CTR")
 
+# Whole-~/.cache mount — same measured root-owned-parent trap as run_smoke.sh.
 CACHE_MOUNTS=(
   -v "$CV_ISAAC_CACHE_ROOT/cache/kit:/isaac-sim/kit/cache:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/ov:/isaac-sim/.cache/ov:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/pip:/isaac-sim/.cache/pip:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/glcache:/isaac-sim/.cache/nvidia/GLCache:rw"
+  -v "$CV_ISAAC_CACHE_ROOT/cache/home:/isaac-sim/.cache:rw"
   -v "$CV_ISAAC_CACHE_ROOT/cache/computecache:/isaac-sim/.nv/ComputeCache:rw"
   -v "$CV_ISAAC_CACHE_ROOT/logs:/isaac-sim/.nvidia-omniverse/logs:rw"
   -v "$CV_ISAAC_CACHE_ROOT/data:/isaac-sim/.local/share/ov/data:rw"

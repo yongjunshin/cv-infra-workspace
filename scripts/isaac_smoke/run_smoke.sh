@@ -60,15 +60,21 @@ chown_for_container() {
     -v "$1":/cv-fix "$IMG" -c "chown -R 1234:1234 /cv-fix"
 }
 log "preparing cache scaffold + output dir ownership for container uid 1234"
-chown_for_container "$CV_ISAAC_CACHE_ROOT"
+# MEASURED trap (2026-07-03, smoke attempt 1): docker creates missing mount-point
+# PARENTS as root, so per-subdir mounts under ~/.cache leave /isaac-sim/.cache
+# root-owned and the uid-1234 app cannot mkdir siblings (warp cache PermissionError
+# -> replicator boot crash). Fix: mount the WHOLE ~/.cache from one host dir.
+# mkdir runs inside the root helper container too (scaffold is 1234-owned after the
+# first run, so a plain host mkdir would be denied).
+"${CV_SUDO[@]}" docker run --rm --user 0 --entrypoint bash \
+  -v "$CV_ISAAC_CACHE_ROOT":/cv-fix "$IMG" \
+  -c "mkdir -p /cv-fix/cache/home/ov /cv-fix/cache/home/pip /cv-fix/cache/home/warp /cv-fix/cache/home/nvidia/GLCache && chown -R 1234:1234 /cv-fix"
 chown_for_container "$RUN_DIR/container"
 
 # Cache mounts follow the MEASURED 5.1.0 layout (uid 1234, HOME=/isaac-sim; R2).
 CACHE_MOUNTS=(
   -v "$CV_ISAAC_CACHE_ROOT/cache/kit:/isaac-sim/kit/cache:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/ov:/isaac-sim/.cache/ov:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/pip:/isaac-sim/.cache/pip:rw"
-  -v "$CV_ISAAC_CACHE_ROOT/cache/glcache:/isaac-sim/.cache/nvidia/GLCache:rw"
+  -v "$CV_ISAAC_CACHE_ROOT/cache/home:/isaac-sim/.cache:rw"
   -v "$CV_ISAAC_CACHE_ROOT/cache/computecache:/isaac-sim/.nv/ComputeCache:rw"
   -v "$CV_ISAAC_CACHE_ROOT/logs:/isaac-sim/.nvidia-omniverse/logs:rw"
   -v "$CV_ISAAC_CACHE_ROOT/data:/isaac-sim/.local/share/ov/data:rw"
