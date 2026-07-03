@@ -159,3 +159,75 @@ bash scripts/workstation_setup/pull_isaac.sh
 `curl` / `gpg` are **not** whitelisted: keys are downloaded as the user and placed with
 `install`. Arguments are unconstrained (accepted, removable, window-limited scope — see
 the drop-in header).
+
+---
+
+## Self-hosted GitHub Actions runner (M8 / DoD-P1-07)
+
+`register_gh_runner.sh` registers this workstation as a **repo-level** self-hosted
+runner for `cv-infra-workspace` (decision `2026-07-03-self-hosted-runner-policy` —
+binding), labels `[self-hosted, cv-infra-gpu]`, persisted as the systemd service
+**`cv-infra-gh-runner`**. Pins (runner version + official tarball sha256) live in
+`common.sh` (→ *P1-07 self-hosted runner pins*). Self-update is disabled
+(`--disableupdate`); GitHub's `./svc.sh` is **not** used (its sudo calls fall outside
+the `/etc/sudoers.d/cv-infra` whitelist — this script only needs whitelisted
+`sudo -n install` / `sudo -n systemctl`).
+
+### Registration (token issued locally, never persisted)
+
+The short-lived registration token is issued **locally** (where `gh` is authenticated;
+the workstation has no `gh`) and piped straight into the remote environment — it must
+never be committed, logged, or echoed:
+
+```bash
+# one shot, local machine:
+scp scripts/workstation_setup/{common.sh,register_gh_runner.sh} cv-infra-ws:/tmp/cv-runner-setup/
+gh api -X POST repos/yongjunshin/cv-infra-workspace/actions/runners/registration-token --jq .token \
+  | ssh cv-infra-ws 'IFS= read -r RUNNER_REG_TOKEN; export RUNNER_REG_TOKEN
+                     bash /tmp/cv-runner-setup/register_gh_runner.sh'
+```
+
+The script is **idempotent**: re-running skips the download (version marker), skips
+registration (`.runner` present — no token needed for a plain re-run), and touches the
+unit only on drift. Verify from any `gh`-enabled host:
+
+```bash
+gh api repos/yongjunshin/cv-infra-workspace/actions/runners \
+  --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'   # expect status=online, busy=false
+ssh cv-infra-ws 'systemctl is-active cv-infra-gh-runner && systemctl is-enabled cv-infra-gh-runner'
+```
+
+### Pin refresh (accepted maintenance)
+
+GitHub may refuse jobs from runners **>30 days** behind the minimum supported version
+(self-update is pinned off). To refresh: re-resolve the latest release
+(`gh api repos/actions/runner/releases/latest`), update `CV_GH_RUNNER_VERSION` +
+`CV_GH_RUNNER_TARBALL_SHA256` in `common.sh` (checksum from the release notes'
+`BEGIN SHA linux-x64` marker), then re-run the script — it stops the service, swaps
+the binaries (registration survives; `.runner` is untouched), and restarts.
+
+### Hardening state (public repo; R10 / OD-1 / D-J)
+
+Applied at registration time — exposure starts the moment the runner is online:
+
+- Repo Actions fork-PR policy: **require approval for ALL outside collaborators**
+  (not just first-time). Set via API/UI at registration; re-check after org/repo changes.
+- **No workflow consumes the `cv-infra-gpu` label until P5** — `ci.yml` stays
+  single-tier `ubuntu-latest`; the runner sits idle by design.
+- GPU jobs will never check out / execute PR-head sources: the SUT enters as an
+  **image ref only** (enforced at P5); `pull_request_target` is not used anywhere.
+
+### Teardown
+
+```bash
+# local machine — issue a short-lived REMOVE token and pipe it in (never echoed):
+gh api -X POST repos/yongjunshin/cv-infra-workspace/actions/runners/remove-token --jq .token \
+  | ssh cv-infra-ws 'IFS= read -r T
+                     sudo -n systemctl disable --now cv-infra-gh-runner
+                     cd ~/cv-infra-gh-runner && ./config.sh remove --token "$T"
+                     sudo -n install -m 0644 /dev/null /etc/systemd/system/cv-infra-gh-runner.service
+                     sudo -n systemctl daemon-reload'
+```
+
+(`install /dev/null` neutralizes the unit within the sudo whitelist; a root shell can
+`rm` the file outright. Then delete `~/cv-infra-gh-runner`.)

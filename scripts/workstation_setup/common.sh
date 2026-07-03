@@ -95,3 +95,26 @@ require_apt_pkg_version() {
     die "Refusing to install a different/unpinned version. Lock common.sh to an offered version and re-run."
   fi
 }
+
+# ---------------------------------------------------------------------------
+# --- P1-07 self-hosted runner pins (M8) ---
+# ---------------------------------------------------------------------------
+# Consumed by register_gh_runner.sh only (DoD-P1-07; decision
+# 2026-07-03-self-hosted-runner-policy — binding). Appended by M8/DX; the M5
+# provisioning pins above are untouched.
+#
+# Pin refresh is ACCEPTED MAINTENANCE: GitHub may refuse jobs from runners more
+# than ~30 days behind the minimum version (self-update is disabled via
+# --disableupdate). Refresh = re-resolve the latest release
+# (`gh api repos/actions/runner/releases/latest`), bump the two pins below, and
+# re-run register_gh_runner.sh (idempotent). See README → runner pin refresh.
+readonly CV_GH_RUNNER_VERSION="2.335.1"       # pinned 2026-07-03 (then-latest official release)
+# Official linux-x64 tarball sha256 published in the v2.335.1 release notes
+# (`<!-- BEGIN SHA linux-x64 -->` marker) — an UPSTREAM-stated checksum, not a
+# first-download measurement. Mismatch at install time = hard die.
+readonly CV_GH_RUNNER_TARBALL_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+readonly CV_GH_RUNNER_REPO_URL="https://github.com/yongjunshin/cv-infra-workspace"  # repo-level target (decision §1)
+readonly CV_GH_RUNNER_NAME="etri6000-cv-infra"
+readonly CV_GH_RUNNER_LABELS="cv-infra-gpu"   # effective label set: [self-hosted, Linux, X64, cv-infra-gpu]
+readonly CV_GH_RUNNER_HOME="${CV_GH_RUNNER_HOME:-$HOME/cv-infra-gh-runner}"
+readonly CV_GH_RUNNER_SERVICE="cv-infra-gh-runner"
