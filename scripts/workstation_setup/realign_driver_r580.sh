@@ -222,7 +222,15 @@ finish() {
     log "rebooting NOW (approved: decision 2026-07-03-driver-r580-realignment) — the new module loads on boot"
     exec "${CV_SUDO[@]}" systemctl reboot
   fi
-  log "DONE — REBOOT REQUIRED to load the $TARGET_UPSTREAM module: sudo -n systemctl reboot"
+  # Only demand a reboot if the LIVE driver differs from the target (a converged
+  # re-run after the realignment reboot must not tell the operator to reboot).
+  local live
+  live="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  if [[ "$live" == "$TARGET_UPSTREAM" ]]; then
+    log "DONE — target driver $TARGET_UPSTREAM is loaded and live (no reboot needed)."
+  else
+    log "DONE — REBOOT REQUIRED to load the $TARGET_UPSTREAM module (live: ${live:-unknown}): sudo -n systemctl reboot"
+  fi
 }
 
 main() {
