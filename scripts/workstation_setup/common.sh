@@ -118,3 +118,16 @@ readonly CV_GH_RUNNER_NAME="etri6000-cv-infra"
 readonly CV_GH_RUNNER_LABELS="cv-infra-gpu"   # effective label set: [self-hosted, Linux, X64, cv-infra-gpu]
 readonly CV_GH_RUNNER_HOME="${CV_GH_RUNNER_HOME:-$HOME/cv-infra-gh-runner}"
 readonly CV_GH_RUNNER_SERVICE="cv-infra-gh-runner"
+
+# ---------------------------------------------------------------------------
+# --- driver R580 realignment pins (M5) ---
+# ---------------------------------------------------------------------------
+# Decision 2026-07-03-driver-r580-realignment (binding): Isaac Sim 5.1.0
+# (kit 107.3.3) deterministically segfaults in the RTX renderer on the R595
+# branch (known NVIDIA issue, no workaround; certified branch = R580 LTSB).
+# The provisioning preflight therefore asserts BRANCH == CV_DRIVER_BRANCH in
+# addition to the CV_DRIVER_FLOOR above — the floor-only assert is what let
+# 595.71.05 through. Consumed by realign_driver_r580.sh and provision.sh.
+readonly CV_DRIVER_BRANCH="580"                                # driver major MUST equal this (branch floor AND ceiling)
+readonly CV_DRIVER_TARGET_STAGE1="580.159.03-0ubuntu0.24.04.1" # Ubuntu noble archive (prebuilt signed per-kernel open modules); confirmed 2026-07-03
+readonly CV_DRIVER_TARGET_STAGE2="580.65.06-0ubuntu1"          # NVIDIA CUDA ubuntu2404 repo (DKMS) — fallback ONLY if stage 1 still crashes RTX
