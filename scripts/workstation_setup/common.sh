@@ -131,3 +131,28 @@ readonly CV_GH_RUNNER_SERVICE="cv-infra-gh-runner"
 readonly CV_DRIVER_BRANCH="580"                                # driver major MUST equal this (branch floor AND ceiling)
 readonly CV_DRIVER_TARGET_STAGE1="580.159.03-0ubuntu0.24.04.1" # Ubuntu noble archive (prebuilt signed per-kernel open modules); confirmed 2026-07-03
 readonly CV_DRIVER_TARGET_STAGE2="580.65.06-0ubuntu1"          # NVIDIA CUDA ubuntu2404 repo (DKMS) — fallback ONLY if stage 1 still crashes RTX
+
+# ---------------------------------------------------------------------------
+# --- P1-04/05 isaac smoke + DDS pins (M2) ---
+# ---------------------------------------------------------------------------
+# Sourced by scripts/isaac_smoke/{run_smoke.sh,run_dds_handshake.sh}. Same rules as
+# above: pins live here only; env-overridable defaults follow the CV_ISAAC_DIGEST
+# 2-stage pattern (pull by exact tag once -> lock @sha256 here -> reference by digest).
+
+# ros:jazzy DDS-handshake peer image (DoD-P1-05). Exact tag pin; @sha256 digest
+# LOCKED 2026-07-03 from the first pull's RepoDigests on etri6000 (manifest-list
+# digest; same 2-stage pattern as CV_ISAAC_DIGEST). Env-overridable for a re-lock.
+readonly CV_ROS_JAZZY_IMAGE="ros:jazzy"
+readonly CV_ROS_JAZZY_DIGEST="${CV_ROS_JAZZY_DIGEST:-sha256:31daab66eef9139933379fb67159449944f4e2dcf2e22c2d12cc715f29873e0f}"
+
+# Smoke/handshake runtime knobs (DoD-P1-04/05).
+readonly CV_SMOKE_NET="${CV_SMOKE_NET:-cv-smoke-net}"        # dedicated bridge net (non-host, R8)
+readonly CV_SMOKE_DOMAIN_ID="${CV_SMOKE_DOMAIN_ID:-42}"      # fixed ROS_DOMAIN_ID (safe range 0..101)
+# Kit/Isaac needs a real /dev/shm (docker default 64m is too small for Kit workloads).
+# This is separate from the DDS SHM *transport*, which stays disabled via the UDPv4
+# profile (R8). Value [VERIFY]: measured in-run usage is recorded by run_smoke.sh.
+readonly CV_SMOKE_SHM_SIZE="${CV_SMOKE_SHM_SIZE:-1g}"
+readonly CV_SMOKE_TIMEOUT_S="${CV_SMOKE_TIMEOUT_S:-2400}"    # smoke wall guard (cold shader compile)
+readonly CV_HANDSHAKE_BOOT_TIMEOUT_S="${CV_HANDSHAKE_BOOT_TIMEOUT_S:-1200}"
+readonly CV_HANDSHAKE_WAIT_S="${CV_HANDSHAKE_WAIT_S:-240}"   # in-sim wall wait for reverse /cmd_vel
+readonly CV_HANDSHAKE_ECHO_TIMEOUT_S="${CV_HANDSHAKE_ECHO_TIMEOUT_S:-60}"
