@@ -95,3 +95,25 @@ require_apt_pkg_version() {
     die "Refusing to install a different/unpinned version. Lock common.sh to an offered version and re-run."
   fi
 }
+
+# --- P1-04/05 isaac smoke + DDS pins (M2) ---
+# Sourced by scripts/isaac_smoke/{run_smoke.sh,run_dds_handshake.sh}. Same rules as
+# above: pins live here only; env-overridable defaults follow the CV_ISAAC_DIGEST
+# 2-stage pattern (pull by exact tag once -> lock @sha256 here -> reference by digest).
+
+# ros:jazzy DDS-handshake peer image (DoD-P1-05). Exact tag pin; digest locked after
+# the first pull on the workstation (run_dds_handshake.sh prints the RepoDigest).
+readonly CV_ROS_JAZZY_IMAGE="ros:jazzy"
+readonly CV_ROS_JAZZY_DIGEST="${CV_ROS_JAZZY_DIGEST:-}"      # lock after first pull
+
+# Smoke/handshake runtime knobs (DoD-P1-04/05).
+readonly CV_SMOKE_NET="${CV_SMOKE_NET:-cv-smoke-net}"        # dedicated bridge net (non-host, R8)
+readonly CV_SMOKE_DOMAIN_ID="${CV_SMOKE_DOMAIN_ID:-42}"      # fixed ROS_DOMAIN_ID (safe range 0..101)
+# Kit/Isaac needs a real /dev/shm (docker default 64m is too small for Kit workloads).
+# This is separate from the DDS SHM *transport*, which stays disabled via the UDPv4
+# profile (R8). Value [VERIFY]: measured in-run usage is recorded by run_smoke.sh.
+readonly CV_SMOKE_SHM_SIZE="${CV_SMOKE_SHM_SIZE:-1g}"
+readonly CV_SMOKE_TIMEOUT_S="${CV_SMOKE_TIMEOUT_S:-2400}"    # smoke wall guard (cold shader compile)
+readonly CV_HANDSHAKE_BOOT_TIMEOUT_S="${CV_HANDSHAKE_BOOT_TIMEOUT_S:-1200}"
+readonly CV_HANDSHAKE_WAIT_S="${CV_HANDSHAKE_WAIT_S:-240}"   # in-sim wall wait for reverse /cmd_vel
+readonly CV_HANDSHAKE_ECHO_TIMEOUT_S="${CV_HANDSHAKE_ECHO_TIMEOUT_S:-60}"
