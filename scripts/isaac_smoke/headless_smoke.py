@@ -157,11 +157,22 @@ def run_smoke(simulation_app, args) -> int:
         return EXIT_FAIL
     log(f"CV_SMOKE_PHYSX_OK z_start={z_start:.3f} z_end={z_end:.3f}")
 
-    # Capture >=1 frame; step further until the annotator yields data.
+    # Capture >=1 frame. Plain world.step(render=True) does not reliably flush
+    # annotator data (measured: empty after 80 steps); rep.orchestrator.step() is
+    # the canonical replicator capture trigger — try plain steps first, then it.
     frame = rgb_annot.get_data()
     tries = 0
     while (frame is None or getattr(frame, "size", 0) == 0) and tries < 20:
         world.step(render=True)
+        frame = rgb_annot.get_data()
+        tries += 1
+    tries = 0
+    while (frame is None or getattr(frame, "size", 0) == 0) and tries < 5:
+        log(f"annotator empty after plain steps; forcing rep.orchestrator.step() #{tries + 1}")
+        try:
+            rep.orchestrator.step(delta_time=0.0, pause_timeline=False)
+        except TypeError:  # older signature
+            rep.orchestrator.step()
         frame = rgb_annot.get_data()
         tries += 1
     if frame is None or getattr(frame, "size", 0) == 0:

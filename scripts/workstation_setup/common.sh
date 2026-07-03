@@ -101,10 +101,11 @@ require_apt_pkg_version() {
 # above: pins live here only; env-overridable defaults follow the CV_ISAAC_DIGEST
 # 2-stage pattern (pull by exact tag once -> lock @sha256 here -> reference by digest).
 
-# ros:jazzy DDS-handshake peer image (DoD-P1-05). Exact tag pin; digest locked after
-# the first pull on the workstation (run_dds_handshake.sh prints the RepoDigest).
+# ros:jazzy DDS-handshake peer image (DoD-P1-05). Exact tag pin; @sha256 digest
+# LOCKED 2026-07-03 from the first pull's RepoDigests on etri6000 (manifest-list
+# digest; same 2-stage pattern as CV_ISAAC_DIGEST). Env-overridable for a re-lock.
 readonly CV_ROS_JAZZY_IMAGE="ros:jazzy"
-readonly CV_ROS_JAZZY_DIGEST="${CV_ROS_JAZZY_DIGEST:-}"      # lock after first pull
+readonly CV_ROS_JAZZY_DIGEST="${CV_ROS_JAZZY_DIGEST:-sha256:31daab66eef9139933379fb67159449944f4e2dcf2e22c2d12cc715f29873e0f}"
 
 # Smoke/handshake runtime knobs (DoD-P1-04/05).
 readonly CV_SMOKE_NET="${CV_SMOKE_NET:-cv-smoke-net}"        # dedicated bridge net (non-host, R8)

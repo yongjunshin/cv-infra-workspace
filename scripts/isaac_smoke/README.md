@@ -49,11 +49,17 @@ runtime env is synthesized from that input and injected with `-e` for that run o
 * **internal Jazzy `LD_LIBRARY_PATH`**: the official `/isaac-sim/setup_ros_env.sh`
   sets `ROS_DISTRO=jazzy` + appends `exts/isaacsim.ros2.bridge/jazzy/lib` — but only
   when `ROS_DISTRO` is *unset* (so we never pass `-e ROS_DISTRO`). Default mode
-  (`preset`) sources it before `python.sh` (LOCKED: env before interpreter boot).
-  `CV_ROS_ENV_MODE=auto` skips the helper to test whether `enable_extension` handles
-  the path alone — result: *(recorded after workstation run — see report)*.
-* **`--shm-size`** (`CV_SMOKE_SHM_SIZE=1g`): in-run `/dev/shm` usage is captured to
-  `shm_usage.txt` — result: *(recorded after workstation run — see report)*.
-* **Multicast discovery on the bridge net**: measured by `run_dds_handshake.sh`
-  (fallback = generated `initialPeers` unicast profile) — result: *(recorded after
-  workstation run — see report)*.
+  (`preset`) sources it before `python.sh` (LOCKED: env before interpreter boot)
+  -> handshake PASS. **Measured (2026-07-03): manual pre-set is REQUIRED** —
+  `CV_ROS_ENV_MODE=auto` (helper skipped) has `enable_extension` return True but
+  the bridge is non-functional: OmniGraph registers zero ros2 node types
+  (`Could not create node ... 'isaacsim.ros2.bridge.ROS2PublishClock'`).
+* **`--shm-size`** (`CV_SMOKE_SHM_SIZE=1g`): measured in-run usage 28K/1.0G (1%)
+  for the smoke scene — 1g is ample; DDS runs over UDPv4 (SHM transport disabled)
+  so /dev/shm stays near-empty. Kept at 1g for Kit headroom (docker default 64m).
+* **Multicast discovery on the bridge net: WORKS** (measured) — `/clock` echoed by
+  the ros:jazzy peer via default multicast discovery (~437 msg/s observed); the
+  `initialPeers` unicast fallback in `run_dds_handshake.sh` was NOT needed.
+* **Frame capture**: plain `world.step(render=True)` alone never flushed annotator
+  data (measured: empty after 80 steps); `rep.orchestrator.step()` is required to
+  trigger the replicator capture (headless_smoke.py does both).
