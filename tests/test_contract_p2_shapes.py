@@ -42,17 +42,29 @@ JOB_SPEC = {
     "sut_image_ref": "carter-sut",
     "interface": {
         "type": "ros2",
+        # SEAM-2 canonical adapter_config keys (full measured fixture + loud-reject
+        # policy live in tests/test_adapter_schema.py).
         "adapter_config": {
             "ros_distro": "jazzy",
             "rmw": "rmw_fastrtps_cpp",
             "use_sim_time": True,
-            "topic_map": {},
             "goal_interface": {
                 "kind": "action",
                 "name": "/navigate_to_pose",
                 "type": "nav2_msgs/action/NavigateToPose",
             },
-            "readiness": {},
+            "cmd_vel": {"topic": "/cmd_vel", "type": "geometry_msgs/msg/Twist"},
+            "clock_topic": "/clock",
+            "odom_topics": ["/odom", "/chassis/odom"],
+            "sensors": [
+                {
+                    "topic": "/front_3d_lidar/lidar_points",
+                    "type": "sensor_msgs/msg/PointCloud2",
+                    "frame": "front_3d_lidar",
+                }
+            ],
+            "frames": {"map": "map", "odom": "odom", "base_link": "base_link"},
+            "readiness": {"is_active_service": "/lifecycle_manager_navigation/is_active"},
         },
     },
     "acceptance_criteria": [
@@ -163,7 +175,8 @@ def test_verdict_set_is_the_four_locked_values():
 
 
 # ---------------------------------------------------------------------------
-# (c) Ros2AdapterConfig — pins, R7 topic_map draft, blackbox negative
+# (c) Ros2AdapterConfig — pins, R7 empty SUT-specific defaults, blackbox negative
+#     (SEAM-2 canonical round-trip / loud-reject tests = tests/test_adapter_schema.py)
 # ---------------------------------------------------------------------------
 
 
@@ -172,20 +185,23 @@ def test_adapter_config_defaults_track_locked_pins():
     assert cfg.ros_distro == "jazzy"
     assert cfg.rmw == "rmw_fastrtps_cpp"
     assert cfg.use_sim_time is True
-    assert cfg.goal_interface["name"] == "/navigate_to_pose"
+    assert cfg.goal_interface.name == "/navigate_to_pose"
 
 
-def test_adapter_config_topic_map_is_empty_draft_no_hardcoded_topics():
-    # R7: no hardcoded scene/sensor topic names — discovered in cycle-3.
-    assert Ros2AdapterConfig().topic_map == {}
+def test_adapter_config_sut_specific_wiring_defaults_empty():
+    # R7: no hardcoded SUT/scene-specific wiring — odom topics + sensor streams
+    # come from the consumer scenario (carter values = measured T2/T3 fixture).
+    cfg = Ros2AdapterConfig()
+    assert cfg.odom_topics == []
+    assert cfg.sensors == []
 
 
 def test_adapter_config_mutable_defaults_are_not_shared():
     a, b = Ros2AdapterConfig(), Ros2AdapterConfig()
-    a.topic_map["scan"] = "/front_3d_lidar/scan"
-    a.goal_interface["name"] = "/other"
-    assert b.topic_map == {}
-    assert b.goal_interface["name"] == "/navigate_to_pose"
+    a.odom_topics.append("/chassis/odom")
+    a.goal_interface.name = "/other"
+    assert b.odom_topics == []
+    assert b.goal_interface.name == "/navigate_to_pose"
 
 
 def test_adapter_config_round_trips():
@@ -201,8 +217,12 @@ def test_adapter_config_has_no_sut_internal_mutation_field():
         "ros_distro",
         "rmw",
         "use_sim_time",
-        "topic_map",
         "goal_interface",
+        "cmd_vel",
+        "clock_topic",
+        "odom_topics",
+        "sensors",
+        "frames",
         "readiness",
     }
     forbidden = {

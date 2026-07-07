@@ -107,7 +107,9 @@ class Interface:
     package is the foundational import layer and must NOT depend on the adapter
     package (.importlinter: contract-is-foundational). The typed view is built by
     the consumer (M2, which imports both) via
-    ``Ros2AdapterConfig.from_dict(interface.adapter_config)``.
+    ``Ros2AdapterConfig.from_dict(interface.adapter_config)`` — the canonical
+    ros2 key set lives in ``cv_infra/adapter/adapter_schema.py`` (SEAM-2), which
+    loud-rejects unknown keys; this raw mapping performs no validation.
     """
 
     type: str = "ros2"
