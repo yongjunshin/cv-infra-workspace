@@ -1,38 +1,48 @@
-# cv-infra — Phase 1 provisioning NOPASSWD drop-in (PROPOSAL / TEMPLATE)
+# cv-infra — unattended maintenance NOPASSWD drop-in (P2+, STANDING)
 # ===========================================================================
 # Install target : /etc/sudoers.d/cv-infra   (mode 0440, owner root:root)
 # Authorized user: etri  (the workstation SSH account on etri6000)
-# Scope          : decision 2026-06-25-workstation-sudo-nopasswd (option A).
-#                  Opens an UNATTENDED sudo channel so the Phase-1 provisioning
-#                  scripts can run over non-interactive SSH (no TTY for a password,
-#                  GOTCHAS G-06).
-# Lifetime       : Phase 1 ONLY. Remove when provisioning is complete:
-#                      sudo rm /etc/sudoers.d/cv-infra
+# Scope          : decision 2026-07-07-fu6-sudo-scope-reduction (option B) —
+#                  SUPERSEDES 2026-06-25 (option A, "Phase 1 ONLY / removable").
+#                  Unattended agents keep needing a non-interactive sudo channel
+#                  (no TTY for a password, GOTCHAS G-06) for RECURRING P2+
+#                  maintenance, not just one-shot Phase-1 provisioning.
+# Lifetime       : standing (P2+). Scope changes require a superseding decision;
+#                  updates ship through the whitelisted channel itself:
+#                      sudo -n install -m 0440 -o root -g root <new> /etc/sudoers.d/cv-infra
 #
-# Why these six binaries, and only these:
-#   Each is invoked by scripts/workstation_setup/*.sh via `sudo -n` (1:1 mapping —
-#   see README "sudo 1:1 mapping"). Keys/repo-lists are written by downloading as the
-#   user and placing them with `install`, so `curl`/`gpg`/`tee` stay OFF this list.
-#     /usr/bin/apt-get   update + install pinned Docker CE / NVIDIA toolkit packages
-#     /usr/bin/install   place apt keyring + sources.list.d files (root-owned paths)
-#     /usr/sbin/usermod  add etri to the docker group
-#     /usr/bin/systemctl enable/restart the docker service
-#     /usr/bin/nvidia-ctk  wire the nvidia runtime into /etc/docker/daemon.json
-#     /usr/bin/docker    GPU passthrough smoke + Isaac pull (docker group not yet
-#                        effective in the provisioning SSH session -> sudo docker)
+# Why these FOUR binaries, and only these — 1:1 with the measured `sudo -n`
+# surface of the maintenance scripts (see README "sudo 1:1 mapping"):
+#   /usr/bin/apt-get   pinned package maintenance — driver realignment/re-pin
+#                      (realign_driver_r580.sh) and container-stack re-provision
+#                      (install_docker.sh / install_nvidia_toolkit.sh)
+#   /usr/bin/install   place root-owned files — runner systemd unit on pin
+#                      refresh (register_gh_runner.sh), apt keyring/sources/pin
+#                      files (realign_driver_r580.sh, install_*.sh), and this
+#                      drop-in's own updates (channel above)
+#   /usr/bin/systemctl runner unit maintenance (stop / daemon-reload /
+#                      enable --now, register_gh_runner.sh), docker service
+#                      enable/restart, reboot after driver realign (--reboot)
+#   /usr/bin/docker    GPU passthrough smoke, pinned image pulls, smoke runs —
+#                      sessions where the docker group is not (yet) effective
 #
-# SECURITY NOTE (accepted scope): arguments are NOT constrained, so each entry is
-# effectively root-equivalent (`docker run -v /:/host ...`, `apt-get install <any>`).
-# This is the explicitly accepted, window-limited, removable scope of the decision
-# above on a dedicated single-tenant GPU host. Do NOT keep this drop-in past Phase 1.
+# REMOVED vs Phase 1 (FU-6 — one-shot provisioning verbs, no P2+ recurrence):
+#   /usr/sbin/usermod    (was: usermod -aG docker etri — done; group persists)
+#   /usr/bin/nvidia-ctk  (was: nvidia-ctk runtime configure — daemon.json set)
+# Consequence: a FULL provision.sh re-run now stops at those two steps; they
+# become operator actions in an interactive terminal (accepted by the decision).
+#
+# SECURITY NOTE (accepted scope): arguments are NOT constrained, so each entry
+# is effectively root-equivalent (`docker run -v /:/host ...`,
+# `apt-get install <any>`, `install <any> /etc/...`). This is the explicitly
+# accepted standing scope of decision 2026-07-07 on a dedicated single-tenant
+# GPU host — the reduction removes verbs, not argument breadth.
 # ===========================================================================
 
-Cmnd_Alias CV_INFRA_PROVISION = \
+Cmnd_Alias CV_INFRA_MAINT = \
     /usr/bin/apt-get, \
     /usr/bin/install, \
-    /usr/sbin/usermod, \
     /usr/bin/systemctl, \
-    /usr/bin/nvidia-ctk, \
     /usr/bin/docker
 
-etri ALL=(root) NOPASSWD: CV_INFRA_PROVISION
+etri ALL=(root) NOPASSWD: CV_INFRA_MAINT
