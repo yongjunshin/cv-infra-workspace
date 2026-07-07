@@ -61,6 +61,17 @@ def test_result_path_missing_raises_usage():
         main.resolve_result_path({})
 
 
+def test_require_job_id_returns_it():
+    assert main.require_job_id({"job_id": "job-0001"}) == "job-0001"
+
+
+def test_require_job_id_missing_or_empty_raises_usage():
+    with pytest.raises(main.BadJobSpec):
+        main.require_job_id({"scene_ref": "s.usd"})  # absent
+    with pytest.raises(main.BadJobSpec):
+        main.require_job_id({"job_id": ""})  # empty
+
+
 def test_write_result_writes_exactly_one_file(tmp_path):
     payload = {"verdict": "pass", "metrics": {"path_len_m": 1.5}}
     out = main.write_result(payload, tmp_path / "result.json")
@@ -212,13 +223,16 @@ def test_reached_goal_yaw_helpers():
 # --------------------------------------------------------------------------- #
 # Result assembly + guards.
 # --------------------------------------------------------------------------- #
-def test_build_result_dict_shape():
+def test_build_result_dict_is_canonical_m1_shape():
+    # SEAM-1 (G-17): canonical keys are job_id / criteria_results / oracle / artifacts.
     outs = [_outcome("reached_goal", True), _outcome("no_collision", True)]
     metrics = {"time_to_goal_s": 3.0, "collision_count": 0, "path_len_m": 3.0}
-    result = evaluate.build_result_dict("pass", outs, metrics)
+    result = evaluate.build_result_dict("job-0001", "pass", outs, metrics)
+    assert result["job_id"] == "job-0001"
     assert result["verdict"] == "pass"
     assert result["metrics"]["min_clearance_m"] is None  # optional in P2
-    assert {c["name"] for c in result["criteria"]} == {"reached_goal", "no_collision"}
+    assert {c["oracle"] for c in result["criteria_results"]} == {"reached_goal", "no_collision"}
+    assert result["artifacts"] == {"mcap": None, "mp4": None}  # fields always present
 
 
 def test_eula_boot_guard_blocks_without_consent():

@@ -71,6 +71,19 @@ def resolve_job_spec_dict(env: dict | None = None) -> dict:
     return data
 
 
+def require_job_id(spec: dict) -> str:
+    """Extract the mandatory ``job_id`` from a JOB_SPEC dict (REQ-EXEC-013).
+
+    The canonical result.json echoes ``job_id`` (M1 ``VerificationResult``), so a
+    spec without one is bad input, pre-sim -> exit 2 (usage), like the other
+    JOB_SPEC failures.
+    """
+    job_id = spec.get("job_id")
+    if not job_id or not isinstance(job_id, str):
+        raise BadJobSpec("JOB_SPEC must include a non-empty job_id (echoed into result.json)")
+    return job_id
+
+
 def resolve_result_path(env: dict | None = None) -> Path:
     """Resolve RESULT_OUT to the result.json path (dir -> dir/result.json)."""
     environ = os.environ if env is None else env
@@ -127,8 +140,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
 
     result_path = resolve_result_path(env)
     spec = resolve_job_spec_dict(env)
-    # M1 seam: VerificationRequest.from_dict(spec) once M1 merges; scaffold reads the
-    # criteria block directly so the pipeline is exercisable meanwhile.
+    job_id = require_job_id(spec)  # echoed into the canonical result (REQ-EXEC-013)
+    # SEAM-2 (cycle 3): the typed request view (VerificationRequest.from_dict) and the
+    # canonical acceptance_criteria list land with the adapter_config formalization;
+    # the scaffold still reads the criteria block directly so the pipeline runs.
     criteria = read_field(spec, "acceptance_criteria", {}) or {}
 
     sim = SimRuntime(
@@ -169,16 +184,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
             "path_len_m": path_length_m(record.gt_pose_samples),
         }
         verdict, outcomes = EvaluationEngine(build_oracles()).evaluate(record, criteria)
-        result = build_result_dict(verdict, outcomes, metrics, request=spec)  # M1 to_dict seam
+        # artifacts=None -> canonical None fields until the recorders produce files
+        # (cycle 4 passes Artifacts(mcap=..., mp4=...) from the recorder stops).
+        result = build_result_dict(job_id, verdict, outcomes, metrics, artifacts=None)
         write_result(result, result_path)  # step 10: exactly one result
         return exit_code_for_verdict(verdict)
     except EulaNotAcceptedError:
         raise
-    except Exception as exc:  # step 10 (degraded): still emit a result for M3
-        write_result(
-            build_result_dict(VERDICT_ERROR, [], {}, request=spec) | {"error": repr(exc)},
-            result_path,
-        )
+    except Exception as exc:  # step 10 (degraded): still emit a (canonical) result for M3
+        print(f"[cv-runner] runner error: {exc!r}", file=sys.stderr, flush=True)
+        write_result(build_result_dict(job_id, VERDICT_ERROR, [], {}), result_path)
         return EXIT_PLATFORM
     finally:
         adapter.teardown()  # step 11: clean shutdown

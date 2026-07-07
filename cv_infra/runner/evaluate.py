@@ -5,11 +5,12 @@ oracles (``reached_goal`` / ``no_collision``) and folding their outcomes. The
 verdict math and the fold (pass / fail / timeout / error) are Isaac-independent
 and are unit-tested on CPU.
 
-M1-contract seam: the final ``Metrics`` / ``CriterionResult`` / ``VerificationResult``
-objects are M1-owned. They are constructed only at the serialization boundary
-(``build_result_dict``), which imports the M1 models lazily so that this module
-imports cleanly while M1's classes are authored in parallel and resolves after the
-M1 -> M2 merge. The oracle layer returns the M2-internal ``OracleOutcome`` (below).
+M1-contract seam (SEAM-1, FU-11): the final ``Metrics`` / ``CriterionResult`` /
+``VerificationResult`` objects are M1-owned and imported for real — the payload is
+built only at the serialization boundary (``build_result_dict``) as
+``VerificationResult.to_dict()``, so the wire shape has a single definition (G-17:
+no hand-built dict, key drift impossible by construction). The oracle layer returns
+the M2-internal ``OracleOutcome`` (below).
 """
 
 from __future__ import annotations
@@ -17,6 +18,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from cv_infra.contract.models import (
+    Artifacts,
+    CriterionResult,
+    Metrics,
+    VerificationResult,
+)
 from cv_infra.runner.telemetry import TelemetryRecord
 
 
@@ -89,34 +96,30 @@ class EvaluationEngine:
 
 
 def build_result_dict(
+    job_id: str,
     verdict: str,
     outcomes: list[OracleOutcome],
     metrics: dict[str, float | None],
-    request: object | None = None,
+    artifacts: Artifacts | None = None,
 ) -> dict:
-    """Assemble the ``result.json`` payload (VerificationResult.to_dict shape).
+    """Assemble ``result.json`` as the M1 canonical ``VerificationResult.to_dict()``.
 
-    M1-contract seam (VERBATIM data contract): the authoritative serialization is
-    ``VerificationResult.to_dict()`` once the M1 models are merged. Until then this
-    builds the same shape from a dict so the runner is exercisable end-to-end and
-    ``main`` writes exactly one result.json. Cycle 3 swaps this for the real model;
-    meanwhile the field names here stay aligned with the M1 contract (VERBATIM).
+    SEAM-1 (FU-11 / G-17): the authoritative serialization IS the M1 model — no
+    hand-built dict remains, so producer/consumer key drift cannot reappear.
+    ``OracleOutcome`` (M2-internal) maps onto the M1 ``CriterionResult``:
+    ``name`` -> ``oracle``; ``detail`` falls back to the ``reason`` tag (so e.g. a
+    bare "timeout" is not lost — ``reason`` itself only steers the verdict fold and
+    is not a canonical field). ``artifacts`` defaults to the canonical None fields
+    until the recorders produce files (cycle 4).
     """
-    return {
-        "verdict": verdict,
-        "criteria": [
-            {
-                "name": o.name,
-                "passed": o.passed,
-                "reason": o.reason,
-                "detail": o.detail,
-            }
+    result = VerificationResult(
+        job_id=job_id,
+        verdict=verdict,
+        metrics=Metrics.from_dict(metrics),
+        criteria_results=[
+            CriterionResult(oracle=o.name, passed=o.passed, detail=(o.detail or o.reason) or None)
             for o in outcomes
         ],
-        "metrics": {
-            "time_to_goal_s": metrics.get("time_to_goal_s"),
-            "min_clearance_m": metrics.get("min_clearance_m"),  # None until measured
-            "collision_count": metrics.get("collision_count"),
-            "path_len_m": metrics.get("path_len_m"),
-        },
-    }
+        artifacts=artifacts if artifacts is not None else Artifacts(),
+    )
+    return result.to_dict()
