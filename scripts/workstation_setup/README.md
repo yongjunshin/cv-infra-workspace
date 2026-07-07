@@ -33,8 +33,9 @@ passthrough (DoD-P1-02) and pull the Isaac Sim base image (DoD-P1-03).
 
 The provisioning scripts run over **non-interactive SSH**, which cannot answer a sudo
 password prompt (G-06). So an operator installs a **NOPASSWD drop-in** once, in their
-own terminal (decision `2026-06-25-workstation-sudo-nopasswd`, option A). Run **on the
-workstation, in your own terminal**:
+own terminal (decision `2026-07-07-fu6-sudo-scope-reduction`, option B — supersedes
+`2026-06-25-workstation-sudo-nopasswd`). Run **on the workstation, in your own
+terminal**:
 
 ```bash
 cd ~/cv-infra-workspace
@@ -44,12 +45,17 @@ sudo visudo -cf /etc/sudoers.d/cv-infra && echo "drop-in OK"
 ```
 
 `visudo -cf` must print `... parsed OK` (and `drop-in OK`). The drop-in authorizes
-exactly six binaries for user `etri`; see [sudo 1:1 mapping](#sudo-11-mapping).
+exactly four binaries for user `etri`; see [sudo 1:1 mapping](#sudo-11-mapping).
 
-**Teardown (after Phase 1 — the drop-in is removable):**
+**Lifetime (P2+): STANDING** — the Phase-1 "removable / teardown" clause is
+superseded by decision `2026-07-07-fu6-sudo-scope-reduction`. Scope changes require
+a superseding decision; updates ship through the whitelisted channel itself
+(validate first, then replace):
 
 ```bash
-sudo rm /etc/sudoers.d/cv-infra
+visudo -c -f scripts/workstation_setup/sudoers.d-cv-infra
+sudo -n install -m 0440 -o root -g root \
+  scripts/workstation_setup/sudoers.d-cv-infra /etc/sudoers.d/cv-infra
 ```
 
 ---
@@ -233,20 +239,24 @@ itself.
 
 ## sudo 1:1 mapping
 
-`sudoers.d-cv-infra` whitelists exactly the binaries the scripts call via `sudo -n`:
+`sudoers.d-cv-infra` whitelists exactly the binaries the scripts call via `sudo -n`
+(P2+ **standing** scope — decision `2026-07-07-fu6-sudo-scope-reduction`, option B):
 
 | Whitelisted binary | Called by | Exact invocation(s) |
 |---|---|---|
 | `/usr/bin/apt-get` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh` | `apt-get update`; `apt-get install -y <pinned pkgs>` (realign: single guarded install/remove transaction + `purge` of 595 config residue) |
-| `/usr/bin/install` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh` | place apt keyring (`/etc/apt/keyrings/...`, `/usr/share/keyrings/...`) + `sources.list.d` + `preferences.d` files |
-| `/usr/sbin/usermod` | `install_docker.sh` | `usermod -aG docker etri` |
-| `/usr/bin/systemctl` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh` | `systemctl enable --now docker`; `systemctl restart docker`; realign: `systemctl reboot` (only with `--reboot`) |
-| `/usr/bin/nvidia-ctk` | `install_nvidia_toolkit.sh` | `nvidia-ctk runtime configure --runtime=docker` |
-| `/usr/bin/docker` | `test_gpu_passthrough.sh`, `pull_isaac.sh` | `docker run --rm --gpus all ...`; `docker image inspect ...`; `docker pull ...` |
+| `/usr/bin/install` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh`, `register_gh_runner.sh` | place apt keyring (`/etc/apt/keyrings/...`, `/usr/share/keyrings/...`) + `sources.list.d` + `preferences.d` files; runner systemd unit (pin refresh / content drift); this drop-in's own updates |
+| `/usr/bin/systemctl` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh`, `register_gh_runner.sh` | `systemctl enable --now docker`; `systemctl restart docker`; realign: `systemctl reboot` (only with `--reboot`); runner: `stop` / `daemon-reload` / `enable --now` |
+| `/usr/bin/docker` | `test_gpu_passthrough.sh`, `pull_isaac.sh`, `isaac_smoke/run_smoke.sh`, `isaac_smoke/run_dds_handshake.sh` | `docker run --rm --gpus all ...`; `docker image inspect ...`; `docker pull ...`; smoke `docker run/network/logs/rm ...` |
+
+**Removed at P2 (FU-6)**: `/usr/sbin/usermod` (`usermod -aG docker etri`) and
+`/usr/bin/nvidia-ctk` (`nvidia-ctk runtime configure --runtime=docker`) — one-shot
+provisioning verbs with no P2+ recurrence. Consequence: a full `provision.sh` re-run
+now fails loud at those two invocations; on a re-provision they are operator actions
+in an interactive terminal (G-06 pattern).
 
 `curl` / `gpg` are **not** whitelisted: keys are downloaded as the user and placed with
-`install`. Arguments are unconstrained (accepted, removable, window-limited scope — see
-the drop-in header).
+`install`. Arguments are unconstrained (accepted standing scope — see the drop-in header).
 
 ---
 
