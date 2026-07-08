@@ -187,7 +187,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     from cv_infra.contract.models import Artifacts
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
     from cv_infra.runner.recording import RosbagRecorder, VideoRecorder, plan_artifacts
-    from cv_infra.runner.ros_bridge import bootstrap_bridge_env, enable_bridge, honored_env
+    from cv_infra.runner.ros_bridge import (
+        bootstrap_bridge_env,
+        enable_bridge,
+        honored_env,
+        reexec_for_bridge_lib,
+    )
     from cv_infra.runner.sim_runtime import SimConfig, SimRuntime
     from cv_infra.runner.telemetry import (
         PhysicsTelemetrySampler,
@@ -224,6 +229,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # keys default from adapter_config (runner works without the T1 supervisor).
         bootstrap = bootstrap_bridge_env(adapter_config.ros_distro, adapter_config.rmw)
         print(f"[cv-runner] bridge bootstrap: {bootstrap}", flush=True)
+        # Measured (p2c5 probe-01): the loader snapshots LD_LIBRARY_PATH at process
+        # start — when bootstrap had to prepend it, re-exec once pre-boot so the
+        # bridge's shared libs resolve (idempotent: marker present after re-exec).
+        reexec_for_bridge_lib(bootstrap)
         sim.boot()  # step 1: SimulationApp first
         _ = honored_env()  # step 2: honor M3-injected env
         enable_bridge(sim.simulation_app)  # step 2: enable bridge

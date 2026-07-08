@@ -96,3 +96,51 @@ def test_bootstrap_without_jazzy_root_still_defaults_env():
     assert report.jazzy_root is None
     assert env["ROS_DISTRO"] == "jazzy"  # bridge may still fall back internally (FU-14)
     assert "LD_LIBRARY_PATH" not in env
+
+
+# --------------------------------------------------------------------------- #
+# LD re-exec (measured p2c5 probe-01: loader snapshots LD_LIBRARY_PATH at
+# process start — in-python prepend alone leaves the bridge libs unresolvable).
+# --------------------------------------------------------------------------- #
+def _bootstrap(prepended: bool) -> ros_bridge.BridgeBootstrap:
+    return ros_bridge.BridgeBootstrap(
+        jazzy_root="/isaac-sim/exts/isaacsim.ros2.bridge/jazzy",
+        ros_distro_defaulted=False,
+        rmw_defaulted=False,
+        ld_path_prepended=prepended,
+        rclpy_site_added=True,
+    )
+
+
+def test_reexec_skipped_when_marker_was_already_present():
+    calls: list = []
+    did = ros_bridge.reexec_for_bridge_lib(
+        _bootstrap(prepended=False), execv=lambda *a: calls.append(a)
+    )
+    assert did is False and calls == []  # no loop after the re-exec'd process
+
+
+def test_reexec_fires_once_with_runner_entry_argv():
+    calls: list = []
+    did = ros_bridge.reexec_for_bridge_lib(
+        _bootstrap(prepended=True), execv=lambda path, args: calls.append((path, args))
+    )
+    assert did is True and len(calls) == 1
+    path, args = calls[0]
+    assert path == args[0]
+    assert args[1:] == ["-m", "cv_infra.runner.main"]  # runner entry preserved
+
+
+def test_reexec_honors_explicit_argv():
+    calls: list = []
+    ros_bridge.reexec_for_bridge_lib(
+        _bootstrap(prepended=True),
+        argv=["/isaac-sim/kit/python/bin/python3", "/cv/probes/scene_probe.py"],
+        execv=lambda path, args: calls.append((path, args)),
+    )
+    assert calls == [
+        (
+            "/isaac-sim/kit/python/bin/python3",
+            ["/isaac-sim/kit/python/bin/python3", "/cv/probes/scene_probe.py"],
+        )
+    ]
