@@ -4,7 +4,11 @@ description = "Continuous verification infrastructure: Isaac Sim simulation gati
 readme = "README.md"
 requires-python = "==3.11.*"
 dynamic = ["version"]
-dependencies = []
+# Runtime deps — exact-pinned (CLAUDE.md §2-7). pyyaml: CLI scenario loading
+# (`cv-infra run`, lazy-imported so --help stays dependency-free).
+dependencies = [
+    "pyyaml==6.0.2",
+]
 
 # Console script (cross-team contract — verbatim pin, do not change).
 # M8 implements `def main() -> int` (exit-code) at cv_infra/cli/main.py.

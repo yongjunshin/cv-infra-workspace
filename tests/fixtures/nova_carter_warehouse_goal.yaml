@@ -1,0 +1,68 @@
+# nova_carter_warehouse_goal.yaml — standard-input instance (Phase-2, cycle-3: measured-aligned).
+#
+# A robot-SW developer's verification request: "drive the Nova Carter to a goal in the
+# warehouse without colliding." This file INSTANTIATES the platform-owned Scenario shape
+# (M1) — CV-User does not define the schema, only exercises it as a consumer.
+#
+# STATUS (cycle-3, SEAM-2): DRAFT lifted — measured alignment complete. adapter_config
+# follows the M1 canonical `Ros2AdapterConfig` keys (retired/unknown keys are now
+# loud-rejected by the platform); every value below is a workstation measurement from
+# reports/user-2026-07-07-seam2-carter-topic-inventory.md (T2 inventory).
+# Remaining residual (explicit, follow-up cycle): goal free-space tuning against the
+# live sim — goal/seed/timeout values are unchanged from the draft (see inline comment).
+
+scenario:
+  scene: nova_carter_warehouse          # static warehouse map (carter_warehouse_navigation)
+  robot: nova_carter
+  goal:                                  # map extent x[-11.975,12.03] y[-17.975,20.83];
+    x: -6.0                              #   AMCL start pose is (-6.0, -1.0, yaw=pi). This goal
+    y: 5.0                               #   is a short straight drive up the same lane.
+    yaw: 1.5708                          #   Free-space tuning vs the live sim = follow-up-cycle residual.
+    frame: map
+  seed: 42                               # fixed seed for determinism (REQ-EXEC-003, NFR-EXEC-001)
+  timeout_s: 120                         # mission timeout (REQ-EXEC-007) — value unchanged from draft
+
+sut:
+  image_ref: carter-sut:p2               # first workstation build (D-1 hybrid local build, FU-10 pin #2):
+                                         #   Image Id sha256:47aff5c993dac05b1664482e44af9401073336f142cb6d4919d81b47f8f9d48a
+                                         #   (local tag => no RepoDigest; the Image Id IS the pin)
+
+interface:
+  type: ros2                             # REQ-EXEC-004 (adapter type; only ros2 for MVP)
+  adapter_config:                        # M1 canonical Ros2AdapterConfig — unknown keys loud-reject
+    ros_distro: jazzy
+    rmw: rmw_fastrtps_cpp
+    use_sim_time: true                   # measured: /clock sub = 20 nodes (REQ-EXEC-003)
+    goal_interface:                      # REQ-EXEC-007 — measured: server = bt_navigator
+      kind: action
+      name: /navigate_to_pose
+      type: nav2_msgs/action/NavigateToPose
+    cmd_vel:                             # SUT publishes -> sim actuates (REQ-EXEC-006)
+      topic: /cmd_vel
+      type: geometry_msgs/msg/Twist      # measured: Twist (NOT TwistStamped), 2 publishers
+    clock_topic: /clock                  # sim publishes -> use_sim_time (REQ-EXEC-003)
+    odom_topics:                         # odom dualization (measured) — wire the SAME Odometry stream to BOTH:
+      - /odom                            #   controller_server (nav2 default; carter params don't override)
+      - /chassis/odom                    #   bt_navigator + odom_smoother (carter params)
+    sensors:                             # sim publishes -> SUT subscribes (REQ-EXEC-006)
+      - topic: /front_3d_lidar/lidar_points
+        type: sensor_msgs/msg/PointCloud2
+        frame: front_3d_lidar            # measured pointcloud_to_laserscan target_frame
+      - topic: /front_2d_lidar/scan      # local_costmap front_2d_lidar_layer (carter params);
+        type: sensor_msgs/msg/LaserScan  #   frame unmeasured -> omitted (header-carried)
+      - topic: /back_2d_lidar/scan       # local_costmap back_2d_lidar_layer (carter params);
+        type: sensor_msgs/msg/LaserScan  #   frame unmeasured -> omitted (header-carried)
+    frames:
+      map: map
+      odom: odom
+      base_link: base_link               # SUT publishes map->odom only (amcl); odom->base_link TF = sim's job
+    readiness:                           # measured: action server is DDS-discoverable even while inactive,
+      is_active_service: /lifecycle_manager_navigation/is_active   # so gate on this Trigger service instead
+
+acceptance_criteria:                     # MVP: reach goal within timeout AND zero collision (REQ-EXEC-011)
+  - oracle: reached_goal                 # REQ-EXEC-010/012
+    params:
+      goal_tolerance_m: 0.5              # draft tolerance (tuned with goal free-space, follow-up cycle)
+      goal_tolerance_yaw: 0.26           # ~15 deg
+  - oracle: no_collision                 # REQ-EXEC-010/011 (collision_count == 0)
+    params: {}
