@@ -4,7 +4,9 @@ description = "Continuous verification infrastructure: Isaac Sim simulation gati
 readme = "README.md"
 requires-python = "==3.11.*"
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+    "docker==7.1.0",  # M3 supervisor spawn/teardown (lazy-imported; runner image installs --no-deps)
+]
 
 # Console script (cross-team contract — verbatim pin, do not change).
 # M8 implements `def main() -> int` (exit-code) at cv_infra/cli/main.py.
