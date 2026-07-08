@@ -43,8 +43,10 @@ EXIT_PLATFORM = 3
 # nav2 lifecycle bringup window is 60s and ``Aborting bringup`` is terminal (G-19);
 # SUT start-order/restart policy is M3's. Deliberately not an adapter_config field
 # (shape frozen cycle-3) — revisit at the Phase-3 schema formalization if consumers
-# need to tune it.
-READINESS_TIMEOUT_S = 60.0
+# need to tune it. 180 = bring-up margin over the 60s nav2 window: the barrier
+# budget also absorbs the SUT's restart round (M3 contract) and the first-flow
+# settling after a cold scene stream; tighten with cycle-6 measurements.
+READINESS_TIMEOUT_S = 180.0
 
 # verdict (result.json) -> process exit code. timeout collapses to FAIL at the exit
 # level (only 4 slots); the precise verdict stays in result.json for M3/M8.
@@ -196,6 +198,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     from cv_infra.runner.sim_runtime import SimConfig, SimRuntime
     from cv_infra.runner.telemetry import (
         PhysicsTelemetrySampler,
+        contact_partners,
         count_real_collisions,
         min_clearance_m,
         path_length_m,
@@ -236,15 +239,18 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         sim.boot()  # step 1: SimulationApp first
         _ = honored_env()  # step 2: honor M3-injected env
         enable_bridge(sim.simulation_app)  # step 2: enable bridge
-        sim.load_scene()  # step 3: scene/spawn/dt/seed
+        chassis_path = read_field(criteria, "chassis_path", "")
+        excluded_paths = read_field(criteria, "collision_excluded_paths", []) or []
+        sampler = PhysicsTelemetrySampler(chassis_path, excluded_paths)
+        # bind() must run PRE-reset (probe-03 recipe A: the tensor-view wrapper
+        # created post-reset is invalidated) — load_scene calls it via the hook.
+        sim.pre_reset.append(sampler.bind)
+        sim.load_scene()  # step 3: scene/spawn/dt/seed (+ telemetry pre-bind)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5
             raise RuntimeError("SUT readiness barrier timed out")
         artifact_plan = plan_artifacts(result_path.parent)
-        chassis_path = read_field(criteria, "chassis_path", "")
-        excluded_paths = read_field(criteria, "collision_excluded_paths", []) or []
-        sampler = PhysicsTelemetrySampler(chassis_path, excluded_paths)
-        sampler.attach(sim.world)  # step 6: telemetry
+        sampler.attach(sim.world)  # step 6: telemetry (callbacks only; bound above)
         rosbag = _start_quiet(RosbagRecorder(artifact_plan, adapter_config))  # step 6: MCAP
         video = _start_quiet(VideoRecorder(artifact_plan))  # step 7: mp4
         if video is not None:
@@ -258,6 +264,13 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         mp4_path = _stop_quiet(video)
 
         record = sampler.record  # step 9: evaluate
+        if record.contact_events:  # bring-up debug surface: name the contact partners
+            partners = contact_partners(record.contact_events, chassis_path)
+            print(
+                f"[cv-runner] contact events: {len(record.contact_events)} with "
+                f"{len(partners)} distinct partner prim(s): {partners[:10]}",
+                flush=True,
+            )
         goal = read_field(criteria, "goal_position")
         pos_tol = float(read_field(criteria, "position_tolerance_m", 0.25))
         goal_xyz = (float(goal[0]), float(goal[1]), float(goal[2]))

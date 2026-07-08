@@ -115,6 +115,10 @@ class SimRuntime:
         # Callbacks invoked after every step (e.g. video frame capture) — kept
         # runner-side so the adapter's step loop stays recorder-agnostic.
         self.on_step: list = []
+        # Hooks called with the World JUST BEFORE world.reset() (measured p2c5
+        # probe-03: tensor-view wrappers — telemetry's SingleRigidPrim — must be
+        # created pre-reset or the cached simulation view is already invalid).
+        self.pre_reset: list = []
 
     def boot(self) -> object:
         """Instantiate SimulationApp FIRST, then it is legal to import omni/isaacsim."""
@@ -182,6 +186,8 @@ class SimRuntime:
                     "(sample asset naming changed? update SCENE_ASSETS)"
                 )
 
+        for hook in self.pre_reset:
+            hook(self.world)
         self.world.reset()
 
     def step(self, render: bool = True) -> None:  # pragma: no cover - GPU path
