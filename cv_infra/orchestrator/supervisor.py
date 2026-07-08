@@ -8,7 +8,10 @@ Per job it
    ``ROS_DOMAIN_ID`` (dual isolation, LOCKED §7.5 — 0..101 domain space);
 2. starts the RUNNER first — the sim is the ``/clock`` source, and a ``use_sim_time``
    SUT started before clock flows freezes and aborts its nav2 bringup (G-19 supply
-   order: clock -> TF/odom -> sensors);
+   order: clock -> TF/odom -> sensors). The runner is Isaac and always needs the GPU
+   on the default ``cv-infra run`` path, so it gets an all-GPU device request by
+   default (``runner_gpus=False`` is the CPU-test opt-out); the SUT never gets one
+   (carter nav2 is CPU-only);
 3. gates on runner readiness (injectable probe; the default only checks the container
    is running — per G-19, endpoint existence is never flow evidence, so the measured
    /clock-flow probe is workstation glue injected by the Wave-2 task);
@@ -128,6 +131,7 @@ def run_job(
     docker_client: Any = None,
     *,
     runner_env: dict[str, str] | None = None,
+    runner_gpus: bool = True,
     readiness_probe: ReadinessProbe | None = None,
     readiness_timeout_s: float = 120.0,
     job_timeout_s: float = 1800.0,
@@ -192,6 +196,16 @@ def run_job(
                 "ROS_DOMAIN_ID": str(domain_id),
             }
         )
+        runner_extra: dict[str, Any] = {}
+        if runner_gpus:
+            # Runner = Isaac = always GPU on the default path (--gpus all equivalent);
+            # NVIDIA_DRIVER_CAPABILITIES=all is baked into the runner image (M5), so
+            # no env propagation is needed. Lazy import, same discipline as `import
+            # docker` above (DoD-P2-12 — module import stays docker-free; this line
+            # only ever executes on the control-plane host where the SDK is pinned).
+            from docker.types import DeviceRequest  # noqa: PLC0415
+
+            runner_extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
         runner_ct = client.containers.run(
             runner_image,
             detach=True,
@@ -202,6 +216,7 @@ def run_job(
                 str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
                 str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
             },
+            **runner_extra,
         )
 
         probe = readiness_probe if readiness_probe is not None else default_readiness_probe
@@ -215,7 +230,9 @@ def run_job(
             infra_error = f"runner readiness gate timed out after {readiness_timeout_s}s"
         else:
             # SUT joins the same network + domain as an unmodified blackbox: no
-            # command/entrypoint override, no operator env leak (DoD-P2-03).
+            # command/entrypoint override, no operator env leak (DoD-P2-03), and
+            # no GPU device request (carter nav2 is CPU-only — GPU slots stay
+            # with the runner).
             sut_ct = client.containers.run(
                 sut_image,
                 detach=True,

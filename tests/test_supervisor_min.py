@@ -366,6 +366,31 @@ def test_runner_env_passes_through_and_seam_keys_win(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# (7) GPU device request — runner=Isaac gets the GPU by default, SUT never does
+# --------------------------------------------------------------------------- #
+
+
+def test_runner_gets_gpu_device_request_by_default_sut_does_not(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client)  # default runner_gpus=True — `cv-infra run` path
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    (request,) = runner_kwargs["device_requests"]  # exactly one request: all GPUs
+    assert request["Count"] == -1  # docker.types.DeviceRequest — `--gpus all` equivalent
+    assert request["Capabilities"] == [["gpu"]]
+    assert "device_requests" not in sut_kwargs  # carter nav2 is CPU-only
+
+
+def test_runner_gpus_opt_out_keeps_cpu_spawn_device_free(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, runner_gpus=False)  # CPU-test opt-out (kw-only)
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    assert "device_requests" not in runner_kwargs
+    assert "device_requests" not in sut_kwargs
+
+
+# --------------------------------------------------------------------------- #
 # seam-contract edges + pure helpers
 # --------------------------------------------------------------------------- #
 
