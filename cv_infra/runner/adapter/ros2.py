@@ -14,14 +14,8 @@ GPU/ROS bodies (R16 — in-process rclpy preferred, availability verified at run
 
 from __future__ import annotations
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
+from cv_infra.adapter.adapter_schema import GoalInterface, Ros2AdapterConfig
 from cv_infra.runner.adapter.base import SimAdapter
-
-# MVP defaults (P2 hardcoded; from adapter_config in P3). Real topic names are
-# discovered on the workstation in cycle 3 (R7) and fed via adapter_config, never
-# baked into oracle/telemetry code paths.
-DEFAULT_GOAL_ACTION = "/navigate_to_pose"
-DEFAULT_GOAL_ACTION_TYPE = "nav2_msgs/action/NavigateToPose"
 
 
 class Ros2Adapter(SimAdapter):
@@ -30,8 +24,21 @@ class Ros2Adapter(SimAdapter):
     interface_type = "ros2"
 
     def __init__(self, config: Ros2AdapterConfig | None = None) -> None:
-        self.config = config
+        # FU-13 (3): all wiring names come from adapter_config — no module DEFAULT_*
+        # constants. Defaults live in the M1 adapter_schema (single definition), so a
+        # config-less adapter gets the schema defaults (LOCKED Nav2 goal action pin).
+        self.config = config if config is not None else Ros2AdapterConfig()
         self._node = None  # internal Jazzy rclpy node (set in wire())
+
+    @property
+    def goal_interface(self) -> GoalInterface:
+        """Mission goal binding (kind/name/type) — always from adapter_config.
+
+        The cycle 3-4 ``wire``/``drive_mission`` bodies bind the Nav2 goal through
+        this seam; real topic names are measured on the workstation (R7) and travel
+        via adapter_config, never baked into code paths.
+        """
+        return self.config.goal_interface
 
     def wire(self, simulation_app: object, adapter_config: object) -> None:  # pragma: no cover
         """Join the SUT DDS domain, remap topics/QoS, bind the Nav2 goal interface."""
@@ -43,7 +50,8 @@ class Ros2Adapter(SimAdapter):
         raise NotImplementedError("readiness barrier lands in cycle 3")
 
     def drive_mission(self, goal: object) -> None:  # pragma: no cover - GPU/ROS path
-        """Send NavigateToPose goal; monitor result/timeout on sim-time (/clock)."""
+        """Send the goal via ``goal_interface``; monitor result/timeout on sim-time
+        (/clock)."""
         raise NotImplementedError("goal driver lands in cycle 3-4")
 
     def teardown(self) -> None:  # pragma: no cover - GPU/ROS path
