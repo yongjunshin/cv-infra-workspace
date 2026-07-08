@@ -4,8 +4,12 @@ description = "Continuous verification infrastructure: Isaac Sim simulation gati
 readme = "README.md"
 requires-python = "==3.11.*"
 dynamic = ["version"]
+# Runtime deps — exact-pinned (CLAUDE.md §2-7). Host-side control plane only;
+# both are lazy-imported (runner image installs the wheel --no-deps and never
+# imports them — DoD-P2-12).
 dependencies = [
-    "docker==7.1.0",  # M3 supervisor spawn/teardown (lazy-imported; runner image installs --no-deps)
+    "docker==7.1.0",  # M3 supervisor spawn/teardown
+    "pyyaml==6.0.2",  # M8 CLI scenario loading (`cv-infra run`; --help stays dependency-free)
 ]
 
 # Console script (cross-team contract — verbatim pin, do not change).
