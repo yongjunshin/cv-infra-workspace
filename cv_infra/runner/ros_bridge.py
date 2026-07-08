@@ -1,19 +1,35 @@
-"""isaacsim.ros2.bridge enable + env honor (M2, REQ-EXEC-004/006, REQ-ORCH-008).
+"""isaacsim.ros2.bridge enable + env honor + boot glue (M2, REQ-EXEC-004/006).
 
 Enables the ROS 2 bridge (bundled internal Jazzy) and *honors* the isolation env
 that M3 injects — ``ROS_DOMAIN_ID`` / ``RMW_IMPLEMENTATION`` / FastDDS profile — it
-never assigns them (LOCKED §5, D-2). The internal-Jazzy ``LD_LIBRARY_PATH`` is set
-by the container env/entrypoint BEFORE ``python.sh`` boots (M2 §3.3 [VERIFY]), not
-here. ``enable_bridge`` defers the Isaac import; ``honored_env`` is a pure env read
-and is CPU-testable.
+never assigns them (LOCKED §5, D-2). ``enable_bridge`` defers the Isaac import;
+``honored_env`` / ``bootstrap_bridge_env`` are pure env logic and CPU-testable.
+
+FU-14 (runner side, cycle-5 PM ruling — knowledge-ownership split): scenario-derived
+values (``ROS_DISTRO``/``RMW_IMPLEMENTATION``) are supervisor-owned keys injected by
+M3 when present; the runner only FILLS ABSENT keys from ``adapter_config`` defaults
+so it works with an older supervisor too. Image-internal knowledge (the bundled
+jazzy ext location) is the runner's: ``bootstrap_bridge_env`` prepends the jazzy
+``lib`` to ``LD_LIBRARY_PATH`` and puts the bundled rclpy site on ``sys.path``
+(cycle-3 measured: the site alone makes rclpy 7.1.5 + nav2_msgs importable without
+SimulationApp). Layout measured 2026-07-08 on ``cv-infra-runner:p2``:
+``/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/{lib,rclpy}``.
+
+[VERIFY @T3] The in-python ``LD_LIBRARY_PATH`` set targets the bridge extension's
+own env-driven loading at ``enable_extension`` time; the dynamic loader consumed the
+process-start value, so M2 §3.3 keeps the container-env/entrypoint route as the
+fallback if T3 still sees the "startup failed -> internal fallback" noise (then this
+becomes an M5 questions/ item — not solvable here).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
-# Env keys the runner honors (never sets) — surfaced for diagnostics + [VERIFY].
+# Env keys the runner honors (never sets when present) — diagnostics + [VERIFY].
 HONORED_ENV_KEYS = (
     "ROS_DOMAIN_ID",
     "RMW_IMPLEMENTATION",
@@ -21,6 +37,11 @@ HONORED_ENV_KEYS = (
     "ROS_DISTRO",
 )
 JAZZY_LD_MARKER = "isaacsim.ros2.bridge/jazzy/lib"
+
+# Bundled jazzy ext discovery (image-internal knowledge, measured 2026-07-08).
+# ``ISAAC_PATH`` (base-image env) wins over the measured default root.
+DEFAULT_ISAAC_ROOTS = ("/isaac-sim",)
+JAZZY_EXT_GLOB = "exts*/isaacsim.ros2.bridge*/jazzy"
 
 
 @dataclass(frozen=True)
@@ -43,6 +64,80 @@ def honored_env(env: dict | None = None) -> BridgeEnv:
         fastdds_profile=environ.get("FASTRTPS_DEFAULT_PROFILES_FILE"),
         ros_distro=environ.get("ROS_DISTRO"),
         jazzy_on_ld_path=JAZZY_LD_MARKER in environ.get("LD_LIBRARY_PATH", ""),
+    )
+
+
+@dataclass(frozen=True)
+class BridgeBootstrap:
+    """What ``bootstrap_bridge_env`` found/changed (log surface for T3 evidence)."""
+
+    jazzy_root: str | None
+    ros_distro_defaulted: bool
+    rmw_defaulted: bool
+    ld_path_prepended: bool
+    rclpy_site_added: bool
+
+
+def find_jazzy_root(
+    roots: tuple[str, ...] = DEFAULT_ISAAC_ROOTS, env: dict | None = None
+) -> Path | None:
+    """Locate the bundled jazzy ext dir (``lib`` must exist) — CPU-testable."""
+    environ = os.environ if env is None else env
+    search: list[str] = []
+    isaac_path = environ.get("ISAAC_PATH")
+    if isaac_path:
+        search.append(isaac_path)
+    search.extend(roots)
+    for root in search:
+        for candidate in sorted(Path(root).glob(JAZZY_EXT_GLOB)):
+            if (candidate / "lib").is_dir():
+                return candidate
+    return None
+
+
+def bootstrap_bridge_env(
+    default_ros_distro: str,
+    default_rmw: str,
+    env: dict | None = None,
+    sys_path: list[str] | None = None,
+    roots: tuple[str, ...] = DEFAULT_ISAAC_ROOTS,
+) -> BridgeBootstrap:
+    """FU-14 runner-side boot glue. Call BEFORE SimulationApp boot (main step 0.5).
+
+    Supervisor-injected ``ROS_DISTRO``/``RMW_IMPLEMENTATION`` are honored untouched;
+    absent keys are defaulted from ``adapter_config`` (the runner must work without
+    the T1 supervisor too — task data contract). The jazzy ``lib``/rclpy-site paths
+    are image-internal knowledge and always ensured (idempotent).
+    """
+    environ = os.environ if env is None else env
+    path_list = sys.path if sys_path is None else sys_path
+
+    ros_distro_defaulted = not environ.get("ROS_DISTRO")
+    if ros_distro_defaulted:
+        environ["ROS_DISTRO"] = default_ros_distro
+    rmw_defaulted = not environ.get("RMW_IMPLEMENTATION")
+    if rmw_defaulted:
+        environ["RMW_IMPLEMENTATION"] = default_rmw
+
+    jazzy = find_jazzy_root(roots, environ)
+    ld_prepended = False
+    site_added = False
+    if jazzy is not None:
+        ld = environ.get("LD_LIBRARY_PATH", "")
+        if JAZZY_LD_MARKER not in ld:
+            environ["LD_LIBRARY_PATH"] = str(jazzy / "lib") + (f":{ld}" if ld else "")
+            ld_prepended = True
+        site = str(jazzy / "rclpy")  # bundled site dir (contains rclpy, nav2_msgs, ...)
+        if site not in path_list:
+            path_list.insert(0, site)
+            site_added = True
+
+    return BridgeBootstrap(
+        jazzy_root=str(jazzy) if jazzy is not None else None,
+        ros_distro_defaulted=ros_distro_defaulted,
+        rmw_defaulted=rmw_defaulted,
+        ld_path_prepended=ld_prepended,
+        rclpy_site_added=site_added,
     )
 
 
