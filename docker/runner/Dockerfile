@@ -95,6 +95,9 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 # (evidence); the artifact reproducibility anchor is the FU-10 image Id pin
 # (decision 2026-07-07-fu10). GNUPGHOME is a throwaway tmpdir so root's gpg
 # call never creates files under the uid-1234 HOME (G-15 hazard).
+# T3.5 (PM ruling A): + nav-msgs/geometry-msgs typesupport — T3 bringup measured
+# `ros2 bag record` dropping /chassis/odom·/cmd_vel as "unknown type" without
+# them (T3 report §6-1; recommends-off keeps them typesupport-only).
 USER root
 RUN set -eu; \
     export DEBIAN_FRONTEND=noninteractive; \
@@ -116,7 +119,8 @@ RUN set -eu; \
     dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.before; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ros-jazzy-ros2bag ros-jazzy-rosbag2-storage-mcap; \
+        ros-jazzy-ros2bag ros-jazzy-rosbag2-storage-mcap \
+        ros-jazzy-nav-msgs ros-jazzy-geometry-msgs; \
     dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.after; \
     echo '=== rosbag2 apt layer manifest (every package this layer installed) ==='; \
     comm -13 /tmp/pkgs.before /tmp/pkgs.after; \
