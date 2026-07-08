@@ -267,6 +267,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         mp4_path = _stop_quiet(video)
 
         record = sampler.record  # step 9: evaluate
+        goal_dbg = read_field(criteria, "goal_position")
+        if record.gt_pose_samples and goal_dbg is not None:
+            # Bring-up debug surface (T4 tolerance tuning): the exact GT
+            # closest-approach — run5 measured nav2 "Reached the goal!" with GT
+            # still outside the oracle tol (AMCL error + nav xy tol stack).
+            import math  # noqa: PLC0415
+
+            gxyz = (float(goal_dbg[0]), float(goal_dbg[1]), float(goal_dbg[2]))
+            closest = min(math.dist(s.position, gxyz) for s in record.gt_pose_samples)
+            print(f"[cv-runner] GT closest-approach to goal: {closest:.3f} m", flush=True)
         if record.contact_events:  # bring-up debug surface: name the contact partners
             partners = contact_partners(record.contact_events, chassis_path)
             print(
