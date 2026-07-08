@@ -152,6 +152,18 @@ def test_collision_filter_empty_is_zero():
     assert telemetry.count_real_collisions([], CHASSIS, ["/World/ground"]) == 0
 
 
+def test_collision_filter_skips_non_chassis_pairs_articulation_aggregation():
+    # Measured p2c5 run1: ContactReportAPI on the chassis (an articulation root)
+    # aggregates WHOLE-robot reports — wheel<->ground pairs (chassis not an
+    # actor) arrived 7344x on a clean run and must not count (D-E surface).
+    events = [
+        ContactEvent(0.1, "/World/carter/wheel_left", "/World/GroundPlane/collisionPlane"),
+        ContactEvent(0.2, "/World/GroundPlane/collisionPlane", "/World/carter/caster_wheel_right"),
+        ContactEvent(0.3, CHASSIS, "/World/obstacle_box"),  # real chassis hit still counts
+    ]
+    assert telemetry.count_real_collisions(events, CHASSIS, []) == 1
+
+
 # --------------------------------------------------------------------------- #
 # MVP oracles (REQ-EXEC-011).
 # --------------------------------------------------------------------------- #

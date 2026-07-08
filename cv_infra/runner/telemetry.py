@@ -98,15 +98,22 @@ def count_real_collisions(
 ) -> int:
     """Chassis-only collision count with ground/self filtered out (D-E).
 
-    A contact counts as a *real* collision only when the non-chassis actor is an
-    external body — i.e. it does NOT match any ``excluded_paths`` entry (ground
-    plane / designated floor / robot self-bodies such as wheels). Matching is by
-    exact path or prim-subtree prefix so a whole floor/robot subtree excludes.
-    Prevents the false FAIL where wheel-on-floor contact reads as a collision.
+    Measured (p2c5 run1): the ContactReportAPI Applied to the chassis body — an
+    ARTICULATION ROOT on the carter — aggregates contact reports of the WHOLE
+    articulation, so wheel/caster<->ground pairs arrive too (7344 events on a
+    clean run, neither actor the chassis). Those are not the D-E surface: an
+    event counts only when the chassis IS one of the actors AND the other actor
+    does not match any ``excluded_paths`` entry (ground plane / designated
+    floor / robot self-bodies). Matching is by exact path or prim-subtree
+    prefix so a whole floor/robot subtree excludes. Prevents the false FAIL
+    where wheel-on-floor contact reads as a collision.
     """
     count = 0
     for e in events:
-        others = {e.actor0_path, e.actor1_path} - {chassis_path}
+        actors = {e.actor0_path, e.actor1_path}
+        if chassis_path not in actors:
+            continue  # other-link contact (articulation aggregation artifact)
+        others = actors - {chassis_path}
         other = next(iter(others)) if others else chassis_path
         if any(_matches(other, ex) for ex in excluded_paths):
             continue
