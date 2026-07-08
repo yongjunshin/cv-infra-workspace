@@ -245,6 +245,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # bind() must run PRE-reset (probe-03 recipe A: the tensor-view wrapper
         # created post-reset is invalidated) — load_scene calls it via the hook.
         sim.pre_reset.append(sampler.bind)
+        obstacle = read_field(criteria, "debug_obstacle")
+        if obstacle:  # P2-04 FAIL-injection knob (free-form criteria params)
+            sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(obstacle))
         sim.load_scene()  # step 3: scene/spawn/dt/seed (+ telemetry pre-bind)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5

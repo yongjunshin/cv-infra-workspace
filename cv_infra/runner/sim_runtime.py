@@ -190,6 +190,27 @@ class SimRuntime:
             hook(self.world)
         self.world.reset()
 
+    def spawn_debug_obstacle(self, spec: dict) -> None:  # pragma: no cover - GPU path
+        """P2-04 FAIL-injection (bring-up): drop a fixed cuboid into the stage.
+
+        Runner-side scene mutation (cycle-plan T3 (7) team-discretion mechanism;
+        wire schema untouched — the spec travels via the FREE-FORM criteria
+        params, e.g. ``debug_obstacle: {x, y, height, width, depth}``). A LOW box
+        (default 0.15 m, below the 2D-lidar scan plane) stays invisible to the
+        blackbox nav's costmaps, so it deterministically meets the chassis.
+        Called as a pre-reset hook so the physics parse includes the collider.
+        """
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.api.objects import FixedCuboid  # noqa: PLC0415
+
+        height = float(spec.get("height", 0.15))
+        FixedCuboid(
+            prim_path="/World/cv_debug_obstacle",
+            name="cv_debug_obstacle",
+            position=np.array([float(spec["x"]), float(spec["y"]), height / 2.0]),
+            scale=np.array([float(spec.get("width", 1.2)), float(spec.get("depth", 0.4)), height]),
+        )
+
     def step(self, render: bool = True) -> None:  # pragma: no cover - GPU path
         """One fixed-dt step (render=True: Nova Carter RTX lidar needs off-screen render)."""
         if self.world is None:
