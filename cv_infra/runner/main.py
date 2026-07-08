@@ -24,6 +24,8 @@ import os
 import sys
 from pathlib import Path
 
+from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.models import VerificationRequest
 from cv_infra.runner.evaluate import (
     VERDICT_ERROR,
     EvaluationEngine,
@@ -36,6 +38,13 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
 EXIT_PLATFORM = 3
+
+# Readiness barrier budget (M2 runtime policy, NOT consumer contract): the measured
+# nav2 lifecycle bringup window is 60s and ``Aborting bringup`` is terminal (G-19);
+# SUT start-order/restart policy is M3's. Deliberately not an adapter_config field
+# (shape frozen cycle-3) — revisit at the Phase-3 schema formalization if consumers
+# need to tune it.
+READINESS_TIMEOUT_S = 60.0
 
 # verdict (result.json) -> process exit code. timeout collapses to FAIL at the exit
 # level (only 4 slots); the precise verdict stays in result.json for M3/M8.
@@ -108,6 +117,49 @@ def exit_code_for_verdict(verdict: str) -> int:
     return _VERDICT_EXIT.get(verdict, EXIT_PLATFORM)
 
 
+def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
+    """Build the typed request + adapter config from a JOB_SPEC dict (FU-13 (2)).
+
+    REAL ``from_dict`` calls — the cycle-3 canonical contract is the only shape
+    definition (G-17: no field-name drift by construction). Any contract violation
+    (missing/renamed key, unknown adapter_config key, non-ros2 interface) is bad
+    input, pre-sim -> BadJobSpec -> exit 2 (usage), like the other JOB_SPEC
+    failures. CPU-testable (no Isaac).
+    """
+    try:
+        request = VerificationRequest.from_dict(spec)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BadJobSpec(f"JOB_SPEC is not a canonical VerificationRequest dict: {exc!r}") from exc
+    if request.interface.type != "ros2":
+        raise BadJobSpec(
+            f"unsupported interface.type {request.interface.type!r} (Phase 2: ros2 only)"
+        )
+    try:
+        adapter_config = Ros2AdapterConfig.from_dict(request.interface.adapter_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BadJobSpec(f"interface.adapter_config rejected: {exc}") from exc
+    return request, adapter_config
+
+
+def criteria_view(request: VerificationRequest) -> dict:
+    """Flatten the typed request into the criteria mapping oracles/metrics read.
+
+    Scenario-derived fields first — ``goal_position`` from the 2D nav goal
+    (planar: z=0.0; an explicit ``goal_position`` param wins if a consumer needs
+    a non-ground goal) and the sim-time budget ``timeout_s`` (D-F) — then each
+    ``AcceptanceCriterion.params`` merged on top. Oracle *selection* stays
+    engine-side (the MVP pair is fixed in Phase 2, REQ-EXEC-011); params travel
+    per-criterion per the canonical shape.
+    """
+    view: dict = {
+        "goal_position": [request.scenario.goal.x, request.scenario.goal.y, 0.0],
+        "timeout_s": request.scenario.timeout_s,
+    }
+    for criterion in request.acceptance_criteria:
+        view.update(criterion.params)
+    return view
+
+
 # --------------------------------------------------------------------------- #
 # GPU orchestration (M2 §3.2 order) — Isaac-deferred; wired in cycles 2-4.
 # --------------------------------------------------------------------------- #
@@ -141,26 +193,26 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
     result_path = resolve_result_path(env)
     spec = resolve_job_spec_dict(env)
     job_id = require_job_id(spec)  # echoed into the canonical result (REQ-EXEC-013)
-    # SEAM-2 (cycle 3): the typed request view (VerificationRequest.from_dict) and the
-    # canonical acceptance_criteria list land with the adapter_config formalization;
-    # the scaffold still reads the criteria block directly so the pipeline runs.
-    criteria = read_field(spec, "acceptance_criteria", {}) or {}
+    # FU-13 (2): REAL typed parse (canonical from_dict chain) — contract violations
+    # are BadJobSpec -> exit 2, raised pre-sim (before any Isaac import/boot).
+    request, adapter_config = parse_request(spec)
+    criteria = criteria_view(request)
 
     sim = SimRuntime(
         SimConfig(
-            scene_ref=read_field(spec, "scene_ref", ""),
-            robot_usd_ref=read_field(spec, "robot_usd_ref", ""),
+            scene_ref=request.scenario.scene,
+            robot_usd_ref=request.scenario.robot,
+            seed=request.scenario.seed,
         )
     )
-    adapter = Ros2Adapter()
+    adapter = Ros2Adapter(adapter_config)
     try:
         sim.boot()  # step 1: SimulationApp first
         _ = honored_env()  # step 2: honor M3-injected env
         enable_bridge(sim.simulation_app)  # step 2: enable bridge
         sim.load_scene()  # step 3: scene/spawn/dt/seed
-        adapter.wire(sim.simulation_app, criteria)  # step 4: DDS wiring (no SUT spawn)
-        readiness_timeout = float(read_field(criteria, "readiness_timeout_s", 60))
-        if not adapter.await_ready(timeout_s=readiness_timeout):  # step 5
+        adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
+        if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5
             raise RuntimeError("SUT readiness barrier timed out")
         artifacts = plan_artifacts(result_path.parent)
         chassis_path = read_field(criteria, "chassis_path", "")
@@ -169,7 +221,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
         sampler.attach(sim.world)  # step 6: telemetry
         RosbagRecorder(artifacts).start()  # step 6: MCAP
         VideoRecorder(artifacts).start()  # step 7: mp4
-        adapter.drive_mission(read_field(criteria, "goal_position"))  # step 8: mission
+        adapter.drive_mission(request.scenario.goal)  # step 8: mission (typed Goal)
 
         record = sampler.record  # step 9: evaluate
         goal = read_field(criteria, "goal_position")
