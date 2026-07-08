@@ -241,7 +241,8 @@ def test_eula_boot_guard_blocks_without_consent():
 
 
 def test_eula_boot_guard_allows_with_consent():
-    sim_runtime.eula_boot_guard({"ACCEPT_EULA": "Y"})  # no raise
+    # opaque token: truthiness check; no consent literal (2026-07-03 decision)
+    sim_runtime.eula_boot_guard({"ACCEPT_EULA": "operator-consent-token"})  # no raise
 
 
 def test_honored_env_reads_injected_isolation_env():
