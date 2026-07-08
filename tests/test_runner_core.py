@@ -152,6 +152,18 @@ def test_collision_filter_empty_is_zero():
     assert telemetry.count_real_collisions([], CHASSIS, ["/World/ground"]) == 0
 
 
+def test_collision_filter_skips_non_chassis_pairs_articulation_aggregation():
+    # Measured p2c5 run1: ContactReportAPI on the chassis (an articulation root)
+    # aggregates WHOLE-robot reports — wheel<->ground pairs (chassis not an
+    # actor) arrived 7344x on a clean run and must not count (D-E surface).
+    events = [
+        ContactEvent(0.1, "/World/carter/wheel_left", "/World/GroundPlane/collisionPlane"),
+        ContactEvent(0.2, "/World/GroundPlane/collisionPlane", "/World/carter/caster_wheel_right"),
+        ContactEvent(0.3, CHASSIS, "/World/obstacle_box"),  # real chassis hit still counts
+    ]
+    assert telemetry.count_real_collisions(events, CHASSIS, []) == 1
+
+
 # --------------------------------------------------------------------------- #
 # MVP oracles (REQ-EXEC-011).
 # --------------------------------------------------------------------------- #
@@ -255,3 +267,23 @@ def test_honored_env_reads_injected_isolation_env():
     assert got.ros_domain_id == "42"
     assert got.rmw_implementation == "rmw_fastrtps_cpp"
     assert got.jazzy_on_ld_path is True
+
+
+# --------------------------------------------------------------------------- #
+# contact_partners (p2c5 bring-up debug surface for excluded_paths measurement).
+# --------------------------------------------------------------------------- #
+def test_contact_partners_names_distinct_non_chassis_actors():
+    from cv_infra.runner.telemetry import ContactEvent, contact_partners
+
+    chassis = "/World/Robot/chassis_link"
+    events = [
+        ContactEvent(0.1, chassis, "/World/wall_a"),
+        ContactEvent(0.2, "/World/wall_a", chassis),  # order-insensitive
+        ContactEvent(0.3, chassis, "/World/floor"),
+        ContactEvent(0.4, chassis, chassis),  # degenerate self-pair kept visible
+    ]
+    assert contact_partners(events, chassis) == [
+        "/World/Robot/chassis_link",
+        "/World/floor",
+        "/World/wall_a",
+    ]

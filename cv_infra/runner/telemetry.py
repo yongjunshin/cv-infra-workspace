@@ -98,20 +98,41 @@ def count_real_collisions(
 ) -> int:
     """Chassis-only collision count with ground/self filtered out (D-E).
 
-    A contact counts as a *real* collision only when the non-chassis actor is an
-    external body — i.e. it does NOT match any ``excluded_paths`` entry (ground
-    plane / designated floor / robot self-bodies such as wheels). Matching is by
-    exact path or prim-subtree prefix so a whole floor/robot subtree excludes.
-    Prevents the false FAIL where wheel-on-floor contact reads as a collision.
+    Measured (p2c5 run1): the ContactReportAPI Applied to the chassis body — an
+    ARTICULATION ROOT on the carter — aggregates contact reports of the WHOLE
+    articulation, so wheel/caster<->ground pairs arrive too (7344 events on a
+    clean run, neither actor the chassis). Those are not the D-E surface: an
+    event counts only when the chassis IS one of the actors AND the other actor
+    does not match any ``excluded_paths`` entry (ground plane / designated
+    floor / robot self-bodies). Matching is by exact path or prim-subtree
+    prefix so a whole floor/robot subtree excludes. Prevents the false FAIL
+    where wheel-on-floor contact reads as a collision.
     """
     count = 0
     for e in events:
-        others = {e.actor0_path, e.actor1_path} - {chassis_path}
+        actors = {e.actor0_path, e.actor1_path}
+        if chassis_path not in actors:
+            continue  # other-link contact (articulation aggregation artifact)
+        others = actors - {chassis_path}
         other = next(iter(others)) if others else chassis_path
         if any(_matches(other, ex) for ex in excluded_paths):
             continue
         count += 1
     return count
+
+
+def contact_partners(events: list[ContactEvent], chassis_path: str) -> list[str]:
+    """Distinct non-chassis actor paths seen in contact events (debug surface).
+
+    Bring-up aid (T3/T4): when no_collision counts unexpected contacts, this
+    names the offending prims so the consumer can extend
+    ``collision_excluded_paths`` with measured values instead of guessing (R7).
+    """
+    partners: set[str] = set()
+    for e in events:
+        others = {e.actor0_path, e.actor1_path} - {chassis_path}
+        partners.add(next(iter(others)) if others else chassis_path)
+    return sorted(partners)
 
 
 def min_clearance_m() -> None:
@@ -141,6 +162,15 @@ class PhysicsTelemetrySampler:
     ``excluded_paths`` (ground plane / designated floor / robot self-bodies).
     Both the chassis prim and the exclusion list travel via adapter_config /
     criteria — never scene-path hardcoded (R7).
+
+    Two-phase acquisition (measured p2c5 probe-02/03): the tensor-view wrapper
+    (``SingleRigidPrim``) MUST be created BEFORE ``world.reset()`` — created
+    after, the cached simulation view is already invalidated by the sample
+    scene's reset-time prim churn ("Simulation view object is invalidated") and
+    ``get_world_pose`` raises. So ``bind`` runs as a SimRuntime pre-reset hook
+    (wrapper + ContactReportAPI Apply — the Apply lands before the physics
+    parse), and ``attach`` (M2 §3.2 step 6, unchanged position) only registers
+    the callbacks.
     """
 
     def __init__(self, chassis_path: str, excluded_paths: list[str]) -> None:
@@ -153,8 +183,9 @@ class PhysicsTelemetrySampler:
 
     _CALLBACK_NAME = "cv_infra_telemetry"
 
-    def attach(self, world: object) -> None:  # pragma: no cover - GPU path (T3)
-        """Register the physics callback + chassis-only contact subscription."""
+    def bind(self, world: object) -> None:  # pragma: no cover - GPU path (T3)
+        """PRE-reset phase: validate the chassis prim, Apply the chassis-only
+        ContactReportAPI, create the tensor-view wrapper (probe-03 recipe A)."""
         if not self.chassis_path:
             raise RuntimeError(
                 "telemetry needs a chassis_path (no_collision criteria params / "
@@ -163,8 +194,7 @@ class PhysicsTelemetrySampler:
             )
 
         import omni.usd  # noqa: PLC0415 (legal only after SimulationApp boot)
-        from omni.physx import get_physx_simulation_interface  # noqa: PLC0415
-        from pxr import PhysicsSchemaTools, PhysxSchema  # noqa: PLC0415
+        from pxr import PhysxSchema  # noqa: PLC0415
 
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(self.chassis_path)
@@ -182,6 +212,17 @@ class PhysicsTelemetrySampler:
         from isaacsim.core.prims import SingleRigidPrim  # noqa: PLC0415
 
         self._chassis_prim = SingleRigidPrim(self.chassis_path)
+
+    def attach(self, world: object) -> None:  # pragma: no cover - GPU path (T3)
+        """Register the physics callback + chassis-only contact subscription."""
+        if self._chassis_prim is None:
+            raise RuntimeError(
+                "bind(world) must run as a pre-reset hook before attach() — the "
+                "tensor-view wrapper created post-reset is invalidated (probe-02)"
+            )
+        from omni.physx import get_physx_simulation_interface  # noqa: PLC0415
+        from pxr import PhysicsSchemaTools  # noqa: PLC0415
+
         self._world = world
 
         def on_physics_step(step_size: float) -> None:

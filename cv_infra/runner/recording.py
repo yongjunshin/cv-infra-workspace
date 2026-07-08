@@ -9,20 +9,26 @@ ships ``cv2`` 4.11.0 -> frames come from an ``omni.replicator`` rgb annotator an
 are CPU-encoded by ``cv2.VideoWriter`` (D-O: no NVENC contention, no ffmpeg
 binary needed — none is in the image).
 
-MCAP path (measured 2026-07-08): the runner image has NO rosbag2 in ANY form
-(no ``rosbag2_py``, no mcap libs in the vendored jazzy ext) — backend routing is
-an M5 image decision pending in
-``questions/runner-2026-07-08-mcap-recorder-routing.md``. ``RosbagRecorder`` is
-authored as the recommended route-A candidate (``ros2 bag record`` subprocess —
-genuine rosbag2 reuse) behind a runtime availability check that raises
-``RecorderUnavailable`` LOUDLY; ``main`` degrades gracefully (artifact stays
-None + stderr warning) so the pass-verdict E2E (P2-01) is never hostage to the
-pending decision (cycle plan's honest-carryover clause covers P2-02).
+MCAP path (M5 routing decision LANDED — option A, report
+deployment-2026-07-08-p2c5-rosbag2-layer): the image carries a genuine rosbag2
+apt layer (``ros-jazzy-ros2bag`` + ``ros-jazzy-rosbag2-storage-mcap``) under
+``/opt/ros/<distro>`` targeting the SYSTEM python3.12. Two measured constraints
+(M5 report §6-1) shape the subprocess glue here: (1) the ``ros2`` CLI is NOT on
+PATH and only works from a *sourced* env -> the child is
+``bash -c 'source .../setup.bash && exec ros2 bag record ...'``; (2) the runner
+process env is the BUNDLED py3.11 interpreter's (``python.sh`` exports
+PYTHONPATH/LD_LIBRARY_PATH into it) and would poison the py3.12 CLI -> the
+child env strips the interpreter-coupled keys while inheriting the DDS keys
+(ROS_DOMAIN_ID / RMW_IMPLEMENTATION / ROS_DISTRO — same-domain join, ABI
+isolation). Absent layer still raises ``RecorderUnavailable`` LOUDLY; ``main``
+degrades gracefully (artifact stays None + stderr warning) so the pass-verdict
+E2E (P2-01) is never hostage to recording.
 """
 
 from __future__ import annotations
 
-import shutil
+import os
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +80,37 @@ def bag_record_cmd(bag_dir: Path, topics: list[str]) -> list[str]:
     return ["ros2", "bag", "record", "--storage", "mcap", "--output", str(bag_dir), *topics]
 
 
+def ros_setup_script(ros_distro: str) -> Path:
+    """The apt-layer env script (M5 rosbag2 layer) — its presence IS the backend check."""
+    return Path("/opt/ros") / ros_distro / "setup.bash"
+
+
+def bag_record_shell_cmd(bag_dir: Path, topics: list[str], setup: Path) -> list[str]:
+    """Sourced-env wrapper (measured M5 §6-1: bare ``ros2`` is not executable).
+
+    ``exec`` replaces bash with the ros2 process so the recorder's SIGINT lands
+    on rosbag2 directly (clean bag close), not on a bash parent.
+    """
+    inner = shlex.join(bag_record_cmd(bag_dir, topics))
+    return ["bash", "-c", f"source {shlex.quote(str(setup))} && exec {inner}"]
+
+
+# Interpreter-coupled env keys the bundled python.sh exports — they would make the
+# system-py3.12 ros2 CLI import the bundled py3.11 site (ABI break, measured M5
+# §6-1 env-separation note). The DDS keys (ROS_DOMAIN_ID / RMW_IMPLEMENTATION /
+# ROS_DISTRO / FASTRTPS profile) pass through untouched — same-domain join.
+_RECORDER_ENV_DROP = ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "PYTHONEXE")
+
+
+def recorder_subprocess_env(base_env: dict | None = None) -> dict:
+    """Child env for the rosbag2 subprocess: inherit all but the bundled-interpreter
+    coupling keys (the sourced setup.bash rebuilds its own paths)."""
+    environ = dict(os.environ if base_env is None else base_env)
+    for key in _RECORDER_ENV_DROP:
+        environ.pop(key, None)
+    return environ
+
+
 def capture_stride(sim_fps: float, video_fps: float) -> int:
     """Capture every Nth sim step for the target video fps (>=1)."""
     if video_fps <= 0:
@@ -98,12 +135,12 @@ class RosbagRecorder:
         self._log_file = None
 
     def start(self) -> None:
-        if shutil.which("ros2") is None:
+        setup = ros_setup_script(self.config.ros_distro)
+        if not setup.is_file():
             raise RecorderUnavailable(
-                "no rosbag2 backend in the runner image (measured 2026-07-08: no "
-                "ros2 CLI / rosbag2_py / mcap libs) — MCAP recording waits on the "
-                "M5 image routing decision "
-                "(questions/runner-2026-07-08-mcap-recorder-routing.md)"
+                f"no rosbag2 apt layer in the runner image ({setup} missing) — the "
+                "MCAP backend is the M5 option-A layer (ros-jazzy-ros2bag + "
+                "rosbag2-storage-mcap; report deployment-2026-07-08-p2c5-rosbag2-layer)"
             )
         self.paths.bag_dir.parent.mkdir(parents=True, exist_ok=True)
         # G-18 evidence culture: keep the recorder's own output as a file.
@@ -111,9 +148,10 @@ class RosbagRecorder:
             self.paths.bag_dir.parent / "rosbag2.log", "w", encoding="utf-8"
         )
         self._proc = subprocess.Popen(  # pragma: no cover - needs the backend
-            bag_record_cmd(self.paths.bag_dir, bag_topics(self.config)),
+            bag_record_shell_cmd(self.paths.bag_dir, bag_topics(self.config), setup),
             stdout=self._log_file,
             stderr=subprocess.STDOUT,
+            env=recorder_subprocess_env(),
         )
 
     def stop(self) -> Path:  # pragma: no cover - needs the backend

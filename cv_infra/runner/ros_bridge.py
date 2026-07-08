@@ -15,11 +15,15 @@ jazzy ext location) is the runner's: ``bootstrap_bridge_env`` prepends the jazzy
 SimulationApp). Layout measured 2026-07-08 on ``cv-infra-runner:p2``:
 ``/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/{lib,rclpy}``.
 
-[VERIFY @T3] The in-python ``LD_LIBRARY_PATH`` set targets the bridge extension's
-own env-driven loading at ``enable_extension`` time; the dynamic loader consumed the
-process-start value, so M2 §3.3 keeps the container-env/entrypoint route as the
-fallback if T3 still sees the "startup failed -> internal fallback" noise (then this
-becomes an M5 questions/ item — not solvable here).
+[VERIFIED @T3 p2c5 probe-01, 2026-07-08] The in-python ``LD_LIBRARY_PATH`` set is
+NOT enough: the dynamic loader snapshots the value at process start, so the bridge
+logged "Could not load ... librosidl_runtime_c.so" + "ROS2 Bridge startup failed"
+even with the prepend in ``os.environ``. The measured fix stays M2-owned
+(image-internal knowledge, no M5 entrypoint change): when bootstrap had to prepend
+the path, ``reexec_for_bridge_lib`` re-executes the interpreter ONCE so the loader
+starts with the bundled jazzy ``lib`` visible. Idempotent by construction — after
+the re-exec the marker is already in the env, ``ld_path_prepended`` is False, and
+no further exec happens.
 """
 
 from __future__ import annotations
@@ -139,6 +143,29 @@ def bootstrap_bridge_env(
         ld_path_prepended=ld_prepended,
         rclpy_site_added=site_added,
     )
+
+
+def reexec_for_bridge_lib(
+    bootstrap: BridgeBootstrap,
+    argv: list[str] | None = None,
+    execv: object = None,
+) -> bool:
+    """Re-exec the interpreter once when the jazzy lib was prepended in-process.
+
+    Measured (p2c5 probe-01): the glibc loader consumes ``LD_LIBRARY_PATH`` at
+    process start — an in-python prepend leaves the bridge's shared libs
+    unresolvable ("ROS2 Bridge startup failed"). Called at main step 0.5 BEFORE
+    SimulationApp boot; ``os.execv`` inherits the already-patched ``os.environ``,
+    and the re-exec'd process finds the marker present (``ld_path_prepended``
+    False) so it never loops. Returns False when no re-exec is needed
+    (CPU-testable via the injectable ``execv``).
+    """
+    if not bootstrap.ld_path_prepended:
+        return False
+    run = os.execv if execv is None else execv
+    args = argv if argv is not None else [sys.executable, "-m", "cv_infra.runner.main"]
+    run(args[0], args)  # pragma: no cover - process image is replaced on GPU path
+    return True  # only reachable with an injected (test) execv
 
 
 def enable_bridge(simulation_app: object) -> None:  # pragma: no cover - GPU path
