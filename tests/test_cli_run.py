@@ -353,3 +353,74 @@ def test_help_path_imports_no_yaml_or_docker(tmp_path):
         cwd=tmp_path,  # neutral cwd: import must come from the installed package
     )
     assert proc.returncode == 0, proc.stderr
+
+
+# --- (6) operator consent env pass-through (decision 2026-07-03) --------------
+# The CLI must forward ACCEPT_EULA / PRIVACY_CONSENT from its own process env
+# to the supervisor's kw-only ``runner_env`` — verbatim, and only when present.
+# Values below are OPAQUE test tokens: no consent-value literal is committed
+# anywhere (repo-wide grep = 0); only pass-through is asserted.
+
+CONSENT_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
+
+
+class ConsentRecordingSupervisor(RecordingSupervisor):
+    """``RecordingSupervisor`` that also records the kw-only seam kwargs."""
+
+    def __init__(self, verdict: str = "pass"):
+        super().__init__(verdict)
+        self.kwargs_calls: list[dict] = []
+
+    def __call__(self, job_spec, out_dir, runner_image, sut_image, **kwargs):
+        self.kwargs_calls.append(kwargs)
+        return super().__call__(job_spec, out_dir, runner_image, sut_image)
+
+
+@pytest.fixture()
+def no_ambient_consent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic baseline: strip any ambient consent env before each case."""
+    for key in CONSENT_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_consent_env_both_present_pass_through_verbatim(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent
+):
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    monkeypatch.setenv("ACCEPT_EULA", "opaque-token-eula-7f3a")
+    monkeypatch.setenv("PRIVACY_CONSENT", "opaque-token-privacy-91c2")
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    # Exactly runner_env, exactly the two keys, values verbatim (no extras leak).
+    assert stub.kwargs_calls == [
+        {
+            "runner_env": {
+                "ACCEPT_EULA": "opaque-token-eula-7f3a",
+                "PRIVACY_CONSENT": "opaque-token-privacy-91c2",
+            }
+        }
+    ]
+
+
+def test_consent_env_absent_passes_nothing(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent
+):
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    # Absent => runner_env NOT passed at all (boot guard refuses honestly; FU-8 is P5).
+    assert stub.kwargs_calls == [{}]
+
+
+@pytest.mark.parametrize("present", CONSENT_KEYS)
+def test_consent_env_partial_forwards_only_present_key(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent, present
+):
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    monkeypatch.setenv(present, "opaque-token-partial-05d8")
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    assert stub.kwargs_calls == [{"runner_env": {present: "opaque-token-partial-05d8"}}]
