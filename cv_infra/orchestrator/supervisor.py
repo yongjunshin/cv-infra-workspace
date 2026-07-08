@@ -196,6 +196,16 @@ def run_job(
                 "ROS_DOMAIN_ID": str(domain_id),
             }
         )
+        # FU-14: scenario-derived ROS env — injected only when the key exists in
+        # interface.adapter_config (scenario is the SoT, so these supervisor-owned
+        # keys override operator runner_env like the seam keys above). Image-internal
+        # paths (LD_LIBRARY_PATH etc.) stay M2 boot-glue knowledge, never set here.
+        interface = job_spec.get("interface")
+        adapter_config = interface.get("adapter_config") if isinstance(interface, dict) else None
+        if isinstance(adapter_config, dict):
+            for cfg_key, env_key in (("ros_distro", "ROS_DISTRO"), ("rmw", "RMW_IMPLEMENTATION")):
+                if cfg_key in adapter_config:
+                    environment[env_key] = str(adapter_config[cfg_key])
         runner_extra: dict[str, Any] = {}
         if runner_gpus:
             # Runner = Isaac = always GPU on the default path (--gpus all equivalent);
