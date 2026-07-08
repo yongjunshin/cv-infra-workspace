@@ -126,19 +126,96 @@ def min_clearance_m() -> None:
 
 
 class PhysicsTelemetrySampler:
-    """GPU-side telemetry acquisition (Isaac-only — wired cycle 3-4).
+    """GPU-side telemetry acquisition (Isaac-only bodies; deferred imports).
 
-    Registers a physics callback via ``world.add_physics_callback`` that, each
-    substep, reads ``Articulation.get_world_pose()`` (GT) and subscribes to
-    ``omni.physx ... subscribe_contact_report_events`` for the chassis body (D-E).
-    Kept as an interface so ``main`` can compose it without importing Isaac on CPU.
+    Registers a physics callback via ``world.add_physics_callback`` that reads
+    the chassis rigid body's ``get_world_pose()`` (GT — never SUT ``/odom``,
+    LOCKED §7) each physics step, and subscribes to
+    ``omni.physx ... subscribe_contact_report_events`` with
+    ``PhysxContactReportAPI`` Applied to the CHASSIS BODY ONLY (D-E).
+
+    P2-13 false-FAIL-zero design point (explicit): collisions are filtered in
+    TWO stages — (1) acquisition: the ContactReportAPI Apply is chassis-limited,
+    so wheel-on-floor contacts of other bodies never even report; (2) reduction:
+    ``count_real_collisions`` drops events whose other actor matches
+    ``excluded_paths`` (ground plane / designated floor / robot self-bodies).
+    Both the chassis prim and the exclusion list travel via adapter_config /
+    criteria — never scene-path hardcoded (R7).
     """
 
     def __init__(self, chassis_path: str, excluded_paths: list[str]) -> None:
         self.chassis_path = chassis_path
         self.excluded_paths = list(excluded_paths)
         self.record = TelemetryRecord()
+        self._world = None
+        self._chassis_prim = None
+        self._contact_sub = None  # keep-alive: dropping the ref unsubscribes
 
-    def attach(self, world: object) -> None:  # pragma: no cover - GPU path
-        """Register the physics callback + contact subscription (cycle 3-4)."""
-        raise NotImplementedError("GPU telemetry acquisition is wired in cycle 3-4")
+    _CALLBACK_NAME = "cv_infra_telemetry"
+
+    def attach(self, world: object) -> None:  # pragma: no cover - GPU path (T3)
+        """Register the physics callback + chassis-only contact subscription."""
+        if not self.chassis_path:
+            raise RuntimeError(
+                "telemetry needs a chassis_path (no_collision criteria params / "
+                "adapter_config) — scene-path hardcoding is forbidden (R7/D-E), so "
+                "the consumer scenario must supply it"
+            )
+
+        import omni.usd  # noqa: PLC0415 (legal only after SimulationApp boot)
+        from omni.physx import get_physx_simulation_interface  # noqa: PLC0415
+        from pxr import PhysicsSchemaTools, PhysxSchema  # noqa: PLC0415
+
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(self.chassis_path)
+        if not prim.IsValid():
+            raise RuntimeError(
+                f"chassis_path {self.chassis_path!r} not found in the stage — "
+                "measure the chassis body prim on the workstation (R7) and fix the "
+                "scenario criteria params"
+            )
+        # D-E: Apply to the chassis body ONLY (never globally); threshold 0 so
+        # light touches report — filtering happens in the reduction, not by force.
+        contact_api = PhysxSchema.PhysxContactReportAPI.Apply(prim)
+        contact_api.CreateThresholdAttr().Set(0.0)
+
+        from isaacsim.core.prims import SingleRigidPrim  # noqa: PLC0415
+
+        self._chassis_prim = SingleRigidPrim(self.chassis_path)
+        self._world = world
+
+        def on_physics_step(step_size: float) -> None:
+            position, orientation = self._chassis_prim.get_world_pose()
+            self.record.gt_pose_samples.append(
+                PoseSample(
+                    sim_time_s=float(self._world.current_time),
+                    position=tuple(float(v) for v in position),
+                    orientation_wxyz=tuple(float(v) for v in orientation),
+                )
+            )
+
+        def on_contact(contact_headers, contact_data) -> None:
+            for header in contact_headers:
+                self.record.contact_events.append(
+                    ContactEvent(
+                        sim_time_s=float(self._world.current_time),
+                        actor0_path=str(PhysicsSchemaTools.intToSdfPath(header.actor0)),
+                        actor1_path=str(PhysicsSchemaTools.intToSdfPath(header.actor1)),
+                    )
+                )
+
+        world.add_physics_callback(self._CALLBACK_NAME, on_physics_step)
+        self._contact_sub = get_physx_simulation_interface().subscribe_contact_report_events(
+            on_contact
+        )
+
+    def detach(self) -> None:
+        """Stop sampling (drop callback + contact subscription). CPU-safe no-op."""
+        if self._world is not None:  # pragma: no cover - GPU path
+            try:
+                self._world.remove_physics_callback(self._CALLBACK_NAME)
+            except Exception:
+                pass
+            self._world = None
+        self._contact_sub = None  # releasing the ref ends the subscription
+        self._chassis_prim = None

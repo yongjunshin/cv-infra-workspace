@@ -171,16 +171,23 @@ def build_oracles() -> list:
     return [ReachedGoalOracle(), NoCollisionOracle()]
 
 
-def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 2-4)
+def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 proves)
     """Execute one job end-to-end and write exactly one result.json.
 
-    Runs the fixed M2 §3.2 sequence on GPU. On CPU this is import-only; the sequence
-    below documents the assembly and is filled with the Isaac/ROS bodies in cycles
-    2-4. The I/O + evaluation seams it calls are the CPU-tested functions above.
+    Runs the fixed M2 §3.2 sequence on GPU. On CPU this is import-only (all Isaac/
+    ROS bodies are deferred imports). The I/O + evaluation seams it calls are the
+    CPU-tested functions above.
+
+    Recording stance (P2-02): recorder failures are LOUD but non-fatal — the
+    artifacts are attachments, the verdict is the product. A missing backend
+    (RecorderUnavailable — pending M5 MCAP routing) or a capture failure leaves
+    the canonical artifact field None + a stderr warning instead of poisoning the
+    verdict with error.
     """
+    from cv_infra.contract.models import Artifacts
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
     from cv_infra.runner.recording import RosbagRecorder, VideoRecorder, plan_artifacts
-    from cv_infra.runner.ros_bridge import enable_bridge, honored_env
+    from cv_infra.runner.ros_bridge import bootstrap_bridge_env, enable_bridge, honored_env
     from cv_infra.runner.sim_runtime import SimConfig, SimRuntime
     from cv_infra.runner.telemetry import (
         PhysicsTelemetrySampler,
@@ -205,8 +212,18 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
             seed=request.scenario.seed,
         )
     )
-    adapter = Ros2Adapter(adapter_config)
+    # The adapter's readiness/mission loops must keep the sim stepping (the sim IS
+    # the /clock source — G-19), so it gets the step function as a dependency.
+    adapter = Ros2Adapter(adapter_config, stepper=sim.step)
+    rosbag = None
+    video = None
+    sampler = None
     try:
+        # step 0.5: FU-14 boot glue — BEFORE SimulationApp so the bridge extension
+        # sees ROS_DISTRO/RMW/LD_LIBRARY_PATH; supervisor-injected keys win, absent
+        # keys default from adapter_config (runner works without the T1 supervisor).
+        bootstrap = bootstrap_bridge_env(adapter_config.ros_distro, adapter_config.rmw)
+        print(f"[cv-runner] bridge bootstrap: {bootstrap}", flush=True)
         sim.boot()  # step 1: SimulationApp first
         _ = honored_env()  # step 2: honor M3-injected env
         enable_bridge(sim.simulation_app)  # step 2: enable bridge
@@ -214,14 +231,22 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5
             raise RuntimeError("SUT readiness barrier timed out")
-        artifacts = plan_artifacts(result_path.parent)
+        artifact_plan = plan_artifacts(result_path.parent)
         chassis_path = read_field(criteria, "chassis_path", "")
         excluded_paths = read_field(criteria, "collision_excluded_paths", []) or []
         sampler = PhysicsTelemetrySampler(chassis_path, excluded_paths)
         sampler.attach(sim.world)  # step 6: telemetry
-        RosbagRecorder(artifacts).start()  # step 6: MCAP
-        VideoRecorder(artifacts).start()  # step 7: mp4
-        adapter.drive_mission(request.scenario.goal)  # step 8: mission (typed Goal)
+        rosbag = _start_quiet(RosbagRecorder(artifact_plan, adapter_config))  # step 6: MCAP
+        video = _start_quiet(VideoRecorder(artifact_plan))  # step 7: mp4
+        if video is not None:
+            sim.on_step.append(video.capture_frame)
+        # step 8: mission on the sim-time budget (D-F; wall runaway watchdog = M3).
+        outcome = adapter.drive_mission(request.scenario.goal, timeout_s=request.scenario.timeout_s)
+        print(f"[cv-runner] mission outcome: {outcome}", flush=True)
+
+        sampler.detach()
+        mcap_path = _stop_quiet(rosbag)
+        mp4_path = _stop_quiet(video)
 
         record = sampler.record  # step 9: evaluate
         goal = read_field(criteria, "goal_position")
@@ -236,9 +261,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
             "path_len_m": path_length_m(record.gt_pose_samples),
         }
         verdict, outcomes = EvaluationEngine(build_oracles()).evaluate(record, criteria)
-        # artifacts=None -> canonical None fields until the recorders produce files
-        # (cycle 4 passes Artifacts(mcap=..., mp4=...) from the recorder stops).
-        result = build_result_dict(job_id, verdict, outcomes, metrics, artifacts=None)
+        result = build_result_dict(
+            job_id,
+            verdict,
+            outcomes,
+            metrics,
+            artifacts=Artifacts(
+                mcap=str(mcap_path) if mcap_path is not None else None,
+                mp4=str(mp4_path) if mp4_path is not None else None,
+            ),
+        )
         write_result(result, result_path)  # step 10: exactly one result
         return exit_code_for_verdict(verdict)
     except EulaNotAcceptedError:
@@ -248,8 +280,35 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (cycles 
         write_result(build_result_dict(job_id, VERDICT_ERROR, [], {}), result_path)
         return EXIT_PLATFORM
     finally:
+        if sampler is not None:
+            sampler.detach()
+        for recorder in (rosbag, video):  # failure paths: no child proc/writer leak
+            if recorder is not None:
+                recorder.abort()
         adapter.teardown()  # step 11: clean shutdown
         sim.close()
+
+
+def _start_quiet(recorder):  # pragma: no cover - GPU path helper
+    """Start a recorder; on failure warn LOUDLY and record without it (P2-02
+    honest degradation — the artifact field stays None, visible to PM/QA)."""
+    try:
+        recorder.start()
+        return recorder
+    except Exception as exc:
+        print(f"[cv-runner] recorder unavailable: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def _stop_quiet(recorder):  # pragma: no cover - GPU path helper
+    """Stop a recorder and return its artifact path; None (loud) on failure."""
+    if recorder is None:
+        return None
+    try:
+        return recorder.stop()
+    except Exception as exc:
+        print(f"[cv-runner] recorder produced no artifact: {exc}", file=sys.stderr, flush=True)
+        return None
 
 
 def main(env: dict | None = None) -> int:

@@ -38,8 +38,14 @@ class SimAdapter(ABC):
         ...
 
     @abstractmethod
-    def drive_mission(self, goal: object) -> None:
-        """Send the mission goal and monitor completion/failure/timeout (sim-time)."""
+    def drive_mission(self, goal: object, *, timeout_s: float | None = None) -> object:
+        """Send the mission goal and monitor completion/failure/timeout.
+
+        ``timeout_s`` is the scenario's SIM-time budget (D-F — measured on the
+        /clock domain, never wall-clock; the wall-clock runaway watchdog is
+        M3's). Returns an adapter-specific terminal outcome for logging; the
+        verdict itself always comes from the oracles over telemetry.
+        """
         ...
 
     @abstractmethod

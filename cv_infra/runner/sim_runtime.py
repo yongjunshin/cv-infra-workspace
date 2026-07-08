@@ -16,6 +16,7 @@ are the seams filled in cycles 2-4.
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
 
 
@@ -49,13 +50,71 @@ class SimConfig:
     seed: int = 0
 
 
+# --------------------------------------------------------------------------- #
+# Scene mapping (scenario.scene name -> Isaac sample asset ref) — CPU-testable.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SceneAsset:
+    """One resolvable scene: sample USD (relative to the Isaac assets root) plus
+    where the pre-wired robot lives in it.
+
+    do-not-reinvent: Phase-2 scenes REUSE the official ``carter_warehouse_navigation``
+    sample (warehouse + Nova Carter + ROS2 OmniGraph pre-wired — clock/TF/odom/
+    sensors/cmd_vel action graphs come WITH the asset; we author no scene). The
+    robot prim path inside the sample is NVIDIA's naming, so it is a candidate
+    list resolved against the live stage (first existing wins) — a rename in a
+    future asset rev degrades to a loud, listing error instead of a wrong pin.
+    """
+
+    scene_usd: str
+    robot_prim_candidates: tuple[str, ...] = ()
+
+
+SCENE_ASSETS: dict[str, SceneAsset] = {
+    # cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml: scene name (M1 Scenario).
+    "nova_carter_warehouse": SceneAsset(
+        scene_usd="/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd",
+        robot_prim_candidates=("/World/Nova_Carter_ROS", "/World/Carter_ROS"),
+    ),
+}
+
+
+def resolve_scene(scene_ref: str) -> SceneAsset:
+    """Map a scenario scene name to its asset ref; direct USD refs pass through.
+
+    A ``.usd``-suffixed ref (omniverse://, http(s)://, or a mounted path) is used
+    as-is with no robot-prim knowledge (P3 direction: consumer-supplied scenes).
+    An unknown scene NAME is bad input -> loud ValueError listing known scenes
+    (REQ-INTAKE-005 friendly-error direction).
+    """
+    if scene_ref in SCENE_ASSETS:
+        return SCENE_ASSETS[scene_ref]
+    if scene_ref.endswith((".usd", ".usda", ".usdz")):
+        return SceneAsset(scene_usd=scene_ref)
+    raise ValueError(
+        f"unknown scenario.scene {scene_ref!r} — known scenes: {sorted(SCENE_ASSETS)} "
+        "(or pass a direct .usd/.usda/.usdz reference)"
+    )
+
+
+def is_direct_usd_ref(scene_usd: str) -> bool:
+    """True when the ref needs NO assets-root prefix (absolute URL or host path)."""
+    return scene_usd.startswith(("omniverse://", "http://", "https://", "file://")) or (
+        not scene_usd.startswith("/Isaac/")
+    )
+
+
 class SimRuntime:
-    """Wraps the SimulationApp / World lifecycle. GPU bodies wired in cycles 2-4."""
+    """Wraps the SimulationApp / World lifecycle. Isaac bodies are deferred-import."""
 
     def __init__(self, config: SimConfig) -> None:
         self.config = config
         self.simulation_app = None  # set by boot()
         self.world = None  # set by load_scene()
+        self.robot_prim_path: str | None = None  # set by load_scene()
+        # Callbacks invoked after every step (e.g. video frame capture) — kept
+        # runner-side so the adapter's step loop stays recorder-agnostic.
+        self.on_step: list = []
 
     def boot(self) -> object:
         """Instantiate SimulationApp FIRST, then it is legal to import omni/isaacsim."""
@@ -66,13 +125,72 @@ class SimRuntime:
         self.simulation_app = SimulationApp({"headless": True})
         return self.simulation_app
 
-    def load_scene(self) -> None:  # pragma: no cover - GPU path (cycle 2-3)
-        """open_stage(scene_ref) + spawn robot at fixed pose; pin dt/seed; world.reset()."""
-        raise NotImplementedError("scene load / robot spawn wired in cycle 2-3")
+    def load_scene(self) -> None:  # pragma: no cover - GPU path (T3 proves)
+        """open_stage(sample scene) + locate pre-wired robot; pin dt/seed; reset.
+
+        REUSE (do-not-reinvent): the sample scene ships the Nova Carter robot with
+        its ROS2 action graphs pre-wired — no robot spawn/graph authoring here for
+        mapped scenes; we only locate the robot prim (candidates -> loud error).
+        """
+        if self.simulation_app is None:
+            raise RuntimeError("boot() must run before load_scene() (M2 §3.2 order)")
+
+        import omni.usd  # noqa: PLC0415 (legal only after SimulationApp)
+        from isaacsim.core.api import World  # noqa: PLC0415
+
+        asset = resolve_scene(self.config.scene_ref)
+        scene_path = asset.scene_usd
+        if not is_direct_usd_ref(scene_path):
+            from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
+
+            root = get_assets_root_path()
+            if root is None:
+                raise RuntimeError(
+                    "Isaac assets root unreachable (cloud assets / cache) — cannot "
+                    f"resolve sample scene {scene_path!r}; check network or asset cache "
+                    "mounts (M5 cache seam)"
+                )
+            scene_path = root + scene_path
+
+        if not omni.usd.get_context().open_stage(scene_path):
+            raise RuntimeError(f"open_stage failed for {scene_path!r}")
+        self.simulation_app.update()
+
+        # Determinism pins (REQ-EXEC-003, LOCKED §6): seed before physics init;
+        # fixed dt on the World. numpy is legal here (post-SimulationApp, D-C).
+        random.seed(self.config.seed)
+        import numpy as np  # noqa: PLC0415
+
+        np.random.seed(self.config.seed & 0xFFFFFFFF)
+        self.world = World(
+            physics_dt=self.config.physics_dt,
+            rendering_dt=self.config.rendering_dt,
+            stage_units_in_meters=1.0,
+        )
+
+        if asset.robot_prim_candidates:
+            stage = omni.usd.get_context().get_stage()
+            for path in asset.robot_prim_candidates:
+                if stage.GetPrimAtPath(path).IsValid():
+                    self.robot_prim_path = path
+                    break
+            if self.robot_prim_path is None:
+                children = [str(p.GetPath()) for p in stage.GetPseudoRoot().GetAllChildren()]
+                raise RuntimeError(
+                    f"robot prim not found in {scene_path!r} — tried "
+                    f"{list(asset.robot_prim_candidates)}; stage roots: {children} "
+                    "(sample asset naming changed? update SCENE_ASSETS)"
+                )
+
+        self.world.reset()
 
     def step(self, render: bool = True) -> None:  # pragma: no cover - GPU path
         """One fixed-dt step (render=True: Nova Carter RTX lidar needs off-screen render)."""
-        raise NotImplementedError("step loop wired in cycle 3-4")
+        if self.world is None:
+            raise RuntimeError("load_scene() must run before step()")
+        self.world.step(render=render)
+        for callback in self.on_step:
+            callback()
 
     def close(self) -> None:
         """Clean shutdown — returns VRAM/slots (REQ-EXEC-015, NFR-EXEC-002/004)."""
