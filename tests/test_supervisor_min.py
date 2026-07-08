@@ -29,8 +29,11 @@ SUT_IMAGE = "carter-sut:test"
 JOB_ID = "job-1"
 
 
-def make_spec(job_id: str = JOB_ID) -> dict:
-    return {"job_id": job_id, "sut_image_ref": SUT_IMAGE, "scenario": {"scene": "warehouse"}}
+def make_spec(job_id: str = JOB_ID, adapter_config: dict | None = None) -> dict:
+    spec = {"job_id": job_id, "sut_image_ref": SUT_IMAGE, "scenario": {"scene": "warehouse"}}
+    if adapter_config is not None:
+        spec["interface"] = {"type": "ros2", "adapter_config": adapter_config}
+    return spec
 
 
 def put_result(tmp_path, job_id: str = JOB_ID, rel: str = "result.json"):
@@ -363,6 +366,60 @@ def test_runner_env_passes_through_and_seam_keys_win(tmp_path):
     assert env["RESULT_OUT"] == RESULT_OUT_MOUNT
     assert env["JOB_SPEC"] == JOB_SPEC_MOUNT
     assert set(sut_kwargs["environment"]) == {"ROS_DOMAIN_ID"}  # no operator leak to SUT
+
+
+# --------------------------------------------------------------------------- #
+# (6b) FU-14: scenario-derived ROS env (interface.adapter_config -> runner env)
+# --------------------------------------------------------------------------- #
+
+
+def test_adapter_config_ros_env_injected_to_runner_not_sut(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    spec = make_spec(adapter_config={"ros_distro": "jazzy", "rmw": "rmw_fastrtps_cpp"})
+    run_job(spec, tmp_path, RUNNER_IMAGE, SUT_IMAGE, client, poll_interval_s=0.0)
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    assert runner_kwargs["environment"]["ROS_DISTRO"] == "jazzy"
+    assert runner_kwargs["environment"]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
+    assert set(sut_kwargs["environment"]) == {"ROS_DOMAIN_ID"}  # blackbox: no leak to SUT
+
+
+def test_absent_adapter_config_keys_are_not_injected(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client)  # default spec: no interface.adapter_config at all
+    (_, runner_kwargs), _ = client.run_calls
+    assert "ROS_DISTRO" not in runner_kwargs["environment"]
+    assert "RMW_IMPLEMENTATION" not in runner_kwargs["environment"]
+
+
+def test_adapter_config_injection_is_per_key(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    spec = make_spec(adapter_config={"rmw": "rmw_fastrtps_cpp"})  # ros_distro missing
+    run_job(spec, tmp_path, RUNNER_IMAGE, SUT_IMAGE, client, poll_interval_s=0.0)
+    (_, runner_kwargs), _ = client.run_calls
+    assert "ROS_DISTRO" not in runner_kwargs["environment"]
+    assert runner_kwargs["environment"]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
+
+
+def test_scenario_ros_env_wins_over_operator_runner_env(tmp_path):
+    put_result(tmp_path)
+    client = FakeClient()
+    spec = make_spec(adapter_config={"ros_distro": "jazzy", "rmw": "rmw_fastrtps_cpp"})
+    operator_env = {"ROS_DISTRO": "humble", "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp"}
+    run_job(
+        spec,
+        tmp_path,
+        RUNNER_IMAGE,
+        SUT_IMAGE,
+        client,
+        poll_interval_s=0.0,
+        runner_env=operator_env,
+    )
+    (_, runner_kwargs), _ = client.run_calls
+    assert runner_kwargs["environment"]["ROS_DISTRO"] == "jazzy"  # scenario is SoT (FU-14)
+    assert runner_kwargs["environment"]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
 
 
 # --------------------------------------------------------------------------- #
