@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +58,13 @@ _VERDICT_EXIT: dict[str, int] = {
     "timeout": EXIT_FAIL,  # SUT missed the sim-time budget = SUT verdict, not infra
     "error": EXIT_INFRA,  # runner-recorded platform error (FU-8)
 }
+
+# Operator consent env keys forwarded verbatim to the runner via the
+# supervisor's kw-only ``runner_env`` — pass-through happens only when the key
+# exists in the CLI process environment. Consent VALUES are operator-provided
+# at runtime and never committed anywhere (decision 2026-07-03; the formal
+# consent gate is P5/M5, honest boot-guard refusal until then).
+_CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 
 # --- sub-command surface (REQ-INTAKE-003) ----------------------------------
 # ``run`` is implemented (Phase 2, D-2); the rest are reserved placeholders so
@@ -245,6 +253,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         verdict "pass"                                            0
         verdict "fail" / "timeout"                                1
         verdict "error" / unknown                                 3
+
+    Operator consent (``ACCEPT_EULA``/``PRIVACY_CONSENT``) is forwarded from
+    the CLI process env to ``runner_env`` only when present — when absent the
+    runner boot guard honestly refuses (surfaces on the infra path, exit 3).
     """
     scenario_path = Path(args.scenario)
     job_id = args.job_id or _default_job_id(scenario_path)
@@ -288,7 +300,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_INFRA
 
-    outcome = run_job(job_spec, out_dir, args.runner_image, request.sut_image_ref)
+    # Consent pass-through (decision 2026-07-03): forward the operator-provided
+    # consent env keys verbatim, only when present. When absent, ``runner_env``
+    # is NOT passed — the runner boot guard refuses to start Isaac (FU-8 is P5).
+    consent_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
+    kwargs: dict[str, Any] = {"runner_env": consent_env} if consent_env else {}
+    outcome = run_job(job_spec, out_dir, args.runner_image, request.sut_image_ref, **kwargs)
     return _exit_from_outcome(outcome)
 
 
