@@ -76,6 +76,57 @@ WORKDIR /isaac-sim
 # base change and spawners (M3) propagate it.
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
+# rosbag2/MCAP apt layer (PM ruling 2026-07-08, T2.5 — option A: reuse genuine
+# rosbag2 per CLAUDE §5 do-not-reinvent; the runner records via a
+# `ros2 bag record --storage mcap` subprocess, glue owned by M2 recording.py).
+# Placed BEFORE the wheel layer on purpose: this layer changes rarely while the
+# wheel changes every rebuild, so wheel rebuilds keep this layer cached.
+# Coexistence safety: this is a separate apt layer targeting the SYSTEM
+# python3.12 under /opt/ros/jazzy — Isaac's bundled py3.11 interpreter and its
+# pinned site-packages are never touched (ABI isolation); the recorder joins DDS
+# from a subprocess on the same ROS_DOMAIN_ID/RMW (env separation = M2 glue).
+# Repo setup is the standard ros-archive-keyring method (no curl|bash): the key
+# is written to the fixed keyring path and its fingerprint is asserted against
+# the fixed Open Robotics fingerprint (loud fail on mismatch); `noble` and
+# `amd64` are hardcoded because the digest-pinned base IS ubuntu 24.04/amd64
+# (measured, T2 report §4). Reproducibility (§2-7): the ROS apt repo is rolling
+# — exact-version pins would break future rebuilds — so the layer prints a
+# dpkg-query manifest of every package it installs into the build log
+# (evidence); the artifact reproducibility anchor is the FU-10 image Id pin
+# (decision 2026-07-07-fu10). GNUPGHOME is a throwaway tmpdir so root's gpg
+# call never creates files under the uid-1234 HOME (G-15 hazard).
+USER root
+RUN set -eu; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+         -o /usr/share/keyrings/ros-archive-keyring.gpg; \
+    GNUPGHOME="$(mktemp -d)"; export GNUPGHOME; \
+    fpr="$(gpg --show-keys --with-colons /usr/share/keyrings/ros-archive-keyring.gpg \
+           | awk -F: '/^fpr:/ {print $10; exit}')"; \
+    rm -rf "$GNUPGHOME"; unset GNUPGHOME; \
+    test "$fpr" = "C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654" \
+      || { echo "ERROR: ROS apt key fingerprint mismatch: got '$fpr'" \
+                "(expected Open Robotics C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654)"; \
+           exit 1; }; \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg]" \
+         "http://packages.ros.org/ros2/ubuntu noble main" \
+         > /etc/apt/sources.list.d/ros2.list; \
+    dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.before; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ros-jazzy-ros2bag ros-jazzy-rosbag2-storage-mcap; \
+    dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.after; \
+    echo '=== rosbag2 apt layer manifest (every package this layer installed) ==='; \
+    comm -13 /tmp/pkgs.before /tmp/pkgs.after; \
+    echo '=== end rosbag2 apt layer manifest ==='; \
+    rm -f /tmp/pkgs.before /tmp/pkgs.after; \
+    rm -rf /var/lib/apt/lists/*
+# Back to the base's measured user (isaac-sim, uid 1234 — R2 note above); the
+# apt layer above is the only root step in this image.
+USER isaac-sim
+
 COPY --from=builder --chown=1234:1234 /dist/cv_infra-*.whl /tmp/cv-infra-wheel/
 
 # --no-deps: never let the wheel's resolver touch Isaac's bundled pins (D-C, R20).
