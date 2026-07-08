@@ -30,14 +30,32 @@ RUN pip install --no-cache-dir uv==0.11.13 \
  && uv build --wheel --project /src --out-dir /dist
 
 # Clobber-prevention guard (D-C, R20): the runtime stage installs the wheel with
-# --no-deps, which is sound ONLY while cv-infra's runtime dependency set is empty
-# (measured 2026-07-07: `uv export --frozen --no-dev --no-emit-project` emits nothing).
-# If a runtime dependency is ever added, fail the build LOUDLY so the uv.lock-based
-# constraints install step (M5 §3.1) gets added instead of silently clobbering the
-# Isaac bundle pins.
-RUN test -z "$(uv export --frozen --no-dev --no-emit-project --project /src | grep -vE '^(#|[[:space:]]*$)')" \
- || { echo "ERROR: cv-infra runtime deps are no longer empty — add the uv.lock" \
-             "constraints install step before --no-deps (M5 §3.1 D-C / R20)"; exit 1; }
+# --no-deps, which is sound ONLY while every runtime dependency is host-only
+# control plane (docker SDK = M3 supervisor spawn, pyyaml = M8 CLI — the runner,
+# DDS-only and without docker.sock, never imports them). HOST_ONLY_DEPS is the
+# explicit allowlist of those deps + ALL their transitives, measured 2026-07-08
+# from `uv export --frozen --no-dev --no-emit-project`. Any runtime dep NOT on
+# the allowlist fails the build LOUDLY: adding one requires an explicit image
+# policy decision (extend the allowlist vs add a uv.lock-based constraints
+# install step before --no-deps) instead of silently clobbering the Isaac
+# bundle pins (M5 §3.1).
+RUN set -eu; \
+    HOST_ONLY_DEPS='certifi charset-normalizer docker idna pywin32 pyyaml requests urllib3'; \
+    uv export --frozen --no-dev --no-emit-project --project /src > /tmp/runtime-deps.txt; \
+    leftover=''; \
+    for dep in $(sed -n 's/^\([A-Za-z0-9._-]*\)==.*/\1/p' /tmp/runtime-deps.txt \
+                 | tr '[:upper:]' '[:lower:]'); do \
+        case " $HOST_ONLY_DEPS " in \
+            *" $dep "*) ;; \
+            *) leftover="$leftover $dep" ;; \
+        esac; \
+    done; \
+    rm -f /tmp/runtime-deps.txt; \
+    test -z "$leftover" \
+    || { echo "ERROR: runtime dep(s) not in the host-only allowlist:$leftover —" \
+               "a new runtime dep needs an image-policy decision (extend" \
+               "HOST_ONLY_DEPS or add the uv.lock constraints install step" \
+               "before --no-deps; M5 §3.1 D-C / R20)"; exit 1; }
 
 # --------------------------------------------------------------------------- #
 # (2) runtime — one thin layer on the pinned Isaac Sim base (no latest; LOCKED §2).
@@ -61,7 +79,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 COPY --from=builder --chown=1234:1234 /dist/cv_infra-*.whl /tmp/cv-infra-wheel/
 
 # --no-deps: never let the wheel's resolver touch Isaac's bundled pins (D-C, R20).
-# No constraints step: runtime dependency set is empty (guarded in the builder stage).
+# No constraints step BY POLICY: runtime deps are host-only control plane
+# (HOST_ONLY_DEPS, guarded in the builder stage) and are excluded from this image
+# on purpose — the wheel must stay importable dep-less, which the runtime import
+# smoke proves (DoD-P2-12); supervisor (M3) and CLI (M8) lazy-import docker/yaml.
 RUN ./python.sh -m pip install --no-cache-dir --no-deps /tmp/cv-infra-wheel/cv_infra-*.whl \
  && rm -rf /tmp/cv-infra-wheel
 
