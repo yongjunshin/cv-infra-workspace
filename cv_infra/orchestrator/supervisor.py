@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -52,6 +53,24 @@ from typing import Any
 # and passed BY PATH (safe for large specs); RESULT_OUT is a mounted rw directory.
 JOB_SPEC_MOUNT = "/cv/job_spec.json"
 RESULT_OUT_MOUNT = "/cv/out"
+
+# FU-16 asset cache (decision 2026-07-09 D-1): mount the host Omniverse/asset cache into
+# the runner so the ~680 MB / 241-file scene closure downloads ONCE, not every job (T0
+# probe: 2nd receive 688 MB -> 1.29 MB — reports/deployment-2026-07-09-fu16-probe.md).
+# Bind paths are the MEASURED Isaac 5.1.0 on-disk layout (differs from 6.0, R2). All rw
+# single-layer: shared-RO base + per-job writable scratch (D-B, 2-tier) is deferred to
+# DoD-P4-15 (Phase 2 is single-job; the warm write is measured +117 KB).
+CACHE_ROOT_ENV = "CV_ISAAC_CACHE_ROOT"
+
+# (host subpath relative to cache root, container bind path)
+CACHE_MOUNTS: tuple[tuple[str, str], ...] = (
+    ("cache/kit", "/isaac-sim/kit/cache"),
+    ("cache/home", "/isaac-sim/.cache"),
+    ("cache/computecache", "/isaac-sim/.nv/ComputeCache"),
+    ("logs", "/isaac-sim/.nvidia-omniverse/logs"),
+    ("data", "/isaac-sim/.local/share/ov/data"),
+    ("documents", "/isaac-sim/Documents"),
+)
 
 # LOCKED §7.5 dual isolation: per-job docker network + ROS_DOMAIN_ID in 0..101.
 ROS_DOMAIN_ID_SPACE = 102
@@ -123,6 +142,35 @@ def default_readiness_probe(runner_container: Any) -> bool:
     return getattr(runner_container, "status", None) == "running"
 
 
+def _cache_volumes(cache_root: str | os.PathLike[str] | None) -> dict[str, dict[str, str]]:
+    """Resolve the Isaac asset-cache root to docker ``volumes`` binds (FU-16 / D-1).
+
+    Effective root = the ``cache_root`` argument (wins) or ``$CV_ISAAC_CACHE_ROOT``;
+    when neither is set there are ZERO cache mounts (today's behavior, backward compat).
+    A given-but-missing / non-directory root is a loud ``ValueError`` — the caller runs
+    this in the same seat as the ``job_id`` check, so it raises BEFORE any resource.
+
+    The root is resolved to a host ABSOLUTE path (``Path.resolve()``): the runner is
+    spawned via docker.sock, so ``-v`` binds resolve against the HOST daemon, not this
+    process's cwd (sibling-container hazard D-O/F5). Subdir existence is NOT required —
+    creating them + ``chown 1234:1234`` is M5 ``warm_cache.sh``'s job (G-15), never this
+    module's. All six binds are ``mode: rw`` single-layer (2-tier RO/scratch = P4-15).
+    """
+    root = cache_root or os.environ.get(CACHE_ROOT_ENV)
+    if not root:
+        return {}
+    resolved = Path(root).resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            f"cache_root {resolved} does not exist or is not a directory "
+            f"(create + chown 1234:1234 is M5 warm_cache.sh's job, D-1)"
+        )
+    return {
+        str(resolved / subpath): {"bind": container_path, "mode": "rw"}
+        for subpath, container_path in CACHE_MOUNTS
+    }
+
+
 def run_job(
     job_spec: dict[str, Any],
     out_dir: Path,
@@ -131,6 +179,7 @@ def run_job(
     docker_client: Any = None,
     *,
     runner_env: dict[str, str] | None = None,
+    cache_root: str | os.PathLike[str] | None = None,
     runner_gpus: bool = True,
     readiness_probe: ReadinessProbe | None = None,
     readiness_timeout_s: float = 120.0,
@@ -146,6 +195,12 @@ def run_job(
     measured Isaac cold boot (~67.5s) with margin, ``job_timeout_s`` is a wall-clock
     runaway watchdog (the sim-time budget lives in the scenario, M1 §3.2).
 
+    ``cache_root`` (or ``$CV_ISAAC_CACHE_ROOT``) mounts the host Isaac asset cache into
+    the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;
+    unset = 0 cache mounts (backward compatible), a given-but-invalid root raises in the
+    same seat as ``job_id``. RO/2-tier caching (D-B) is deferred to DoD-P4-15 — the
+    ``rw`` single layer here is what Phase 2's single job needs (see ``_cache_volumes``).
+
     Infra failures (docker/spawn/collection) are returned as ``infra_error``, never
     raised; a missing ``job_id`` is a seam-contract violation and raises ValueError
     before any resource is created.
@@ -155,6 +210,9 @@ def run_job(
         raise ValueError("job_spec must carry a non-empty job_id (seam contract, D-2)")
     if sut_restart_limit < 0:
         raise ValueError(f"sut_restart_limit must be >= 0, got {sut_restart_limit}")
+    # Resolve cache mounts up front: a bad cache_root fails loud BEFORE any network or
+    # container is created (same seat as the job_id check, D-1).
+    cache_volumes = _cache_volumes(cache_root)
 
     client = docker_client
     if client is None:
@@ -223,6 +281,9 @@ def run_job(
             network=net_name,
             environment=environment,
             volumes={
+                # Cache binds first so the seam mounts below win on any host-path
+                # collision (same principle as the seam env keys above).
+                **cache_volumes,
                 str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
                 str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
             },
