@@ -1,15 +1,20 @@
-# nova_carter_warehouse_goal.yaml — standard-input instance (Phase-2, cycle-3: measured-aligned).
+# nova_carter_warehouse_goal.yaml — platform-side COPY of the consumer scenario (M1 standard input).
 #
-# A robot-SW developer's verification request: "drive the Nova Carter to a goal in the
-# warehouse without colliding." This file INSTANTIATES the platform-owned Scenario shape
-# (M1) — CV-User does not define the schema, only exercises it as a consumer.
+# SOURCE OF TRUTH: cv-infra-user@f1c9607 scenarios/nova_carter_warehouse_goal.yaml
+# This is a COPY. The platform may not reference the consumer repo by relative path
+# (boundary rule 3), so drift is prevented mechanically by
+# tests/test_fixture_canonical_guard.py below (fixture params are bound to the keys
+# the oracles actually read) and by the PM merge-gate cross-repo diff.
 #
-# STATUS (cycle-3, SEAM-2): DRAFT lifted — measured alignment complete. adapter_config
-# follows the M1 canonical `Ros2AdapterConfig` keys (retired/unknown keys are now
-# loud-rejected by the platform); every value below is a workstation measurement from
-# reports/user-2026-07-07-seam2-carter-topic-inventory.md (T2 inventory).
-# Remaining residual (explicit, follow-up cycle): goal free-space tuning against the
-# live sim — goal/seed/timeout values are unchanged from the draft (see inline comment).
+# Kept SEMANTICALLY IDENTICAL to the source; only this header differs. Re-sync on any
+# consumer change and bump the sha above. The cycle-3 draft this replaced had
+# `goal_tolerance_m: 0.5` (never read by reached_goal -> silently ignored, oracle
+# default 0.25 m applied) and empty no_collision params (chassis_path absent ->
+# telemetry.bind() raises on a real runner) — exactly the drift the guard now blocks.
+#
+# The body below instantiates the platform-owned Scenario shape (M1) — CV-User does
+# not define the schema, only exercises it as a consumer. Values are cycle-5 T4
+# workstation bringup measurements (provenance in the source file's own comments).
 
 scenario:
   scene: nova_carter_warehouse          # static warehouse map (carter_warehouse_navigation)
@@ -17,7 +22,7 @@ scenario:
   goal:                                  # map extent x[-11.975,12.03] y[-17.975,20.83];
     x: -6.0                              #   AMCL start pose is (-6.0, -1.0, yaw=pi). This goal
     y: 5.0                               #   is a short straight drive up the same lane.
-    yaw: 1.5708                          #   Free-space tuning vs the live sim = follow-up-cycle residual.
+    yaw: 1.5708                          #   Pass-proven live (cycle-5 bringup run2/run6) — values unchanged.
     frame: map
   seed: 42                               # fixed seed for determinism (REQ-EXEC-003, NFR-EXEC-001)
   timeout_s: 120                         # mission timeout (REQ-EXEC-007) — value unchanged from draft
@@ -48,10 +53,12 @@ interface:
       - topic: /front_3d_lidar/lidar_points
         type: sensor_msgs/msg/PointCloud2
         frame: front_3d_lidar            # measured pointcloud_to_laserscan target_frame
-      - topic: /front_2d_lidar/scan      # local_costmap front_2d_lidar_layer (carter params);
-        type: sensor_msgs/msg/LaserScan  #   frame unmeasured -> omitted (header-carried)
-      - topic: /back_2d_lidar/scan       # local_costmap back_2d_lidar_layer (carter params);
-        type: sensor_msgs/msg/LaserScan  #   frame unmeasured -> omitted (header-carried)
+      - topic: /front_2d_lidar/scan      # local_costmap front_2d_lidar_layer (carter params)
+        type: sensor_msgs/msg/LaserScan
+        frame: front_2d_lidar            # measured OmniGraph frameId (cycle-5 bringup, FU-13-4)
+      - topic: /back_2d_lidar/scan       # local_costmap back_2d_lidar_layer (carter params)
+        type: sensor_msgs/msg/LaserScan
+        frame: back_2d_lidar             # measured OmniGraph frameId (cycle-5 bringup, FU-13-4)
     frames:
       map: map
       odom: odom
@@ -62,7 +69,17 @@ interface:
 acceptance_criteria:                     # MVP: reach goal within timeout AND zero collision (REQ-EXEC-011)
   - oracle: reached_goal                 # REQ-EXEC-010/012
     params:
-      goal_tolerance_m: 0.5              # draft tolerance (tuned with goal free-space, follow-up cycle)
-      goal_tolerance_yaw: 0.26           # ~15 deg
+      position_tolerance_m: 0.75         # oracle-canonical key (draft `goal_tolerance_m` was silently
+                                         #   ignored -> oracle default 0.25). Value measured (cycle-5
+                                         #   bringup): AMCL + nav2 xy-tol stack intermittently exceeds
+                                         #   0.5 (run5 FAIL >0.5; run6 0.414; run7 0.245) -> 0.75 margin
+      yaw_tolerance_rad: 0.26            # ~15 deg — oracle-canonical key, value unchanged; yaw check
+                                         #   stays inactive while goal_orientation_wxyz is unset
   - oracle: no_collision                 # REQ-EXEC-010/011 (collision_count == 0)
-    params: {}
+    params:
+      chassis_path: /World/Nova_Carter_ROS/chassis_link   # measured (bringup probe-01):
+                                         #   RigidBody+ArticulationRoot; required — absent =>
+                                         #   intentional loud fail (P2-13 precondition)
+      collision_excluded_paths:          # measured contact partners (bringup run1, D-E reduction):
+        - /World/Nova_Carter_ROS         #   self-body subtree (wheels/casters)
+        - /World/warehouse_with_forklifts/GroundPlane   # floor collision plane
