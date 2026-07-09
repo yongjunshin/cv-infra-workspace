@@ -19,10 +19,14 @@ acceptance literal is baked here (NEG-2).
 """
 
 # stdlib only before SimulationApp (LOCKED §7.7) — no omni.*/isaacsim.* here.
+# cv_infra.runner.sim_runtime is safe at import time for the same reason: it defers
+# every omni/isaacsim import into function bodies.
 import argparse
 import os
 import sys
 import time
+
+from cv_infra.runner.sim_runtime import SCENE_ASSETS
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -30,7 +34,12 @@ EXIT_PLATFORM = 3
 
 # Default = the P2 canonical carter warehouse nav scene (relative to the S3 asset root).
 # Overridable so the warmed closure can be matched to the scenario under test.
-DEFAULT_SCENE_REL = "/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd"
+#
+# Sourced from the runner's own SCENE_ASSETS table rather than re-typed here: a warmed
+# closure that does not match the scene the runner opens is a silently-cold measurement.
+# (PM merge-gate hardening, cycle p2c6 — same copy-drift class that stalled the FU-15
+# roundtrip gate on a stale fixture.)
+DEFAULT_SCENE_REL = SCENE_ASSETS["nova_carter_warehouse"].scene_usd
 
 
 def log(msg: str) -> None:
