@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
 from cv_infra.orchestrator.supervisor import (
+    CACHE_ROOT_ENV,
     JOB_SPEC_MOUNT,
     RESULT_OUT_MOUNT,
     ROS_DOMAIN_ID_SPACE,
@@ -489,3 +491,115 @@ def test_package_level_lazy_export_resolves():
 
     assert orch.run_job is run_job
     assert orch.JobOutcome is JobOutcome
+
+
+# --------------------------------------------------------------------------- #
+# (8) FU-16 asset-cache mount seam (decision 2026-07-09 D-1)
+# --------------------------------------------------------------------------- #
+
+# The D-1 정본 six binds (host subpath -> container path), asserted verbatim so a wrong
+# CACHE_MOUNTS constant fails here (not derived from the module under test).
+EXPECTED_CACHE_BINDS = {
+    "cache/kit": "/isaac-sim/kit/cache",
+    "cache/home": "/isaac-sim/.cache",
+    "cache/computecache": "/isaac-sim/.nv/ComputeCache",
+    "logs": "/isaac-sim/.nvidia-omniverse/logs",
+    "data": "/isaac-sim/.local/share/ov/data",
+    "documents": "/isaac-sim/Documents",
+}
+
+
+def test_no_cache_root_no_env_keeps_exactly_two_volumes(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client)  # cache_root defaults to None (backward compat)
+    (_, runner_kwargs), _ = client.run_calls
+    assert len(runner_kwargs["volumes"]) == 2  # spec(ro) + result(rw) only — regression guard
+    assert all("/isaac-sim" not in v["bind"] for v in runner_kwargs["volumes"].values())
+
+
+def test_cache_root_adds_six_rw_binds_exactly(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    put_result(tmp_path)
+    cache = tmp_path / "isaac-cache"
+    cache.mkdir()  # supervisor requires the root to exist; subdirs it does NOT
+    client = FakeClient()
+    run_min(tmp_path, client, cache_root=cache)
+    (_, runner_kwargs), _ = client.run_calls
+    volumes = runner_kwargs["volumes"]
+    assert len(volumes) == 8  # 2 seam + 6 cache
+    resolved = cache.resolve()
+    for subpath, bind in EXPECTED_CACHE_BINDS.items():
+        host = str(resolved / subpath)
+        assert volumes[host] == {"bind": bind, "mode": "rw"}  # exact bind + rw mode
+
+
+def test_env_fallback_then_arg_precedence(tmp_path, monkeypatch):
+    put_result(tmp_path)
+    env_cache = tmp_path / "env-cache"
+    env_cache.mkdir()
+    arg_cache = tmp_path / "arg-cache"
+    arg_cache.mkdir()
+
+    # env alone -> env used
+    monkeypatch.setenv(CACHE_ROOT_ENV, str(env_cache))
+    client = FakeClient()
+    run_min(tmp_path, client)
+    (_, runner_kwargs), _ = client.run_calls
+    assert str(env_cache.resolve() / "cache/kit") in runner_kwargs["volumes"]
+
+    # arg + env -> arg wins, env absent
+    client2 = FakeClient()
+    run_min(tmp_path, client2, cache_root=arg_cache)
+    (_, runner_kwargs2), _ = client2.run_calls
+    assert str(arg_cache.resolve() / "cache/kit") in runner_kwargs2["volumes"]
+    assert str(env_cache.resolve() / "cache/kit") not in runner_kwargs2["volumes"]
+
+
+def test_missing_cache_root_raises_before_any_resource(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    client = FakeClient()
+    with pytest.raises(ValueError):
+        run_min(tmp_path, client, cache_root=tmp_path / "does-not-exist")
+    assert client.events == []  # no network/container created before the raise
+
+
+def test_file_cache_root_raises_before_any_resource(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    a_file = tmp_path / "not-a-dir"
+    a_file.write_text("x", encoding="utf-8")
+    client = FakeClient()
+    with pytest.raises(ValueError):
+        run_min(tmp_path, client, cache_root=a_file)
+    assert client.events == []  # non-directory root is loud, pre-resource
+
+
+def test_cache_mounts_never_leak_to_sut(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    put_result(tmp_path)
+    cache = tmp_path / "isaac-cache"
+    cache.mkdir()
+    client = FakeClient()
+    run_min(tmp_path, client, cache_root=cache)
+    (_, _runner_kwargs), (_, sut_kwargs) = client.run_calls
+    assert "volumes" not in sut_kwargs  # SUT is a blackbox: no cache, no GPU
+    assert "device_requests" not in sut_kwargs
+
+
+def test_cache_root_resolved_to_host_absolute_path(tmp_path, monkeypatch):
+    """Relative cache_root must still be passed as a host ABSOLUTE path (D-O/F5)."""
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    put_result(tmp_path)
+    (tmp_path / "rel-cache").mkdir()
+    monkeypatch.chdir(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, cache_root="rel-cache")  # relative arg
+    (_, runner_kwargs), _ = client.run_calls
+    cache_binds = [
+        host for host, spec in runner_kwargs["volumes"].items() if spec["bind"].startswith("/isaac")
+    ]
+    assert len(cache_binds) == 6
+    for host in cache_binds:
+        assert Path(host).is_absolute()  # never a relative bind
+        assert host.startswith(str((tmp_path / "rel-cache").resolve()))
