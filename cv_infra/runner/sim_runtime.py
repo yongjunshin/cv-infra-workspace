@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from dataclasses import dataclass
 
 
@@ -156,9 +157,19 @@ class SimRuntime:
                 )
             scene_path = root + scene_path
 
+        t0 = time.monotonic()
         if not omni.usd.get_context().open_stage(scene_path):
             raise RuntimeError(f"open_stage failed for {scene_path!r}")
         self.simulation_app.update()
+        # P2-09 cold/warm attribution: report how long the runner actually spent
+        # loading the scene (open_stage + first app pump). Lets the cold penalty be
+        # split into asset-download vs shader/compute-compile terms. The resolved
+        # path/URL is logged so cold/warm & local/remote can be told apart post-hoc.
+        print(
+            f"[cv-runner] scene load: {scene_path} took "
+            f"{time.monotonic() - t0:.2f}s (open_stage+update)",
+            flush=True,
+        )
 
         # Determinism pins (REQ-EXEC-003, LOCKED §6): seed before physics init;
         # fixed dt on the World. numpy is legal here (post-SimulationApp, D-C).
