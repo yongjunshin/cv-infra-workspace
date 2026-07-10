@@ -8,8 +8,8 @@ shared per-job bridge network + ROS_DOMAIN_ID (D-2/D-D); the adapter only joins
 that transport at the DDS level and drives/measures the SUT as a blackbox
 (REQ-EXEC-005: SUT internals unmodified).
 
-This is the M2 runner-plane adapter base and is distinct from ``cv_infra.adapter``
-(M1's contract-side ``SUTAdapter`` interface + wire schema).
+This is the M2 runner-plane adapter base and is distinct from M1's contract-side
+wire schema (``cv_infra.contract.adapter_schema`` — interface.type/adapter_config).
 """
 
 from __future__ import annotations

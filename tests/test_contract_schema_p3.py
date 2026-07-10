@@ -3,8 +3,10 @@
 Covers: extra='forbid' at EVERY nesting level (loud unknown-key rejection),
 the REQ-INTAKE-006 required triad, known-key oracle params (legacy
 ``goal_tolerance_m`` clear rejection), optional ``sut.image_id`` sha256 pin,
-envelope/budget/settings shapes, and the mechanical field-name guards binding
-the new sub-models to the Phase-2 dataclasses they formalize (G-25).
+envelope/budget/settings shapes, explicit field-set pins (the Phase-2
+dataclass canon these used to track retired with D-4'), and the Result-side
+emission binding — the REAL Phase-2 producer dict passes through ``Result``
+unmodified (ported from the retired equivalence/roundtrip tests, G-25).
 
 Also pins the container-safety constraints (D-C/R20 as amended by D-4'
 2026-07-10): the wheel still installs --no-deps, pydantic is BUNDLE-SUPPLIED
@@ -17,14 +19,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from dataclasses import fields as dc_fields
 
 import pytest
 from pydantic import ValidationError
 
-from cv_infra.contract import models as old_models
 from cv_infra.contract.apiversion import API_VERSION
 from cv_infra.contract.schema import (
+    VERDICTS,
     CustomCriterion,
     DebugObstacle,
     ExecutionSettings,
@@ -33,10 +34,12 @@ from cv_infra.contract.schema import (
     ReachedGoalCriterion,
     RequestEnvelope,
     ResourceBudget,
+    Result,
     Scenario,
     SutRef,
     VerificationRequest,
 )
+from cv_infra.runner.evaluate import OracleOutcome, build_result_dict
 
 VALID_DOC = {
     "scenario": {
@@ -149,6 +152,10 @@ def test_scenario_timeout_must_be_positive_sim_time_budget():
         Scenario.model_validate({**VALID_DOC["scenario"], "timeout_s": -5})
 
 
+def test_goal_frame_defaults_to_map():
+    assert Goal.model_validate({"x": 1.0, "y": 2.0, "yaw": 0.0}).frame == "map"
+
+
 # --- scenario.debug_obstacle (D-2' 2026-07-10: world state, not a criterion) -- #
 def test_scenario_debug_obstacle_accepts_known_keys():
     minimal = Scenario.model_validate(
@@ -225,27 +232,25 @@ def test_resource_budget_shape_and_bounds():
 
 
 # --------------------------------------------------------------------------- #
-# Mechanical drift guards: new sub-models <-> the Phase-2 dataclasses (G-25).
+# Field-set pins — explicit literals since D-4' retired the Phase-2 dataclass
+# canon these used to track mechanically. Adding/renaming a wire field is a
+# conscious contract change and must touch this pin too (G-25).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    ("new_model", "old_dataclass", "p3_additions"),
+    ("model", "expected"),
     [
-        (Goal, old_models.Goal, set()),
-        # debug_obstacle: D-2' addition (2026-07-10) — intentionally absent from
-        # the retiring Phase-2 dataclass (models.py retires this cycle, D-4').
-        (Scenario, old_models.Scenario, {"debug_obstacle"}),
+        (Goal, {"x", "y", "yaw", "frame"}),
+        # debug_obstacle = the D-2' addition (2026-07-10) on the Phase-2 set.
+        (Scenario, {"scene", "robot", "goal", "seed", "timeout_s", "debug_obstacle"}),
     ],
 )
-def test_field_names_track_the_phase2_dataclasses(new_model, old_dataclass, p3_additions):
-    expected = {f.name for f in dc_fields(old_dataclass)} | p3_additions
-    assert set(new_model.model_fields) == expected
+def test_field_sets_pin_the_wire_shape(model, expected):
+    assert set(model.model_fields) == expected
 
 
 def test_criterion_members_keep_the_canonical_two_keys():
     for member in (ReachedGoalCriterion, NoCollisionCriterion, CustomCriterion):
-        assert set(member.model_fields) == {
-            f.name for f in dc_fields(old_models.AcceptanceCriterion)
-        }
+        assert set(member.model_fields) == {"oracle", "params"}
 
 
 def test_runner_import_surface_pulls_no_host_only_deps():
@@ -256,7 +261,7 @@ def test_runner_import_surface_pulls_no_host_only_deps():
     # deps must still never be pulled (wheel installs --no-deps).
     code = (
         "import sys\n"
-        "import cv_infra.contract.models, cv_infra.oracles.no_collision, cv_infra.runner.main\n"
+        "import cv_infra.contract.schema, cv_infra.oracles.no_collision, cv_infra.runner.main\n"
         "assert 'yaml' not in sys.modules, 'runner import surface pulled pyyaml'\n"
         "assert 'docker' not in sys.modules, 'runner import surface pulled docker'\n"
     )
@@ -275,3 +280,105 @@ def test_contract_package_import_stays_stdlib_only():
         "assert 'yaml' not in sys.modules, 'contract package import pulled pyyaml'\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# --------------------------------------------------------------------------- #
+# Result side — emission binding (ported from the retired
+# test_contract_result_equivalence.py / test_result_roundtrip.py, D-4'):
+# the dict the REAL Phase-2 producer emits must pass through ``Result``
+# UNMODIFIED. The producer-vs-literal wire pin lives in
+# tests/test_result_emission_golden.py; these bind the SCHEMA to that wire.
+# --------------------------------------------------------------------------- #
+_RESULT_EMISSIONS = {
+    "pass-full": build_result_dict(
+        "job-0001",
+        "pass",
+        [
+            OracleOutcome(name="reached_goal", passed=True, detail="within 0.25m"),
+            OracleOutcome(name="no_collision", passed=True),
+        ],
+        {"time_to_goal_s": 42.5, "min_clearance_m": None, "collision_count": 0, "path_len_m": 7.3},
+    ),
+    "error-degraded": build_result_dict("job-0001", "error", [], {}),
+    # ``reason`` steers the verdict fold; without prose detail it is kept as the
+    # detail so it is not lost on the wire.
+    "timeout-reason-fallback": build_result_dict(
+        "job-0001",
+        "timeout",
+        [OracleOutcome(name="reached_goal", passed=False, reason="timeout")],
+        {},
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_RESULT_EMISSIONS))
+def test_result_passes_real_emission_unmodified(name):
+    emitted = _RESULT_EMISSIONS[name]
+    assert Result.model_validate(emitted).model_dump() == emitted
+
+
+def test_result_typed_view_of_emitted_result():
+    res = Result.model_validate(_RESULT_EMISSIONS["pass-full"])
+    assert res.job_id == "job-0001"  # propagated from JOB_SPEC (REQ-EXEC-013)
+    assert res.metrics.collision_count == 0 and res.metrics.min_clearance_m is None
+    assert [c.oracle for c in res.criteria_results] == ["reached_goal", "no_collision"]
+    assert res.artifacts.mcap is None and res.artifacts.mp4 is None
+    assert res.is_self_test is False
+
+
+def test_result_minimal_shim_materializes_the_wire_defaults():
+    # The crosscut roundtrip gate writes minimal {"job_id","verdict"} shims that
+    # the CLI recovers through ``Result``; the materialized defaults are the
+    # Phase-2 wire defaults, pinned as an EXPLICIT literal (measured from the
+    # retiring dataclass canon at base 1fd55e4 — never regenerated from the
+    # model under test, or the pin is vacuous).
+    assert Result.model_validate({"job_id": "rt-0", "verdict": "pass"}).model_dump() == {
+        "job_id": "rt-0",
+        "verdict": "pass",
+        "metrics": {
+            "time_to_goal_s": None,
+            "min_clearance_m": None,
+            "collision_count": 0,
+            "path_len_m": None,
+        },
+        "criteria_results": [],
+        "artifacts": {"mcap": None, "mp4": None},
+        "request_identity_key": None,
+        "origin": None,
+        "is_self_test": False,
+    }
+
+
+def test_result_verdict_domain_is_the_four_locked_values():
+    assert set(VERDICTS) == {"pass", "fail", "timeout", "error"}
+    for verdict in VERDICTS:
+        assert Result.model_validate({"job_id": "j", "verdict": verdict}).verdict == verdict
+    with pytest.raises(ValidationError):
+        Result.model_validate({"job_id": "j", "verdict": "not_a_verdict"})
+
+
+# positive controls (G-25) — the binding must actually fail on one-field drift.
+def test_result_positive_control_renamed_top_level_key_fails_loud():
+    emitted = dict(_RESULT_EMISSIONS["pass-full"])
+    emitted["criteria"] = emitted.pop("criteria_results")  # the historical G-17 drift
+    with pytest.raises(ValidationError):
+        Result.model_validate(emitted)
+
+
+def test_result_positive_control_unknown_nested_key_fails_loud():
+    emitted = dict(_RESULT_EMISSIONS["pass-full"])
+    emitted["metrics"] = {**emitted["metrics"], "goal_tolerance_m": 0.5}
+    with pytest.raises(ValidationError):
+        Result.model_validate(emitted)
+
+
+def test_result_positive_control_corrupted_verdict_fails_loud():
+    with pytest.raises(ValidationError):
+        Result.model_validate({**_RESULT_EMISSIONS["pass-full"], "verdict": "ok"})
+
+
+def test_result_positive_control_equality_discriminates_value_drift():
+    # The dump-equality the binding uses is itself non-vacuous: a one-value
+    # change on the emission side is detected by the same ==.
+    emitted = _RESULT_EMISSIONS["pass-full"]
+    assert Result.model_validate(emitted).model_dump() != {**emitted, "job_id": "job-9999"}

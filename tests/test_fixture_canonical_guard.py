@@ -33,11 +33,14 @@ import yaml
 # replace the retired ``_scenario_doc_to_job_spec``. Detection power preserved
 # (same fixture -> REAL CLI wire -> runner parse -> criteria_view -> oracle
 # validator), and the fixture now additionally passes the full admit gate.
+# P3 cycle-2 legacy retire (task p3c2-legacy-retire, PM pre-approved): the old
+# stdlib-dataclass ``VerificationRequest.from_dict`` stand-in retired with the
+# Phase-2 models module (D-4') — the JOB_SPEC now goes through the runner's
+# REAL ``parse_request`` (contract.schema model_validate), same chain/power.
 from cv_infra.cli.main import _job_spec_from_request
 from cv_infra.contract.loader import load_request
-from cv_infra.contract.models import VerificationRequest
 from cv_infra.oracles.no_collision import NoCollisionOracle
-from cv_infra.runner.main import build_oracles, criteria_view
+from cv_infra.runner.main import build_oracles, criteria_view, parse_request
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
 
@@ -108,6 +111,7 @@ def test_fixture_satisfies_no_collision_bind_precondition():
     on a real runner (P2-13 precondition). No requirement is retyped — the oracle
     code decides what is required (chassis_path, D-E/R7)."""
     job_spec = _job_spec_from_request(load_request(FIXTURE).request, "fixture-guard")
-    view = criteria_view(VerificationRequest.from_dict(job_spec))
+    request, _ = parse_request(job_spec)  # the runner's REAL JOB_SPEC parse (D-4')
+    view = criteria_view(request)
     NoCollisionOracle().validate_params(view)  # raises ValueError if chassis_path missing
     assert view.get("chassis_path"), "criteria_view is missing chassis_path after merge"
