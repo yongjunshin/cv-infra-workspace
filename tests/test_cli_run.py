@@ -1,19 +1,20 @@
-"""``cv-infra run`` wiring tests (M8, DoD-P2-07) — supervisor STUBBED (G-17).
+"""``cv-infra run`` wiring tests (M8, DoD-P2-07 + P3 friendly errors) —
+supervisor STUBBED (G-17).
 
-The run path (scenario YAML -> canonical JOB_SPEC -> supervisor -> exit code,
-D-2) is proven against a stub of the pinned M8->M3 seam
-(``cv_infra.orchestrator.supervisor.run_job`` / ``JobOutcome`` — cycle
-p2-supervisor-min verbatim pin). The real supervisor lands in a parallel M3
-worktree, so these tests inject a fake module into ``sys.modules`` via
-monkeypatch — NOTHING is written into ``cv_infra/orchestrator/``; the
-real-import round-trip is the PM merge gate. CPU-only, stdlib + pytest
-(+ pyyaml, which is the CLI's own dependency under test).
+The run path (scenario YAML -> M1 6-stage loader admit gate -> canonical
+JOB_SPEC -> supervisor -> exit code) is proven against a stub of the pinned
+M8->M3 seam (``cv_infra.orchestrator.supervisor.run_job`` / ``JobOutcome`` —
+cycle p2-supervisor-min verbatim pin), injected into ``sys.modules`` via
+monkeypatch — NOTHING is written into ``cv_infra/orchestrator/``. The loader
+under the CLI is the REAL ``contract.loader.load_request`` (P3 cycle-2 wiring):
+every rejection case doubles as an ADMIT-GATE SPY — ``stub.calls == []``
+proves the supervisor is never invoked on rejected input (NFR-INTAKE-003).
+CPU-only, stdlib + pytest (+ pyyaml/pydantic, the run path's own deps).
 
-The scenario fixture is a VERBATIM copy (byte-identical, sha256-checked at
-copy time) of the real consumer instance
-``cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml``, kept under
-``tests/fixtures/`` because tests must not reference the consumer repo at
-runtime (boundary rule) and ruff must not lint its long comment lines.
+The scenario fixture is the platform copy of the real consumer instance
+``cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml`` (drift-guarded by
+tests/test_fixture_canonical_guard.py), kept under ``tests/fixtures/`` because
+tests must not reference the consumer repo at runtime (boundary rule).
 """
 
 from __future__ import annotations
@@ -30,8 +31,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+import cv_infra.contract.version as version_mod
 from cv_infra.cli.main import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS, main
-from cv_infra.contract.models import VerificationRequest, VerificationResult
+from cv_infra.contract.version import DeprecatedVersion
 
 RUNNER_IMAGE = "cv-infra-runner:p2"
 
@@ -56,8 +58,11 @@ class FakeJobOutcome:
 class RecordingSupervisor:
     """Stub of the pinned ``run_job`` seam: records the call, writes result.json.
 
-    The result dict is built with the REAL M1 ``VerificationResult`` so the
-    payload the CLI parses is canonical by construction (G-17).
+    The payload is the minimal canonical subset ``{job_id, verdict}`` (the CLI
+    re-validates it with the REAL M1 ``schema.Result``, whose optional fields
+    default; full-shape wire equivalence with the runner emission is guarded
+    by tests/test_contract_result_equivalence.py). A raw dict — not a model —
+    so the unknown-verdict fold case ("wat") can be exercised too.
     """
 
     def __init__(self, verdict: str = "pass"):
@@ -76,8 +81,8 @@ class RecordingSupervisor:
         job_dir = out_dir / job_spec["job_id"]
         job_dir.mkdir(parents=True, exist_ok=True)
         result_path = job_dir / "result.json"
-        result = VerificationResult(job_id=job_spec["job_id"], verdict=self.verdict)
-        result_path.write_text(json.dumps(result.to_dict()), encoding="utf-8")
+        payload = {"job_id": job_spec["job_id"], "verdict": self.verdict}
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
         return FakeJobOutcome(
             job_id=job_spec["job_id"],
             result_path=result_path,
@@ -133,8 +138,23 @@ def test_job_spec_reaches_stub_in_canonical_shape(monkeypatch, scenario_file, tm
     assert spec["interface"]["adapter_config"]["odom_topics"] == ["/odom", "/chassis/odom"]
     assert [c["oracle"] for c in spec["acceptance_criteria"]] == ["reached_goal", "no_collision"]
 
-    # Round-trips through the real M1 model without loss (G-17).
-    assert VerificationRequest.from_dict(spec).to_dict() == spec
+    # Wire-freeze pin (P3 cycle-2, task data contract): the validated-model
+    # mapping emits the SAME sections the pre-loader raw pass-through did for
+    # the canonical fixture (which spells every adapter_config key). Only
+    # validated-type materialization differs textually (timeout_s: 120 ->
+    # 120.0 — python-equal; measured 2026-07-10 probe).
+    doc = yaml.safe_load(CARTER_YAML)
+    assert spec["scenario"] == doc["scenario"]
+    assert spec["interface"] == doc["interface"]
+    assert spec["acceptance_criteria"] == doc["acceptance_criteria"]
+
+    # Contract-side fields stay OFF the frozen Phase-2 wire; None-valued
+    # optional fields stay absent (a present-None would defeat the oracles'
+    # ``read_field(name, default)`` fallback).
+    assert "debug_obstacle" not in spec["scenario"]
+    assert "goal_orientation_wxyz" not in spec["acceptance_criteria"][0]["params"]
+    for off_wire in ("apiVersion", "api_version", "execution_settings"):
+        assert off_wire not in spec
 
     # Pinned positional seam: (job_spec, out_dir, runner_image, sut_image).
     assert call["out_dir"] == out_dir
@@ -150,6 +170,22 @@ def test_job_id_flag_overrides_generated(monkeypatch, scenario_file, tmp_path):
     assert stub.calls[0]["job_spec"]["job_id"] == "my-job-001"
 
 
+def test_debug_obstacle_rides_the_scenario_wire_only_when_declared(monkeypatch, tmp_path):
+    """D-2': the fail-injection cuboid is scenario world-state — declared keys
+    reach the runner via the JOB_SPEC wire; undeclared dims stay ABSENT
+    (runner defaults apply; the canonical-fixture test pins the absent case)."""
+    stub = RecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    doc = yaml.safe_load(CARTER_YAML)
+    doc["scenario"]["debug_obstacle"] = {"x": -6.0, "y": 2.0, "height": 0.15}
+    path = tmp_path / "obstacle.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    assert _run_cli(path, tmp_path / "out") == EXIT_PASS
+    wire = stub.calls[0]["job_spec"]["scenario"]["debug_obstacle"]
+    assert wire == {"x": -6.0, "y": 2.0, "height": 0.15}  # width/depth: None -> off the wire
+
+
 # --- (2) verdict -> exit code ------------------------------------------------
 
 
@@ -158,9 +194,11 @@ def test_job_id_flag_overrides_generated(monkeypatch, scenario_file, tmp_path):
     [
         ("pass", EXIT_PASS),
         ("fail", EXIT_FAIL),
-        ("timeout", EXIT_FAIL),  # SUT verdict (models.py fold), not infra
+        ("timeout", EXIT_FAIL),  # SUT verdict (schema.py Verdict fold), not infra
         ("error", EXIT_INFRA),  # runner-recorded platform error
-        ("wat", EXIT_INFRA),  # unknown verdict folds to INFRA, never FAIL
+        # Unknown verdict: schema.Result's Verdict Literal rejects it at parse
+        # (non-canonical result.json branch) -> folds to INFRA, never FAIL.
+        ("wat", EXIT_INFRA),
     ],
 )
 def test_recovered_verdict_maps_to_exit_code(
@@ -183,16 +221,18 @@ def test_recovered_verdict_outranks_runner_exit_code(monkeypatch, scenario_file,
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
 
 
-# --- (3) contract errors -> exit 2, no spawn ---------------------------------
+# --- (3) contract errors -> friendly stderr + exit 2, supervisor never invoked
 
 
 def _assert_contract_error(capsys, stub, rc) -> str:
+    """Common admit-gate assertions: exit 2, SPY (zero supervisor calls —
+    NFR-INTAKE-003), M1 ``str(err)`` prose on stderr, raw traceback 0."""
     assert rc == EXIT_CONTRACT
-    assert stub.calls == []  # contract errors must precede any spawn
+    assert stub.calls == []  # ADMIT-GATE SPY: rejected input never spawns
     err = capsys.readouterr().err
-    assert "cv-infra run: invalid scenario" in err
-    assert "Traceback" not in err
-    assert len(err.strip().splitlines()) == 1  # one-line cause (raw traceback 0)
+    assert err.startswith("cv-infra run: ")
+    assert "expected" in err  # M1 friendly shape: field path + expected + ...
+    assert "Traceback" not in err  # raw traceback 0 (NFR-INTAKE-001)
     return err
 
 
@@ -200,15 +240,18 @@ def test_missing_file_exits_2(monkeypatch, tmp_path, capsys):
     stub = RecordingSupervisor()
     _install_supervisor(monkeypatch, stub)
     rc = _run_cli(tmp_path / "does-not-exist.yaml", tmp_path / "out")
-    _assert_contract_error(capsys, stub, rc)
+    err = _assert_contract_error(capsys, stub, rc)
+    assert "readable YAML request file" in err
 
 
-def test_broken_yaml_exits_2(monkeypatch, tmp_path, capsys):
+def test_broken_yaml_exits_2_with_line_location(monkeypatch, tmp_path, capsys):
     stub = RecordingSupervisor()
     _install_supervisor(monkeypatch, stub)
     bad = tmp_path / "broken.yaml"
     bad.write_text("scenario: [unclosed\n", encoding="utf-8")
-    _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "well-formed YAML" in err
+    assert f"at {bad}:" in err  # parse errors carry the YAML line/col mark
 
 
 def test_non_mapping_top_level_exits_2(monkeypatch, tmp_path, capsys):
@@ -216,7 +259,8 @@ def test_non_mapping_top_level_exits_2(monkeypatch, tmp_path, capsys):
     _install_supervisor(monkeypatch, stub)
     bad = tmp_path / "list.yaml"
     bad.write_text("- 1\n- 2\n", encoding="utf-8")
-    _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "a YAML mapping" in err
 
 
 def test_unknown_top_level_key_loud_rejects_exit_2(monkeypatch, tmp_path, capsys):
@@ -235,7 +279,8 @@ def test_unknown_sut_key_loud_rejects_exit_2(monkeypatch, tmp_path, capsys):
     doc["sut"]["tag"] = "oops"
     bad = tmp_path / "sut-extra.yaml"
     bad.write_text(yaml.safe_dump(doc), encoding="utf-8")
-    _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "sut.tag" in err  # dotted field path (M1 render_loc)
 
 
 def test_schema_violation_missing_goal_exits_2(monkeypatch, tmp_path, capsys):
@@ -245,7 +290,8 @@ def test_schema_violation_missing_goal_exits_2(monkeypatch, tmp_path, capsys):
     del doc["scenario"]["goal"]
     bad = tmp_path / "no-goal.yaml"
     bad.write_text(yaml.safe_dump(doc), encoding="utf-8")
-    _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "scenario.goal" in err
 
 
 def test_schema_violation_unknown_adapter_key_exits_2(monkeypatch, tmp_path, capsys):
@@ -255,7 +301,88 @@ def test_schema_violation_unknown_adapter_key_exits_2(monkeypatch, tmp_path, cap
     doc["interface"]["adapter_config"]["topic_map"] = {}  # retired key -> SEAM-2 loud-reject
     bad = tmp_path / "retired-key.yaml"
     bad.write_text(yaml.safe_dump(doc), encoding="utf-8")
-    _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "topic_map" in err
+
+
+def test_self_containedness_empty_criteria_exits_2(monkeypatch, tmp_path, capsys):
+    """REQ-INTAKE-006 triad: a request without >=1 acceptance criterion is not
+    self-contained — rejected at the gate, never executed."""
+    stub = RecordingSupervisor()
+    _install_supervisor(monkeypatch, stub)
+    doc = yaml.safe_load(CARTER_YAML)
+    doc["acceptance_criteria"] = []
+    bad = tmp_path / "no-criteria.yaml"
+    bad.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "acceptance_criteria" in err
+
+
+def test_multiple_violations_all_render_on_stderr(monkeypatch, tmp_path, capsys):
+    """Task pin: several pydantic violations -> the CLI renders the FULL
+    ``from_validation_error`` list (one ``str(err)`` line group per violation),
+    not just the loader's first."""
+    stub = RecordingSupervisor()
+    _install_supervisor(monkeypatch, stub)
+    doc = yaml.safe_load(CARTER_YAML)
+    del doc["scenario"]["goal"]  # violation 1
+    del doc["sut"]  # violation 2
+    bad = tmp_path / "two-violations.yaml"
+    bad.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "scenario.goal" in err
+    assert "\ncv-infra run: sut:" in err  # the second violation got its own render
+
+
+def test_absent_api_version_exits_2_with_add_the_key_guidance(monkeypatch, tmp_path, capsys):
+    """D-1' strict: no apiVersion key -> friendly reject telling the user the
+    exact line to add (never silently treated as current)."""
+    stub = RecordingSupervisor()
+    _install_supervisor(monkeypatch, stub)
+    lines = [ln for ln in CARTER_YAML.splitlines() if not ln.startswith("apiVersion:")]
+    assert len(lines) == len(CARTER_YAML.splitlines()) - 1  # exactly the key line removed
+    bad = tmp_path / "no-apiversion.yaml"
+    bad.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "apiVersion" in err
+    assert "example: apiVersion: cv-infra/v1" in err
+
+
+def test_unknown_api_version_exits_2_with_migration_pointer(monkeypatch, tmp_path, capsys):
+    stub = RecordingSupervisor()
+    _install_supervisor(monkeypatch, stub)
+    bad = tmp_path / "future-apiversion.yaml"
+    bad.write_text(
+        CARTER_YAML.replace("apiVersion: cv-infra/v1", "apiVersion: cv-infra/v999"),
+        encoding="utf-8",
+    )
+    err = _assert_contract_error(capsys, stub, _run_cli(bad, tmp_path / "out"))
+    assert "cv-infra/v999" in err
+    assert "apiVersion policy" in err  # doc_link pointer (M1 §3.1 citation anchor)
+
+
+def test_deprecated_api_version_warns_and_continues(monkeypatch, tmp_path, capsys):
+    """M8-D5 accept-with-WARNING leg: deprecated (via injected table — the real
+    DEPRECATED table is honestly empty for cv-infra/v1) -> stderr WARNING with
+    sunset + migration link, and the run PROCEEDS to its verdict exit."""
+    stub = RecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    monkeypatch.setattr(
+        version_mod,
+        "DEPRECATED",
+        {"cv-infra/v0": DeprecatedVersion(sunset="removed after v3", migration_link="docs/mig.md")},
+    )
+    deprecated = tmp_path / "deprecated-apiversion.yaml"
+    deprecated.write_text(
+        CARTER_YAML.replace("apiVersion: cv-infra/v1", "apiVersion: cv-infra/v0"),
+        encoding="utf-8",
+    )
+
+    assert _run_cli(deprecated, tmp_path / "out") == EXIT_PASS  # verdict exit, not 2
+    assert len(stub.calls) == 1  # deprecated = accepted: the job actually ran
+    err = capsys.readouterr().err
+    assert "cv-infra run: WARNING:" in err
+    assert "DEPRECATED" in err and "sunset" in err and "docs/mig.md" in err
 
 
 def test_missing_runner_image_is_usage_error_2(monkeypatch, scenario_file):
@@ -331,8 +458,9 @@ def test_supervisor_import_failure_exits_3(monkeypatch, scenario_file, tmp_path,
 # --- (5) --help path stays dependency-free -----------------------------------
 
 
-def test_help_path_imports_no_yaml_or_docker(tmp_path):
-    """``cv-infra --help`` must exit 0 WITHOUT pulling pyyaml or docker (lazy imports)."""
+def test_help_path_imports_no_yaml_pydantic_or_docker(tmp_path):
+    """``cv-infra --help`` must exit 0 WITHOUT pulling pyyaml, pydantic (the M1
+    loader) or docker — the loader import is lazy inside the run path."""
     probe = textwrap.dedent("""
         import sys
         from cv_infra.cli.main import main
@@ -342,6 +470,7 @@ def test_help_path_imports_no_yaml_or_docker(tmp_path):
             rc = e.code or 0
         assert rc == 0, f"--help exit {rc}"
         assert "yaml" not in sys.modules, "pyyaml imported on --help path"
+        assert "pydantic" not in sys.modules, "pydantic (M1 loader) imported on --help path"
         assert "docker" not in sys.modules, "docker imported on --help path"
         """)
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}  # G-10 isolation

@@ -3,12 +3,16 @@
 This module is the *single contract surface* that both CI/CD and humans drive
 (REQ-INTAKE-003): a GitHub Action is only a thin wrapper over this CLI
 (LOCKED Sec.10 — CLI-first, Action-after). Phase 0 reserved the surface;
-Phase 2 wires ``run`` for real (decision 2026-07-07 D-2: CLI builds the
+Phase 2 wired ``run`` for real (decision 2026-07-07 D-2: CLI builds the
 JOB_SPEC, the M3 supervisor co-spawns SUT + runner and recovers result.json,
-the CLI maps the recovered verdict to an exit code). The other sub-commands,
-GitHub integration and friendly-error rendering land in later Phases (M8
-Sec.5); the formal M1 loader (pydantic, field-path prose) is Phase 3 — the
-YAML->JOB_SPEC mapping here is deliberately minimal.
+the CLI maps the recovered verdict to an exit code). Phase 3 replaced the
+``run`` input path with the M1 6-stage loader (``contract.loader.load_request``
+— the acceptance gate, NFR-INTAKE-003): any stage-1..5 rejection renders the
+M1 ``ContractError`` friendly prose on stderr (``str(err)`` verbatim — field
+path + expected + example + YAML line/col; raw traceback 0) and exits 2
+BEFORE the supervisor is ever invoked; a deprecated ``apiVersion`` warns on
+stderr and the run continues (M8-D4/D5). The other sub-commands and GitHub
+integration land in later Phases (M8 Sec.5).
 
 Exit-code contract (LOCKED Sec.9 — exercised standalone at DoD-P2-07)::
 
@@ -36,12 +40,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
-from cv_infra.contract.models import VerificationRequest, VerificationResult
+# NO top-level cv_infra.contract / third-party imports: the --help and
+# placeholder sub-command paths must stay dependency-free (REQ-INTAKE-003/005).
+# The M1 loader (pydantic + pyyaml) is imported lazily inside the run path.
 
 # --- exit-code contract slots (LOCKED Sec.9) -------------------------------
-# The 0/1 verdict branching + 2 (bad input) + 3 (infra) paths are wired for
-# ``run`` at Phase 2 (DoD-P2-07); friendly-error prose is Phase 3.
+# The 0/1 verdict branching + 2 (bad input, M1 friendly prose) + 3 (infra)
+# paths are all wired for ``run`` (DoD-P2-07 + DoD-P3 friendly errors).
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_CONTRACT = 2
@@ -49,8 +54,8 @@ EXIT_INFRA = 3
 
 # result.json verdict -> exit code. The RECOVERED result.json verdict OUTRANKS
 # the runner container's exit code (which is informational only) — same fold as
-# the runner's own _VERDICT_EXIT (cv_infra/runner/main.py) and the comment
-# table in cv_infra/contract/models.py. Unknown verdicts fold to INFRA (3),
+# the runner's own _VERDICT_EXIT (cv_infra/runner/main.py); the verdict domain
+# is contract/schema.py ``Verdict``. Unknown verdicts fold to INFRA (3),
 # never to FAIL (1).
 _VERDICT_EXIT: dict[str, int] = {
     "pass": EXIT_PASS,
@@ -87,12 +92,6 @@ _EXIT_CODE_EPILOG = (
     "\n"
     "Phase 2: 'run' is implemented; the other sub-commands are reserved (later Phases)."
 )
-
-# scenario YAML -> canonical JOB_SPEC mapping surface (loud-reject, no silent
-# drop — same contract as adapter_schema). The SUT image comes from the
-# scenario's ``sut.image_ref`` (the scenario is the SoT), never a CLI flag.
-_TOP_LEVEL_KEYS = frozenset({"apiVersion", "scenario", "sut", "interface", "acceptance_criteria"})
-_SUT_KEYS = frozenset({"image_ref"})
 
 
 def _add_run_arguments(sub: argparse.ArgumentParser) -> None:
@@ -148,52 +147,56 @@ def _default_job_id(scenario_path: Path) -> str:
     return f"{scenario_path.stem}-{stamp}"
 
 
-def _load_scenario_doc(path: Path) -> Any:
-    # Lazy pyyaml import: non-run paths (--help, placeholders) must not pull
-    # third-party deps (standalone surface stays cheap — REQ-INTAKE-003/005).
-    import yaml
+def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
+    """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
-    text = path.read_text(encoding="utf-8")  # OSError -> contract error upstream
-    try:
-        return yaml.safe_load(text)
-    except yaml.YAMLError as exc:  # normalize: upstream catch stays stdlib-only
-        raise ValueError(f"YAML parse error: {_one_line(exc)}") from exc
+    The wire shape is the frozen Phase-2 seam (supervisor JOB_SPEC file ->
+    runner parse): exact top-level key set ``{job_id, scenario, sut_image_ref,
+    interface, acceptance_criteria}`` with ``sut.image_ref`` flattened
+    (REQ-INTAKE-006). Contract-side fields (``apiVersion`` /
+    ``execution_settings`` / ``sut.image_id``) stay OFF the wire — consuming
+    them is a later-cycle supervisor/runner surface.
 
-
-def _scenario_doc_to_job_spec(doc: Any, job_id: str) -> dict[str, Any]:
-    """Map a scenario YAML doc to the canonical VerificationRequest dict (JOB_SPEC).
-
-    ``scenario`` / ``interface`` / ``acceptance_criteria`` pass through as-is;
-    ``sut.image_ref`` flattens to ``sut_image_ref``; ``job_id`` is attached.
-    Unknown keys (top level and under ``sut``) are LOUD-REJECTED — adapter_config
-    unknown keys are rejected downstream by ``Ros2AdapterConfig.from_dict``.
+    ``exclude_none=True`` keeps "None = downstream default applies" fields
+    ABSENT exactly as the raw-YAML pass-through did: a present-but-``null``
+    known-key param (e.g. ``goal_orientation_wxyz``) would defeat the oracle's
+    ``read_field(name, default)`` fallback. Free-form dict values (custom
+    criterion params) are NOT filtered by pydantic's ``exclude_none`` —
+    explicit nulls a user wrote survive verbatim (measured 2026-07-10).
+    ``scenario.debug_obstacle`` (D-2') rides the wire only when declared.
     """
-    if not isinstance(doc, dict):
-        raise ValueError(
-            "top level must be a mapping (scenario / sut / interface / acceptance_criteria)"
-        )
-    unknown = sorted(set(doc) - _TOP_LEVEL_KEYS)
-    if unknown:
-        raise ValueError(f"unknown top-level key(s) {unknown}; allowed: {sorted(_TOP_LEVEL_KEYS)}")
-    missing = sorted(k for k in ("scenario", "sut") if k not in doc)
-    if missing:
-        raise ValueError(f"missing required top-level key(s) {missing}")
-    sut = doc["sut"]
-    if not isinstance(sut, dict):
-        raise ValueError("'sut' must be a mapping with 'image_ref'")
-    unknown_sut = sorted(set(sut) - _SUT_KEYS)
-    if unknown_sut:
-        raise ValueError(f"unknown key(s) under 'sut' {unknown_sut}; allowed: {sorted(_SUT_KEYS)}")
-    image_ref = sut.get("image_ref")
-    if not isinstance(image_ref, str) or not image_ref:
-        raise ValueError("'sut.image_ref' must be a non-empty string (scenario is the SUT SoT)")
     return {
         "job_id": job_id,
-        "scenario": doc["scenario"],
-        "sut_image_ref": image_ref,  # flattened canonical field (REQ-INTAKE-006)
-        "interface": doc.get("interface"),
-        "acceptance_criteria": doc.get("acceptance_criteria") or [],
+        "scenario": request.scenario.model_dump(exclude_none=True),
+        "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
+        "interface": request.interface.model_dump(exclude_none=True),
+        "acceptance_criteria": [
+            criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
+        ],
     }
+
+
+def _render_contract_errors(err: Any) -> None:
+    """Render a loader rejection to stderr — ``errors.py``'s ``str(err)`` format
+    verbatim (M1 owns the friendly shape; the CLI invents no format of its own).
+
+    The loader raises only the FIRST violation (location-enriched). When its
+    cause is a pydantic ``ValidationError`` carrying several violations, the
+    remaining ones are re-rendered via ``from_validation_error`` (list
+    traversal — the first element IS ``err``, minus the loader's line/col
+    enrichment) so one run surfaces every violation. Duck-typed on a callable
+    ``.errors`` exactly like ``errors.py`` itself — no pydantic import here.
+    """
+    print(f"cv-infra run: {err}", file=sys.stderr)
+    cause = err.__cause__
+    if cause is None or not callable(getattr(cause, "errors", None)):
+        return
+    from cv_infra.contract.errors import from_validation_error
+    from cv_infra.contract.schema import VerificationRequest
+
+    rest = from_validation_error(cause, model=VerificationRequest, source_path=err.source_path)[1:]
+    for extra in rest:
+        print(f"cv-infra run: {extra}", file=sys.stderr)
 
 
 def _exit_from_outcome(outcome: Any) -> int:
@@ -212,8 +215,14 @@ def _exit_from_outcome(outcome: Any) -> int:
         )
         return EXIT_INFRA
     result_path = Path(outcome.result_path)
+    # Lazy import (pydantic): the M1 canonical Result re-validates the recovered
+    # payload at this trust boundary (the runner emission is wire-equal by the
+    # equivalence guard; pydantic ValidationError is a ValueError subclass, so
+    # the stdlib-only catch below already covers it).
+    from cv_infra.contract.schema import Result
+
     try:
-        result = VerificationResult.from_dict(json.loads(result_path.read_text(encoding="utf-8")))
+        result = Result.model_validate(json.loads(result_path.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
         print(
             f"cv-infra run: result.json at {result_path} is unreadable or non-canonical: "
@@ -236,16 +245,21 @@ def _exit_from_outcome(outcome: Any) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    """``cv-infra run``: scenario YAML -> JOB_SPEC -> supervisor -> exit code (D-2).
+    """``cv-infra run``: M1 6-stage admit gate -> JOB_SPEC -> supervisor -> exit code.
 
-    Exit-code mapping (DoD-P2-07). The RECOVERED result.json verdict outranks
-    the runner container's exit code — the runner code is informational only::
+    The input path IS ``contract.loader.load_request`` (parse -> apiVersion
+    resolve -> pydantic validate -> self-containedness -> oracle bind -> admit,
+    NFR-INTAKE-003): rejected input never reaches the supervisor — this
+    function only consumes the loader's verdict, it re-validates nothing.
+    Exit-code mapping (DoD-P2-07/P3-02..06); the RECOVERED result.json verdict
+    outranks the runner container's exit code (informational only)::
 
         condition                                              exit
         -----------------------------------------------------  ----
-        file missing / YAML parse error / non-mapping doc         2
-        unknown top-level or sut key (loud-reject)                2
-        schema violation (VerificationRequest / adapter_config)   2
+        loader stage 1-5 reject: file missing / parse error /
+          absent|unknown apiVersion / schema violation /
+          non-self-contained / oracle unbindable                  2
+        deprecated apiVersion                                     (stderr WARNING, run continues)
         supervisor unavailable / out-dir not creatable            3
         outcome.infra_error set                                   3
         result.json not recovered (result_path is None)           3
@@ -260,25 +274,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
     """
     scenario_path = Path(args.scenario)
     job_id = args.job_id or _default_job_id(scenario_path)
+
+    # Lazy loader import: the 6-stage gate pulls pydantic + pyyaml, which the
+    # --help / placeholder paths must never load (REQ-INTAKE-003/005).
+    from cv_infra.contract.errors import ContractError
+    from cv_infra.contract.loader import load_request
+
     try:
-        doc = _load_scenario_doc(scenario_path)
-        draft = _scenario_doc_to_job_spec(doc, job_id)
-        # Only proceed once the real contract models accept the spec (task pin):
-        # VerificationRequest for the top-level shape, Ros2AdapterConfig for the
-        # adapter_config sub-schema (loud-rejects unknown keys — SEAM-2).
-        request = VerificationRequest.from_dict(draft)
-        if request.interface.type != "ros2":
-            raise ValueError(
-                f"interface.type {request.interface.type!r} is unsupported (MVP: 'ros2')"
-            )
-        Ros2AdapterConfig.from_dict(request.interface.adapter_config)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f"cv-infra run: invalid scenario {scenario_path}: {_one_line(exc)}", file=sys.stderr)
+        admitted = load_request(scenario_path)
+    except ContractError as err:
+        _render_contract_errors(err)
         return EXIT_CONTRACT
 
-    # Canonical JOB_SPEC = round-trip through the real M1 model (defaults
-    # materialized, exact canonical key set — G-17: the model, not prose, is SoT).
-    job_spec = request.to_dict()
+    # Deprecated apiVersion (and any future stage-2 warning): warn, continue —
+    # the exit code stays the verdict's (M8-D5 / NFR-INTAKE-002).
+    for warning in admitted.warnings:
+        print(f"cv-infra run: WARNING: {warning}", file=sys.stderr)
+
+    # Canonical JOB_SPEC from the ADMITTED model (G-17: the model, not prose,
+    # is SoT) — wire shape frozen at the Phase-2 seam (_job_spec_from_request).
+    job_spec = _job_spec_from_request(admitted.request, job_id)
 
     out_dir = Path(args.out_dir)
     try:
@@ -305,7 +320,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # is NOT passed — the runner boot guard refuses to start Isaac (FU-8 is P5).
     consent_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
     kwargs: dict[str, Any] = {"runner_env": consent_env} if consent_env else {}
-    outcome = run_job(job_spec, out_dir, args.runner_image, request.sut_image_ref, **kwargs)
+    outcome = run_job(job_spec, out_dir, args.runner_image, job_spec["sut_image_ref"], **kwargs)
     return _exit_from_outcome(outcome)
 
 

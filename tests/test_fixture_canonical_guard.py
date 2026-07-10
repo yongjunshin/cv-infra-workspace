@@ -28,7 +28,13 @@ from pathlib import Path
 
 import yaml
 
-from cv_infra.cli.main import _scenario_doc_to_job_spec
+# P3 cycle-2 re-wire (M8 task p3c2-cli-loader, minimal): the CLI transform is
+# now loader-fed — ``load_request`` (M1 6-stage gate) + ``_job_spec_from_request``
+# replace the retired ``_scenario_doc_to_job_spec``. Detection power preserved
+# (same fixture -> REAL CLI wire -> runner parse -> criteria_view -> oracle
+# validator), and the fixture now additionally passes the full admit gate.
+from cv_infra.cli.main import _job_spec_from_request
+from cv_infra.contract.loader import load_request
 from cv_infra.contract.models import VerificationRequest
 from cv_infra.oracles.no_collision import NoCollisionOracle
 from cv_infra.runner.main import build_oracles, criteria_view
@@ -101,7 +107,7 @@ def test_fixture_satisfies_no_collision_bind_precondition():
     ``params: {}``), ``validate_params`` raises and ``telemetry.bind()`` would raise
     on a real runner (P2-13 precondition). No requirement is retyped — the oracle
     code decides what is required (chassis_path, D-E/R7)."""
-    job_spec = _scenario_doc_to_job_spec(_fixture_doc(), "fixture-guard")
+    job_spec = _job_spec_from_request(load_request(FIXTURE).request, "fixture-guard")
     view = criteria_view(VerificationRequest.from_dict(job_spec))
     NoCollisionOracle().validate_params(view)  # raises ValueError if chassis_path missing
     assert view.get("chassis_path"), "criteria_view is missing chassis_path after merge"
