@@ -24,3 +24,9 @@ forbidden_modules =
     cv_infra.cli
     cv_infra.oracles
     cv_infra.adapter
+; P3 cycle-1 (M1 §3.3 stage 5): the contract loader BINDS oracle plugins via the
+; M1-owned loader entry in cv_infra/oracles/base.py (itself stdlib+contract.errors
+; only). This single sanctioned edge is allowed; everything else in
+; cv_infra.oracles (concrete M2 oracles) stays forbidden to the contract.
+ignore_imports =
+    cv_infra.contract.loader -> cv_infra.oracles.base

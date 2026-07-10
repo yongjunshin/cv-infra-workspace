@@ -1,0 +1,288 @@
+"""Contract models (M1 §3.2) — Phase 3 pydantic v2 formalization.
+
+Single definition of the verification contract (blueprint §8 — consumers
+import, never redefine): ``RequestEnvelope`` / ``VerificationRequest`` /
+``Result`` / ``ExecutionSettings`` / ``ResourceBudget`` + their sub-models.
+Every model rejects unknown keys loudly (``extra="forbid"`` at EVERY nesting
+level) — nothing is silently dropped (the G-25 ``goal_tolerance_m`` lesson).
+
+Wire grounding (karpathy — only fields with a real basis exist):
+
+* Request side = the canonical consumer scenario document
+  (tests/fixtures/nova_carter_warehouse_goal.yaml @ cv-infra-user f1c9607):
+  ``scenario`` / ``sut`` / ``interface`` / ``acceptance_criteria`` top level,
+  plus the M1 §3.2 additions ``apiVersion`` (optional, resolver = version.py)
+  and ``execution_settings`` (optional; ``repeats`` is consumed by M3 fan-out).
+* Result side = the exact result.json the Phase-2 runner emits
+  (``cv_infra.runner.evaluate.build_result_dict`` ==
+  ``contract.models.VerificationResult.to_dict()``). The new ``Result`` must
+  pass that dict through UNMODIFIED — bound mechanically by
+  tests/test_contract_result_equivalence.py (equivalence guard + positive
+  control, G-25/G-17).
+
+Phase-2 consumers (CLI/runner/orchestrator) still import
+``cv_infra.contract.models`` (stdlib dataclasses) — they migrate here in P3
+cycle-2. This module is imported lazily from ``cv_infra.contract`` so the
+package import stays stdlib-only (runner image has no pydantic — D-C/R20).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    model_validator,
+)
+
+from cv_infra.contract.adapter_schema import Interface
+from cv_infra.contract.apiversion import API_VERSION
+
+# Verdict domain (REQ-EXEC-013; LOCKED exit fold documented in contract/models.py).
+Verdict = Literal["pass", "fail", "timeout", "error"]
+VERDICTS: tuple[str, ...] = ("pass", "fail", "timeout", "error")
+
+
+class _ForbidExtra(BaseModel):
+    """Shared config: unknown keys are a loud contract violation, never dropped."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+# --------------------------------------------------------------------------- #
+# Request side (REQ-INTAKE-001/002/006)
+# --------------------------------------------------------------------------- #
+class Goal(_ForbidExtra):
+    """Navigation goal pose (REQ-EXEC-004). Coordinates are expressed in ``frame``."""
+
+    x: float = Field(examples=[-6.0])
+    y: float = Field(examples=[5.0])
+    yaw: float = Field(examples=[1.5708])
+    frame: str = "map"
+
+
+class Scenario(_ForbidExtra):
+    """Self-contained scene + goal + determinism inputs (REQ-INTAKE-006).
+
+    ``timeout_s`` is a SIM-time (/clock) budget, NOT wall-clock — the
+    wall-clock runaway watchdog is M3's (M1 §3.2, D-F). ``seed`` backs
+    determinism (LOCKED §7-6).
+    """
+
+    scene: str = Field(min_length=1, examples=["nova_carter_warehouse"])
+    robot: str = Field(min_length=1, examples=["nova_carter"])
+    goal: Goal
+    seed: int = Field(examples=[42])
+    timeout_s: float = Field(gt=0, examples=[120])
+
+
+class SutRef(_ForbidExtra):
+    """SUT image reference (REQ-INTAKE-006 required element #1).
+
+    ``image_id`` optionally pins the EXACT image (image-as-artifact, FU-10):
+    local tags carry no RepoDigest, so the docker Image Id is the pin. Optional
+    — when given it must be a full ``sha256:`` id (loud, friendly reject
+    otherwise; example = the measured carter-sut:p2 Image Id).
+    """
+
+    image_ref: str = Field(min_length=1, examples=["carter-sut:p2"])
+    image_id: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        examples=["sha256:47aff5c993dac05b1664482e44af9401073336f142cb6d4919d81b47f8f9d48a"],
+    )
+
+
+class ExecutionSettings(_ForbidExtra):
+    """Execution knobs (M1 §3.2). All optional — the canonical scenario omits it.
+
+    ``repeats`` is the 2-axis fan-out input (M3 ``fanout.py`` — single
+    definition, blueprint §8). ``fixed_dt`` expresses the determinism dt lock
+    (LOCKED §7-6; the Phase-2 runner steps at 1/60 — enforcement is M2's).
+    ``seed`` / mission ``timeout_s`` live in ``Scenario`` (canonical fixture),
+    NOT here — one home per field.
+    """
+
+    repeats: int = Field(default=1, ge=1, examples=[3])
+    fixed_dt: float | None = Field(default=None, gt=0, examples=[0.016667])
+
+
+# --- acceptance criteria ("criteria are also input", REQ-INTAKE-007) -------- #
+class ReachedGoalParams(_ForbidExtra):
+    """Known-key params for the ``reached_goal`` oracle.
+
+    Keys are the oracle's OWN read set (``read_field`` call sites in
+    cv_infra/oracles/reached_goal.py; fixture-real: ``position_tolerance_m`` /
+    ``yaw_tolerance_rad``). ``None`` means "oracle default applies" — the
+    default VALUES stay oracle-owned (M2), the shape is M1's.
+    """
+
+    position_tolerance_m: float | None = Field(default=None, gt=0, examples=[0.75])
+    yaw_tolerance_rad: float | None = Field(default=None, gt=0, examples=[0.26])
+    goal_orientation_wxyz: list[float] | None = Field(
+        default=None, min_length=4, max_length=4, examples=[[1.0, 0.0, 0.0, 0.0]]
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_goal_tolerance(cls, data: Any) -> Any:
+        """The cycle-3 draft key was silently ignored by the oracle (G-25 root
+        cause) — reject it LOUDLY with the migration instead of re-swallowing."""
+        if isinstance(data, Mapping) and "goal_tolerance_m" in data:
+            raise ValueError(
+                "legacy key 'goal_tolerance_m' is not read by the reached_goal "
+                "oracle (it was silently ignored pre-P3) — use "
+                "'position_tolerance_m' (example: position_tolerance_m: 0.75)"
+            )
+        return data
+
+
+class NoCollisionParams(_ForbidExtra):
+    """Known-key params for the ``no_collision`` oracle (keys = its read set).
+
+    ``chassis_path`` is REQUIRED at contract time — absent, the runner's
+    ``telemetry.bind()`` raises mid-mission (P2-13 precondition); rejecting
+    here keeps bad input out of the execution plane (NFR-INTAKE-003, D-E/R7).
+    """
+
+    chassis_path: str = Field(min_length=1, examples=["/World/Nova_Carter_ROS/chassis_link"])
+    collision_excluded_paths: list[str] = Field(
+        default_factory=list, examples=[["/World/Nova_Carter_ROS"]]
+    )
+
+
+class ReachedGoalCriterion(_ForbidExtra):
+    oracle: Literal["reached_goal"]
+    params: ReachedGoalParams = Field(default_factory=ReachedGoalParams)
+
+
+class NoCollisionCriterion(_ForbidExtra):
+    oracle: Literal["no_collision"]
+    params: NoCollisionParams
+
+
+class CustomCriterion(_ForbidExtra):
+    """Any non-MVP oracle: the plugin named here is loaded/bound at loader
+    stage 5 (REQ-INTAKE-007/008) and validates its OWN params — the contract
+    cannot know a plugin's key set, so ``params`` stays a free mapping."""
+
+    oracle: str = Field(min_length=1, examples=["my_pkg.checks:MyOracle"])
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+def _criterion_tag(value: Any) -> str:
+    """Discriminate on ``oracle``: MVP names get their known-key schema, every
+    other name routes to ``CustomCriterion`` (plugin-validated)."""
+    oracle = value.get("oracle") if isinstance(value, Mapping) else getattr(value, "oracle", None)
+    return oracle if oracle in ("reached_goal", "no_collision") else "custom"
+
+
+AcceptanceCriterion = Annotated[
+    (
+        Annotated[ReachedGoalCriterion, Tag("reached_goal")]
+        | Annotated[NoCollisionCriterion, Tag("no_collision")]
+        | Annotated[CustomCriterion, Tag("custom")]
+    ),
+    Discriminator(_criterion_tag),
+]
+
+
+class VerificationRequest(_ForbidExtra):
+    """Self-contained verification instance (REQ-INTAKE-002/006) — the wire
+    shape of one consumer scenario document.
+
+    Required triad (REQ-INTAKE-006): ``sut`` (image ref) + ``scenario`` +
+    ``acceptance_criteria`` (>=1). ``apiVersion`` is optional here as a FIELD;
+    its semantics (accept/warn/reject) are version.py's — the schema does not
+    duplicate the version table (single definition).
+    """
+
+    api_version: str = Field(default=API_VERSION, alias="apiVersion", examples=[API_VERSION])
+    scenario: Scenario
+    sut: SutRef
+    interface: Interface = Field(default_factory=Interface)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(min_length=1)
+    execution_settings: ExecutionSettings = Field(default_factory=ExecutionSettings)
+
+
+class RequestEnvelope(_ForbidExtra):
+    """N>=1 ``VerificationRequest`` container (REQ-INTAKE-001; single submission
+    = size-1 envelope). ``trigger_source`` records human vs CI provenance
+    (REQ-INTAKE-003 — required, never silently defaulted); ``is_self_test`` /
+    ``origin`` mark self-test envelopes (M7 consumes)."""
+
+    api_version: str = Field(default=API_VERSION, alias="apiVersion", examples=[API_VERSION])
+    trigger_source: Literal["human-manual", "ci-cd"] = Field(examples=["ci-cd"])
+    is_self_test: bool = False
+    origin: str | None = None
+    requests: list[VerificationRequest] = Field(min_length=1)
+
+
+# --------------------------------------------------------------------------- #
+# Result side (REQ-EXEC-012/013/014) — wire-equal to the Phase-2 emission
+# --------------------------------------------------------------------------- #
+class Metrics(_ForbidExtra):
+    """Declared-metrics container (REQ-EXEC-012). Values are computed by the M2
+    oracle engine; M1 owns only the shape. Defaults mirror contract/models.py
+    exactly (equivalence guard material)."""
+
+    time_to_goal_s: float | None = None
+    min_clearance_m: float | None = None
+    collision_count: int = 0
+    path_len_m: float | None = None
+
+
+class CriterionResult(_ForbidExtra):
+    """Per-criterion outcome (one per AcceptanceCriterion)."""
+
+    oracle: str
+    passed: bool
+    detail: str | None = None
+
+
+class Artifacts(_ForbidExtra):
+    """Telemetry / recording artifact refs (REQ-EXEC-014). ``None`` until the
+    recorders produce files (honest degradation, P2-02)."""
+
+    mcap: str | None = None
+    mp4: str | None = None
+
+
+class Result(_ForbidExtra):
+    """Exactly one result per job (REQ-EXEC-013). Formalizes
+    ``contract.models.VerificationResult`` — the wire dict (key set, nesting,
+    defaults) is IDENTICAL to the Phase-2 runner emission and is bound by the
+    equivalence guard test (G-25: guard + positive control, not prose).
+
+    ``request_identity_key`` is a FIELD only — derivation/normalization is
+    M4's (LOCKED §7-13). ``origin`` / ``is_self_test`` are M7 markers.
+    """
+
+    job_id: str = Field(min_length=1)
+    verdict: Verdict
+    metrics: Metrics = Field(default_factory=Metrics)
+    criteria_results: list[CriterionResult] = Field(default_factory=list)
+    artifacts: Artifacts = Field(default_factory=Artifacts)
+    request_identity_key: str | None = None
+    origin: str | None = None
+    is_self_test: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Resource budget (REQ-DEPLOY-012 — schema shared: M5 configures, M3 consumes)
+# --------------------------------------------------------------------------- #
+class ResourceBudget(_ForbidExtra):
+    """Operator resource budget (M1 §3.2). Feeds the Phase-4 concurrency cap
+    ``k = min(max_concurrent, floor(VRAM / vram_per_instance_gb), ...)`` — the
+    VALUES are measured/operator-set (never hardcoded, CLAUDE §2-4); only the
+    shape is fixed here. ``scheduling_policy`` vocabulary is M3's to extend
+    (Phase-2 scheduler is FIFO wave-based)."""
+
+    vram_per_instance_gb: float = Field(gt=0, examples=[8.0])
+    max_concurrent: int = Field(ge=1, examples=[2])
+    scheduling_policy: str = Field(default="fifo", min_length=1, examples=["fifo"])

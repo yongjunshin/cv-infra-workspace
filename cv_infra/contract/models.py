@@ -1,3 +1,4 @@
+# DEPRECATED: canonical = cv_infra/contract/schema.py (pydantic v2; P3 cycle-2 migration)
 """Contract data models (M1) — Phase 2 minimal shape.
 
 Envelope / VerificationRequest / VerificationResult and their supporting types.

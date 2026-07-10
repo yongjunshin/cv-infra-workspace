@@ -1,3 +1,4 @@
+# DEPRECATED: canonical = cv_infra/contract/adapter_schema.py (P3 cycle-2 migration)
 """Adapter contract schema (M1) — Phase 2 canonical (SEAM-2).
 
 Versioned sub-schema for ``adapter_config`` when ``interface.type == "ros2"``

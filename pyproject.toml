@@ -10,12 +10,27 @@ dynamic = ["version"]
 dependencies = [
     "docker==7.1.0",  # M3 supervisor spawn/teardown
     "pyyaml==6.0.2",  # M8 CLI scenario loading (`cv-infra run`; --help stays dependency-free)
+    # M1 Phase-3 contract models (schema/loader/version — lazy-exported so
+    # `import cv_infra.contract` stays stdlib-only). HOST/CONTROL-PLANE ONLY this
+    # cycle: the runner image installs the wheel --no-deps and its unmodified
+    # import surface (contract.models / oracles / adapter) never touches pydantic;
+    # whether the runner BUNDLE consumes it is a cycle-2 image-policy decision
+    # after the T1 probe (D-C/R20, docker/runner/Dockerfile HOST_ONLY_DEPS guard).
+    "pydantic==2.13.4",  # latest stable at pin time (2026-07-10)
 ]
 
 # Console script (cross-team contract — verbatim pin, do not change).
 # M8 implements `def main() -> int` (exit-code) at cv_infra/cli/main.py.
 [project.scripts]
 cv-infra = "cv_infra.cli.main:main"
+
+# Oracle plugin registry (M1 §3.6, REQ-INTAKE-007): the contract loader binds
+# acceptance-criteria oracles through this entry-point group (stdlib
+# importlib.metadata discovery — custom oracles register here from their own
+# distribution, or are addressed by an explicit "module:Class" path).
+[project.entry-points."cv_infra.oracles"]
+reached_goal = "cv_infra.oracles.reached_goal:ReachedGoalOracle"
+no_collision = "cv_infra.oracles.no_collision:NoCollisionOracle"
 
 # Dev toolchain — exact-pinned for local/CI parity (decision 2026-06-24 env-reproducibility §4).
 # uv installs this group by default on `uv sync`.
