@@ -33,7 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.adapter_schema import Ros2AdapterConfig
 
 BAG_DIR_NAME = "bag"
 VIDEO_NAME = "recording.mp4"

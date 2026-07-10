@@ -24,8 +24,11 @@ import os
 import sys
 from pathlib import Path
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
-from cv_infra.contract.models import VerificationRequest
+from pydantic import ValidationError
+
+from cv_infra.contract.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.errors import from_validation_error
+from cv_infra.contract.schema import VerificationRequest
 from cv_infra.runner.evaluate import (
     VERDICT_ERROR,
     EvaluationEngine,
@@ -120,45 +123,60 @@ def exit_code_for_verdict(verdict: str) -> int:
 
 
 def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
-    """Build the typed request + adapter config from a JOB_SPEC dict (FU-13 (2)).
+    """Build the typed request + adapter config from a JOB_SPEC dict (D-4').
 
-    REAL ``from_dict`` calls — the cycle-3 canonical contract is the only shape
-    definition (G-17: no field-name drift by construction). Any contract violation
-    (missing/renamed key, unknown adapter_config key, non-ros2 interface) is bad
-    input, pre-sim -> BadJobSpec -> exit 2 (usage), like the other JOB_SPEC
-    failures. CPU-testable (no Isaac).
+    REAL ``contract.schema`` ``model_validate`` — the M1 pydantic canon is the
+    only shape definition (G-17: no field-name drift by construction; the runner
+    executes it on the BUNDLED pydantic, D-4'). The JOB_SPEC *wire* itself is
+    unchanged (T1 seam, frozen): its runner-envelope keys are adapted into the
+    schema's nesting before validation — ``job_id`` is peeled off (owned by
+    ``require_job_id``) and the flattened ``sut_image_ref`` maps to
+    ``sut.image_ref``. Any contract violation (missing/renamed/unknown key,
+    non-ros2 interface, debug_obstacle riding in criteria params — D-2'
+    supersedes that home) is bad input, pre-sim -> BadJobSpec -> exit 2 (usage),
+    rendered with the M1 friendly-error prose. CPU-testable (no Isaac).
     """
+    wire = dict(spec)
+    wire.pop("job_id", None)
+    if "sut_image_ref" in wire:
+        if "sut" in wire:
+            raise BadJobSpec("JOB_SPEC carries both 'sut_image_ref' and 'sut' — ambiguous SUT pin")
+        wire["sut"] = {"image_ref": wire.pop("sut_image_ref")}
     try:
-        request = VerificationRequest.from_dict(spec)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise BadJobSpec(f"JOB_SPEC is not a canonical VerificationRequest dict: {exc!r}") from exc
+        request = VerificationRequest.model_validate(wire)
+    except ValidationError as exc:
+        friendly = "; ".join(str(e) for e in from_validation_error(exc, model=VerificationRequest))
+        raise BadJobSpec(f"JOB_SPEC is not a canonical VerificationRequest: {friendly}") from exc
     if request.interface.type != "ros2":
-        raise BadJobSpec(
-            f"unsupported interface.type {request.interface.type!r} (Phase 2: ros2 only)"
-        )
-    try:
-        adapter_config = Ros2AdapterConfig.from_dict(request.interface.adapter_config)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise BadJobSpec(f"interface.adapter_config rejected: {exc}") from exc
-    return request, adapter_config
+        raise BadJobSpec(f"unsupported interface.type {request.interface.type!r} (MVP: ros2 only)")
+    # The schema already parsed adapter_config into the typed M1 model — no
+    # second from_dict pass (single validation, single definition).
+    return request, request.interface.adapter_config
 
 
 def criteria_view(request: VerificationRequest) -> dict:
     """Flatten the typed request into the criteria mapping oracles/metrics read.
 
     Scenario-derived fields first — ``goal_position`` from the 2D nav goal
-    (planar: z=0.0; an explicit ``goal_position`` param wins if a consumer needs
-    a non-ground goal) and the sim-time budget ``timeout_s`` (D-F) — then each
-    ``AcceptanceCriterion.params`` merged on top. Oracle *selection* stays
-    engine-side (the MVP pair is fixed in Phase 2, REQ-EXEC-011); params travel
-    per-criterion per the canonical shape.
+    (planar: z=0.0; an explicit ``goal_position`` param from a custom criterion
+    wins if a consumer needs a non-ground goal) and the sim-time budget
+    ``timeout_s`` (D-F) — then each ``AcceptanceCriterion.params`` merged on
+    top. Known-key params models merge with ``exclude_none`` (None = "oracle
+    default applies" — the default VALUES stay oracle-owned); a custom
+    criterion's free mapping merges as-is. Duck-typed on purpose: the same view
+    works over the old dataclass request (QA fixture guard) during the P3
+    migration window. Ownership: M2 (D-3' — execution-plane merge, M1 validates
+    intrinsics only).
     """
     view: dict = {
         "goal_position": [request.scenario.goal.x, request.scenario.goal.y, 0.0],
         "timeout_s": request.scenario.timeout_s,
     }
     for criterion in request.acceptance_criteria:
-        view.update(criterion.params)
+        params = criterion.params
+        if not isinstance(params, dict):
+            params = params.model_dump(exclude_none=True)
+        view.update(params)
     return view
 
 
@@ -186,7 +204,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     the canonical artifact field None + a stderr warning instead of poisoning the
     verdict with error.
     """
-    from cv_infra.contract.models import Artifacts
+    from cv_infra.contract.schema import Artifacts
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
     from cv_infra.runner.recording import RosbagRecorder, VideoRecorder, plan_artifacts
     from cv_infra.runner.ros_bridge import (
@@ -208,8 +226,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     result_path = resolve_result_path(env)
     spec = resolve_job_spec_dict(env)
     job_id = require_job_id(spec)  # echoed into the canonical result (REQ-EXEC-013)
-    # FU-13 (2): REAL typed parse (canonical from_dict chain) — contract violations
-    # are BadJobSpec -> exit 2, raised pre-sim (before any Isaac import/boot).
+    # D-4': REAL typed parse (contract.schema model_validate on the bundled
+    # pydantic) — contract violations are BadJobSpec -> exit 2, raised pre-sim
+    # (before any Isaac import/boot).
     request, adapter_config = parse_request(spec)
     criteria = criteria_view(request)
 
@@ -245,9 +264,15 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # bind() must run PRE-reset (probe-03 recipe A: the tensor-view wrapper
         # created post-reset is invalidated) — load_scene calls it via the hook.
         sim.pre_reset.append(sampler.bind)
-        obstacle = read_field(criteria, "debug_obstacle")
-        if obstacle:  # P2-04 FAIL-injection knob (free-form criteria params)
+        if request.scenario.debug_obstacle is not None:  # D-2': obstacle = WORLD state
+            obstacle = request.scenario.debug_obstacle.model_dump(exclude_none=True)
             sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(obstacle))
+        # FU-17: declared-sensor render products must be enabled PRE-play
+        # (BEFORE world.reset() — mid-play toggling is a measured no-op), so
+        # this rides the same pre_reset seam as the telemetry bind.
+        sensor_topics = [s.topic for s in adapter_config.sensors]
+        if sensor_topics:
+            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
         sim.load_scene()  # step 3: scene/spawn/dt/seed (+ telemetry pre-bind)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5

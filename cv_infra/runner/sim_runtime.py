@@ -105,6 +105,79 @@ def is_direct_usd_ref(scene_usd: str) -> bool:
     )
 
 
+# --------------------------------------------------------------------------- #
+# FU-17: declared-sensor render-product activation (pre-play) — CPU-testable.
+# --------------------------------------------------------------------------- #
+# The blocking node TYPE measured in the carter sample (p3c1 probe): the 2D lidar
+# publish graph is complete but gated by ``IsaacCreateRenderProduct`` nodes with
+# ``inputs:enabled=False``. The node NAMES (front/back_2d_lidar_render_product)
+# are asset naming and deliberately NOT depended on — matching goes declared
+# ``sensors[].topic`` -> publish node (``inputs:topicName``) -> upstream walk.
+RENDER_PRODUCT_NODE_TYPE = "IsaacCreateRenderProduct"
+
+
+def _node_type(prim) -> str:
+    """OmniGraph node type id (``node:type`` attr) or "" — USD-generic access."""
+    attr = prim.GetAttribute("node:type")
+    value = attr.Get() if attr else None
+    return str(value) if value else ""
+
+
+def _upstream_prims(stage, start):
+    """BFS the OmniGraph upstream of ``start`` via ``inputs:*`` connections.
+
+    Pure USD traversal (attribute connections), no omni.graph runtime API — the
+    same walk works on a fake stage in CPU tests and on the live stage on GPU.
+    """
+    seen = {str(start.GetPath())}
+    queue = [start]
+    while queue:
+        prim = queue.pop()
+        for attr in prim.GetAttributes():
+            if not attr.GetName().startswith("inputs:"):
+                continue
+            for source in attr.GetConnections():
+                src = stage.GetPrimAtPath(source.GetPrimPath())
+                if not src or str(src.GetPath()) in seen:
+                    continue
+                seen.add(str(src.GetPath()))
+                queue.append(src)
+                yield src
+
+
+def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
+    """FU-17: enable the render products feeding the DECLARED sensor topics.
+
+    For each publish node whose ``inputs:topicName`` is in ``topics``, walk its
+    upstream graph and set ``inputs:enabled=true`` on every
+    ``IsaacCreateRenderProduct`` node still False. In-memory attribute set only
+    (never a stage save — the asset stays unmodified); idempotent (already-enabled
+    nodes are left untouched, so a second call is a no-op). Returns
+    ``(newly_enabled_node_paths, declared_topics_with_no_publish_node)`` — the
+    second list is the original FU-17 bug class (declared but publisher-less)
+    and is surfaced loudly by the caller.
+    """
+    wanted = {t for t in topics if t}
+    if not wanted:
+        return [], []
+    enabled: list[str] = []
+    matched: set[str] = set()
+    for prim in stage.Traverse():
+        topic_attr = prim.GetAttribute("inputs:topicName")
+        topic = topic_attr.Get() if topic_attr else None
+        if topic not in wanted:
+            continue
+        matched.add(topic)
+        for node in _upstream_prims(stage, prim):
+            if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
+                continue
+            enabled_attr = node.GetAttribute("inputs:enabled")
+            if enabled_attr and not enabled_attr.Get():
+                enabled_attr.Set(True)
+                enabled.append(str(node.GetPath()))
+    return sorted(set(enabled)), sorted(wanted - matched)
+
+
 class SimRuntime:
     """Wraps the SimulationApp / World lifecycle. Isaac bodies are deferred-import."""
 
@@ -201,15 +274,44 @@ class SimRuntime:
             hook(self.world)
         self.world.reset()
 
+    def enable_declared_sensors(self, topics) -> list[str]:  # pragma: no cover - GPU path
+        """FU-17 GPU wrapper: pre_reset hook body over the LIVE stage.
+
+        Runs the pure ``enable_sensor_render_products`` walk inside a
+        session-layer edit context — the exact p3c1 probe recipe (in-memory,
+        asset-unmodified, never saved). Must run BEFORE ``world.reset()``
+        (measured: the render-product exec chain is one-shot; mid-play toggling
+        publishes nothing), which the pre_reset seam guarantees.
+        """
+        import omni.usd  # noqa: PLC0415 (legal only after SimulationApp)
+        from pxr import Usd  # noqa: PLC0415
+
+        stage = omni.usd.get_context().get_stage()
+        with Usd.EditContext(stage, stage.GetSessionLayer()):
+            enabled, unmatched = enable_sensor_render_products(stage, topics)
+        print(
+            f"[cv-runner] sensor render products enabled: {enabled or '(none needed)'}",
+            flush=True,
+        )
+        if unmatched:  # declared but publisher-less — the original FU-17 bug class
+            print(
+                f"[cv-runner] WARNING: declared sensor topic(s) with no publish "
+                f"graph node in the scene: {unmatched}",
+                flush=True,
+            )
+        return enabled
+
     def spawn_debug_obstacle(self, spec: dict) -> None:  # pragma: no cover - GPU path
         """P2-04 FAIL-injection (bring-up): drop a fixed cuboid into the stage.
 
-        Runner-side scene mutation (cycle-plan T3 (7) team-discretion mechanism;
-        wire schema untouched — the spec travels via the FREE-FORM criteria
-        params, e.g. ``debug_obstacle: {x, y, height, width, depth}``). A LOW box
-        (default 0.15 m, below the 2D-lidar scan plane) stays invisible to the
-        blackbox nav's costmaps, so it deterministically meets the chassis.
-        Called as a pre-reset hook so the physics parse includes the collider.
+        Runner-side scene mutation. The spec travels via the M1 known-key field
+        ``scenario.debug_obstacle {x, y, height, width, depth}`` (D-2' — an
+        obstacle is WORLD state, not a judging criterion; supersedes the P2
+        criteria-params ride-along). Dimension defaults below stay RUNNER-owned
+        (schema None = "runner default applies"). A LOW box (default 0.15 m,
+        below the 2D-lidar scan plane) stays invisible to the blackbox nav's
+        costmaps, so it deterministically meets the chassis. Called as a
+        pre-reset hook so the physics parse includes the collider.
         """
         import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
         from isaacsim.core.api.objects import FixedCuboid  # noqa: PLC0415

@@ -10,12 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.adapter_schema import Ros2AdapterConfig
 from cv_infra.runner import recording
 
 
 def _cfg() -> Ros2AdapterConfig:
-    return Ros2AdapterConfig.from_dict(
+    return Ros2AdapterConfig.model_validate(
         {"odom_topics": ["/odom", "/chassis/odom"]}  # measured dualization (cycle-3)
     )
 
@@ -39,7 +39,7 @@ def test_bag_topics_clock_plus_nav_streams():
 
 
 def test_bag_topics_dedupes_preserving_order():
-    cfg = Ros2AdapterConfig.from_dict({"odom_topics": ["/odom", "/odom"]})
+    cfg = Ros2AdapterConfig.model_validate({"odom_topics": ["/odom", "/odom"]})
     assert recording.bag_topics(cfg) == ["/clock", "/odom", "/cmd_vel"]
 
 

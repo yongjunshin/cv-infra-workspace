@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from cv_infra.adapter.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.adapter_schema import Ros2AdapterConfig
 from cv_infra.runner import sim_runtime
 from cv_infra.runner.adapter import ros2
 

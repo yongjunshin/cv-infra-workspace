@@ -6,9 +6,11 @@ the REQ-INTAKE-006 required triad, known-key oracle params (legacy
 envelope/budget/settings shapes, and the mechanical field-name guards binding
 the new sub-models to the Phase-2 dataclasses they formalize (G-25).
 
-Also pins the container-safety constraint (D-C/R20): the runner image installs
-the wheel --no-deps (no pydantic), so the runner's unmodified import surface
-must never pull pydantic — asserted in a subprocess.
+Also pins the container-safety constraints (D-C/R20 as amended by D-4'
+2026-07-10): the wheel still installs --no-deps, pydantic is BUNDLE-SUPPLIED
+(runner consumes contract.schema on the kit-prebundled pydantic; skew guarded
+in docker/runner/Dockerfile), while host-only control-plane deps (yaml/docker)
+must never reach the runner import surface — asserted in subprocesses.
 """
 
 from __future__ import annotations
@@ -246,14 +248,30 @@ def test_criterion_members_keep_the_canonical_two_keys():
         }
 
 
-def test_runner_import_surface_stays_pydantic_free():
-    # D-C/R20: the runner container has NO pydantic (wheel --no-deps). Its
-    # unmodified import surface — contract.models via the package __init__,
-    # oracles, runner.main — must not pull it transitively.
+def test_runner_import_surface_pulls_no_host_only_deps():
+    # D-4' (supersedes the D-C/R20 "no pydantic in the runner" premise): the
+    # runner consumes contract.schema on the BUNDLE-SUPPLIED pydantic, so
+    # pydantic on its import surface is sanctioned (version skew is a loud
+    # BUILD failure — docker/runner/Dockerfile assert). Host-only control-plane
+    # deps must still never be pulled (wheel installs --no-deps).
     code = (
         "import sys\n"
         "import cv_infra.contract.models, cv_infra.oracles.no_collision, cv_infra.runner.main\n"
-        "assert 'pydantic' not in sys.modules, 'runner import surface pulled pydantic'\n"
         "assert 'yaml' not in sys.modules, 'runner import surface pulled pyyaml'\n"
+        "assert 'docker' not in sys.modules, 'runner import surface pulled docker'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_contract_package_import_stays_stdlib_only():
+    # The PEP 562 lazy-export invariant survives D-4': ``import
+    # cv_infra.contract`` alone (no schema attribute touched) stays stdlib-only
+    # — third-party pulls happen only at the consumer's explicit submodule
+    # import (runner: schema on the bundled pydantic; CLI: + yaml).
+    code = (
+        "import sys\n"
+        "import cv_infra.contract\n"
+        "assert 'pydantic' not in sys.modules, 'contract package import pulled pydantic'\n"
+        "assert 'yaml' not in sys.modules, 'contract package import pulled pyyaml'\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
