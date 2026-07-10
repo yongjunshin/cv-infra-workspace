@@ -11,11 +11,11 @@ dependencies = [
     "docker==7.1.0",  # M3 supervisor spawn/teardown
     "pyyaml==6.0.2",  # M8 CLI scenario loading (`cv-infra run`; --help stays dependency-free)
     # M1 Phase-3 contract models (schema/loader/version — lazy-exported so
-    # `import cv_infra.contract` stays stdlib-only). HOST/CONTROL-PLANE ONLY this
-    # cycle: the runner image installs the wheel --no-deps and its unmodified
-    # import surface (contract.models / oracles / adapter) never touches pydantic;
-    # whether the runner BUNDLE consumes it is a cycle-2 image-policy decision
-    # after the T1 probe (D-C/R20, docker/runner/Dockerfile HOST_ONLY_DEPS guard).
+    # `import cv_infra.contract` stays stdlib-only). Consumed on BOTH planes
+    # (D-4', decisions/2026-07-10-p3-consume-decisions.md): host/CLI via this
+    # pin, runner via the kit-prebundled pydantic — the wheel still installs
+    # --no-deps; docker/runner/Dockerfile's BUNDLE_SUPPLIED guard asserts the
+    # bundled version equals this pin at build time.
     # BUNDLE-ALIGNED PIN (PM ruling, decisions/2026-07-10-p3-entry-decisions.md
     # D-1 ruling): the image #5 kit-prebundled interpreter already ships
     # pydantic 2.11.7 / pydantic_core 2.33.2 (T1 probe measurement,
