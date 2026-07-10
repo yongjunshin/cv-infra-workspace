@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from cv_infra.adapter.adapter_schema import GoalInterface, Ros2AdapterConfig
+from cv_infra.contract.adapter_schema import GoalInterface, Ros2AdapterConfig
 from cv_infra.runner.adapter.base import SimAdapter
 
 # /clock FLOW threshold for the readiness barrier (G-19): flow is claimed from a

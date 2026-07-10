@@ -5,12 +5,16 @@ oracles (``reached_goal`` / ``no_collision``) and folding their outcomes. The
 verdict math and the fold (pass / fail / timeout / error) are Isaac-independent
 and are unit-tested on CPU.
 
-M1-contract seam (SEAM-1, FU-11): the final ``Metrics`` / ``CriterionResult`` /
-``VerificationResult`` objects are M1-owned and imported for real — the payload is
-built only at the serialization boundary (``build_result_dict``) as
-``VerificationResult.to_dict()``, so the wire shape has a single definition (G-17:
-no hand-built dict, key drift impossible by construction). The oracle layer returns
-the M2-internal ``OracleOutcome`` (below).
+M1-contract seam (SEAM-1, FU-11 / D-4' 2026-07-10): the final ``Metrics`` /
+``CriterionResult`` / ``Result`` objects are the M1 pydantic canon
+(``contract.schema``, run on the BUNDLED pydantic in the runner image) and are
+imported for real — the payload is built only at the serialization boundary
+(``build_result_dict``) as ``Result.model_dump()``, so the wire shape has a
+single definition (G-17: no hand-built dict, key drift impossible by
+construction). The emitted dict is WIRE-IDENTICAL to the Phase-2 emission —
+pinned by the golden shape test (tests/test_result_emission_golden.py) and the
+old<->new equivalence guard. The oracle layer returns the M2-internal
+``OracleOutcome`` (below).
 """
 
 from __future__ import annotations
@@ -18,11 +22,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from cv_infra.contract.models import (
+from cv_infra.contract.schema import (
     Artifacts,
     CriterionResult,
     Metrics,
-    VerificationResult,
+    Result,
 )
 from cv_infra.runner.telemetry import TelemetryRecord
 
@@ -102,7 +106,7 @@ def build_result_dict(
     metrics: dict[str, float | None],
     artifacts: Artifacts | None = None,
 ) -> dict:
-    """Assemble ``result.json`` as the M1 canonical ``VerificationResult.to_dict()``.
+    """Assemble ``result.json`` as the M1 canonical ``Result.model_dump()``.
 
     SEAM-1 (FU-11 / G-17): the authoritative serialization IS the M1 model — no
     hand-built dict remains, so producer/consumer key drift cannot reappear.
@@ -110,16 +114,17 @@ def build_result_dict(
     ``name`` -> ``oracle``; ``detail`` falls back to the ``reason`` tag (so e.g. a
     bare "timeout" is not lost — ``reason`` itself only steers the verdict fold and
     is not a canonical field). ``artifacts`` defaults to the canonical None fields
-    until the recorders produce files (cycle 4).
+    until the recorders produce files. The emitted key tree/values are frozen by
+    the golden shape test (D-4' wire invariance — supersedes nothing on the wire).
     """
-    result = VerificationResult(
+    result = Result(
         job_id=job_id,
         verdict=verdict,
-        metrics=Metrics.from_dict(metrics),
+        metrics=Metrics.model_validate(metrics or {}),
         criteria_results=[
             CriterionResult(oracle=o.name, passed=o.passed, detail=(o.detail or o.reason) or None)
             for o in outcomes
         ],
         artifacts=artifacts if artifacts is not None else Artifacts(),
     )
-    return result.to_dict()
+    return result.model_dump()
