@@ -1,9 +1,6 @@
 # nova_carter_warehouse_goal.yaml — platform-side COPY of the consumer scenario (M1 standard input).
 #
-# SOURCE OF TRUTH: cv-infra-user@f1c9607 scenarios/nova_carter_warehouse_goal.yaml
-#   + apiVersion pending canonical sync(T3) — D-1' strict (2026-07-10) requires the
-#   key; CV-User adds it to the canonical scenario this cycle, PM merge gate
-#   cross-diffs. Bump the sha above on re-sync.
+# SOURCE OF TRUTH: cv-infra-user@94aff95 scenarios/nova_carter_warehouse_goal.yaml
 # This is a COPY. The platform may not reference the consumer repo by relative path
 # (boundary rule 3), so drift is prevented mechanically by
 # tests/test_fixture_canonical_guard.py below (fixture params are bound to the keys
@@ -18,9 +15,27 @@
 # The body below instantiates the platform-owned Scenario shape (M1) — CV-User does
 # not define the schema, only exercises it as a consumer. Values are cycle-5 T4
 # workstation bringup measurements (provenance in the source file's own comments).
+# nova_carter_warehouse_goal.yaml — standard-input instance (Phase-2, cycle-5: bringup-measured fill).
+#
+# A robot-SW developer's verification request: "drive the Nova Carter to a goal in the
+# warehouse without colliding." This file INSTANTIATES the platform-owned Scenario shape
+# (M1) — CV-User does not define the schema, only exercises it as a consumer.
+#
+# STATUS (cycle-5, T4): bringup-measured fill. adapter_config keys stay M1-canonical
+# (cycle-3 SEAM-2; values measured in reports/user-2026-07-07-seam2-carter-topic-inventory.md).
+# acceptance_criteria params + 2D lidar frames now carry the workstation E2E bringup
+# measurements from reports/runner-2026-07-08-p2c5-bringup.md §4 (pass verdict
+# reproduced x2; intentional-FAIL and timeout legs also exercised live).
+# Earlier residual (goal free-space tuning) is CLOSED: goal/seed/timeout are unchanged
+# and pass-proven against the live sim (bringup run2/run6).
+#
+# STATUS (p3-contract-consume, T3): apiVersion added as the first top-level key
+# (D-1' strict versioning — absent key now gets a friendly reject + exit 2).
+# 2D lidar comments realigned to FU-17 ruling (a): the carter asset ships the
+# publish graphs complete; the runner enables their render products pre-play
+# (platform wiring lands in p3c2). All VALUES unchanged from the cycle-5 fill.
 
-apiVersion: cv-infra/v1                  # versioned contract (NFR-INTAKE-002) — REQUIRED since
-                                         #   D-1' strict (absent => friendly reject + exit 2)
+apiVersion: cv-infra/v1
 
 scenario:
   scene: nova_carter_warehouse          # static warehouse map (carter_warehouse_navigation)
@@ -59,12 +74,15 @@ interface:
       - topic: /front_3d_lidar/lidar_points
         type: sensor_msgs/msg/PointCloud2
         frame: front_3d_lidar            # measured pointcloud_to_laserscan target_frame
-      - topic: /front_2d_lidar/scan      # local_costmap front_2d_lidar_layer (carter params)
-        type: sensor_msgs/msg/LaserScan
-        frame: front_2d_lidar            # measured OmniGraph frameId (cycle-5 bringup, FU-13-4)
-      - topic: /back_2d_lidar/scan       # local_costmap back_2d_lidar_layer (carter params)
-        type: sensor_msgs/msg/LaserScan
-        frame: back_2d_lidar             # measured OmniGraph frameId (cycle-5 bringup, FU-13-4)
+      - topic: /front_2d_lidar/scan      # local_costmap front_2d_lidar_layer (carter params);
+        type: sensor_msgs/msg/LaserScan  #   publish graph ships complete in the asset — runner
+        frame: front_2d_lidar            #   enables its render product pre-play (FU-17 ruling (a),
+                                         #   p3c1 probe: 329/349 msgs; wiring = platform, p3c2).
+                                         #   frame = measured OmniGraph frameId (cycle-5, FU-13-4)
+      - topic: /back_2d_lidar/scan       # local_costmap back_2d_lidar_layer (carter params);
+        type: sensor_msgs/msg/LaserScan  #   same as front: graph complete, runner enables render
+        frame: back_2d_lidar             #   product pre-play (FU-17 (a), p3c2 wiring).
+                                         #   frame = measured OmniGraph frameId (cycle-5, FU-13-4)
     frames:
       map: map
       odom: odom
