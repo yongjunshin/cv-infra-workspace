@@ -29,33 +29,41 @@ COPY . /src
 RUN pip install --no-cache-dir uv==0.11.13 \
  && uv build --wheel --project /src --out-dir /dist
 
-# Clobber-prevention guard (D-C, R20): the runtime stage installs the wheel with
-# --no-deps, which is sound ONLY while every runtime dependency is host-only
-# control plane (docker SDK = M3 supervisor spawn, pyyaml = M8 CLI — the runner,
-# DDS-only and without docker.sock, never imports them). HOST_ONLY_DEPS is the
-# explicit allowlist of those deps + ALL their transitives, measured 2026-07-08
-# from `uv export --frozen --no-dev --no-emit-project`. Any runtime dep NOT on
-# the allowlist fails the build LOUDLY: adding one requires an explicit image
-# policy decision (extend the allowlist vs add a uv.lock-based constraints
-# install step before --no-deps) instead of silently clobbering the Isaac
-# bundle pins (M5 §3.1).
+# Clobber-prevention guard (D-C, R20, D-4' 2026-07-10): the runtime stage installs
+# the wheel with --no-deps, which is sound ONLY while every runtime dependency
+# falls into one of two audited categories:
+#   * HOST_ONLY_DEPS      — host-side control plane (docker SDK = M3 supervisor
+#     spawn, pyyaml = M8 CLI); the runner, DDS-only and without docker.sock,
+#     never imports them.
+#   * BUNDLE_SUPPLIED_DEPS — deps the kit-prebundled interpreter ALREADY ships
+#     (D-4': pydantic stack, measured 2.11.7/core 2.33.2 on image #5, p3c1 probe
+#     bundled-pydantic.txt); the runner consumes contract.schema on that bundle.
+#     Version skew bundle<->pyproject is a loud BUILD failure — see the assert in
+#     the runtime stage below (the pin value is derived from the wheel metadata,
+#     never re-recorded here — G-25/G-27).
+# Both lists cover the deps + ALL their transitives, measured from
+# `uv export --frozen --no-dev --no-emit-project`. Any runtime dep NOT on either
+# allowlist fails the build LOUDLY: adding one requires an explicit image policy
+# decision (extend an allowlist vs add a uv.lock-based constraints install step
+# before --no-deps) instead of silently clobbering the Isaac bundle pins (M5 §3.1).
 RUN set -eu; \
     HOST_ONLY_DEPS='certifi charset-normalizer docker idna pywin32 pyyaml requests urllib3'; \
+    BUNDLE_SUPPLIED_DEPS='annotated-types pydantic pydantic-core typing-extensions typing-inspection'; \
     uv export --frozen --no-dev --no-emit-project --project /src > /tmp/runtime-deps.txt; \
     leftover=''; \
     for dep in $(sed -n 's/^\([A-Za-z0-9._-]*\)==.*/\1/p' /tmp/runtime-deps.txt \
                  | tr '[:upper:]' '[:lower:]'); do \
-        case " $HOST_ONLY_DEPS " in \
+        case " $HOST_ONLY_DEPS $BUNDLE_SUPPLIED_DEPS " in \
             *" $dep "*) ;; \
             *) leftover="$leftover $dep" ;; \
         esac; \
     done; \
     rm -f /tmp/runtime-deps.txt; \
     test -z "$leftover" \
-    || { echo "ERROR: runtime dep(s) not in the host-only allowlist:$leftover —" \
+    || { echo "ERROR: runtime dep(s) not in the host-only/bundle-supplied allowlists:$leftover —" \
                "a new runtime dep needs an image-policy decision (extend" \
-               "HOST_ONLY_DEPS or add the uv.lock constraints install step" \
-               "before --no-deps; M5 §3.1 D-C / R20)"; exit 1; }
+               "an allowlist or add the uv.lock constraints install step" \
+               "before --no-deps; M5 §3.1 D-C / R20 / D-4')"; exit 1; }
 
 # --------------------------------------------------------------------------- #
 # (2) runtime — one thin layer on the pinned Isaac Sim base (no latest; LOCKED §2).
@@ -135,10 +143,26 @@ COPY --from=builder --chown=1234:1234 /dist/cv_infra-*.whl /tmp/cv-infra-wheel/
 
 # --no-deps: never let the wheel's resolver touch Isaac's bundled pins (D-C, R20).
 # No constraints step BY POLICY: runtime deps are host-only control plane
-# (HOST_ONLY_DEPS, guarded in the builder stage) and are excluded from this image
-# on purpose — the wheel must stay importable dep-less, which the runtime import
-# smoke proves (DoD-P2-12); supervisor (M3) and CLI (M8) lazy-import docker/yaml.
+# (HOST_ONLY_DEPS) or bundle-supplied (BUNDLE_SUPPLIED_DEPS — pydantic stack the
+# kit interpreter already ships, D-4'), both guarded in the builder stage;
+# host-only deps are excluded from this image on purpose — the wheel must stay
+# importable on the bundle alone, which the runtime import smoke proves
+# (DoD-P2-12); supervisor (M3) and CLI (M8) lazy-import docker/yaml.
+#
+# D-4' skew guard (G-27 mechanized): the bundled pydantic the runner will import
+# must EQUAL the pyproject pin. The pin is DERIVED from the just-installed wheel's
+# own metadata (Requires-Dist, generated from pyproject) — never re-recorded in
+# this file (G-25: a copied pin drifts silently). Skew = loud build failure.
 RUN ./python.sh -m pip install --no-cache-dir --no-deps /tmp/cv-infra-wheel/cv_infra-*.whl \
+ && ./python.sh -c "\
+import pydantic; from importlib.metadata import requires; \
+pins = [r.split('==', 1)[1].split(';')[0].strip() \
+        for r in requires('cv-infra') if r.startswith('pydantic==')]; \
+assert len(pins) == 1, 'expected exactly one pydantic pin in the cv-infra wheel metadata: %r' % pins; \
+assert pydantic.VERSION == pins[0], \
+    'bundled pydantic %s != pyproject pin %s — D-4 skew: re-pin pyproject to the ' \
+    'measured bundle (G-27) or record a new image-policy decision' % (pydantic.VERSION, pins[0]); \
+print('[guard] bundled pydantic %s == pyproject pin (D-4 aligned)' % pydantic.VERSION)" \
  && rm -rf /tmp/cv-infra-wheel
 
 # Stateless runner (LOCKED §15, NFR-EXEC-002): no job state/scenario/result baked in.
