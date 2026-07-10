@@ -11,6 +11,15 @@ GetConnections / Get / Set) — the live-stage wrapper (session-layer edit,
 Matching is topicName-driven (contract consumption): node NAMES like
 ``front_2d_lidar_render_product`` never appear in the code under test — the
 graph below deliberately uses different prim names to prove that.
+
+Topic-form fidelity (T4 p3c2 L1 regression): the graph-side ``inputs:topicName``
+values below carry NO leading slash — the MEASURED asset form (p3c1 probe,
+workstation ``~/cv-infra-p2-out/p3c1/probe/runA/inventory-og-hits.txt``), while
+scenarios declare ROS-absolute ``/...`` names. The first fixture authored the
+graph side WITH slashes (matching the code, not reality — G-25 class), so a
+literal comparison passed CPU tests yet 0-matched on the live asset
+(``~/cv-infra-p2-out/p3c2/L1/runner-container.log:454-455``). The
+slash-normalization positive controls below keep that gap closed.
 """
 
 from __future__ import annotations
@@ -79,7 +88,12 @@ class FakeStage:
 
 def _lidar_graph(front_enabled=False, back_enabled=False) -> FakeStage:
     """Measured shape: publish <- compute <- render-product (per 2D lidar) +
-    an unrelated exec source upstream (must be walked over harmlessly)."""
+    an unrelated exec source upstream (must be walked over harmlessly).
+
+    ``inputs:topicName`` values are SLASHLESS on purpose — the measured asset
+    form (p3c1 probe ``runA/inventory-og-hits.txt``); do not "fix" them to the
+    declared ``/...`` spelling, that re-opens the T4 L1 0-match regression.
+    """
     g = "/World/Robot/graph"
     return FakeStage(
         [
@@ -104,7 +118,7 @@ def _lidar_graph(front_enabled=False, back_enabled=False) -> FakeStage:
                 f"{g}/pub_a",
                 [
                     FakeAttr("node:type", "isaacsim.ros2.bridge.ROS2PublishLaserScan"),
-                    FakeAttr("inputs:topicName", "/front_2d_lidar/scan"),
+                    FakeAttr("inputs:topicName", "front_2d_lidar/scan"),  # measured: no "/"
                     FakeAttr("inputs:execIn", connections=[f"{g}/scan_a"]),
                 ],
             ),
@@ -120,7 +134,7 @@ def _lidar_graph(front_enabled=False, back_enabled=False) -> FakeStage:
                 f"{g}/pub_b",
                 [
                     FakeAttr("node:type", "isaacsim.ros2.bridge.ROS2PublishLaserScan"),
-                    FakeAttr("inputs:topicName", "/back_2d_lidar/scan"),
+                    FakeAttr("inputs:topicName", "back_2d_lidar/scan"),  # measured: no "/"
                     FakeAttr("inputs:renderProductPath", connections=[f"{g}/rp_b"]),
                 ],
             ),
@@ -129,7 +143,7 @@ def _lidar_graph(front_enabled=False, back_enabled=False) -> FakeStage:
                 f"{g}/pub_3d",
                 [
                     FakeAttr("node:type", "isaacsim.ros2.bridge.ROS2PublishPointCloud"),
-                    FakeAttr("inputs:topicName", "/front_3d_lidar/lidar_points"),
+                    FakeAttr("inputs:topicName", "front_3d_lidar/lidar_points"),  # no "/"
                 ],
             ),
         ]
@@ -181,8 +195,48 @@ def test_declared_topic_without_publish_node_is_reported():
     # scene. The walk cannot fix that — it must surface it, not swallow it.
     enabled, unmatched = enable_sensor_render_products(_lidar_graph(), ["/no/such/topic"])
     assert enabled == []
-    assert unmatched == ["/no/such/topic"]
+    assert unmatched == ["/no/such/topic"]  # reported in the DECLARED spelling
 
 
 def test_empty_declaration_is_noop():
     assert enable_sensor_render_products(_lidar_graph(), []) == ([], [])
+
+
+# --------------------------------------------------------------------------- #
+# Slash-normalization positive controls (T4 p3c2 L1 regression, G-07).
+# --------------------------------------------------------------------------- #
+def test_normalization_is_load_bearing_cross_form_match():
+    # G-07 non-vacuousness: first PROVE the two spellings really differ (so a
+    # literal `in` comparison — the T4 L1 defect — could NOT have matched),
+    # then assert the walk matches them anyway. Removing the normalization
+    # makes this test fail exactly like the live asset did (0-match).
+    stage = _lidar_graph()
+    declared = "/front_2d_lidar/scan"  # scenario form (ROS-absolute)
+    graph_value = (
+        stage.GetPrimAtPath("/World/Robot/graph/pub_a").GetAttribute("inputs:topicName").Get()
+    )
+    assert graph_value != declared  # measured asset form: no leading slash
+    assert graph_value == declared.lstrip("/")
+    enabled, unmatched = enable_sensor_render_products(stage, [declared])
+    assert enabled == ["/World/Robot/graph/rp_a"]
+    assert unmatched == []
+
+
+def test_slashless_declaration_matches_too():
+    # Normalization is applied to BOTH sides — a consumer declaring the
+    # slashless spelling still matches the same publish node.
+    enabled, unmatched = enable_sensor_render_products(_lidar_graph(), ["front_2d_lidar/scan"])
+    assert enabled == ["/World/Robot/graph/rp_a"]
+    assert unmatched == []
+
+
+def test_matched_but_nothing_to_flip_is_not_reported_missing():
+    # T4 L1 symptom to never regress: the gateless 3D lidar (and an
+    # already-enabled 2D chain) warned "no publish graph node". They MATCH —
+    # they are match-then-no-op, never "declared but publisher-less".
+    stage = _lidar_graph(front_enabled=True)
+    enabled, unmatched = enable_sensor_render_products(
+        stage, ["/front_3d_lidar/lidar_points", "/front_2d_lidar/scan"]
+    )
+    assert enabled == []  # gateless + already-enabled -> nothing to flip...
+    assert unmatched == []  # ...and NOT reported as missing publishers

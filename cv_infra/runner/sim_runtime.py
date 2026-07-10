@@ -145,19 +145,34 @@ def _upstream_prims(stage, start):
                 yield src
 
 
+def _normalized_topic(name) -> str:
+    """Topic name in slashless-canonical form for MATCHING only.
+
+    Measured (T4 p3c2 L1 + p3c1 probe runA/inventory-og-hits.txt): the scenario
+    declares ROS-absolute names (``/front_2d_lidar/scan``) while the carter
+    asset's OmniGraph ``inputs:topicName`` values carry NO leading slash
+    (``front_2d_lidar/scan``) — a literal comparison 0-matched every declared
+    topic. Both sides strip the leading ``/`` before comparing; reporting/log
+    strings keep the DECLARED spelling untouched.
+    """
+    return str(name).lstrip("/")
+
+
 def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
     """FU-17: enable the render products feeding the DECLARED sensor topics.
 
-    For each publish node whose ``inputs:topicName`` is in ``topics``, walk its
+    For each publish node whose ``inputs:topicName`` names a declared topic
+    (slash-normalized comparison — see ``_normalized_topic``), walk its
     upstream graph and set ``inputs:enabled=true`` on every
     ``IsaacCreateRenderProduct`` node still False. In-memory attribute set only
     (never a stage save — the asset stays unmodified); idempotent (already-enabled
     nodes are left untouched, so a second call is a no-op). Returns
     ``(newly_enabled_node_paths, declared_topics_with_no_publish_node)`` — the
-    second list is the original FU-17 bug class (declared but publisher-less)
-    and is surfaced loudly by the caller.
+    second list (declared spelling, as-written) is the original FU-17 bug class
+    (declared but publisher-less) and is surfaced loudly by the caller.
     """
-    wanted = {t for t in topics if t}
+    # normalized form -> declared as-written (reporting stays in declared form)
+    wanted = {_normalized_topic(t): t for t in topics if t}
     if not wanted:
         return [], []
     enabled: list[str] = []
@@ -165,9 +180,9 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
     for prim in stage.Traverse():
         topic_attr = prim.GetAttribute("inputs:topicName")
         topic = topic_attr.Get() if topic_attr else None
-        if topic not in wanted:
+        if topic is None or _normalized_topic(topic) not in wanted:
             continue
-        matched.add(topic)
+        matched.add(_normalized_topic(topic))
         for node in _upstream_prims(stage, prim):
             if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
                 continue
@@ -175,7 +190,7 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
             if enabled_attr and not enabled_attr.Get():
                 enabled_attr.Set(True)
                 enabled.append(str(node.GetPath()))
-    return sorted(set(enabled)), sorted(wanted - matched)
+    return sorted(set(enabled)), sorted(wanted[k] for k in set(wanted) - matched)
 
 
 class SimRuntime:
