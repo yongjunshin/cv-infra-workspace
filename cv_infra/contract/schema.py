@@ -66,6 +66,25 @@ class Goal(_ForbidExtra):
     frame: str = "map"
 
 
+class DebugObstacle(_ForbidExtra):
+    """FAIL-injection cuboid dropped into the stage pre-reset (D-2' 2026-07-10).
+
+    An obstacle is WORLD STATE, not a judging criterion — hence a ``Scenario``
+    field (supersedes the P2 free-form criteria-params ride-along). Keys are
+    1:1 with the runner's ``SimRuntime.spawn_debug_obstacle`` read set
+    (cv_infra/runner/sim_runtime.py — bound mechanically in the schema tests).
+    ``None`` on a dimension means "runner default applies" — the default
+    VALUES stay runner-owned (M2), the shape is M1's (ReachedGoalParams
+    pattern).
+    """
+
+    x: float = Field(examples=[-6.0])
+    y: float = Field(examples=[2.0])
+    height: float | None = Field(default=None, gt=0, examples=[0.15])
+    width: float | None = Field(default=None, gt=0, examples=[1.2])
+    depth: float | None = Field(default=None, gt=0, examples=[0.4])
+
+
 class Scenario(_ForbidExtra):
     """Self-contained scene + goal + determinism inputs (REQ-INTAKE-006).
 
@@ -79,6 +98,7 @@ class Scenario(_ForbidExtra):
     goal: Goal
     seed: int = Field(examples=[42])
     timeout_s: float = Field(gt=0, examples=[120])
+    debug_obstacle: DebugObstacle | None = None
 
 
 class SutRef(_ForbidExtra):

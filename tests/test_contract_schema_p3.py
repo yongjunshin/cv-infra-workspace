@@ -24,6 +24,7 @@ from cv_infra.contract import models as old_models
 from cv_infra.contract.apiversion import API_VERSION
 from cv_infra.contract.schema import (
     CustomCriterion,
+    DebugObstacle,
     ExecutionSettings,
     Goal,
     NoCollisionCriterion,
@@ -146,6 +147,48 @@ def test_scenario_timeout_must_be_positive_sim_time_budget():
         Scenario.model_validate({**VALID_DOC["scenario"], "timeout_s": -5})
 
 
+# --- scenario.debug_obstacle (D-2' 2026-07-10: world state, not a criterion) -- #
+def test_scenario_debug_obstacle_accepts_known_keys():
+    minimal = Scenario.model_validate(
+        {**VALID_DOC["scenario"], "debug_obstacle": {"x": -6.0, "y": 2.0}}
+    )
+    assert (minimal.debug_obstacle.x, minimal.debug_obstacle.y) == (-6.0, 2.0)
+    # dimensions default to None = "runner default applies" (values stay M2-owned)
+    assert minimal.debug_obstacle.height is None
+    full = {"x": -6.0, "y": 2.0, "height": 0.15, "width": 1.2, "depth": 0.4}
+    scenario = Scenario.model_validate({**VALID_DOC["scenario"], "debug_obstacle": full})
+    assert scenario.debug_obstacle.model_dump() == full
+
+
+def test_scenario_debug_obstacle_is_optional_and_rejects_unknown_keys():
+    assert Scenario.model_validate(VALID_DOC["scenario"]).debug_obstacle is None  # optional
+    with pytest.raises(ValidationError):  # known-key: no free-form ride-alongs (D-2')
+        Scenario.model_validate(
+            {**VALID_DOC["scenario"], "debug_obstacle": {"x": 0.0, "y": 0.0, "radius": 1.0}}
+        )
+    with pytest.raises(ValidationError):  # x/y are the runner's unconditional reads
+        Scenario.model_validate({**VALID_DOC["scenario"], "debug_obstacle": {"y": 0.0}})
+    with pytest.raises(ValidationError):  # physical dimensions must be positive
+        Scenario.model_validate(
+            {**VALID_DOC["scenario"], "debug_obstacle": {"x": 0.0, "y": 0.0, "height": 0}}
+        )
+
+
+def test_debug_obstacle_keys_match_the_runner_read_set():
+    # G-25-style mechanical bind: the contract's known keys == the keys
+    # ``SimRuntime.spawn_debug_obstacle`` actually reads (``spec["k"]`` /
+    # ``spec.get("k", ...)`` call sites) — never a hand-kept list.
+    import inspect
+    import re
+
+    from cv_infra.runner.sim_runtime import SimRuntime
+
+    src = inspect.getsource(SimRuntime.spawn_debug_obstacle)
+    reads = set(re.findall(r"""spec(?:\.get\(|\[)\s*["'](\w+)["']""", src))
+    assert reads, "read-set extraction went empty (positive control, G-07)"
+    assert set(DebugObstacle.model_fields) == reads
+
+
 def test_execution_settings_bounds():
     assert ExecutionSettings().repeats == 1 and ExecutionSettings().fixed_dt is None
     assert ExecutionSettings(repeats=3, fixed_dt=1 / 60).repeats == 3
@@ -183,11 +226,17 @@ def test_resource_budget_shape_and_bounds():
 # Mechanical drift guards: new sub-models <-> the Phase-2 dataclasses (G-25).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    ("new_model", "old_dataclass"),
-    [(Goal, old_models.Goal), (Scenario, old_models.Scenario)],
+    ("new_model", "old_dataclass", "p3_additions"),
+    [
+        (Goal, old_models.Goal, set()),
+        # debug_obstacle: D-2' addition (2026-07-10) — intentionally absent from
+        # the retiring Phase-2 dataclass (models.py retires this cycle, D-4').
+        (Scenario, old_models.Scenario, {"debug_obstacle"}),
+    ],
 )
-def test_field_names_track_the_phase2_dataclasses(new_model, old_dataclass):
-    assert set(new_model.model_fields) == {f.name for f in dc_fields(old_dataclass)}
+def test_field_names_track_the_phase2_dataclasses(new_model, old_dataclass, p3_additions):
+    expected = {f.name for f in dc_fields(old_dataclass)} | p3_additions
+    assert set(new_model.model_fields) == expected
 
 
 def test_criterion_members_keep_the_canonical_two_keys():
