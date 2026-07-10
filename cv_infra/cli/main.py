@@ -91,7 +91,7 @@ _EXIT_CODE_EPILOG = (
 # scenario YAML -> canonical JOB_SPEC mapping surface (loud-reject, no silent
 # drop — same contract as adapter_schema). The SUT image comes from the
 # scenario's ``sut.image_ref`` (the scenario is the SoT), never a CLI flag.
-_TOP_LEVEL_KEYS = frozenset({"scenario", "sut", "interface", "acceptance_criteria"})
+_TOP_LEVEL_KEYS = frozenset({"apiVersion", "scenario", "sut", "interface", "acceptance_criteria"})
 _SUT_KEYS = frozenset({"image_ref"})
 
 
