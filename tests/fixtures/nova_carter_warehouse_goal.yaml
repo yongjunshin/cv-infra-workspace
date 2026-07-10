@@ -1,6 +1,9 @@
 # nova_carter_warehouse_goal.yaml — platform-side COPY of the consumer scenario (M1 standard input).
 #
 # SOURCE OF TRUTH: cv-infra-user@f1c9607 scenarios/nova_carter_warehouse_goal.yaml
+#   + apiVersion pending canonical sync(T3) — D-1' strict (2026-07-10) requires the
+#   key; CV-User adds it to the canonical scenario this cycle, PM merge gate
+#   cross-diffs. Bump the sha above on re-sync.
 # This is a COPY. The platform may not reference the consumer repo by relative path
 # (boundary rule 3), so drift is prevented mechanically by
 # tests/test_fixture_canonical_guard.py below (fixture params are bound to the keys
@@ -15,6 +18,9 @@
 # The body below instantiates the platform-owned Scenario shape (M1) — CV-User does
 # not define the schema, only exercises it as a consumer. Values are cycle-5 T4
 # workstation bringup measurements (provenance in the source file's own comments).
+
+apiVersion: cv-infra/v1                  # versioned contract (NFR-INTAKE-002) — REQUIRED since
+                                         #   D-1' strict (absent => friendly reject + exit 2)
 
 scenario:
   scene: nova_carter_warehouse          # static warehouse map (carter_warehouse_navigation)

@@ -26,6 +26,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
 
 # Variant material (scene/goal/criteria all differ from the canonical fixture).
 OFFICE_VARIANT = """\
+apiVersion: cv-infra/v1
 scenario:
   scene: small_office
   robot: nova_carter
@@ -59,6 +60,14 @@ acceptance_criteria:
 
 def _fixture_text() -> str:
     return FIXTURE.read_text(encoding="utf-8")
+
+
+def _without_api_version() -> str:
+    # Strip the fixture's apiVersion KEY line (its continuation comment line is
+    # a pure comment and may stay) — the D-1' strict absent-reject material.
+    lines = [ln for ln in _fixture_text().splitlines() if not ln.startswith("apiVersion:")]
+    assert len(lines) == len(_fixture_text().splitlines()) - 1  # exactly the key line removed
+    return "\n".join(lines) + "\n"
 
 
 def _load_mutated(replace: str, with_: str) -> AdmittedRequest:
@@ -102,9 +111,7 @@ def test_deprecated_api_version_warns_but_admits(monkeypatch):
         "DEPRECATED",
         {"cv-infra/v0": DeprecatedVersion(sunset="2 releases", migration_link="changelog")},
     )
-    admitted = load_request(
-        io.StringIO("apiVersion: cv-infra/v0\n" + _fixture_text()), source_path="s.yaml"
-    )
+    admitted = _load_mutated("apiVersion: cv-infra/v1", "apiVersion: cv-infra/v0")
     assert admitted.admitted is True  # accept + WARNING, execution continues
     assert len(admitted.warnings) == 1 and "DEPRECATED" in admitted.warnings[0]
 
@@ -131,14 +138,29 @@ def test_missing_file_rejects_as_contract_error(tmp_path):
 
 
 def test_stage2_unknown_api_version_rejects_with_location():
+    mutated = _fixture_text().replace("apiVersion: cv-infra/v1", "apiVersion: cv-infra/v99")
     with pytest.raises(ContractError) as exc_info:
-        load_request(
-            io.StringIO("apiVersion: cv-infra/v99\n" + _fixture_text()), source_path="s.yaml"
-        )
+        load_request(io.StringIO(mutated), source_path="s.yaml")
     err = exc_info.value
     assert err.field_path == "apiVersion"
-    assert (err.source_line, err.source_col) == (1, 13)  # value node of line 1
+    key_line = next(
+        i for i, ln in enumerate(mutated.splitlines(), 1) if ln.startswith("apiVersion:")
+    )
+    assert (err.source_line, err.source_col) == (key_line, 13)  # value node location
     assert "cv-infra/v1" in err.example
+
+
+def test_stage2_absent_api_version_rejects_with_add_the_key_guidance():
+    # D-1' strict: the key is REQUIRED — absence is a friendly reject naming
+    # the exact line to add, never a silent resolve-as-current.
+    with pytest.raises(ContractError) as exc_info:
+        load_request(io.StringIO(_without_api_version()), source_path="s.yaml")
+    err = exc_info.value
+    assert err.field_path == "apiVersion"
+    assert err.got == "(missing)"
+    assert err.example == "apiVersion: cv-infra/v1"
+    assert "required" in err.expected
+    assert "Traceback" not in str(err)
 
 
 def test_stage3_schema_violation_never_reaches_the_oracle_binder(monkeypatch):
@@ -212,7 +234,8 @@ def test_rejection_paths_never_construct_an_admitted_request(monkeypatch):
     monkeypatch.setattr(loader_mod, "AdmittedRequest", spying)
     for bad in (
         "- a list\n",
-        "apiVersion: cv-infra/v99\n" + _fixture_text(),
+        _fixture_text().replace("apiVersion: cv-infra/v1", "apiVersion: cv-infra/v99"),
+        _without_api_version(),  # D-1' strict absent-reject
         _fixture_text().replace("timeout_s: 120", "timeout_s: banana"),
         _fixture_text().replace("oracle: no_collision", "oracle: does_not_exist"),
     ):

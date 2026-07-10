@@ -4,7 +4,7 @@ The 6-stage pipeline IS the acceptance gate (NFR-INTAKE-003 — order matters,
 any failing stage rejects BEFORE the execution plane ever sees the input):
 
     (1) safe parse (SafeLoader)      -> parse error   = friendly reject
-    (2) apiVersion resolve           -> unknown       = reject / deprecated = warn
+    (2) apiVersion resolve           -> unknown/absent = reject / deprecated = warn
     (3) pydantic model_validate      -> schema error  = friendly reject
     (4) self-containedness           -> missing triad = reject   (REQ-INTAKE-006)
     (5) oracle load + bind           -> load failure  = reject   (REQ-INTAKE-007/008)

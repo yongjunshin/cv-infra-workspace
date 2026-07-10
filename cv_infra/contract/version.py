@@ -14,10 +14,11 @@ are INDEPENDENT — no single hardcoded version (R17); the compat matrix is
 surfaced to users by M8.
 
 The apiVersion CONSTANT is reused from ``apiversion.py`` (single definition —
-never redefined here). An ABSENT apiVersion resolves as the current version
-(accept): the canonical consumer scenario (tests/fixtures/
-nova_carter_warehouse_goal.yaml @ cv-infra-user f1c9607) carries no apiVersion
-key and must keep loading unmodified (DoD-P3-01 material).
+never redefined here). An ABSENT apiVersion is a STRICT reject (D-1'
+2026-07-10, supersedes the cycle-1 accept-as-current assumption): silently
+treating absence as current would hollow out the versioned contract
+(NFR-INTAKE-002; loud > silent). The friendly error tells the user exactly
+which line to add (``apiVersion: cv-infra/v1``).
 
 ``cv-infra/v1`` has no deprecated predecessors yet, so ``DEPRECATED`` is empty
 — tests exercise the warn path by injecting a deprecation table (no fake
@@ -79,15 +80,20 @@ def resolve_api_version(
     """Resolve a document's ``apiVersion`` value through the 3-state table.
 
     ``value`` is the raw (pre-validation) document value: absent (``None``)
-    resolves as the current version; a non-string value rejects with a
-    friendly error. ``supported``/``deprecated`` default to the module tables
-    (overridable so tests/tools can evaluate hypothetical windows).
+    is a STRICT reject with add-the-key guidance (D-1'); a non-string value
+    rejects with a friendly error. ``supported``/``deprecated`` default to the
+    module tables (overridable so tests/tools can evaluate hypothetical
+    windows).
     """
     supported = SUPPORTED if supported is None else supported
     deprecated = DEPRECATED if deprecated is None else deprecated
 
     if value is None:
-        return VersionResolution(api_version=API_VERSION, state="accept")
+        return VersionResolution(
+            api_version="(missing)",
+            state="reject",
+            error=_reject_error(None, supported, deprecated, source_path),
+        )
 
     if not isinstance(value, str):
         return VersionResolution(
@@ -118,16 +124,23 @@ def resolve_api_version(
 
 
 def _reject_error(
-    got: str,
+    got: str | None,
     supported: frozenset[str],
     deprecated: Mapping[str, DeprecatedVersion],
     source_path: str | None,
 ) -> ContractError:
+    """``got is None`` = the key is ABSENT (D-1' strict): guide the user to add
+    it (``ContractError``'s default ``got`` renders the "(missing)" sentinel)."""
     known = sorted(supported | set(deprecated))
+    expected = f"a supported contract apiVersion, one of {known}"
+    got_kwargs: dict[str, str] = {"got": repr(got)}
+    if got is None:
+        expected += " — the key is required; add it at the top level of the document"
+        got_kwargs = {}
     return ContractError(
         field_path="apiVersion",
-        expected=f"a supported contract apiVersion, one of {known}",
-        got=repr(got),
+        expected=expected,
+        **got_kwargs,
         example=f"apiVersion: {API_VERSION}",
         doc_link=DOC_LINK,
         source_path=source_path,

@@ -1,10 +1,11 @@
 """M1 P3 apiVersion 3-state resolver tests (version.py — NFR-INTAKE-002).
 
 States: supported/current -> accept; supported/deprecated -> accept + WARNING
-(sunset + migration link); unknown -> reject carrying an exit-2-ELIGIBLE
-friendly error object (``sys.exit`` is the consumer's, never called here).
-``cv-infra/v1`` has no deprecated predecessors, so the warn path is exercised
-by INJECTING a deprecation table — no fake version constant in the module.
+(sunset + migration link); unknown OR ABSENT (D-1' strict, 2026-07-10) ->
+reject carrying an exit-2-ELIGIBLE friendly error object (``sys.exit`` is the
+consumer's, never called here). ``cv-infra/v1`` has no deprecated
+predecessors, so the warn path is exercised by INJECTING a deprecation table
+— no fake version constant in the module.
 """
 
 from __future__ import annotations
@@ -35,11 +36,20 @@ def test_current_version_accepts():
     assert res.api_version == API_VERSION
 
 
-def test_absent_version_accepts_as_current():
-    # The canonical consumer fixture carries no apiVersion key and must keep
-    # loading unmodified (DoD-P3-01 material) — absent resolves as current.
-    res = resolve_api_version(None)
-    assert res.state == "accept" and res.api_version == API_VERSION
+def test_absent_version_rejects_with_add_the_key_guidance():
+    # D-1' strict (supersedes the cycle-1 absent-accept assumption): absence
+    # must reject LOUDLY with the exact line to add — never silently resolve
+    # to current (NFR-INTAKE-002, versioned contract).
+    res = resolve_api_version(None, source_path="s.yaml")
+    assert res.state == "reject" and res.warning is None
+    err = res.error
+    assert isinstance(err, ContractError)
+    assert err.field_path == "apiVersion"
+    assert err.got == "(missing)"
+    assert err.example == f"apiVersion: {API_VERSION}"  # the exact line to add
+    assert "required" in err.expected  # add-the-key guidance, not a bare reject
+    assert err.source_path == "s.yaml"
+    assert "Traceback" not in str(err)
 
 
 def test_deprecated_version_accepts_with_sunset_warning():
