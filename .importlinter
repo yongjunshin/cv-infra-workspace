@@ -17,13 +17,16 @@ name = cv_infra.contract is the foundational layer (imports no sibling package)
 type = forbidden
 source_modules =
     cv_infra.contract
+; D-4' (2026-07-10): ``cv_infra.adapter`` removed from this list because the
+; package itself is DELETED (adapter schema now lives INSIDE the foundational
+; layer at cv_infra/contract/adapter_schema.py) — not a boundary relaxation:
+; every still-existing sibling remains forbidden to the contract.
 forbidden_modules =
     cv_infra.orchestrator
     cv_infra.runner
     cv_infra.report
     cv_infra.cli
     cv_infra.oracles
-    cv_infra.adapter
 ; P3 cycle-1 (M1 §3.3 stage 5): the contract loader BINDS oracle plugins via the
 ; M1-owned loader entry in cv_infra/oracles/base.py (itself stdlib+contract.errors
 ; only). This single sanctioned edge is allowed; everything else in

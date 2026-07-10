@@ -4,14 +4,15 @@ Public surface (consumers import from here or the submodules — never redefine)
 
 * ``API_VERSION`` (apiversion.py) + ``resolve_api_version`` (version.py)
 * pydantic v2 models (schema.py / adapter_schema.py) — Phase 3 canonical
+  (the Phase-2 stdlib models.py / adapter package retired, D-4')
 * ``load_request`` 6-stage loader + ``AdmittedRequest`` (loader.py)
 * ``ContractError`` friendly error object (errors.py)
-* Phase-2 stdlib models (models.py) — DEPRECATED, migrate in P3 cycle-2
 
 Third-party-backed symbols are exported LAZILY (PEP 562): the runner image
-installs the wheel ``--no-deps`` (no pydantic/yaml) and must keep importing
-``cv_infra.contract.models`` — which triggers this package __init__ — without
-pulling the host-only control-plane deps (D-C/R20, DoD-P2-12 direction).
+installs the wheel ``--no-deps`` — ``import cv_infra.contract`` alone stays
+stdlib-only, and host-only control-plane deps (yaml/docker) must never ride
+this package import. The runner pulls schema.py explicitly and executes it on
+the BUNDLE-SUPPLIED pydantic (D-4', skew asserted at image build).
 """
 
 from cv_infra.contract.apiversion import API_VERSION  # stdlib-safe, eager

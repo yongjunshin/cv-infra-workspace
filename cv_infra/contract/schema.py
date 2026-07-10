@@ -14,16 +14,17 @@ Wire grounding (karpathy — only fields with a real basis exist):
   plus the M1 §3.2 additions ``apiVersion`` (optional, resolver = version.py)
   and ``execution_settings`` (optional; ``repeats`` is consumed by M3 fan-out).
 * Result side = the exact result.json the Phase-2 runner emits
-  (``cv_infra.runner.evaluate.build_result_dict`` ==
-  ``contract.models.VerificationResult.to_dict()``). The new ``Result`` must
-  pass that dict through UNMODIFIED — bound mechanically by
-  tests/test_contract_result_equivalence.py (equivalence guard + positive
-  control, G-25/G-17).
+  (``cv_infra.runner.evaluate.build_result_dict``). ``Result`` must pass that
+  dict through UNMODIFIED — the wire is pinned against explicit literals by
+  tests/test_result_emission_golden.py and bound to this model by the
+  emission-binding tests in tests/test_contract_schema_p3.py (guard +
+  positive control, G-25/G-17).
 
-Phase-2 consumers (CLI/runner/orchestrator) still import
-``cv_infra.contract.models`` (stdlib dataclasses) — they migrate here in P3
-cycle-2. This module is imported lazily from ``cv_infra.contract`` so the
-package import stays stdlib-only (runner image has no pydantic — D-C/R20).
+This pydantic canon is the ONLY definition since D-4' (2026-07-10): the
+Phase-2 stdlib dataclasses (contract/models.py) are retired, all consumers
+validate through here. This module is imported lazily from
+``cv_infra.contract`` so the package import stays stdlib-only; the runner
+executes it on the BUNDLE-SUPPLIED pydantic (D-4').
 """
 
 from __future__ import annotations
@@ -43,7 +44,16 @@ from pydantic import (
 from cv_infra.contract.adapter_schema import Interface
 from cv_infra.contract.apiversion import API_VERSION
 
-# Verdict domain (REQ-EXEC-013; LOCKED exit fold documented in contract/models.py).
+# Verdict domain (REQ-EXEC-013). Kept as a Literal + tuple so the wire value is
+# a plain string (result.json field ``verdict: str``).
+#
+# verdict -> CLI exit-code mapping (COMMENT ONLY; contract LOCK = cycle-6 P2-07,
+# rendered in cv_infra/cli/main.py):
+#   pass    -> 0
+#   fail    -> 1
+#   timeout -> 1   (SUT missed the sim-time budget = SUT verdict, not infra)
+#   error   -> 3   (runner crash / Isaac unreached / EULA not agreed = platform, FU-8)
+# (bad input, pre-sim -> exit 2 is raised on the CLI side, not carried in a Result.)
 Verdict = Literal["pass", "fail", "timeout", "error"]
 VERDICTS: tuple[str, ...] = ("pass", "fail", "timeout", "error")
 
@@ -248,8 +258,8 @@ class RequestEnvelope(_ForbidExtra):
 # --------------------------------------------------------------------------- #
 class Metrics(_ForbidExtra):
     """Declared-metrics container (REQ-EXEC-012). Values are computed by the M2
-    oracle engine; M1 owns only the shape. Defaults mirror contract/models.py
-    exactly (equivalence guard material)."""
+    oracle engine; M1 owns only the shape. Defaults are the Phase-2 wire
+    defaults (pinned by the golden literals)."""
 
     time_to_goal_s: float | None = None
     min_clearance_m: float | None = None
@@ -274,10 +284,10 @@ class Artifacts(_ForbidExtra):
 
 
 class Result(_ForbidExtra):
-    """Exactly one result per job (REQ-EXEC-013). Formalizes
-    ``contract.models.VerificationResult`` — the wire dict (key set, nesting,
-    defaults) is IDENTICAL to the Phase-2 runner emission and is bound by the
-    equivalence guard test (G-25: guard + positive control, not prose).
+    """Exactly one result per job (REQ-EXEC-013). The wire dict (key set,
+    nesting, defaults) is IDENTICAL to the Phase-2 runner emission — bound by
+    the emission-binding tests in tests/test_contract_schema_p3.py against the
+    real producer (G-25: guard + positive control, not prose).
 
     ``request_identity_key`` is a FIELD only — derivation/normalization is
     M4's (LOCKED §7-13). ``origin`` / ``is_self_test`` are M7 markers.
