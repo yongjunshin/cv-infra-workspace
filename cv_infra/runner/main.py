@@ -83,7 +83,14 @@ def resolve_job_spec_dict(env: dict | None = None) -> dict:
     if not raw:
         raise BadJobSpec("JOB_SPEC is required (path to VerificationRequest JSON, or inline JSON)")
     candidate = Path(raw)
-    text = candidate.read_text(encoding="utf-8") if candidate.is_file() else raw
+    try:
+        is_file = candidate.is_file()
+    except OSError:
+        # Inline JSON can exceed NAME_MAX (measured p3c3: a slash-free spec
+        # > 255 bytes made is_file() raise ENAMETOOLONG) — "not a statable
+        # path" simply means the inline form, never a crash.
+        is_file = False
+    text = candidate.read_text(encoding="utf-8") if is_file else raw
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
