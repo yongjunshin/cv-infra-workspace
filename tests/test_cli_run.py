@@ -37,9 +37,13 @@ from cv_infra.contract.version import DeprecatedVersion
 
 RUNNER_IMAGE = "cv-infra-runner:p2"
 
-# Verbatim copy (sha256 3b328ed4…302a, identical to the consumer instance) of
-# cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml — cycle-3
-# measured-aligned; sut.image_ref = carter-sut:p2.
+# Platform-side copy of the consumer instance
+# cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml — cycle-5
+# bringup-measured fill; sut.image_ref = carter-sut:p2. The body is
+# semantically identical to the source; only the fixture's platform header
+# differs (its SOURCE OF TRUTH anchor + re-sync policy live in that header —
+# no hash is retyped here, G-25: the drift guard is
+# tests/test_fixture_canonical_guard.py + the PM merge-gate cross-repo diff).
 CARTER_YAML = (Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml").read_text(
     encoding="utf-8"
 )
@@ -553,3 +557,44 @@ def test_consent_env_partial_forwards_only_present_key(
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
     assert stub.kwargs_calls == [{"runner_env": {present: "opaque-token-partial-05d8"}}]
+
+
+# --- (7) oracle_plugin_dir pass-through (D-1 wiring contract #2, 2026-07-11) --
+# An admitted CustomCriterion -> the CLI hands the scenario's parent directory
+# (resolved absolute) to the supervisor as kw-only ``oracle_plugin_dir`` so it
+# can be ro-mounted into the runner (contract #3). MVP-only criteria -> None:
+# the kwarg stays unpassed (= the pinned kw-only default, no mount, no env).
+# Detection is ``isinstance(..., CustomCriterion)`` on the ADMITTED model, not
+# a string heuristic — proven via a real module:Class oracle that stage-5 binds
+# (tests.oracle_plugin_fixture, the loader tests' plugin stand-in).
+
+
+def test_custom_criterion_passes_scenario_parent_as_oracle_plugin_dir(
+    monkeypatch, tmp_path, no_ambient_consent
+):
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    doc = yaml.safe_load(CARTER_YAML)
+    doc["acceptance_criteria"].append(
+        {"oracle": "tests.oracle_plugin_fixture:CustomOracle", "params": {"anything": "goes"}}
+    )
+    nested = tmp_path / "scenarios"  # parent dir != cwd: the DIR must ride, not "."
+    nested.mkdir()
+    scenario = nested / "custom.yaml"
+    scenario.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    assert _run_cli(scenario, tmp_path / "out") == EXIT_PASS
+    assert stub.kwargs_calls == [{"oracle_plugin_dir": str(nested.resolve())}]
+
+
+def test_mvp_only_criteria_pass_oracle_plugin_dir_none(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent
+):
+    """No CustomCriterion (canonical fixture: reached_goal + no_collision only)
+    -> the delivered seam value is the contract's ``None``: the kwarg is not
+    passed, so the supervisor's pinned kw-only default ``None`` applies."""
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    assert stub.kwargs_calls == [{}]  # no oracle_plugin_dir key -> default None
