@@ -32,6 +32,16 @@ def test_job_spec_from_file(tmp_path):
     assert main.resolve_job_spec_dict({"JOB_SPEC": str(p)})["scene_ref"] == "file.usd"
 
 
+def test_job_spec_inline_json_longer_than_name_max():
+    # Measured (p3c3): a slash-free inline JSON > NAME_MAX (255 bytes) made
+    # the file-or-inline probe's Path.is_file() raise ENAMETOOLONG instead of
+    # returning False (earlier specs dodged it by luck — their "/" split the
+    # string into short path components). Unstatable raw => inline, no crash.
+    spec = {"scene_ref": "s.usd", "padding": "x" * 300}
+    env = {"JOB_SPEC": json.dumps(spec)}
+    assert main.resolve_job_spec_dict(env)["scene_ref"] == "s.usd"
+
+
 def test_job_spec_missing_raises_usage():
     with pytest.raises(main.BadJobSpec):
         main.resolve_job_spec_dict({})
