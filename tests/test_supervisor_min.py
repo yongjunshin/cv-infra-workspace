@@ -18,6 +18,7 @@ import pytest
 from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
     JOB_SPEC_MOUNT,
+    ORACLE_PLUGIN_DIR_ENV,
     RESULT_OUT_MOUNT,
     ROS_DOMAIN_ID_SPACE,
     JobOutcome,
@@ -603,3 +604,51 @@ def test_cache_root_resolved_to_host_absolute_path(tmp_path, monkeypatch):
     for host in cache_binds:
         assert Path(host).is_absolute()  # never a relative bind
         assert host.startswith(str((tmp_path / "rel-cache").resolve()))
+
+
+# --------------------------------------------------------------------------- #
+# (9) D-1 custom-oracle plugin dir (decision 2026-07-11 — wiring contract #3)
+# --------------------------------------------------------------------------- #
+
+
+def test_oracle_plugin_dir_none_keeps_container_spec_unchanged(tmp_path, monkeypatch):
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, oracle_plugin_dir=None)  # explicit None == the default
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    assert ORACLE_PLUGIN_DIR_ENV not in runner_kwargs["environment"]
+    assert len(runner_kwargs["volumes"]) == 2  # spec(ro) + result(rw) only — unchanged
+    assert "volumes" not in sut_kwargs
+
+
+def test_oracle_plugin_dir_mounts_ro_same_absolute_path_plus_env_on_runner(tmp_path):
+    put_result(tmp_path)
+    plugin = tmp_path / "scenario-dir"
+    plugin.mkdir()
+    client = FakeClient()
+    run_min(tmp_path, client, oracle_plugin_dir=str(plugin))
+    (_, runner_kwargs), _ = client.run_calls
+    host = str(plugin.resolve())
+    # SAME absolute path on both sides, read-only (G-26 idiom — runner sys.path's it),
+    # and the env value is that very string (D-1 wiring contract #3).
+    assert runner_kwargs["volumes"][host] == {"bind": host, "mode": "ro"}
+    assert runner_kwargs["environment"][ORACLE_PLUGIN_DIR_ENV] == host
+
+
+def test_oracle_plugin_dir_never_leaks_to_sut(tmp_path):
+    put_result(tmp_path)
+    plugin = tmp_path / "scenario-dir"
+    plugin.mkdir()
+    client = FakeClient()
+    run_min(tmp_path, client, oracle_plugin_dir=str(plugin))
+    _, (_, sut_kwargs) = client.run_calls
+    assert "volumes" not in sut_kwargs  # no mount on the SUT (blackbox)
+    assert set(sut_kwargs["environment"]) == {"ROS_DOMAIN_ID"}  # no env leak either
+
+
+def test_missing_oracle_plugin_dir_raises_before_any_resource(tmp_path):
+    client = FakeClient()
+    with pytest.raises(ValueError):
+        run_min(tmp_path, client, oracle_plugin_dir=str(tmp_path / "does-not-exist"))
+    assert client.events == []  # loud + pre-resource — never a silent no-op (G-26)
