@@ -85,8 +85,9 @@ class EvaluationEngine:
     """Binds oracles and evaluates a telemetry record into (verdict, outcomes).
 
     Oracles are injected (not imported here) to keep ``oracles`` -> ``evaluate``
-    the only dependency edge and avoid an import cycle. ``main`` builds the engine
-    with the concrete ``reached_goal`` / ``no_collision`` oracles.
+    the only dependency edge and avoid an import cycle. ``main`` composes the
+    engine from the request's criteria through the M1 loader (``build_oracles``,
+    D-1 (4) uniform path — MVP entry points and custom ``module:Class`` alike).
     """
 
     def __init__(self, oracles: list[object]) -> None:

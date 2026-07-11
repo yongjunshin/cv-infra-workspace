@@ -13,8 +13,9 @@ The runner holds NO docker.sock and creates NO network/domain: ``ros_domain_id``
 exit-code mapping, and result assembly below are Isaac-independent and CPU-tested.
 
 Exit-code contract (0/1/2/3 — LOCKED §9): 0=pass, 1=fail/timeout (mission not met;
-the fine-grained verdict is retained in result.json), 2=bad JOB_SPEC/usage,
-3=platform (EULA missing, runner crash, verdict=error).
+the fine-grained verdict is retained in result.json), 2=bad JOB_SPEC/usage (incl.
+oracle-load failure — defence-in-depth, admit rejects first), 3=platform (EULA
+missing, runner crash, verdict=error).
 """
 
 from __future__ import annotations
@@ -22,13 +23,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from importlib import metadata
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from cv_infra.contract.adapter_schema import Ros2AdapterConfig
-from cv_infra.contract.errors import from_validation_error
+from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.schema import VerificationRequest
+from cv_infra.oracles.base import ENTRY_POINT_GROUP, load_oracle
 from cv_infra.runner.evaluate import (
     VERDICT_ERROR,
     EvaluationEngine,
@@ -50,6 +53,11 @@ EXIT_PLATFORM = 3
 # budget also absorbs the SUT's restart round (M3 contract) and the first-flow
 # settling after a cold scene stream; tighten with cycle-6 measurements.
 READINESS_TIMEOUT_S = 180.0
+
+# D-1 (4) supervisor->runner env naming the ro-mounted custom-oracle plugin dir.
+# The name is the cross-team wire (M3 injects it character-exact — G-17 drift
+# class): change it only with a decisions/ update on both sides.
+ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
 
 # verdict (result.json) -> process exit code. timeout collapses to FAIL at the exit
 # level (only 4 slots); the precise verdict stays in result.json for M3/M8.
@@ -181,14 +189,60 @@ def criteria_view(request: VerificationRequest) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Evaluation-engine composition (D-1 (4), 2026-07-11) — CPU-testable.
+# --------------------------------------------------------------------------- #
+def insert_oracle_plugin_dir(env: dict | None = None) -> str | None:
+    """Put the M3-mounted custom-oracle dir on ``sys.path`` (D-1 (4)), pre-engine.
+
+    The supervisor bind-mounts the consumer's scenario dir into the runner
+    container at the SAME absolute path (ro) and injects
+    ``CV_ORACLE_PLUGIN_DIR`` — inserting it makes ``module:Class`` criteria
+    importable exactly as they were on the admit plane (M1 loader stage 5).
+    Unset -> no-op (sys.path untouched); an empty string counts as unset
+    (inserting ``""`` would put the CWD on sys.path — G-26's empty-env
+    variant). Returns the inserted dir (for the boot log) or None.
+    """
+    environ = os.environ if env is None else env
+    plugin_dir = environ.get(ORACLE_PLUGIN_DIR_ENV)
+    if not plugin_dir:
+        return None
+    sys.path.insert(0, plugin_dir)
+    return plugin_dir
+
+
+def build_oracles(request: VerificationRequest | None = None) -> list:
+    """Compose one oracle instance per acceptance criterion via the M1 loader.
+
+    The UNIFORM path (D-1 (4)): every ``criterion.oracle`` goes through
+    ``load_oracle`` — an MVP name resolves in the ``cv_infra.oracles``
+    entry-point group, a custom ``module:Class`` through the explicit path —
+    so no hardcoded oracle imports remain here. Two criteria naming the same
+    oracle load twice (two instances) on purpose: no caching/dedup (D-1).
+    Without a request the registered built-in set is composed (entry-point
+    enumeration; the QA fixture-canonical guard derives oracle read-sets from
+    this form).
+
+    A load failure here is DEFENCE-IN-DEPTH only — the FIRST rejection is
+    admit's (M1 loader stage 5, pre-execution-plane); reaching it means the
+    runner got a spec admit never saw, or the plugin-dir mount is broken. It
+    maps onto the friendly BadJobSpec -> exit 2 path, never a traceback.
+    """
+    if request is None:
+        names = sorted(ep.name for ep in metadata.entry_points(group=ENTRY_POINT_GROUP))
+    else:
+        names = [criterion.oracle for criterion in request.acceptance_criteria]
+    oracles = []
+    for name in names:
+        try:
+            oracles.append(load_oracle(name))
+        except ContractError as exc:
+            raise BadJobSpec(f"oracle {name!r} failed to load: {exc}") from exc
+    return oracles
+
+
+# --------------------------------------------------------------------------- #
 # GPU orchestration (M2 §3.2 order) — Isaac-deferred; wired in cycles 2-4.
 # --------------------------------------------------------------------------- #
-def build_oracles() -> list:
-    """Bind the MVP oracles (deferred import keeps evaluate<-oracles edge one-way)."""
-    from cv_infra.oracles.no_collision import NoCollisionOracle  # noqa: PLC0415
-    from cv_infra.oracles.reached_goal import ReachedGoalOracle  # noqa: PLC0415
-
-    return [ReachedGoalOracle(), NoCollisionOracle()]
 
 
 def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 proves)
@@ -231,6 +285,14 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # (before any Isaac import/boot).
     request, adapter_config = parse_request(spec)
     criteria = criteria_view(request)
+    # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
+    # engine composes uniformly via the M1 loader — still PRE-sim, so a load
+    # failure (defence-in-depth; admit already rejected it once) is
+    # BadJobSpec -> exit 2 before any Isaac import/boot, like the parse above.
+    plugin_dir = insert_oracle_plugin_dir(env)
+    if plugin_dir is not None:
+        print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
+    engine = EvaluationEngine(build_oracles(request))
 
     sim = SimRuntime(
         SimConfig(
@@ -320,7 +382,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
             ),
             "path_len_m": path_length_m(record.gt_pose_samples),
         }
-        verdict, outcomes = EvaluationEngine(build_oracles()).evaluate(record, criteria)
+        verdict, outcomes = engine.evaluate(record, criteria)  # engine composed pre-sim
         result = build_result_dict(
             job_id,
             verdict,
