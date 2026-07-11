@@ -105,7 +105,10 @@ class Scenario(_ForbidExtra):
 
     scene: str = Field(min_length=1, examples=["nova_carter_warehouse"])
     robot: str = Field(min_length=1, examples=["nova_carter"])
-    goal: Goal
+    # Block-valued examples (here and in VerificationRequest below) exist so a
+    # WHOLE-BLOCK-MISSING violation still gets a fixable example (DoD-P3-02
+    # footnote, p3c3) — dicts render as valid YAML flow mappings.
+    goal: Goal = Field(examples=[{"x": -6.0, "y": 5.0, "yaw": 1.5708}])
     seed: int = Field(examples=[42])
     timeout_s: float = Field(gt=0, examples=[120])
     debug_obstacle: DebugObstacle | None = None
@@ -233,10 +236,22 @@ class VerificationRequest(_ForbidExtra):
     """
 
     api_version: str = Field(default=API_VERSION, alias="apiVersion", examples=[API_VERSION])
-    scenario: Scenario
-    sut: SutRef
+    scenario: Scenario = Field(
+        examples=[
+            {
+                "scene": "nova_carter_warehouse",
+                "robot": "nova_carter",
+                "goal": {"x": -6.0, "y": 5.0, "yaw": 1.5708},
+                "seed": 42,
+                "timeout_s": 120,
+            }
+        ]
+    )
+    sut: SutRef = Field(examples=[{"image_ref": "carter-sut:p2"}])
     interface: Interface = Field(default_factory=Interface)
-    acceptance_criteria: list[AcceptanceCriterion] = Field(min_length=1)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(
+        min_length=1, examples=[[{"oracle": "reached_goal"}]]
+    )
     execution_settings: ExecutionSettings = Field(default_factory=ExecutionSettings)
 
 
@@ -276,8 +291,21 @@ class CriterionResult(_ForbidExtra):
 
 
 class Artifacts(_ForbidExtra):
-    """Telemetry / recording artifact refs (REQ-EXEC-014). ``None`` until the
-    recorders produce files (honest degradation, P2-02)."""
+    """Result-attached artifact references (REQ-EXEC-014) — attachment
+    semantics formalized by D-3 (2026-07-11, schema UNEXTENDED):
+
+    * ``mcap`` — path to the rosbag2 MCAP telemetry recording of the run
+      (REQ-EXEC-008/014): the machine-readable replay/debug attachment,
+      playable from the referenced path (``ros2 bag info``).
+    * ``mp4`` — path to the visual recording of the mission (REQ-EXEC-009/014):
+      MVP = exactly ONE camera-view video per job (no per-sensor fan-out),
+      playable from the referenced path (ffprobe/frame count).
+
+    Paths are meaningful on the plane that persisted the result (runner
+    out-dir / its host mount). ``None`` = that recorder produced nothing —
+    honest degradation, loud at the source, never a fabricated path (P2-02).
+    Additional fields (e.g. ``media_type``) are DEFERRED until a 2nd media
+    type has real demand (D-3 — no speculative extension)."""
 
     mcap: str | None = None
     mp4: str | None = None

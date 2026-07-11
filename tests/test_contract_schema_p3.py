@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from cv_infra.contract.apiversion import API_VERSION
 from cv_infra.contract.schema import (
     VERDICTS,
+    Artifacts,
     CustomCriterion,
     DebugObstacle,
     ExecutionSettings,
@@ -375,6 +376,22 @@ def test_result_positive_control_unknown_nested_key_fails_loud():
 def test_result_positive_control_corrupted_verdict_fails_loud():
     with pytest.raises(ValidationError):
         Result.model_validate({**_RESULT_EMISSIONS["pass-full"], "verdict": "ok"})
+
+
+# --------------------------------------------------------------------------- #
+# D-3 (2026-07-11) — Artifacts attachment semantics formalized WITHOUT schema
+# extension: the field set stays exactly the P2 wire {mcap, mp4} (negative:
+# no ``media_type`` etc.), and the docstring carries the REQ-EXEC-009/014
+# trace (mp4 = single camera-view video, MVP).
+# --------------------------------------------------------------------------- #
+def test_artifacts_field_set_is_frozen_to_the_p2_wire():
+    assert set(Artifacts.model_fields) == {"mcap", "mp4"}
+
+
+def test_artifacts_docstring_carries_the_attachment_semantics_trace():
+    doc = Artifacts.__doc__ or ""
+    assert "REQ-EXEC-009" in doc and "REQ-EXEC-014" in doc
+    assert "camera-view" in doc  # mp4 MVP semantics named (D-3)
 
 
 def test_result_positive_control_equality_discriminates_value_drift():
