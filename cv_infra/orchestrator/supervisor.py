@@ -72,6 +72,13 @@ CACHE_MOUNTS: tuple[tuple[str, str], ...] = (
     ("documents", "/isaac-sim/Documents"),
 )
 
+# D-1 custom-oracle plugin dir (decision 2026-07-11, wiring contract #3): the scenario
+# directory holding consumer oracle .py files is bind-mounted read-only at the SAME
+# absolute path inside the RUNNER (G-26 idiom — the runner sys.path's that very string,
+# so host/container paths must agree verbatim) and announced via this env. Runner-only:
+# the SUT never sees the mount or the env (blackbox no-leak invariant).
+ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
+
 # LOCKED §7.5 dual isolation: per-job docker network + ROS_DOMAIN_ID in 0..101.
 ROS_DOMAIN_ID_SPACE = 102
 
@@ -171,6 +178,27 @@ def _cache_volumes(cache_root: str | os.PathLike[str] | None) -> dict[str, dict[
     }
 
 
+def _resolve_oracle_plugin_dir(oracle_plugin_dir: str | None) -> str | None:
+    """Validate + absolutize the custom-oracle plugin dir (D-1 wiring contract #3).
+
+    None -> None: no mount, no env — behavior fully unchanged. A given-but-missing /
+    non-directory path is a loud ``ValueError``, never a silent no-op (G-26); the
+    caller runs this pre-resource, in the same seat as the job_id / cache_root checks.
+    ``Path.resolve()`` matters twice here: the ``-v`` bind resolves against the HOST
+    daemon (G-26 sibling-container hazard), and the returned string is used verbatim
+    as host source, container target AND env value (same-absolute-path idiom).
+    """
+    if oracle_plugin_dir is None:
+        return None
+    resolved = Path(oracle_plugin_dir).resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            f"oracle_plugin_dir {resolved} does not exist or is not a directory "
+            f"(expected the scenario directory holding the custom oracle .py, D-1)"
+        )
+    return str(resolved)
+
+
 def run_job(
     job_spec: dict[str, Any],
     out_dir: Path,
@@ -180,6 +208,7 @@ def run_job(
     *,
     runner_env: dict[str, str] | None = None,
     cache_root: str | os.PathLike[str] | None = None,
+    oracle_plugin_dir: str | None = None,
     runner_gpus: bool = True,
     readiness_probe: ReadinessProbe | None = None,
     readiness_timeout_s: float = 120.0,
@@ -201,6 +230,13 @@ def run_job(
     same seat as ``job_id``. RO/2-tier caching (D-B) is deferred to DoD-P4-15 — the
     ``rw`` single layer here is what Phase 2's single job needs (see ``_cache_volumes``).
 
+    ``oracle_plugin_dir`` (D-1 2026-07-11, wiring contract #3) is the consumer's
+    scenario directory holding custom oracle ``.py`` files: when not None it is
+    bind-mounted read-only at the SAME absolute path inside the RUNNER and announced
+    via ``CV_ORACLE_PLUGIN_DIR=<that path>`` — runner-only, never the SUT (blackbox
+    no-leak invariant); the runner sys.path's it before evaluation (M2). None = no
+    mount, no env; a missing directory raises loud (G-26, ``_resolve_oracle_plugin_dir``).
+
     Infra failures (docker/spawn/collection) are returned as ``infra_error``, never
     raised; a missing ``job_id`` is a seam-contract violation and raises ValueError
     before any resource is created.
@@ -210,9 +246,10 @@ def run_job(
         raise ValueError("job_spec must carry a non-empty job_id (seam contract, D-2)")
     if sut_restart_limit < 0:
         raise ValueError(f"sut_restart_limit must be >= 0, got {sut_restart_limit}")
-    # Resolve cache mounts up front: a bad cache_root fails loud BEFORE any network or
-    # container is created (same seat as the job_id check, D-1).
+    # Resolve cache mounts + oracle plugin dir up front: a bad path fails loud BEFORE
+    # any network or container is created (same seat as the job_id check).
     cache_volumes = _cache_volumes(cache_root)
+    plugin_dir = _resolve_oracle_plugin_dir(oracle_plugin_dir)
 
     client = docker_client
     if client is None:
@@ -254,6 +291,10 @@ def run_job(
                 "ROS_DOMAIN_ID": str(domain_id),
             }
         )
+        if plugin_dir is not None:
+            # D-1: announce the mounted plugin dir to the runner ONLY (supervisor-
+            # owned, so it overrides operator runner_env like the seam keys above).
+            environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
         # FU-14: scenario-derived ROS env — injected only when the key exists in
         # interface.adapter_config (scenario is the SoT, so these supervisor-owned
         # keys override operator runner_env like the seam keys above). Image-internal
@@ -281,9 +322,11 @@ def run_job(
             network=net_name,
             environment=environment,
             volumes={
-                # Cache binds first so the seam mounts below win on any host-path
-                # collision (same principle as the seam env keys above).
+                # Cache/plugin binds first so the seam mounts below win on any
+                # host-path collision (same principle as the seam env keys above).
+                # Plugin bind = SAME absolute path host->container, read-only (D-1).
                 **cache_volumes,
+                **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
                 str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
                 str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
             },
