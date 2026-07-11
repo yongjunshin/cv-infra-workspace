@@ -271,6 +271,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     Operator consent (``ACCEPT_EULA``/``PRIVACY_CONSENT``) is forwarded from
     the CLI process env to ``runner_env`` only when present — when absent the
     runner boot guard honestly refuses (surfaces on the infra path, exit 3).
+
+    A ``CustomCriterion`` among the ADMITTED criteria means consumer oracle
+    plugin ``.py`` files sit next to the scenario YAML: the scenario's parent
+    directory rides to the supervisor as kw-only ``oracle_plugin_dir`` (D-1
+    wiring contract #2, decision 2026-07-11) for the read-only runner mount
+    (contract #3). MVP-only criteria leave the kwarg unpassed — the pinned
+    kw-only default ``None`` (no mount, no env) applies.
     """
     scenario_path = Path(args.scenario)
     job_id = args.job_id or _default_job_id(scenario_path)
@@ -279,6 +286,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # --help / placeholder paths must never load (REQ-INTAKE-003/005).
     from cv_infra.contract.errors import ContractError
     from cv_infra.contract.loader import load_request
+    from cv_infra.contract.schema import CustomCriterion
 
     try:
         admitted = load_request(scenario_path)
@@ -320,6 +328,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # is NOT passed — the runner boot guard refuses to start Isaac (FU-8 is P5).
     consent_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
     kwargs: dict[str, Any] = {"runner_env": consent_env} if consent_env else {}
+    # D-1 wiring contract #2 (decision 2026-07-11): an admitted CustomCriterion
+    # means consumer oracle plugin .py files live next to the scenario YAML —
+    # hand that directory (resolved absolute) to the supervisor, which ro-mounts
+    # it into the runner at the SAME path + announces CV_ORACLE_PLUGIN_DIR
+    # (contract #3). Detection is isinstance on the ADMITTED model, never a
+    # string heuristic. MVP-only criteria -> kwarg unpassed = the pinned
+    # kw-only default None (no mount, no env), mirroring runner_env above.
+    if any(isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria):
+        kwargs["oracle_plugin_dir"] = str(scenario_path.parent.resolve())
     outcome = run_job(job_spec, out_dir, args.runner_image, job_spec["sut_image_ref"], **kwargs)
     return _exit_from_outcome(outcome)
 
