@@ -31,6 +31,16 @@ from typing import Any
 #: would drown the actual problem).
 _MISSING = "(missing)"
 
+#: Module-INTERNAL attribute name under which a YAML locator passed to
+#: ``from_validation_error`` is remembered on the ``ValidationError`` instance
+#: itself, so a later locator-less re-render of the SAME exception (the CLI's
+#: multi-violation list traversal over ``err.__cause__``) still attaches
+#: line/col to the 2nd+ violations. Private (`_` prefix) — public promotion is
+#: a PM merge-gate call. Attribute stash measured OK on the bundle-matched
+#: pydantic 2.11.7 (pydantic_core ValidationError accepts setattr; weakref
+#: does NOT — probed 2026-07-11).
+_LOCATOR_ATTR = "_cv_infra_yaml_locator"
+
 #: The 8 machine-readable annotation keys (M1 §3.4 <-> M8 file/line/col, 1:1).
 ANNOTATION_KEYS = (
     "field_path",
@@ -189,7 +199,19 @@ def from_validation_error(
     output). ``model`` enables ``examples=[...]`` lookup; ``locator`` is an
     optional ``callable(loc) -> (line, col) | None`` (see ``loader.py`` — YAML
     node walk) filling the M8 annotation line/col when available.
+
+    A passed ``locator`` is remembered on ``exc`` (``_LOCATOR_ATTR``,
+    best-effort) so re-rendering the same exception WITHOUT one — the consumer
+    idiom for surfacing violations beyond the loader's first — keeps line/col
+    on every violation, not just the first.
     """
+    if locator is None:
+        locator = getattr(exc, _LOCATOR_ATTR, None)
+    else:
+        try:
+            setattr(exc, _LOCATOR_ATTR, locator)
+        except (AttributeError, TypeError):  # exotic exc types: stay best-effort
+            pass
     out: list[ContractError] = []
     for err in exc.errors(include_url=False):
         loc = tuple(err.get("loc") or ())

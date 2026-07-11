@@ -7,7 +7,8 @@ any failing stage rejects BEFORE the execution plane ever sees the input):
     (2) apiVersion resolve           -> unknown/absent = reject / deprecated = warn
     (3) pydantic model_validate      -> schema error  = friendly reject
     (4) self-containedness           -> missing triad = reject   (REQ-INTAKE-006)
-    (5) oracle load + bind           -> load failure  = reject   (REQ-INTAKE-007/008)
+    (5) oracle load + bind           -> load failure  = reject   (REQ-INTAKE-007/008;
+                                        scenario dir on sys.path while binding — D-1)
     (6) admit marking                -> AdmittedRequest           (REQ-INTAKE-009)
 
 Rejection = a raised ``ContractError`` (friendly: field path + expected +
@@ -15,7 +16,9 @@ example + YAML line/col when locatable — NFR-INTAKE-001). The consumer maps it
 to exit 2 / HTTP 422 (LOCKED §7-9) — this module never calls ``sys.exit`` and
 never leaks a raw traceback into its message. When pydantic reports several
 violations the FIRST is raised; consumers that want the full list post-process
-via ``errors.from_validation_error`` directly.
+via ``errors.from_validation_error`` directly (the loader's YAML locator is
+remembered on the exception, so those re-renders keep line/col on EVERY
+violation, not just the first — p3c3).
 
 Inputs are a file path or an open text stream — nothing else (no URL, no
 inline-string convenience). Envelope (N>=1) loading is a later-cycle consumer
@@ -28,6 +31,7 @@ never imports the loader — D-C/R20).
 from __future__ import annotations
 
 import io
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -116,18 +120,29 @@ def load_request(
     _check_self_contained(request, source_path)
 
     # (5) oracle load + bind (REQ-INTAKE-007/008) ---------------------------- #
+    # D-1(a) submission plane (decision 2026-07-11 §D-1 wiring item 1):
+    # scenario-adjacent custom oracle modules ("module:Class" next to the YAML)
+    # resolve while binding — the scenario's directory joins sys.path for
+    # stage 5 ONLY, try/finally-restored. Stream sources have no directory.
+    plugin_dir = str(Path(source).parent.resolve()) if isinstance(source, (str, Path)) else None
     bound: list[str] = []
-    for i, criterion in enumerate(request.acceptance_criteria):
-        try:
-            oracle = load_oracle(criterion.oracle)
-        except ContractError as err:
-            raise _relocated(
-                err,
-                field_path=f"acceptance_criteria[{i}].oracle",
-                source_path=source_path,
-                line_col=locator(("acceptance_criteria", i, "oracle")),
-            ) from err
-        bound.append(oracle.name)
+    if plugin_dir is not None:
+        sys.path.insert(0, plugin_dir)
+    try:
+        for i, criterion in enumerate(request.acceptance_criteria):
+            try:
+                oracle = load_oracle(criterion.oracle)
+            except ContractError as err:
+                raise _relocated(
+                    err,
+                    field_path=f"acceptance_criteria[{i}].oracle",
+                    source_path=source_path,
+                    line_col=locator(("acceptance_criteria", i, "oracle")),
+                ) from err
+            bound.append(oracle.name)
+    finally:
+        if plugin_dir is not None and plugin_dir in sys.path:
+            sys.path.remove(plugin_dir)
 
     # (6) admit marking (REQ-INTAKE-009) ------------------------------------- #
     return AdmittedRequest(

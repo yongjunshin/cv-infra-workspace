@@ -12,14 +12,16 @@ oracle binder (no propagation past the gate, NFR-INTAKE-003).
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 
 import pytest
 
 import cv_infra.contract.loader as loader_mod
 import cv_infra.contract.version as version_mod
-from cv_infra.contract.errors import ContractError
+from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.loader import AdmittedRequest, load_request
+from cv_infra.contract.schema import VerificationRequest
 from cv_infra.contract.version import DeprecatedVersion
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
@@ -105,6 +107,59 @@ def test_custom_oracle_variant_admits_via_explicit_path(tmp_path):
     }
 
 
+_ADJACENT_ORACLE_SRC = """\
+from cv_infra.oracles.base import OracleBase
+
+
+class AdjacentOracle(OracleBase):
+    name = "adjacent_fixture"
+    version = "0.0.1"
+
+    def validate_params(self, criteria):
+        return None
+
+    def evaluate(self, telemetry, criteria):
+        return {"passed": True}
+"""
+
+
+def test_stage5_scenario_adjacent_oracle_binds_and_syspath_is_restored(tmp_path):
+    # D-1(a) wiring item 1 (p3c3): a consumer drops the custom oracle .py NEXT
+    # TO the scenario YAML — the scenario's directory joins sys.path during
+    # stage-5 binding ONLY, and is restored afterwards (try/finally).
+    (tmp_path / "p3c3_adjacent_oracle.py").write_text(_ADJACENT_ORACLE_SRC, encoding="utf-8")
+    scenario = tmp_path / "dock.yaml"
+    scenario.write_text(
+        CUSTOM_ORACLE_VARIANT.replace(
+            "tests.oracle_plugin_fixture:CustomOracle", "p3c3_adjacent_oracle:AdjacentOracle"
+        ),
+        encoding="utf-8",
+    )
+    before = list(sys.path)
+    try:
+        admitted = load_request(scenario)
+    finally:
+        sys.modules.pop("p3c3_adjacent_oracle", None)  # no cross-test import residue
+    assert admitted.oracles == ("adjacent_fixture",)  # bound via the adjacent dir
+    assert sys.path == before  # restored — the scenario dir does not leak
+    assert str(tmp_path.resolve()) not in sys.path
+
+
+def test_stage5_syspath_is_restored_when_binding_fails(tmp_path):
+    scenario = tmp_path / "dock.yaml"
+    scenario.write_text(
+        CUSTOM_ORACLE_VARIANT.replace(
+            "tests.oracle_plugin_fixture:CustomOracle", "p3c3_no_such_module:Nope"
+        ),
+        encoding="utf-8",
+    )
+    before = list(sys.path)
+    with pytest.raises(ContractError) as exc_info:
+        load_request(scenario)
+    assert exc_info.value.field_path == "acceptance_criteria[0].oracle"
+    assert sys.path == before  # finally-restored on the reject path too
+
+
 def test_deprecated_api_version_warns_but_admits(monkeypatch):
     monkeypatch.setattr(
         version_mod,
@@ -175,6 +230,29 @@ def test_stage3_schema_violation_never_reaches_the_oracle_binder(monkeypatch):
     assert err.field_path == "scenario.timeout_s"
     assert err.example == "timeout_s: 120"
     assert err.source_line is not None  # YAML-located for the M8 annotation
+
+
+def test_stage3_multi_violation_rerender_keeps_line_col_beyond_the_first():
+    # p3c3 ①: with TWO violations in one YAML, the consumer's list-traversal
+    # re-render of ``err.__cause__`` (no locator argument — the CLI idiom)
+    # must carry YAML line/col on the SECOND violation too, not just the first.
+    mutated = _fixture_text().replace("seed: 42", "seed: banana")
+    mutated = mutated.replace("timeout_s: 120", "timeout_s: banana")
+    with pytest.raises(ContractError) as exc_info:
+        load_request(io.StringIO(mutated), source_path="s.yaml")
+    err = exc_info.value
+    assert err.field_path == "scenario.seed"  # first violation, enriched as before
+    assert err.source_line is not None
+    rerendered = from_validation_error(
+        err.__cause__, model=VerificationRequest, source_path=err.source_path
+    )
+    assert [e.field_path for e in rerendered] == ["scenario.seed", "scenario.timeout_s"]
+    lines = mutated.splitlines()
+    seed_line = next(i for i, ln in enumerate(lines, 1) if ln.lstrip().startswith("seed:"))
+    timeout_line = next(i for i, ln in enumerate(lines, 1) if ln.lstrip().startswith("timeout_s:"))
+    assert (rerendered[0].source_line, rerendered[1].source_line) == (seed_line, timeout_line)
+    assert rerendered[1].source_col is not None
+    assert rerendered[1].example == "timeout_s: 120"  # still the fixable shape
 
 
 def test_stage3_missing_sut_rejects():

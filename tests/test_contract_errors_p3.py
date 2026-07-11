@@ -123,3 +123,46 @@ def test_str_carries_location_when_present():
     assert "positive number (seconds)" in text
     assert "timeout_s: 120" in text
     assert "scenarios/warehouse_goal.yaml:42:18" in text
+
+
+def test_locator_is_remembered_for_locator_less_rerenders():
+    # p3c3 ①: a locator passed once is remembered on the SAME exception, so the
+    # consumer's list-traversal re-render (no locator argument — the CLI idiom
+    # over ``err.__cause__``) still attaches line/col to EVERY violation.
+    exc = _validation_error(
+        {
+            "scene": "s",
+            "robot": "r",
+            "goal": {"x": 0, "y": 0, "yaw": 0},
+            "seed": "banana",
+            "timeout_s": "banana",
+        }
+    )
+    first = from_validation_error(exc, model=Scenario, locator=lambda loc: (7, 3))
+    assert len(first) == 2
+    again = from_validation_error(exc, model=Scenario)  # no locator
+    assert [(e.source_line, e.source_col) for e in again] == [(7, 3), (7, 3)]
+
+
+def test_block_missing_top_level_fields_carry_a_fixable_example():
+    # p3c3 ② (DoD-P3-02 footnote): whole-block-missing violations now carry an
+    # example from ``Field(examples=[...])`` — dicts render as YAML flow maps.
+    with pytest.raises(ValidationError) as exc_info:
+        VerificationRequest.model_validate({"apiVersion": "cv-infra/v1"})
+    errors = {
+        e.field_path: e for e in from_validation_error(exc_info.value, model=VerificationRequest)
+    }
+    assert errors["scenario"].example.startswith("scenario: {")
+    assert "'scene'" in errors["scenario"].example
+    assert errors["sut"].example.startswith("sut: {")
+    assert "image_ref" in errors["sut"].example
+    assert errors["acceptance_criteria"].example.startswith("acceptance_criteria: [")
+    assert "reached_goal" in errors["acceptance_criteria"].example
+
+
+def test_block_missing_nested_goal_carries_a_fixable_example():
+    exc = _validation_error({"scene": "s", "robot": "r", "seed": 42, "timeout_s": 120})
+    errors = {e.field_path: e for e in from_validation_error(exc, model=Scenario)}
+    assert errors["goal"].got == "(missing)"
+    assert errors["goal"].example.startswith("goal: {")
+    assert "'yaw'" in errors["goal"].example
