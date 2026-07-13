@@ -11,8 +11,11 @@ the CLI maps the recovered verdict to an exit code). Phase 3 replaced the
 M1 ``ContractError`` friendly prose on stderr (``str(err)`` verbatim — field
 path + expected + example + YAML line/col; raw traceback 0) and exits 2
 BEFORE the supervisor is ever invoked; a deprecated ``apiVersion`` warns on
-stderr and the run continues (M8-D4/D5). The other sub-commands and GitHub
-integration land in later Phases (M8 Sec.5).
+stderr and the run continues (M8-D4/D5). Phase 4 added the batch surface
+``submit``/``status``/``wait`` (``cv_infra/cli/batch.py``, lazily imported —
+envelope submit to the M3 REST surface + terminal aggregated-verdict exit,
+M8-D11); ``report``/``selftest`` and GitHub integration land in later Phases
+(M8 Sec.5).
 
 Exit-code contract (LOCKED Sec.9 — exercised standalone at DoD-P2-07)::
 
@@ -72,16 +75,21 @@ _VERDICT_EXIT: dict[str, int] = {
 _CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 
 # --- sub-command surface (REQ-INTAKE-003) ----------------------------------
-# ``run`` is implemented (Phase 2, D-2); the rest are reserved placeholders so
-# the contract surface stays visible via ``cv-infra --help``.
+# ``run`` is implemented (Phase 2, D-2); ``submit``/``status``/``wait`` are
+# implemented (Phase 4 batch surface — cv_infra/cli/batch.py, lazily imported);
+# ``report``/``selftest`` stay reserved placeholders (P5) so the full contract
+# surface remains visible via ``cv-infra --help``.
 _SUBCOMMANDS: dict[str, str] = {
     "run": "Run a single scenario end-to-end (supervisor co-spawns SUT + runner; envelope-less).",
-    "submit": "Submit an envelope / scenario glob to the orchestrator [--wait].",
-    "status": "Show progress of an async envelope by id (informational).",
-    "wait": "Block until an envelope reaches a terminal aggregated verdict.",
+    "submit": "Submit a RequestEnvelope YAML (scenario file refs) to the orchestrator [--wait].",
+    "status": "Show progress of an async envelope by id (informational; never gates on verdict).",
+    "wait": "Block until an envelope reaches a terminal aggregated verdict (exit 0/1/3).",
     "report": "Print the aggregated report for an envelope (informational).",
     "selftest": "Run the built-in stub round-trip (no external SUT).",
 }
+
+#: Batch sub-commands dispatched to ``cv_infra.cli.batch`` (Phase 4).
+_BATCH_COMMANDS = ("submit", "status", "wait")
 
 _EXIT_CODE_EPILOG = (
     "exit-code contract (LOCKED Sec.9):\n"
@@ -90,7 +98,8 @@ _EXIT_CODE_EPILOG = (
     "  2  CONTRACT  contract/validation error (bad YAML, unsupported apiVersion)\n"
     "  3  INFRA     infrastructure error (orchestrator down, EULA not accepted)\n"
     "\n"
-    "Phase 2: 'run' is implemented; the other sub-commands are reserved (later Phases)."
+    "'run' (P2) and 'submit'/'status'/'wait' (P4) are implemented; "
+    "'report'/'selftest' are reserved (P5)."
 )
 
 
@@ -116,6 +125,40 @@ def _add_run_arguments(sub: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_api_argument(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--api",
+        default=None,
+        help="orchestrator base URL (default: $CV_INFRA_API, else http://127.0.0.1:8000)",
+    )
+
+
+def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
+    """Argument schema for the Phase-4 batch commands (cv_infra/cli/batch.py)."""
+    if name == "submit":
+        sub.add_argument(
+            "envelope",
+            help="RequestEnvelope YAML path (scenario file-reference list, decision p4c3 D-2)",
+        )
+        sub.add_argument(
+            "--wait",
+            action="store_true",
+            help="block until the terminal aggregated verdict and exit 0/1/3 (M8-D11)",
+        )
+    else:
+        sub.add_argument("envelope_id", help="envelope id printed by 'cv-infra submit'")
+    if name in ("submit", "wait"):
+        sub.add_argument(
+            "--timeout",
+            type=float,
+            default=None,
+            metavar="S",
+            help="max seconds to wait for the terminal verdict; exceeded => exit 3 "
+            "(submit: requires --wait; default: wait indefinitely)",
+        )
+    _add_api_argument(sub)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cv-infra",
@@ -131,6 +174,8 @@ def _build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name, help=help_text, description=help_text)
         if name == "run":
             _add_run_arguments(sub)
+        elif name in _BATCH_COMMANDS:
+            _add_batch_arguments(name, sub)
     return parser
 
 
@@ -350,10 +395,11 @@ def main(argv: list[str] | None = None) -> int:
     matching EXIT_CONTRACT).
     """
     parser = _build_parser()
-    # The placeholder sub-commands take no real arguments yet, so we absorb
-    # (and ignore) their trailing tokens with ``parse_known_args`` — this keeps
-    # e.g. ``cv-infra submit x.yaml`` on the honest "not implemented (3)" path.
-    # ``run`` parses its real schema and treats leftovers as usage errors (2).
+    # The placeholder sub-commands (report/selftest) take no real arguments
+    # yet, so we absorb (and ignore) their trailing tokens with
+    # ``parse_known_args`` — this keeps e.g. ``cv-infra report x`` on the
+    # honest "not implemented (3)" path. Implemented commands parse their real
+    # schema and treat leftovers as usage errors (2).
     args, extra = parser.parse_known_args(argv)
 
     if args.command is None:
@@ -362,14 +408,33 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return EXIT_CONTRACT
 
-    if args.command == "run":
+    if args.command == "run" or args.command in _BATCH_COMMANDS:
         if extra:
             print(
-                f"cv-infra run: unrecognized argument(s): {' '.join(extra)}",
+                f"cv-infra {args.command}: unrecognized argument(s): {' '.join(extra)}",
                 file=sys.stderr,
             )
             return EXIT_CONTRACT
+
+    if args.command == "run":
         return _cmd_run(args)
+
+    if args.command in _BATCH_COMMANDS:
+        try:
+            # Lazy import (mirrors the supervisor idiom above): the batch
+            # surface pulls httpx + the M3 REST module — the --help and run
+            # paths must never load them.
+            from cv_infra.cli import batch
+        except ImportError as exc:
+            print(
+                f"cv-infra {args.command}: batch surface unavailable ({_one_line(exc)}) — "
+                "platform build incomplete; this is an infrastructure error, "
+                "not a SUT verdict",
+                file=sys.stderr,
+            )
+            return EXIT_INFRA
+        dispatch = {"submit": batch.cmd_submit, "status": batch.cmd_status, "wait": batch.cmd_wait}
+        return dispatch[args.command](args)
 
     # Reserved surface: not wired yet. Report as an infrastructure / not-ready
     # condition (3), never as a SUT FAIL (1) — see the 1-vs-3 rationale in the
