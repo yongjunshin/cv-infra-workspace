@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from cv_infra.orchestrator.fake_runner import FakeRunner
-from cv_infra.orchestrator.fanout import fan_out
+from cv_infra.orchestrator.fanout import fan_out, fan_out_requests
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import IllegalTransitionError, Scheduler, transition
@@ -41,6 +41,31 @@ def test_fanout_single_request_repeats1_is_minimal_path():
 def test_fanout_rejects_repeats_below_one():
     with pytest.raises(ValueError):
         fan_out(["req"], repeats=0)
+
+
+def test_fanout_requests_expands_per_request_repeats():
+    # p4c2 generalization: repeats is a PER-REQUEST axis — total = Σ_i repeats(i).
+    jobs = fan_out_requests([("req-a", 1), ("req-b", 3), ("req-c", 2)])
+    assert len(jobs) == 6
+    keys = {(j.request_id, j.repeat_index) for j in jobs}
+    assert len(keys) == 6  # (request_id, repeat_index) unique
+    assert sorted(j.repeat_index for j in jobs if j.request_id == "req-b") == [0, 1, 2]
+    assert all(j.state is JobState.QUEUED and j.attempt_count == 0 for j in jobs)
+
+
+def test_fanout_uniform_path_delegates_to_general_form():
+    uniform = fan_out(["req-a", "req-b"], repeats=2)
+    general = fan_out_requests([("req-a", 2), ("req-b", 2)])
+    assert [(j.request_id, j.repeat_index) for j in uniform] == [
+        (j.request_id, j.repeat_index) for j in general
+    ]
+
+
+def test_fanout_requests_rejects_bad_repeats_and_duplicate_ids():
+    with pytest.raises(ValueError):
+        fan_out_requests([("req-a", 1), ("req-b", 0)])
+    with pytest.raises(ValueError):  # dup ids would silently merge on the store key
+        fan_out_requests([("req-a", 1), ("req-a", 2)])
 
 
 # ---------------------------------------------------------------------------

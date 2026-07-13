@@ -72,6 +72,16 @@ class DomainIdAllocator:
     out twice. Deterministic preference + probing comes from
     ``allocate_ros_domain_id`` — the same job id gets the same id back when the
     space is free, which keeps parallel runs reproducible.
+
+    Allocation unit = one ATTEMPT, not one job lifetime (p4c1 follow-up ⑤
+    pinned, PM 룰링 cycle-plan 2026-07-13): the supervisor allocates at
+    admission and releases when the attempt terminates, so a retried job
+    releases its id and RE-allocates on the next attempt (deterministic
+    preference usually hands the same id back, but that is a convenience, not
+    a hold). Rationale: isolation only matters while containers are live —
+    holding an id across the re-queue wait would shrink the 0..101 space for
+    no isolation gain. Between attempts the job holds NO live id
+    (``in_use()`` excludes it).
     """
 
     def __init__(self, store: Store) -> None:

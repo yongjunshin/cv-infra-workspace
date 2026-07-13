@@ -104,8 +104,11 @@ def compute_k(
     * ``render_cap`` is an independent cap TERM, not an arithmetic division
       (M3 §3.4 D-O) — optional until the Phase-4 throughput curve fixes it.
 
-    Returns 0 when the VRAM guard leaves no capacity (admission stays closed —
-    the caller decides how to surface it).
+    k < 1 (the VRAM guard leaves no capacity — the only term that can floor to
+    zero) is a LOUD config error, never a silent 0: SlotAccountant/Scheduler
+    require k >= 1, so a returned 0 would either crash later without context or
+    park admission forever with no operator signal (p4c1 follow-up ①, PM 룰링
+    cycle-plan 2026-07-13 — 대기-무한 침묵 금지).
     """
     if max_concurrent < 1:
         raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
@@ -121,7 +124,15 @@ def compute_k(
 
     k = max_concurrent
     if vram_gauge is not None and vram_per_instance_mb is not None:
-        k = min(k, int(vram_gauge.available_vram_mb() // vram_per_instance_mb))
+        available_mb = vram_gauge.available_vram_mb()
+        k = min(k, int(available_mb // vram_per_instance_mb))
+        if k < 1:
+            raise ValueError(
+                f"computed k = 0: available VRAM {available_mb:.0f} MiB cannot fit one"
+                f" instance of {vram_per_instance_mb:.0f} MiB — operator misconfiguration"
+                " (free GPU memory or correct vram_per_instance to the Phase-2/4 measured"
+                " value); refusing to park admission silently"
+            )
     if render_cap is not None:
         k = min(k, render_cap)
     return k

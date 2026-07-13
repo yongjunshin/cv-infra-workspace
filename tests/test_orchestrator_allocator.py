@@ -70,6 +70,21 @@ def test_release_frees_id_for_reuse_and_restores_determinism(store):
     assert allocator.allocate("job-a") == first  # deterministic preference restored
 
 
+def test_domain_id_allocation_unit_is_one_attempt(store):
+    # p4c1 follow-up ⑤ pinned (allocator docstring): allocate at admission,
+    # release at attempt end — a RETRY releases then re-allocates; between
+    # attempts the job holds NO live id. (The supervisor-level retry walk is
+    # test_timeout_retry_reclaims_slot_and_domain_then_recovers.)
+    allocator = DomainIdAllocator(store)
+    attempt1 = allocator.allocate("job-a")  # attempt 1 admission
+    allocator.release("job-a")  # attempt 1 terminated (timeout/fail)
+    assert allocator.in_use() == {}  # nothing held while re-queued
+    attempt2 = allocator.allocate("job-a")  # attempt 2 re-allocates (fresh row)
+    assert attempt2 == attempt1  # deterministic preference — convenience, not a hold
+    allocator.release("job-a")
+    assert allocator.in_use() == {}
+
+
 def test_same_preferred_id_probes_past_live_allocation(store):
     allocator = DomainIdAllocator(store)
     first = allocator.allocate("job-a")
