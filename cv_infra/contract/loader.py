@@ -21,8 +21,9 @@ remembered on the exception, so those re-renders keep line/col on EVERY
 violation, not just the first — p3c3).
 
 Inputs are a file path or an open text stream — nothing else (no URL, no
-inline-string convenience). Envelope (N>=1) loading is a later-cycle consumer
-surface; this loader admits ONE request document (the Phase-2/3 CLI unit).
+inline-string convenience). This loader admits ONE request document; the
+user-facing RequestEnvelope (N>=1 scenario file references) is envelope.py's,
+built ON this gate (D-2 p4c3).
 
 Host/control-plane module: imports pydantic + yaml freely (the runner image
 never imports the loader — D-C/R20).
@@ -63,7 +64,10 @@ class AdmittedRequest:
 
 
 def load_request(
-    source: str | Path | io.TextIOBase, *, source_path: str | None = None
+    source: str | Path | io.TextIOBase,
+    *,
+    source_path: str | None = None,
+    plugin_dir: str | None = None,
 ) -> AdmittedRequest:
     """Run one YAML request document through the 6-stage gate.
 
@@ -72,6 +76,11 @@ def load_request(
         source_path: consumer-repo-relative path recorded into errors/annotations
             (defaults to the file path when ``source`` is one; M8 owns the
             host->checkout path translation, D-L).
+        plugin_dir: explicit stage-5 custom-oracle anchor directory (p4c3).
+            When given it is used for scenario-adjacent ``module:Class``
+            resolution even for STREAM sources (envelope.py / M3 api.py pass
+            the scenario file's parent dir); when omitted, a file source keeps
+            the existing parent-dir auto-anchor unchanged.
 
     Returns:
         ``AdmittedRequest`` — admitted, executable, with bound oracle names.
@@ -122,9 +131,14 @@ def load_request(
     # (5) oracle load + bind (REQ-INTAKE-007/008) ---------------------------- #
     # D-1(a) submission plane (decision 2026-07-11 §D-1 wiring item 1):
     # scenario-adjacent custom oracle modules ("module:Class" next to the YAML)
-    # resolve while binding — the scenario's directory joins sys.path for
-    # stage 5 ONLY, try/finally-restored. Stream sources have no directory.
-    plugin_dir = str(Path(source).parent.resolve()) if isinstance(source, (str, Path)) else None
+    # resolve while binding — the anchor directory joins sys.path for stage 5
+    # ONLY, try/finally-restored. An explicit ``plugin_dir`` wins (stream
+    # submissions carry their anchor, p4c3); otherwise a file source anchors
+    # its parent dir, and anchor-less streams stay anchor-less.
+    if plugin_dir is not None:
+        plugin_dir = str(Path(plugin_dir).resolve())
+    elif isinstance(source, (str, Path)):
+        plugin_dir = str(Path(source).parent.resolve())
     bound: list[str] = []
     if plugin_dir is not None:
         sys.path.insert(0, plugin_dir)
