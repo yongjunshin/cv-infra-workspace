@@ -22,6 +22,11 @@ dependencies = [
     # ~/cv-infra-p2-out/p3c1/probe/bundled-pydantic.txt) — the host pin matches
     # it so contract validation semantics/error prose never skew across planes.
     "pydantic==2.11.7",
+    # M3 scheduler NVML 2nd guard (REQ-ORCH-005, LOCKED §7.4) — lazy-imported
+    # inside PynvmlVramGauge so GPU-free hosts import cleanly. Control plane
+    # runs in the host venv only (no kit-bundle alignment concern, G-27);
+    # pinned to the current PyPI stable (2026-06-01 release).
+    "nvidia-ml-py==13.610.43",
 ]
 
 # Console script (cross-team contract — verbatim pin, do not change).
