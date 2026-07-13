@@ -39,13 +39,15 @@ Seams (G-17 — M1 T1 lands ``contract/envelope.py`` in parallel)
 * ``_load_envelope`` is the ONE adapter around the M1 envelope loader; nothing
   else in this module touches ``cv_infra.contract.envelope``. Client-side
   pre-validation failure = the M1 friendly prose on stderr + exit 2, and the
-  server is NEVER called. Tests monkeypatch this seam with verbatim-shaped
-  stubs; the real-loader round-trip is measured at the PM merge gate.
-* ``_wire_body`` builds the wire-v2 POST body ``{"requests": [<raw_doc>...]}``.
-  The ``oracle_plugin_dirs`` sibling field (equal length, absolute dirs) is
-  CODE-READY behind ``_INCLUDE_ORACLE_PLUGIN_DIRS`` but stays OFF the wire
-  until the M3 server-side acceptance lands (Wave 2 — PM flips the flag at
-  that merge gate).
+  server is NEVER called. Unit tests monkeypatch this seam with
+  verbatim-shaped stubs; the real-loader round-trip is covered by the E2E
+  tests in ``tests/test_cli_batch.py`` (Wave-2 integration).
+* ``_wire_body`` builds the wire-v2 POST body ``{"requests": [<raw_doc>...],
+  "oracle_plugin_dirs": [...]}``. The anchor field (equal length; each item =
+  the scenario file's parent dir, absolute — the stage-5 custom-oracle
+  anchor, same-host trusted path per api.py) is ON since the M3 server
+  acceptance landed (Wave 2); ``_INCLUDE_ORACLE_PLUGIN_DIRS`` stays as the
+  explicit escape hatch.
 * ``_make_client`` builds the httpx ``AsyncClient`` (tests inject an
   ``ASGITransport`` over the real FastAPI app here). The command bodies are
   async for exactly this reason; each command is one ``asyncio.run``.
@@ -84,11 +86,12 @@ _API_ENV = "CV_INFRA_API"
 #: minutes (M3 §7 async submission), so a 1s poll is generous, not chatty.
 _POLL_INTERVAL_S = 1.0
 
-#: Wire v2 prepared field (task pin 2026-07-13): ``oracle_plugin_dirs`` rides
-#: the POST body equal-length with ``requests`` once the M3 server accepts it
-#: (Wave 2). OFF by default — the current server ignores unknown wrapper keys,
-#: but the contract stays explicit until both sides speak it.
-_INCLUDE_ORACLE_PLUGIN_DIRS = False
+#: Wire v2 anchor field: ``oracle_plugin_dirs`` rides the POST body
+#: equal-length with ``requests`` (scenario parent dirs — stage-5 custom
+#: oracle anchors, same-host trusted paths per api.py). ON since the M3
+#: server-side acceptance landed (Wave 2 merge, cycle p4-batch-cli); the gate
+#: stays as an explicit escape hatch (both states unit-pinned).
+_INCLUDE_ORACLE_PLUGIN_DIRS = True
 
 #: ``report_outcome`` literal -> exit code. THE M8 single source (D-I) —
 #: literals imported from ``cv_infra.orchestrator.api`` (재정의 금지), exit
@@ -126,9 +129,10 @@ def _load_envelope(source: str) -> Any:
                          oracle_plugin_dir: str)
         load_envelope(source: str | Path) -> LoadedEnvelope   # 실패 = ContractError
 
-    Lazy import: ``cv_infra.contract.envelope`` lands in the parallel M1
-    branch — tests stub THIS function, and the real round-trip is measured at
-    the PM merge gate.
+    Lazy import (keeps pydantic/yaml off the non-batch CLI paths). Unit tests
+    stub THIS function; the real-loader round-trip is exercised end-to-end in
+    ``tests/test_cli_batch.py`` (Wave-2 integration: real ``load_envelope`` ->
+    wire v2 -> real server admit).
     """
     from cv_infra.contract.envelope import load_envelope
 
@@ -147,8 +151,8 @@ def _resolve_api(flag_value: str | None) -> str:
 
 def _wire_body(envelope: Any) -> dict[str, Any]:
     """LoadedEnvelope -> wire-v2 POST body (raw docs verbatim, D-1 internal
-    representation). ``oracle_plugin_dirs`` is prepared but gated (see the
-    module constant) — when included it is equal-length with ``requests``."""
+    representation). ``oracle_plugin_dirs`` (equal-length stage-5 anchors) is
+    emitted by default — see the module gate ``_INCLUDE_ORACLE_PLUGIN_DIRS``."""
     body: dict[str, Any] = {"requests": [ref.raw_doc for ref in envelope.requests]}
     if _INCLUDE_ORACLE_PLUGIN_DIRS:
         body["oracle_plugin_dirs"] = [ref.oracle_plugin_dir for ref in envelope.requests]

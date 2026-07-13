@@ -3,12 +3,12 @@
 The REAL M3 FastAPI app (``orchestrator.api.create_app`` + fake runners) is
 wired straight into the CLI through httpx ``ASGITransport`` injected at the
 ``batch._make_client`` seam — no sockets, no uvicorn. The M1 envelope loader
-is NOT consumed here (G-17: T1 lands ``contract/envelope.py`` in parallel):
-the ``batch._load_envelope`` adapter is monkeypatched with verbatim-shaped
-stubs (``LoadedEnvelope``/``LoadedRequestRef``, task data contract); the
-real-loader round-trip is the PM merge gate's measurement. Submissions ride
-the wire-v2 OMISSION path (no ``oracle_plugin_dirs`` — server acceptance is
-Wave 2); the prepared field is unit-pinned separately.
+is consumed two ways (G-17 close-out, Wave-2 integration): most tests
+monkeypatch the ``batch._load_envelope`` adapter with verbatim-shaped stubs
+(``LoadedEnvelope``/``LoadedRequestRef`` — unit isolation kept), while the
+E2E section (7) drives the REAL ``contract.envelope.load_envelope`` from an
+envelope YAML on disk through wire v2 (``oracle_plugin_dirs`` emitted — the
+M3 server acceptance landed with Wave 2) into the real server admit gate.
 
 Loop-lifetime note (why the timeout case uses a purpose-built app): the app's
 envelope drive task lives on the event loop of the CLI invocation that
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -98,6 +99,21 @@ class SpyASGITransport(httpx.ASGITransport):
         return await super().handle_async_request(request)
 
 
+def _wire_transport(
+    monkeypatch: pytest.MonkeyPatch, app, *, spy: SpyASGITransport | None = None
+) -> SpyASGITransport:
+    """Wire ONLY the HTTP seam: real app over a spying ASGITransport + fast
+    polls. The envelope adapter stays REAL (E2E section 7)."""
+    spy = spy if spy is not None else SpyASGITransport(app)
+    monkeypatch.setattr(
+        batch,
+        "_make_client",
+        lambda api_base: httpx.AsyncClient(transport=spy, base_url="http://cv-infra.test"),
+    )
+    monkeypatch.setattr(batch, "_POLL_INTERVAL_S", 0.01)
+    return spy
+
+
 def _wire_cli(
     monkeypatch: pytest.MonkeyPatch,
     app,
@@ -105,8 +121,8 @@ def _wire_cli(
     docs: list[dict] | None = None,
     load_error: ContractError | None = None,
 ) -> SpyASGITransport:
-    """Wire the CLI seams: stub envelope adapter + ASGI transport + fast polls."""
-    spy = SpyASGITransport(app)
+    """``_wire_transport`` + the STUBBED envelope adapter (unit isolation)."""
+    spy = _wire_transport(monkeypatch, app)
 
     def fake_load(source):
         if load_error is not None:
@@ -115,12 +131,6 @@ def _wire_cli(
         return _stub_envelope(docs)
 
     monkeypatch.setattr(batch, "_load_envelope", fake_load)
-    monkeypatch.setattr(
-        batch,
-        "_make_client",
-        lambda api_base: httpx.AsyncClient(transport=spy, base_url="http://cv-infra.test"),
-    )
-    monkeypatch.setattr(batch, "_POLL_INTERVAL_S", 0.01)
     return spy
 
 
@@ -169,12 +179,16 @@ def test_submit_wait_roundtrip_maps_terminal_outcome_to_exit(
         assert out_lines[0].startswith("env-")  # bare envelope_id first (scriptable)
         assert f"report_outcome={expected_outcome}" in out_lines[-1]
 
-        # Wire-v2 pin, OMISSION path: raw docs verbatim, and NO
-        # oracle_plugin_dirs key until the M3 server acceptance lands (Wave 2).
+        # Wire-v2 pin: raw docs verbatim + equal-length oracle_plugin_dirs
+        # (stub anchors — emitted since the Wave-2 server acceptance).
         (post,) = [r for r in spy.requests if r.method == "POST"]
         body = json.loads(post.content)
-        assert set(body) == {"requests"}
+        assert set(body) == {"requests", "oracle_plugin_dirs"}
         assert body["requests"] == docs
+        assert body["oracle_plugin_dirs"] == [
+            "/abs/consumer/scenarios0",
+            "/abs/consumer/scenarios1",
+        ]
 
 
 def test_standalone_wait_returns_the_terminal_verdict_exit(
@@ -342,7 +356,7 @@ def test_server_422_rerejection_renders_friendly_prose(
 
 
 # --------------------------------------------------------------------------- #
-# (6) infra reachability + pure units (mapping single source, wire prep, --api)
+# (6) infra reachability + pure units (mapping single source, wire gate, --api)
 # --------------------------------------------------------------------------- #
 
 
@@ -381,17 +395,17 @@ def test_report_outcome_exit_mapping_is_the_single_source():
     assert batch.exit_code_for_report_outcome(None) == EXIT_INFRA
 
 
-def test_wire_body_prepares_oracle_plugin_dirs_equal_length(monkeypatch):
-    """Wave-2 prepared path (code-only this cycle): flipping the module gate
-    adds ``oracle_plugin_dirs`` equal-length with ``requests``; the default
-    stays the omission path (server acceptance = M3 T3)."""
+def test_wire_body_emits_oracle_plugin_dirs_equal_length(monkeypatch):
+    """Wire v2 (Wave-2 flip): the anchor field rides by DEFAULT, equal-length
+    with ``requests``; the module gate stays as an explicit escape hatch."""
     envelope = _stub_envelope([_request_doc(), _request_doc()])
-    assert set(batch._wire_body(envelope)) == {"requests"}  # default: omitted
-
-    monkeypatch.setattr(batch, "_INCLUDE_ORACLE_PLUGIN_DIRS", True)
     body = batch._wire_body(envelope)
+    assert set(body) == {"requests", "oracle_plugin_dirs"}
     assert body["oracle_plugin_dirs"] == ["/abs/consumer/scenarios0", "/abs/consumer/scenarios1"]
     assert len(body["oracle_plugin_dirs"]) == len(body["requests"])  # 등길이 (wire v2)
+
+    monkeypatch.setattr(batch, "_INCLUDE_ORACLE_PLUGIN_DIRS", False)
+    assert set(batch._wire_body(envelope)) == {"requests"}  # escape hatch: omission path
 
 
 def test_api_base_resolution_flag_env_default(monkeypatch):
@@ -400,3 +414,134 @@ def test_api_base_resolution_flag_env_default(monkeypatch):
     monkeypatch.setenv("CV_INFRA_API", "http://gpu-box:8000")
     assert batch._resolve_api(None) == "http://gpu-box:8000"
     assert batch._resolve_api("http://flag:9") == "http://flag:9"  # flag outranks env
+
+
+# --------------------------------------------------------------------------- #
+# (7) Wave-2 E2E: REAL load_envelope -> wire v2 -> REAL server admit (no stubs)
+# --------------------------------------------------------------------------- #
+
+
+def _write_envelope_tree(
+    tmp_path: Path, scenario_texts: dict[str, str], envelope_text: str
+) -> Path:
+    """tmp layout mirroring the consumer shape: batch.yaml + scenarios/ beside it."""
+    scenarios = tmp_path / "scenarios"
+    scenarios.mkdir(exist_ok=True)
+    for name, text in scenario_texts.items():
+        (scenarios / name).write_text(text, encoding="utf-8")
+    envelope = tmp_path / "batch.yaml"
+    envelope.write_text(envelope_text, encoding="utf-8")
+    return envelope
+
+
+def test_e2e_real_envelope_submit_wait_roundtrip_pass(monkeypatch, tmp_path, capsys):
+    """No adapter stub: envelope YAML (file refs + repeats override) -> REAL
+    ``contract.envelope.load_envelope`` -> wire v2 (anchors = scenario parent
+    dirs) -> REAL server admit -> fan-out -> terminal exit 0 (M8-D11의 실
+    라운드트립 관찰 형태)."""
+    fixture_text = _FIXTURE.read_text(encoding="utf-8")
+    envelope = _write_envelope_tree(
+        tmp_path,
+        {"goal_a.yaml": fixture_text, "goal_b.yaml": fixture_text},
+        "apiVersion: cv-infra/v1\n"
+        "requests:\n"
+        "  - scenario: scenarios/goal_a.yaml\n"
+        "    repeats: 2\n"
+        "  - scenario: scenarios/goal_b.yaml\n",
+    )
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(), k=2)
+        spy = _wire_transport(monkeypatch, app)  # _load_envelope stays REAL
+
+        assert main(["submit", str(envelope), "--wait"]) == EXIT_PASS
+        out_lines = capsys.readouterr().out.strip().splitlines()
+        envelope_id = out_lines[0]
+        assert envelope_id.startswith("env-")
+        assert "report_outcome=pass" in out_lines[-1]
+
+        # Real-loader wire: verbatim scenario docs, the envelope ``repeats``
+        # override applied to raw_doc, REAL parent-dir anchors (equal length).
+        (post,) = [r for r in spy.requests if r.method == "POST"]
+        body = json.loads(post.content)
+        assert set(body) == {"requests", "oracle_plugin_dirs"}
+        assert body["requests"][0]["execution_settings"]["repeats"] == 2
+        assert "execution_settings" not in body["requests"][1]  # no override -> doc untouched
+        anchor = str((tmp_path / "scenarios").resolve())
+        assert body["oracle_plugin_dirs"] == [anchor, anchor]
+
+        # The override drove the REAL fan-out: 2 + 1 jobs.
+        assert main(["status", envelope_id]) == EXIT_PASS
+        status_body = json.loads(capsys.readouterr().out)
+        assert len(status_body["jobs"]) == 3
+
+
+_E2E_ORACLE_MODULE = "p4c3_cli_e2e_oracle"
+
+#: Consumer-authored custom oracle module (the ``tests/oracle_plugin_fixture``
+#: CustomOracle shape) — written NEXT TO the scenario YAML, the D-1(a)
+#: scenario-adjacent ``module:Class`` submission-plane form.
+_E2E_ORACLE_SRC = """\
+from cv_infra.oracles.base import OracleBase
+
+
+class CliE2EOracle(OracleBase):
+    name = "cli_e2e_fixture"
+    version = "0.0.1"
+
+    def validate_params(self, criteria):
+        return None
+
+    def evaluate(self, telemetry, criteria):
+        return {"passed": True}
+"""
+
+
+class ProcessBoundaryTransport(SpyASGITransport):
+    """SpyASGITransport that drops the custom-oracle module from
+    ``sys.modules`` before every server-side request.
+
+    In production the orchestrator is a separate process with its OWN import
+    cache; in-process ASGI wiring would otherwise let the server's stage-5
+    bind silently reuse the module the CLIENT-side ``load_envelope`` already
+    imported — the "server re-admits via the wire anchor" claim would be
+    vacuous (G-28: model the external boundary as it really is).
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        sys.modules.pop(_E2E_ORACLE_MODULE, None)
+        return await super().handle_async_request(request)
+
+
+def test_e2e_custom_oracle_anchor_rides_wire_and_readmits(monkeypatch, tmp_path, capsys):
+    """Scenario-adjacent ``module:Class`` oracle: REAL ``load_envelope``
+    anchors the scenario's parent dir (client-side stage-5 bind), the anchor
+    rides ``oracle_plugin_dirs``, and the REAL server re-admits through it
+    (fresh import per request — ProcessBoundaryTransport) -> terminal exit 0.
+    A broken anchor plumbing would surface as a server 422 -> exit 2 here."""
+    doc = _request_doc()
+    doc["acceptance_criteria"].append(
+        {"oracle": f"{_E2E_ORACLE_MODULE}:CliE2EOracle", "params": {"anything": "goes"}}
+    )
+    envelope = _write_envelope_tree(
+        tmp_path,
+        {"custom.yaml": yaml.safe_dump(doc)},
+        "apiVersion: cv-infra/v1\nrequests:\n  - scenario: scenarios/custom.yaml\n",
+    )
+    (tmp_path / "scenarios" / f"{_E2E_ORACLE_MODULE}.py").write_text(
+        _E2E_ORACLE_SRC, encoding="utf-8"
+    )
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(), k=1)
+        spy = _wire_transport(monkeypatch, app, spy=ProcessBoundaryTransport(app))
+        try:
+            rc = main(["submit", str(envelope), "--wait"])
+        finally:
+            sys.modules.pop(_E2E_ORACLE_MODULE, None)  # no import residue (G-29 정신)
+
+        out_lines = capsys.readouterr().out.strip().splitlines()
+        assert rc == EXIT_PASS
+        assert "report_outcome=pass" in out_lines[-1]
+        (post,) = [r for r in spy.requests if r.method == "POST"]
+        body = json.loads(post.content)
+        anchor = str((tmp_path / "scenarios").resolve())
+        assert body["oracle_plugin_dirs"] == [anchor]  # the anchor the server bound with
