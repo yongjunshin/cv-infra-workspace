@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 
 class JobState(StrEnum):
@@ -51,6 +52,14 @@ class Job:
     to ``run_job(oracle_plugin_dir=...)`` — None = no anchor (entry-point oracles only). It is
     request-level data denormalized onto the job (the job spec is self-contained) and is
     persisted with the job (REQ-ORCH-011) so a restored/retried job keeps its anchor.
+
+    ``job_spec`` (p4c4 REST->runner glue, T1 report §7-1 (a)): the canonical per-job JOB_SPEC
+    dict (frozen P2 M3->M2 seam shape incl. its OWN ``job_id`` = ``store.job_key``) that the
+    api submit path materializes from the ADMITTED M1 model (``api._job_spec_for``) onto every
+    fanned-out job — same denormalization rationale as the anchor above: the job is
+    self-contained, so the production runner seam (``supervisor.RunJobRunner``) drives
+    ``run_job(job_spec, ...)`` without re-admitting, and a restored/retried job keeps its
+    spec (persisted, REQ-ORCH-011). None = CPU-skeleton jobs driven by fake runners only.
     """
 
     request_id: str
@@ -58,6 +67,7 @@ class Job:
     state: JobState = JobState.QUEUED
     attempt_count: int = 0
     oracle_plugin_dir: str | None = None
+    job_spec: dict[str, Any] | None = None
 
 
 @dataclass

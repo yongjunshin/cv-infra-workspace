@@ -3,10 +3,11 @@
 CPU-only: state-machine home move (queue.py, re-exported from scheduler), the
 retry policy (attempt_count++ / re-queue within max_attempts), SQLite(WAL)
 persistence of every transition, and restart restore through a FRESH Store
-object on the same file (DoD-P4-07 CPU 선행). p4c4 additions: schema-v2
-versioning + v1 in-place upgrade, the envelope->request registry and
-request-rollup persistence (api.py 유실 해소), and the job-riding stage-5
-anchor column.
+object on the same file (DoD-P4-07 CPU 선행). p4c4 additions: schema
+versioning + v1/v2 in-place upgrades (current stamp v3 — jobs.job_spec, the
+p4c4 REST glue), the envelope->request registry and request-rollup persistence
+(api.py 유실 해소), and the job-riding stage-5 anchor / canonical job_spec
+columns.
 """
 
 from __future__ import annotations
@@ -230,7 +231,7 @@ def test_release_all_domain_ids_clears_and_counts(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# (e) schema v2: user_version stamp + v1 file upgrades in place (p4c4 방침)
+# (e) schema versioning: user_version stamp + v1/v2 files upgrade in place
 # --------------------------------------------------------------------------- #
 
 # The EXACT v1 schema as shipped by p4c1 (store.py @ 1fcbc85) — a legacy file
@@ -241,6 +242,23 @@ CREATE TABLE IF NOT EXISTS jobs (
     repeat_index  INTEGER NOT NULL,
     state         TEXT    NOT NULL,
     attempt_count INTEGER NOT NULL,
+    PRIMARY KEY (request_id, repeat_index)
+);
+CREATE TABLE IF NOT EXISTS ros_domain_ids (
+    domain_id INTEGER PRIMARY KEY,
+    job_id    TEXT NOT NULL UNIQUE
+);
+"""
+
+# The EXACT v2 jobs shape as shipped by p4c4 T1 (store.py @ b0dc1f6) — v2 files
+# carry oracle_plugin_dir but predate job_spec (same anchoring discipline).
+_V2_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    request_id        TEXT    NOT NULL,
+    repeat_index      INTEGER NOT NULL,
+    state             TEXT    NOT NULL,
+    attempt_count     INTEGER NOT NULL,
+    oracle_plugin_dir TEXT,
     PRIMARY KEY (request_id, repeat_index)
 );
 CREATE TABLE IF NOT EXISTS ros_domain_ids (
@@ -263,21 +281,50 @@ def _make_v1_file(db):
         legacy.close()
 
 
+def _stamped_version(db) -> int:
+    external = sqlite3.connect(str(db))
+    try:
+        return external.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        external.close()
+
+
 def test_v1_file_upgrades_in_place_and_keeps_rows(tmp_path):
     db = tmp_path / "cv.sqlite3"
     _make_v1_file(db)
-    with Store(db) as store:  # opening upgrades: adds the column + new tables + stamp
+    with Store(db) as store:  # opening upgrades: adds the columns + new tables + stamp
         (job,) = store.load_jobs()
         assert job.request_id == "old-req"
         assert job.state is JobState.COMPLETED
         assert job.oracle_plugin_dir is None  # v1 rows read back with a NULL anchor
+        assert job.job_spec is None  # ... and a NULL spec (v3 column, p4c4 glue)
         store.record_envelope("env-1", ["r0"])  # new tables exist and accept writes
         assert store.load_envelope("env-1") is not None
-    external = sqlite3.connect(str(db))
+    assert _stamped_version(db) == 3
+
+
+def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
+    # A p4c4-T1 file (anchor column, no job_spec) opens, gains the v3 column in
+    # place and keeps its rows — same additive 방침 as the v1 path.
+    db = tmp_path / "cv.sqlite3"
+    legacy = sqlite3.connect(str(db))
     try:
-        assert external.execute("PRAGMA user_version").fetchone()[0] == 2
+        legacy.executescript(_V2_JOBS_SCHEMA)
+        legacy.execute(
+            "INSERT INTO jobs (request_id, repeat_index, state, attempt_count,"
+            " oracle_plugin_dir) VALUES ('v2-req', 0, 'completed', 1, '/abs/anchor')"
+        )
+        legacy.execute("PRAGMA user_version = 2")
+        legacy.commit()
     finally:
-        external.close()
+        legacy.close()
+    with Store(db) as store:
+        (job,) = store.load_jobs()
+        assert job.oracle_plugin_dir == "/abs/anchor"  # v2 data survives verbatim
+        assert job.job_spec is None
+        job.job_spec = {"job_id": "v2-req:0", "sut_image_ref": "img:1"}
+        store.upsert_job(job)  # the new column accepts writes
+    assert _stamped_version(db) == 3
 
 
 def test_newer_schema_version_refuses_loudly(tmp_path):
@@ -302,6 +349,29 @@ def test_job_oracle_plugin_dir_roundtrips_via_fresh_store(tmp_path):
     with Store(db) as reopened:
         by_key = {job_key(j): j for j in reopened.load_jobs()}
         assert by_key["req-a:0"].oracle_plugin_dir == "/abs/scenario-dir"
+
+
+def test_job_spec_roundtrips_via_fresh_store(tmp_path):
+    # p4c4 glue (재기동 대비 영속): the canonical JOB_SPEC dict rides the job
+    # row as JSON and restores IDENTICAL through a fresh Store; spec-less jobs
+    # stay None (CPU-skeleton compatibility).
+    db = tmp_path / "cv.sqlite3"
+    specced, plain = fan_out(["req-a", "req-b"], repeats=1)
+    spec = {
+        "job_id": "req-a:0",
+        "scenario": {"scene_ref": "s.usd", "mission": {"nested": [1, 2]}},
+        "sut_image_ref": "ghcr.io/x/sut@sha256:abc",
+        "interface": {"type": "ros2"},
+        "acceptance_criteria": [{"oracle": "reached_goal", "params": {"explicit_null": None}}],
+    }
+    specced.job_spec = spec
+    with Store(db) as store:
+        store.upsert_job(specced)
+        store.upsert_job(plain)
+    with Store(db) as reopened:
+        by_key = {job_key(j): j for j in reopened.load_jobs()}
+        assert by_key["req-a:0"].job_spec == spec  # deep equality incl. explicit null param
+        assert by_key["req-b:0"].job_spec is None
         assert by_key["req-b:0"].oracle_plugin_dir is None
 
 
