@@ -159,6 +159,32 @@ def test_restored_queue_resumes_only_queued_jobs_to_terminal(tmp_path):
         assert all(j.state is JobState.COMPLETED for j in final.load_jobs())
 
 
+def test_timeout_state_persists_and_restores_via_fresh_store(tmp_path):
+    # QA probe 1 promoted (p4c1 follow-up ③, scratchpad/qa-p4c1/qa_probe_gaps.py):
+    # TIMEOUT is the one M3 §3.3 state the shipped tests never persisted
+    # explicitly — pin it to SQLite (raw SQL, no Store internals) AND through a
+    # fresh Store restore, attempt_count included.
+    db = tmp_path / "cv.sqlite3"
+    (job,) = fan_out(["req"], repeats=1)
+    with Store(db) as store:
+        q = JobQueue([job], store=store, retry_on_timeout=False)
+        j = q.pop_next()
+        q.mark_running(j)
+        assert q.record_outcome(j, JobState.TIMEOUT) is False  # terminal
+    external = sqlite3.connect(str(db))
+    try:
+        assert external.execute("SELECT state, attempt_count FROM jobs").fetchone() == (
+            "timeout",
+            1,
+        )
+    finally:
+        external.close()
+    with Store(db) as reopened:
+        (restored,) = reopened.load_jobs()
+        assert restored.state is JobState.TIMEOUT
+        assert restored.attempt_count == 1
+
+
 def test_restore_leaves_running_orphans_for_reconciliation(tmp_path):
     # A job persisted RUNNING (orchestrator died mid-flight) must NOT be
     # silently re-queued — docker-label reconciliation owns it (M3 §3.9, R14).

@@ -155,6 +155,50 @@ def test_timeout_marks_only_the_runaway_job_and_others_complete():
     assert slots.acquired_total == slots.released_total  # timeout still reclaims
 
 
+def test_timeout_retry_reclaims_slot_and_domain_then_recovers(tmp_path):
+    # QA probe 2 promoted (p4c1 follow-up ③, scratchpad/qa-p4c1/qa_probe_gaps.py):
+    # attempt 1 blocks past the watchdog (TIMEOUT) -> slot AND domain id are
+    # reclaimed -> attempt 2 recovers. Pins the retry-after-timeout path the
+    # shipped tests only covered via crash, plus the attempt-unit domain-id
+    # semantics (allocator docstring): between/after attempts nothing is held.
+    class TimeoutThenPassRunner:
+        """Attempt 1 blocks past the watchdog; attempt 2 returns immediately."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, job: Job) -> JobResult:
+            self.calls += 1
+            if self.calls == 1:
+                time.sleep(0.5)
+            return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+    db = tmp_path / "cv.sqlite3"
+    (job,) = fan_out(["req"], repeats=1)
+    with Store(db) as store:
+        allocator = DomainIdAllocator(store)
+        (result,), sup, _, slots = run_supervisor(
+            [job],
+            TimeoutThenPassRunner(),
+            k=1,
+            store=store,
+            max_attempts=2,
+            allocator=allocator,
+            job_timeout_s=0.1,
+        )
+        assert result.state is JobState.COMPLETED, result
+        assert job.attempt_count == 2
+        assert slots.acquired_total == slots.released_total == 2  # one slot per attempt
+        assert slots.over_launch_count == 0
+        assert allocator.in_use() == {}  # domain id reclaimed after each attempt
+        key = job_key(job)
+        assert sup.events == [("start", key), ("end", key), ("start", key), ("end", key)]
+    with Store(db) as reopened:  # recovery is persisted too
+        (persisted,) = reopened.load_jobs()
+        assert persisted.state is JobState.COMPLETED
+        assert persisted.attempt_count == 2
+
+
 # --------------------------------------------------------------------------- #
 # (d) crash -> failed -> retry linkage (REQ-ORCH-010, NFR-EXEC-004 받침 —
 #     DoD-P4-07/11 CPU 선행)

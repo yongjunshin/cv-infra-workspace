@@ -59,9 +59,17 @@ def test_k_is_min_of_all_three_terms():
     )
 
 
-def test_insufficient_vram_yields_zero_capacity():
-    # Guard leaves no room -> 0 (admission stays closed); never negative.
-    assert compute_k(4, vram_gauge=FakeGauge(1000), vram_per_instance_mb=4096) == 0
+def test_insufficient_vram_is_a_loud_config_error():
+    # p4c1 follow-up ① (PM 룰링, cycle-plan 2026-07-13): the VRAM guard leaving
+    # no capacity is an operator misconfiguration surfaced LOUDLY — a silent 0
+    # would either crash SlotAccountant later or park admission forever.
+    with pytest.raises(ValueError, match="computed k = 0"):
+        compute_k(4, vram_gauge=FakeGauge(1000), vram_per_instance_mb=4096)
+
+
+def test_vram_guard_k_of_exactly_one_is_still_valid():
+    # Boundary: one instance fits — no error, k floors to 1 (not over-loud).
+    assert compute_k(4, vram_gauge=FakeGauge(4096), vram_per_instance_mb=4096) == 1
 
 
 def test_half_configured_vram_guard_is_a_loud_config_error():
