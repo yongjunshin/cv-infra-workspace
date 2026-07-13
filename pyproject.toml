@@ -27,6 +27,13 @@ dependencies = [
     # runs in the host venv only (no kit-bundle alignment concern, G-27);
     # pinned to the current PyPI stable (2026-06-01 release).
     "nvidia-ml-py==13.610.43",
+    # M3 REST submit surface (api.py — REQ-INTAKE-001, M3 §2.1 Reuse). Host
+    # venv only (no kit-bundle alignment concern, G-27); fastapi 0.139.0
+    # declares pydantic>=2.9.0 — compatible with the bundle-aligned 2.11.7 pin
+    # above (uv lock re-checks the constraint). uvicorn is the P5 compose
+    # server; nothing in cv_infra imports it yet (resident deployment = P5).
+    "fastapi==0.139.0",
+    "uvicorn==0.51.0",
 ]
 
 # Console script (cross-team contract — verbatim pin, do not change).
@@ -50,6 +57,8 @@ dev = [
     "black==26.5.1",
     "pytest==9.1.1",
     "import-linter==2.12",
+    # starlette TestClient transport (tests/test_orchestrator_api.py) — test-only.
+    "httpx==0.28.1",
 ]
 
 [build-system]
