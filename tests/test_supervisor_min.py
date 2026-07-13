@@ -19,6 +19,7 @@ from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
     CACHE_SCRATCH_ROOT_ENV,
     JOB_SPEC_MOUNT,
+    LABEL_JOB_ID,
     ORACLE_PLUGIN_DIR_ENV,
     RESULT_OUT_MOUNT,
     ROS_DOMAIN_ID_SPACE,
@@ -41,8 +42,12 @@ def make_spec(job_id: str = JOB_ID, adapter_config: dict | None = None) -> dict:
 
 
 def put_result(tmp_path, job_id: str = JOB_ID, rel: str = "result.json"):
-    """Pre-create a result file where the runner would have written it."""
-    path = tmp_path / job_id / "result" / rel
+    """Pre-create a result file where the runner would have written it.
+
+    The host job dir is the bind-safe ``network_name_for`` slug (p4c4
+    colon-bind fix) — NOT the raw job id, which may carry ':'.
+    """
+    path = tmp_path / network_name_for(job_id) / "result" / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"job_id": job_id, "verdict": "pass"}), encoding="utf-8")
     return path
@@ -216,14 +221,79 @@ def test_job_spec_mounted_ro_and_result_dir_precreated_rw(tmp_path):
     client = FakeClient()
     run_min(tmp_path, client)
     _, runner_kwargs = client.run_calls[0]
-    spec_path = tmp_path / JOB_ID / "job_spec.json"
-    result_dir = tmp_path / JOB_ID / "result"
+    job_dir = tmp_path / network_name_for(JOB_ID)  # bind-safe slug dir (p4c4 colon fix)
+    spec_path = job_dir / "job_spec.json"
+    result_dir = job_dir / "result"
     assert runner_kwargs["volumes"][str(spec_path)] == {"bind": JOB_SPEC_MOUNT, "mode": "ro"}
     assert runner_kwargs["volumes"][str(result_dir)] == {"bind": RESULT_OUT_MOUNT, "mode": "rw"}
     assert runner_kwargs["environment"]["JOB_SPEC"] == JOB_SPEC_MOUNT  # passed BY PATH
     assert runner_kwargs["environment"]["RESULT_OUT"] == RESULT_OUT_MOUNT
     assert result_dir.is_dir()  # G-15: supervisor pre-creates the mount dir, not dockerd
     assert json.loads(spec_path.read_text(encoding="utf-8")) == make_spec()
+
+
+# --------------------------------------------------------------------------- #
+# (2b) bind-safe host paths for fan-out job ids — p4c4 colon-bind fix (룰링 A)
+# --------------------------------------------------------------------------- #
+
+# Fan-out job ids carry ':' (store.job_key "<request_id>:<repeat_index>"). The
+# docker daemon parses bind specs as colon-delimited "src:dst:mode", so a raw
+# out_dir/job_id bind SOURCE is rejected — MEASURED against the real daemon
+# (G-28 anchor): `APIError 500 ... invalid volume specification:
+# '/.../r0:0/job_spec.json:/cv/job_spec.json:ro'`, with a colon-free control
+# running fine. Evidence: workstation
+# ~/cv-infra-p2-out/p4c4/T4/L0/colon-bind-repro.txt (T4 L0, 2026-07-13).
+_FANOUT_JOB_ID = "env-75c01e93a6af/r0:0"  # the EXACT job_key shape T4 L0 observed
+
+
+def test_fanout_job_id_yields_colon_free_bind_sources(tmp_path, cache_env_clear):
+    """Full 9-mount surface (2 seam + 3 base + 3 scratch + plugin) assembled for
+    a REAL fan-out job_key: every bind SOURCE is colon-free, the job dir uses
+    the SAME slug idiom as the cache scratch (비대칭 해소), and ONLY the host
+    dir name changed — spec content / labels keep the verbatim job id."""
+    expected = put_result(tmp_path, job_id=_FANOUT_JOB_ID)
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    plugin = tmp_path / "scenario-dir"
+    plugin.mkdir()
+    client = FakeClient()
+    outcome = run_job(
+        make_spec(job_id=_FANOUT_JOB_ID),
+        tmp_path,
+        RUNNER_IMAGE,
+        SUT_IMAGE,
+        client,
+        poll_interval_s=0.0,
+        cache_root=base,
+        cache_scratch_root=scratch_root,
+        oracle_plugin_dir=str(plugin),
+    )
+    (_, runner_kwargs), _ = client.run_calls
+    sources = list(runner_kwargs["volumes"])
+    assert len(sources) == 9
+    for source in sources:
+        assert ":" not in source, f"bind source would break the 'src:dst:mode' spec: {source}"
+    job_dir = tmp_path / network_name_for(_FANOUT_JOB_ID)  # scratch와 동일 슬러그 관용구
+    assert str(job_dir / "job_spec.json") in sources
+    assert str(job_dir / "result") in sources
+    # Invariants the fix must NOT move: verbatim job id in the JOB_SPEC content,
+    # in the reconciliation label, and in the returned outcome — and the job
+    # still round-trips to the pre-seeded result.
+    assert (
+        json.loads((job_dir / "job_spec.json").read_text(encoding="utf-8"))["job_id"]
+        == _FANOUT_JOB_ID
+    )
+    assert runner_kwargs["labels"][LABEL_JOB_ID] == _FANOUT_JOB_ID
+    assert outcome == JobOutcome(_FANOUT_JOB_ID, expected, 0, None)
+
+
+def test_colon_guard_positive_control(tmp_path):
+    """변이 프로브 (G-28 ②): the PRE-FIX assembly (raw ``out_dir/job_id``) is
+    exactly the colon-carrying source the daemon rejected — so the negative
+    above is non-vacuous: reverting the slug would trip it."""
+    raw_source = str(tmp_path / _FANOUT_JOB_ID / "job_spec.json")
+    assert ":" in raw_source  # what the daemon saw in the T4 L0 repro
+    slugged = str(tmp_path / network_name_for(_FANOUT_JOB_ID) / "job_spec.json")
+    assert ":" not in slugged
 
 
 # --------------------------------------------------------------------------- #
