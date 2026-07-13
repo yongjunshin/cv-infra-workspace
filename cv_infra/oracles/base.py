@@ -45,9 +45,12 @@ class OracleBase(ABC):
     """Abstract acceptance-criteria oracle (the plugin contract).
 
     ``name``/``version`` identify the plugin; ``validate_params`` is the
-    contract-time check of the (merged) criteria view; ``evaluate`` produces
-    the verdict + metrics at evaluation time (concrete impl = M2 engine).
-    The interface is kept open to a future user-supplied checker (post-MVP).
+    runner-plane pre-boot check of the (merged) criteria view — the runner
+    calls it on every composed oracle right after ``build_oracles``, before
+    sim boot, and a raise rejects the job with contract-error semantics
+    (exit 2; D-1 2026-07-13); ``evaluate`` produces the verdict + metrics at
+    evaluation time (concrete impl = M2 engine). The interface is kept open
+    to a future user-supplied checker (post-MVP).
     """
 
     #: Oracle plugin name (set by subclass).
@@ -57,7 +60,13 @@ class OracleBase(ABC):
 
     @abstractmethod
     def validate_params(self, criteria: object) -> None:
-        """Contract-time check of the criteria view; raise on invalid params."""
+        """Runner-plane pre-boot check of the merged criteria view.
+
+        Raise (any exception type) on invalid params: the runner calls this
+        for every composed oracle right after ``build_oracles`` and maps a
+        raise onto the contract-error rejection (exit 2) BEFORE sim boot, so
+        bad params never spend GPU time (D-1 2026-07-13, NFR-INTAKE-003).
+        """
         ...
 
     @abstractmethod

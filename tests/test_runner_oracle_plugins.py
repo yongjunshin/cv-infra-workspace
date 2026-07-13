@@ -10,6 +10,7 @@ path (defence-in-depth — the first rejection is admit's), with no traceback
 and no result.json. GPU wiring stays out of scope (T-GPU leg).
 """
 
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -18,7 +19,7 @@ import pytest
 
 from cv_infra.oracles.no_collision import NoCollisionOracle
 from cv_infra.oracles.reached_goal import ReachedGoalOracle
-from cv_infra.runner import main
+from cv_infra.runner import main, sim_runtime
 from cv_infra.runner.evaluate import EvaluationEngine
 from cv_infra.runner.telemetry import PoseSample, TelemetryRecord
 
@@ -195,3 +196,108 @@ def test_plugin_dir_env_unset_or_empty_leaves_syspath_untouched(plugin_import_st
     # empty-env variant: silently importing from the wrong place).
     assert main.insert_oracle_plugin_dir({"CV_ORACLE_PLUGIN_DIR": ""}) is None
     assert sys.path == before
+
+
+# --------------------------------------------------------------------------- #
+# (e) D-1 2026-07-13 (b): validate_params runs pre-boot; a raise joins exit 2.
+# --------------------------------------------------------------------------- #
+class _BootReached(Exception):
+    """Sentinel: constructing SimRuntime means the params gate failed to stop pre-boot."""
+
+
+@pytest.fixture()
+def boot_sentinel(monkeypatch):
+    """Any attempt to build the sim runtime raises LOUDLY (pre-boot proof).
+
+    ``run()`` imports SimRuntime from the module at call time, so patching the
+    module attribute intercepts the construction — reaching it on the params-
+    error path would surface as an unhandled ``_BootReached``, never a silent
+    pass.
+    """
+
+    def _explode(*_args, **_kwargs):
+        raise _BootReached
+
+    monkeypatch.setattr(sim_runtime, "SimRuntime", _explode)
+
+
+def test_builtin_params_error_joins_contract_error_path():
+    # ① unit: the gate runs EVERY composed oracle against the merged view (the
+    # first oracle passes, the SECOND raises) and joins the raise onto
+    # BadJobSpec — the existing exit-2 exception — naming oracle + param.
+    # Real built-ins, real validate_params, no mocks. (On the canonical wire
+    # the M1 schema already requires chassis_path, so for built-ins this gate
+    # is defence-in-depth; the free-form custom params below are its real bite.)
+    oracles = [ReachedGoalOracle(), NoCollisionOracle()]
+    view = {"goal_position": [3.0, 0.0, 0.0]}  # satisfies reached_goal, lacks chassis_path
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.validate_oracle_params(oracles, view)
+    msg = str(excinfo.value)
+    assert "no_collision" in msg and "chassis_path" in msg
+
+
+def test_params_error_rejected_pre_boot_exit_2(
+    plugin_import_state, boot_sentinel, monkeypatch, tmp_path, capsys
+):
+    # ①+③ e2e through main(): a CUSTOM plugin oracle's validate_params (the
+    # M1 schema cannot know its free-form params — CustomCriterion) rejects ->
+    # friendly exit 2 BEFORE any sim construction (boot_sentinel would raise),
+    # no result.json, no traceback. The recorded call proves the plugin's gate
+    # runs on the SAME uniform path as the built-ins.
+    calls = []
+
+    def _reject(self, criteria):
+        calls.append(criteria)
+        raise ValueError("params must carry custom_should_pass")
+
+    main.insert_oracle_plugin_dir({"CV_ORACLE_PLUGIN_DIR": str(PLUGIN_DIR)})
+    plugin = importlib.import_module(PLUGIN_MODULE)
+    monkeypatch.setattr(plugin.ParamVerdictOracle, "validate_params", _reject)
+
+    spec = _spec([REACHED_GOAL, {"oracle": CUSTOM_ORACLE, "params": {}}])
+    env = {
+        "JOB_SPEC": json.dumps(spec),
+        "RESULT_OUT": str(tmp_path),
+        "CV_ORACLE_PLUGIN_DIR": str(PLUGIN_DIR),
+    }
+    assert main.main(env) == main.EXIT_USAGE
+    assert len(calls) == 1  # the plugin's own gate WAS invoked (and rejected)
+    assert not (tmp_path / "result.json").exists()  # bad input is not a Result
+    err = capsys.readouterr().err
+    assert "param_verdict" in err and "custom_should_pass" in err
+    assert "Traceback" not in err
+
+
+def test_valid_params_pass_the_gate_then_flow_reaches_boot(
+    plugin_import_state, boot_sentinel, monkeypatch, tmp_path
+):
+    # ② positive control: with valid params the gate runs (the spy records the
+    # merged criteria view it was handed) and RETURNS, and the flow proceeds to
+    # sim construction — proving the exit 2 above is caused by validation
+    # alone, not something upstream (G-07 spirit: non-vacuous negative).
+    calls = []
+
+    def _record_only(self, criteria):
+        calls.append(criteria)
+
+    main.insert_oracle_plugin_dir({"CV_ORACLE_PLUGIN_DIR": str(PLUGIN_DIR)})
+    plugin = importlib.import_module(PLUGIN_MODULE)
+    monkeypatch.setattr(plugin.ParamVerdictOracle, "validate_params", _record_only)
+
+    spec = _spec(
+        [
+            REACHED_GOAL,
+            NO_COLLISION,
+            {"oracle": CUSTOM_ORACLE, "params": {"custom_should_pass": True}},
+        ]
+    )
+    env = {
+        "JOB_SPEC": json.dumps(spec),
+        "RESULT_OUT": str(tmp_path),
+        "CV_ORACLE_PLUGIN_DIR": str(PLUGIN_DIR),
+    }
+    with pytest.raises(_BootReached):
+        main.main(env)
+    (view,) = calls  # called exactly once, with the merged criteria view
+    assert view["goal_position"] == [3.0, 0.0, 0.0]
+    assert view["timeout_s"] == 120.0

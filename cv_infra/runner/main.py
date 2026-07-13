@@ -14,8 +14,9 @@ exit-code mapping, and result assembly below are Isaac-independent and CPU-teste
 
 Exit-code contract (0/1/2/3 — LOCKED §9): 0=pass, 1=fail/timeout (mission not met;
 the fine-grained verdict is retained in result.json), 2=bad JOB_SPEC/usage (incl.
-oracle-load failure — defence-in-depth, admit rejects first), 3=platform (EULA
-missing, runner crash, verdict=error).
+oracle-load failure — defence-in-depth, admit rejects first — and an oracle's
+``validate_params`` rejection, D-1 2026-07-13 pre-boot), 3=platform (EULA missing,
+runner crash, verdict=error).
 """
 
 from __future__ import annotations
@@ -247,6 +248,25 @@ def build_oracles(request: VerificationRequest | None = None) -> list:
     return oracles
 
 
+def validate_oracle_params(oracles: list, criteria: object) -> None:
+    """Run every composed oracle's ``validate_params`` over the merged criteria view.
+
+    D-1 (2026-07-13, option b): the runner-plane pre-boot params gate. Called at
+    ONE site — right after ``build_oracles``, still pre-sim — so bad oracle
+    params (above all a custom plugin's free-form ones, which the M1 schema
+    cannot know) join the existing friendly BadJobSpec -> exit 2 path before
+    any Isaac import/boot spends GPU time (NFR-INTAKE-003). The OracleBase
+    contract is "raise on invalid params", so ANY exception counts — the
+    exception type stays the plugin's own.
+    """
+    for oracle in oracles:
+        try:
+            oracle.validate_params(criteria)
+        except Exception as exc:
+            name = getattr(oracle, "name", type(oracle).__name__)
+            raise BadJobSpec(f"oracle {name!r} rejected its params: {exc}") from exc
+
+
 # --------------------------------------------------------------------------- #
 # GPU orchestration (M2 §3.2 order) — Isaac-deferred; wired in cycles 2-4.
 # --------------------------------------------------------------------------- #
@@ -299,7 +319,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     plugin_dir = insert_oracle_plugin_dir(env)
     if plugin_dir is not None:
         print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
-    engine = EvaluationEngine(build_oracles(request))
+    oracles = build_oracles(request)
+    validate_oracle_params(oracles, criteria)  # D-1 (b): pre-boot params gate
+    engine = EvaluationEngine(oracles)
 
     sim = SimRuntime(
         SimConfig(
