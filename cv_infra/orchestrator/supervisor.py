@@ -349,7 +349,19 @@ def run_job(
     # G-15: pre-create every host path that gets bind-mounted (dockerd would create
     # missing dirs as root). The runner runs non-root (uid 1234, R2 실측), so the
     # result dir is made world-writable; precise chown is workstation glue (Wave 2).
-    job_dir = Path(out_dir) / job_id
+    #
+    # Bind-safe host dir (p4c4 colon-bind fix, PM 룰링 옵션 A): fan-out job ids
+    # carry ':' (store.job_key "<request_id>:<repeat_index>") and the docker
+    # bind spec is colon-delimited "src:dst:mode", so a raw out_dir/job_id
+    # source is rejected by the daemon with `invalid volume specification` —
+    # MEASURED, T4 L0 재현: ~/cv-infra-p2-out/p4c4/T4/L0/colon-bind-repro.txt.
+    # The host dir therefore uses the SAME slug idiom the per-job cache scratch
+    # already uses (network_name_for — docker-safe charset + collision-free
+    # hash; 비대칭 해소). ONLY the host directory name changes: the JOB_SPEC
+    # content (its job_id key), labels, store keys and domain-id derivation all
+    # keep the verbatim job_id.
+    net_name = network_name_for(job_id)
+    job_dir = Path(out_dir) / net_name
     result_dir = job_dir / "result"
     result_dir.mkdir(parents=True, exist_ok=True)
     result_dir.chmod(0o777)
@@ -368,9 +380,9 @@ def run_job(
     result_path: Path | None = None
     infra_error: str | None = None
     try:
-        net_name = network_name_for(job_id)
         # Networks carry the same reconciliation labels as the containers so the
         # restart sweep (reconcile_at_restart, M3 §3.9) can find and remove them.
+        # net_name was computed above (it also names the bind-safe job_dir).
         network = client.networks.create(net_name, driver="bridge", labels=labels)
 
         # Runner FIRST — the sim supplies /clock (G-19 supply order). Supervisor-owned

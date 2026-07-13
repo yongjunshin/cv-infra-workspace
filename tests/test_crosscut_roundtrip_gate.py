@@ -24,6 +24,7 @@ import pytest
 
 import docker  # real module on purpose (G-20) — entrypoint patched per-test
 from cv_infra.cli.main import main
+from cv_infra.orchestrator.supervisor import network_name_for
 from tests.test_supervisor_min import FakeClient
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
@@ -48,7 +49,10 @@ def spawned(monkeypatch):
 def run_case(out_dir: Path, job_id: str, scenario: Path, pre_verdict: str | None = None) -> int:
     """Invoke the real CLI; optionally pre-write the result the fake runner would emit."""
     if pre_verdict is not None:
-        result = out_dir / job_id / "result" / "result.json"
+        # Host job dir = bind-safe network_name_for slug (p4c4 colon-bind fix,
+        # PM 룰링 A — task orchestration-2026-07-13-p4-colon-bind-fix; this ONE
+        # line adjusted by M3 under that task's "기존 job_dir 단정 테스트 조정").
+        result = out_dir / network_name_for(job_id) / "result" / "result.json"
         result.parent.mkdir(parents=True, exist_ok=True)
         result.write_text(json.dumps({"job_id": job_id, "verdict": pre_verdict}), encoding="utf-8")
     return main(
