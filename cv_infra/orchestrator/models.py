@@ -71,11 +71,14 @@ class JobResult:
 class RequestRollup:
     """Request-level rollup of repeated jobs + flakiness (M3 §3.7; SR-10, REQ-ORCH-012/013).
 
-    PLACEHOLDER: emitted to M4 for the report-level pass/fail matrix (SR-19) — the two aggregation
-    responsibilities are split (LOCKED §7.12). The flakiness metric / rollup policy finalize in
-    Phase 4.
+    Emitted to M4 for the report-level pass/fail matrix (SR-19) — the two aggregation
+    responsibilities are split (LOCKED §7.12). ``verdict`` is the rolled-up request verdict
+    under the any-fail=fail policy; ``flakiness`` (repeat disagreement) is surfaced
+    SEPARATELY, never folded into the verdict — policy + metric are pinned in
+    ``rollup.roll_up``. M4 consumes this shape: field additions are allowed, renames frozen.
     """
 
     request_id: str
     verdicts: list[Verdict] = field(default_factory=list)
     flakiness: float | None = None
+    verdict: Verdict | None = None

@@ -186,6 +186,17 @@ def test_rollup_skips_verdictless_results():
     assert rollup.flakiness == 0.0
 
 
+def test_rollup_verdict_policy_is_any_fail():
+    # any-fail=fail (rollup.py 정책 확정): one FAIL fails the request; flakiness
+    # stays a SEPARATE signal, never folded into the verdict.
+    assert roll_up("r", _results("r", [Verdict.PASS, Verdict.PASS])).verdict is Verdict.PASS
+    mixed = roll_up("r", _results("r", [Verdict.PASS, Verdict.FAIL, Verdict.PASS]))
+    assert mixed.verdict is Verdict.FAIL
+    assert mixed.flakiness is not None and mixed.flakiness > 0.0
+    # all repeats verdict-less = infra outcome, not a domain judgement
+    assert roll_up("r", _results("r", [None, None])).verdict is None
+
+
 # ---------------------------------------------------------------------------
 # end-to-end: ws3 full path — fan-out → schedule → rollup
 # ---------------------------------------------------------------------------
