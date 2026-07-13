@@ -31,22 +31,51 @@ boot guard refuses to start Isaac without it.
 
 ``import docker`` is deferred into ``run_job`` so ``import cv_infra.orchestrator``
 keeps working where the docker SDK is absent — the runner image installs the wheel
-with ``--no-deps`` (DoD-P2-12). Tests inject a duck-typed fake client. This is the
-MIN seam: queue/scheduler/REST/runner-retry around it are Phase 4.
+with ``--no-deps`` (DoD-P2-12). Tests inject a duck-typed fake client.
+
+Phase 4 layers ``ParallelSupervisor`` (end of module) on top: k-parallel asyncio
+supervision of the per-job seam via ``JobQueue`` + ``SlotAccountant`` +
+``DomainIdAllocator``. The single-runner ``run_job`` path above stays frozen
+(P2/P3 ``cv-infra run`` 계약). The pure isolation helpers
+(``allocate_ros_domain_id`` / ``network_name_for`` / ``ROS_DOMAIN_ID_SPACE``)
+moved verbatim to ``allocator.py`` (M3 §3.6 home) and are re-exported here.
 """
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
 import os
-import re
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from cv_infra.orchestrator.allocator import (
+    LABEL_JOB_ID,
+    LABEL_ROS_DOMAIN_ID,
+    DomainIdAllocator,
+)
+
+# Redundant-alias imports below = explicit re-exports: these helpers moved
+# verbatim to allocator.py (M3 §3.6 home); the supervisor import path stays
+# frozen for P2/P3 consumers/tests.
+from cv_infra.orchestrator.allocator import (
+    ROS_DOMAIN_ID_SPACE as ROS_DOMAIN_ID_SPACE,
+)
+from cv_infra.orchestrator.allocator import (
+    allocate_ros_domain_id as allocate_ros_domain_id,
+)
+from cv_infra.orchestrator.allocator import (
+    network_name_for as network_name_for,
+)
+from cv_infra.orchestrator.fake_runner import Runner
+from cv_infra.orchestrator.models import Job, JobResult, JobState
+from cv_infra.orchestrator.queue import JobQueue
+from cv_infra.orchestrator.scheduler import SlotAccountant
+from cv_infra.orchestrator.store import job_key
 
 # Container-side seam paths (M3 -> M2 env contract; 정본 = cv_infra/runner/main.py
 # resolve_job_spec_dict / resolve_result_path). JOB_SPEC is bind-mounted read-only
@@ -79,9 +108,6 @@ CACHE_MOUNTS: tuple[tuple[str, str], ...] = (
 # the SUT never sees the mount or the env (blackbox no-leak invariant).
 ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
 
-# LOCKED §7.5 dual isolation: per-job docker network + ROS_DOMAIN_ID in 0..101.
-ROS_DOMAIN_ID_SPACE = 102
-
 _TEARDOWN_STOP_TIMEOUT_S = 10  # graceful stop window before force-remove
 _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immediately)
 
@@ -106,37 +132,6 @@ class JobOutcome:
     result_path: Path | None = None
     runner_exit_code: int | None = None
     infra_error: str | None = None
-
-
-def allocate_ros_domain_id(job_id: str, in_use: frozenset[int] = frozenset()) -> int:
-    """Deterministically allocate a ``ROS_DOMAIN_ID`` in 0..101 (LOCKED §7.5).
-
-    Derivation is a stable hash of ``job_id`` (sha256, NOT Python's randomized
-    ``hash()``) with linear probing over the domain space to skip ``in_use`` ids.
-    Supervisor-min runs a single job so ``in_use`` is empty today; the probing seam
-    is the deterministic foundation for the Phase-4 multi-job allocator.
-    """
-    if len(in_use) >= ROS_DOMAIN_ID_SPACE:
-        raise ValueError(f"all {ROS_DOMAIN_ID_SPACE} ROS domain ids are in use")
-    digest = hashlib.sha256(job_id.encode("utf-8")).digest()
-    start = int.from_bytes(digest[:4], "big") % ROS_DOMAIN_ID_SPACE
-    for offset in range(ROS_DOMAIN_ID_SPACE):
-        candidate = (start + offset) % ROS_DOMAIN_ID_SPACE
-        if candidate not in in_use:
-            return candidate
-    raise AssertionError("unreachable: in_use guard above")  # pragma: no cover
-
-
-def network_name_for(job_id: str) -> str:
-    """Per-job docker bridge network name — deterministic, docker-safe, collision-free.
-
-    ``job_id`` is slugged to docker's allowed charset and suffixed with a short stable
-    hash of the FULL id, so distinct job_ids that slug identically still get distinct
-    networks. Same-name leftovers are prevented by the finally-teardown, not the name.
-    """
-    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", job_id).strip("-.")[:24] or "job"
-    suffix = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8]
-    return f"cvj-{slug}-{suffix}"
 
 
 def default_readiness_probe(runner_container: Any) -> bool:
@@ -270,6 +265,10 @@ def run_job(
     spec_path.write_text(json.dumps(job_spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     domain_id = allocate_ros_domain_id(job_id)
+    # Crash-reconciliation labels (M3 §3.9, R14): both containers carry the job id
+    # and its live domain id so a restarted orchestrator can re-attach in-flight
+    # jobs and restore allocations from `docker ps` instead of re-assigning.
+    labels = {LABEL_JOB_ID: job_id, LABEL_ROS_DOMAIN_ID: str(domain_id)}
     network: Any = None
     runner_ct: Any = None
     sut_ct: Any = None
@@ -320,6 +319,7 @@ def run_job(
             detach=True,
             name=f"{net_name}-runner",
             network=net_name,
+            labels=labels,
             environment=environment,
             volumes={
                 # Cache/plugin binds first so the seam mounts below win on any
@@ -352,6 +352,7 @@ def run_job(
                 detach=True,
                 name=f"{net_name}-sut",
                 network=net_name,
+                labels=labels,
                 environment={"ROS_DOMAIN_ID": str(domain_id)},
             )
             runner_exit_code, infra_error = _supervise_until_runner_exit(
@@ -461,3 +462,118 @@ def _teardown(containers: tuple[Any, ...], network: Any) -> None:
             network.remove()
         except Exception as exc:
             print(f"[cv-supervisor] teardown network remove failed: {exc!r}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: k-parallel asyncio supervision (M3 §3.5) — layered ON TOP of the
+# frozen single-job seam above.
+# --------------------------------------------------------------------------- #
+
+
+class ParallelSupervisor:
+    """k-parallel asyncio supervision — REQ-ORCH-006/007/009/010, NFR-ORCH-003.
+
+    Generalizes the single-runner seam: one asyncio task per admitted job
+    (잡↔러너 1:1, REQ-ORCH-007), driving the injected synchronous ``Runner``
+    seam. The real per-job callable is ``run_job`` (blocking Docker SDK), so
+    every attempt is offloaded to the default thread pool via
+    ``loop.run_in_executor`` (M3 §3.5 R-DS — the event loop is never blocked
+    and the k supervision tasks stay concurrent); CPU tests inject fakes.
+
+    * **admission**: fill free slots from the ``JobQueue`` through the
+      ``SlotAccountant`` gate — a closed gate means the launch never happens
+      (over-launch 0, NFR-ORCH-003). When an allocator is attached, the job's
+      ``ROS_DOMAIN_ID`` is allocated at admission (M3 §3.6).
+    * **wall-clock watchdog** (REQ-ORCH-009): ``asyncio.wait_for(job_timeout_s)``
+      classifies the attempt TIMEOUT. The container kill itself is the real
+      runner seam's own watchdog + finally-teardown (``run_job(job_timeout_s=)``)
+      — this layer only classifies; sim-time mission timeouts stay M2-owned
+      (D-F, never judged on wall-clock).
+    * **completion path**: the slot token and domain id are reclaimed FIRST,
+      then the retry policy (``JobQueue.record_outcome``) decides re-queue vs
+      terminal — a freed slot is immediately re-assignable to a waiting job
+      (REQ-ORCH-006, REQ-EXEC-015 수신).
+    * **crash boundary**: a raising runner marks THAT attempt FAILED; other
+      in-flight jobs are unaffected (NFR-EXEC-004 받침).
+
+    ``events`` is the observation log — ``("start"|"end", job_key)`` in
+    wall-clock order — that makes slot re-assignment / cap invariants
+    unit-assertable (DoD-P4-03/04 CPU 선행).
+    """
+
+    def __init__(
+        self,
+        queue: JobQueue,
+        slots: SlotAccountant,
+        runner: Runner,
+        *,
+        allocator: DomainIdAllocator | None = None,
+        job_timeout_s: float | None = None,
+    ) -> None:
+        self._queue = queue
+        self._slots = slots
+        self._runner = runner
+        self._allocator = allocator
+        self._job_timeout_s = job_timeout_s
+        self.events: list[tuple[str, str]] = []
+
+    async def run(self) -> list[JobResult]:
+        """Drive every queued job to a terminal state; one JobResult per job.
+
+        Retried attempts do not emit intermediate results — only the terminal
+        outcome of each job is returned (same semantics as the P1 Scheduler).
+        """
+        loop = asyncio.get_running_loop()
+        results: list[JobResult] = []
+        in_flight: dict[asyncio.Task[JobResult], Job] = {}
+        while self._queue.pending() or in_flight:
+            self._admit(loop, in_flight)
+            if not in_flight:
+                # Unreachable when slot/allocator accounting is correct (slots
+                # free whenever nothing is in flight) — loud beats a silent hang.
+                raise RuntimeError(
+                    "admission produced no task while jobs are pending"
+                    " (slot/allocator accounting bug)"
+                )
+            done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                job = in_flight.pop(task)
+                key = job_key(job)
+                # Reclaim BEFORE the retry decision: the freed slot/domain id is
+                # available to the next admission wave immediately (REQ-ORCH-006).
+                self._slots.release()
+                if self._allocator is not None:
+                    self._allocator.release(key)
+                self.events.append(("end", key))
+                result = task.result()  # _run_one never raises (crash boundary inside)
+                if not self._queue.record_outcome(job, result.state):
+                    results.append(result)
+        return results
+
+    def _admit(self, loop: asyncio.AbstractEventLoop, in_flight: dict) -> None:
+        """Admission gate: fill free slots up to k from the queue (REQ-ORCH-006)."""
+        while self._queue.pending() and self._slots.try_acquire():
+            job = self._queue.pop_next()
+            assert job is not None  # pending() > 0 above
+            key = job_key(job)
+            self._queue.mark_running(job)
+            if self._allocator is not None:
+                self._allocator.allocate(key)
+            self.events.append(("start", key))
+            in_flight[loop.create_task(self._run_one(loop, job))] = job
+
+    async def _run_one(self, loop: asyncio.AbstractEventLoop, job: Job) -> JobResult:
+        """One attempt: offload the blocking Runner seam; classify the outcome."""
+        try:
+            attempt = loop.run_in_executor(None, self._runner.run, job)
+            if self._job_timeout_s is None:
+                return await attempt
+            return await asyncio.wait_for(attempt, timeout=self._job_timeout_s)
+        except TimeoutError:
+            # py3.11: asyncio.TimeoutError IS this builtin. The executor thread
+            # may still be draining — the real seam's own watchdog kills the
+            # container (run_job); classification is all the state machine needs.
+            return JobResult(job=job, state=JobState.TIMEOUT, verdict=None)
+        except Exception:
+            # Runner crash boundary: this attempt failed; other jobs unaffected.
+            return JobResult(job=job, state=JobState.FAILED, verdict=None)
