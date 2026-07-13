@@ -3,19 +3,22 @@
 CPU + fake 러너, TestClient only (resident uvicorn = P5): submit -> background
 supervision -> status roundtrip for all three ``report_outcome`` values, the
 structured-422 admit path (M1 ContractError fields, zero traceback, zero job
-non-propagation), the frozen ``RequestRollup`` wire shape, and SQLite job
-persistence through the API path. The TestClient is always entered as a
-context manager — the app's background drive task lives on the client's
-portal loop, which only persists inside the ``with`` block.
+non-propagation), the frozen ``RequestRollup`` wire shape, SQLite job
+persistence through the API path, and the wire-v2 ``oracle_plugin_dirs``
+per-request stage-5 anchor (p4c3 — section d). The TestClient is always
+entered as a context manager — the app's background drive task lives on the
+client's portal loop, which only persists inside the ``with`` block.
 """
 
 from __future__ import annotations
 
 import copy
+import sys
 import threading
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -275,3 +278,84 @@ def test_unknown_envelope_is_404(tmp_path):
         app = create_app(store, FakeRunner(), k=1)
         with TestClient(app) as client:
             assert client.get("/envelopes/env-nope").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# (d) wire v2: oracle_plugin_dirs — per-request stage-5 anchor (p4c3)
+# --------------------------------------------------------------------------- #
+
+# The EXISTING runner-side plugin fixture dir (tests/fixtures/) stands in for
+# a consumer scenario dir; its module is only importable WITH the anchor.
+_PLUGIN_DIR = str(Path(__file__).parent / "fixtures")
+_PLUGIN_MODULE = "custom_oracle_plugin"
+_CUSTOM_ORACLE = f"{_PLUGIN_MODULE}:ParamVerdictOracle"
+
+
+def _custom_oracle_doc() -> dict:
+    doc = _request_doc()
+    doc["acceptance_criteria"] = [
+        {"oracle": _CUSTOM_ORACLE, "params": {"custom_should_pass": True}}
+    ]
+    return doc
+
+
+@pytest.fixture()
+def plugin_import_state():
+    """No cached-import bleed-through: an earlier admit must not make the
+    anchor-less negative pass vacuously (test_runner_oracle_plugins idiom)."""
+    sys.modules.pop(_PLUGIN_MODULE, None)
+    yield
+    sys.modules.pop(_PLUGIN_MODULE, None)
+
+
+def test_custom_oracle_admits_with_plugin_dir_anchor(tmp_path, plugin_import_state):
+    # Mixed envelope: r0 anchor-less (entry-point oracles, null item leaves it
+    # unchanged) + r1 anchored to the fixture dir -> both admit, jobs fan out.
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(), k=2)
+        with TestClient(app) as client:
+            response = client.post(
+                "/envelopes",
+                json={
+                    "requests": [_request_doc(), _custom_oracle_doc()],
+                    "oracle_plugin_dirs": [None, _PLUGIN_DIR],
+                },
+            )
+            assert response.status_code == 202, response.text
+            body = _wait_completed(client, response.json()["envelope_id"])
+            assert len(body["jobs"]) == 2  # one job per request (default repeats)
+            assert body["report_outcome"] == "pass"
+        assert len(store.load_jobs()) == 2
+
+
+def test_custom_oracle_without_anchor_is_structured_422(tmp_path, plugin_import_state):
+    # Positive control (p4c2 실측 재확인): the SAME document admits above WITH
+    # the anchor and rejects without it — the anchor is load-bearing.
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(), k=2)
+        with TestClient(app) as client:
+            response = client.post("/envelopes", json={"requests": [_custom_oracle_doc()]})
+            assert response.status_code == 422
+            (error,) = response.json()["detail"]["errors"]
+            assert error["field_path"] == "acceptance_criteria[0].oracle"
+            assert error["source_path"] == "requests[0]"
+            assert "Traceback" not in response.text
+        assert store.load_jobs() == []
+
+
+def test_oracle_plugin_dirs_wrapper_violations_are_structured_422(tmp_path):
+    # 등길이 위반(짧게/길게) · 리스트 아님 · 항목이 str/절대경로 아님 — 전부
+    # 구조화 422, 잡 0 (기존 wrapper-위반 관용구와 동일 shape).
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(), k=2)
+        with TestClient(app) as client:
+            for dirs in ([], [None, None], "not-a-list", [123], ["relative/path"]):
+                response = client.post(
+                    "/envelopes", json={"requests": [_request_doc()], "oracle_plugin_dirs": dirs}
+                )
+                assert response.status_code == 422, dirs
+                (error,) = response.json()["detail"]["errors"]
+                assert error["field_path"].startswith("oracle_plugin_dirs")
+                assert error["expected"]  # structured, self-describing
+                assert "Traceback" not in response.text
+        assert store.load_jobs() == []  # 비전파: no job from any rejected envelope

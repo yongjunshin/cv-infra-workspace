@@ -9,20 +9,28 @@ rollup / Store — reused, never reimplemented):
 * ``GET /envelopes/{envelope_id}`` — job states + per-request ``RequestRollup``s
   + the envelope-level ``report_outcome``.
 
-Wire format (D-1, decisions/2026-07-13-p4c2-envelope-contract-timing.md): the
-JSON body ``{"requests": [<request document>, ...]}`` is an INTERNAL
-representation — the user-facing RequestEnvelope contract (YAML schema,
-apiVersion, friendly file errors) freezes with the M8 batch-CLI submit cycle
-together with M1; this module adapts to it then. Wrapper keys other than
-``"requests"`` are not interpreted this cycle (formal envelope semantics,
-e.g. ``trigger_source``, land with that contract). Each request document IS
+Wire format (D-1 wire v2, decisions/2026-07-13-p4c2-envelope-contract-timing.md):
+the JSON body ``{"requests": [...], "oracle_plugin_dirs": [...]}`` is an
+INTERNAL representation — the user-facing RequestEnvelope contract (YAML
+schema, apiVersion, friendly file errors) freezes with the M8 batch-CLI submit
+cycle together with M1; this module adapts to it then. Wrapper keys other than
+these two are not interpreted this cycle (formal envelope semantics, e.g.
+``trigger_source``, land with that contract). Each request document IS
 validated NOW: it goes through the full M1 6-stage admit gate
 (``contract.loader.load_request`` — no contract bypass; the JSON document is
 fed to the loader as a canonical indented-JSON stream, which any YAML loader
-parses, so error line/col point into that rendering). Scenario-adjacent custom
-oracles ("module:Class" next to a YAML file) need a directory anchor and
-therefore also arrive with the M8 file-submit cycle; entry-point oracles
-resolve here already.
+parses, so error line/col point into that rendering).
+
+``oracle_plugin_dirs`` (optional, p4c3) carries per-request stage-5 custom
+oracle anchors: when present it must be a list of the SAME length as
+``"requests"`` whose items are ``null`` (no anchor) or an ABSOLUTE directory
+path string, forwarded as ``load_request(..., plugin_dir=...)`` so
+scenario-adjacent ``module:Class`` oracles admit over REST too (the M8
+file-submit path re-admits its scenario dirs here). Absent field = previous
+behavior, unchanged; entry-point oracles resolve without any anchor.
+Same-host trusted-path assumption (MVP, M8 §8 g5): submitter and API share a
+filesystem, so the anchor is used as-is on THIS host. Admit-only this cycle —
+supervisor (real-runner) propagation is a GPU-cycle follow-up.
 
 Submission is all-or-nothing (비전파): every request must admit before ANY job
 is created — one bad request rejects the whole envelope with a structured 422
@@ -72,6 +80,7 @@ import io
 import json
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -121,23 +130,32 @@ class _EnvelopeRecord:
     error: str | None = None  # supervision crash (loud 500 on status reads)
 
 
-def _wire_error(field_path: str, expected: str, got: str) -> ContractError:
+_ANCHOR_EXAMPLE = '{"requests": [{...}, {...}], "oracle_plugin_dirs": ["/abs/scenario/dir", null]}'
+
+
+def _wire_error(
+    field_path: str, expected: str, got: str, *, example: str | None = None
+) -> ContractError:
     """Structured wrapper-level violation (same 8-key shape as M1 admit errors)."""
     return ContractError(
         field_path=field_path,
         expected=expected,
         got=got,
-        example='{"requests": [{"apiVersion": "cv-infra/v1", ...}]}',
+        example=example or '{"requests": [{"apiVersion": "cv-infra/v1", ...}]}',
         doc_link=_DOC_LINK,
     )
 
 
-def _parse_envelope(body: Any) -> list[dict[str, Any]]:
-    """Validate the internal wire wrapper -> the raw request documents.
+def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
+    """Validate the internal wire wrapper -> (request documents, stage-5 anchors).
 
     Wrapper-only checks (each document's validation is the M1 loader's):
     the body must be a JSON object whose ``"requests"`` is a non-empty list
-    of objects. Violations raise ``ContractError`` (rendered as 422).
+    of objects. ``"oracle_plugin_dirs"`` (wire v2, optional) must — when
+    present — be an equal-length list of ``null`` (no anchor) or absolute
+    directory path strings; absent/null field means no anchors (previous
+    behavior, unchanged). Anchors are same-host trusted paths (module
+    docstring — MVP, M8 §8 g5). Violations raise ``ContractError`` (422).
     """
     if not isinstance(body, dict):
         raise _wire_error("(document)", 'a JSON object body {"requests": [...]}', repr(body))
@@ -151,25 +169,46 @@ def _parse_envelope(body: Any) -> list[dict[str, Any]]:
     for i, doc in enumerate(requests):
         if not isinstance(doc, dict):
             raise _wire_error(f"requests[{i}]", "a Verification Request object", repr(doc))
-    return requests
+    plugin_dirs = body.get("oracle_plugin_dirs")
+    if plugin_dirs is None:  # field absent (or explicit null): no anchors — unchanged path
+        return requests, [None] * len(requests)
+    if not isinstance(plugin_dirs, list) or len(plugin_dirs) != len(requests):
+        raise _wire_error(
+            "oracle_plugin_dirs",
+            f"a list of exactly {len(requests)} items — one per request, null = no anchor",
+            repr(plugin_dirs),
+            example=_ANCHOR_EXAMPLE,
+        )
+    for i, anchor in enumerate(plugin_dirs):
+        if anchor is not None and not (isinstance(anchor, str) and Path(anchor).is_absolute()):
+            raise _wire_error(
+                f"oracle_plugin_dirs[{i}]",
+                "null or an absolute directory path string (stage-5 oracle anchor)",
+                repr(anchor),
+                example=_ANCHOR_EXAMPLE,
+            )
+    return requests, plugin_dirs
 
 
-def _admit_all(documents: list[dict[str, Any]]) -> tuple[list[int], list[dict[str, Any]]]:
+def _admit_all(
+    documents: list[dict[str, Any]], plugin_dirs: list[str | None]
+) -> tuple[list[int], list[dict[str, Any]]]:
     """Run EVERY document through the M1 admit gate before any job exists.
 
     Returns ``(per-request repeats, admit errors as annotation dicts)`` — a
     non-empty error list means the whole envelope is rejected (all-or-nothing,
     비전파). One error per failing request (the loader raises its first
     violation), so a multi-bad envelope still reports every bad request.
+    ``plugin_dirs`` (parsed, equal length) rides into stage 5 per request.
     """
     repeats: list[int] = []
     errors: list[dict[str, Any]] = []
-    for i, doc in enumerate(documents):
+    for i, (doc, plugin_dir) in enumerate(zip(documents, plugin_dirs, strict=True)):
         # Canonical indented-JSON stream through the REAL M1 gate (module
         # docstring — JSON is YAML; line/col point into this rendering).
         stream = io.StringIO(json.dumps(doc, indent=2, sort_keys=True))
         try:
-            admitted = load_request(stream, source_path=f"requests[{i}]")
+            admitted = load_request(stream, source_path=f"requests[{i}]", plugin_dir=plugin_dir)
         except ContractError as err:
             errors.append(err.to_annotation_dict())
             continue
@@ -212,7 +251,7 @@ def create_app(
     async def submit_envelope(request: Request) -> dict[str, str]:
         try:
             body = await request.json()
-            documents = _parse_envelope(body)
+            documents, plugin_dirs = _parse_envelope(body)
         except json.JSONDecodeError as exc:
             err = _wire_error("(document)", "a JSON body", str(exc))
             raise HTTPException(
@@ -222,7 +261,7 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail={"errors": [err.to_annotation_dict()]}
             ) from err
-        repeats, errors = _admit_all(documents)
+        repeats, errors = _admit_all(documents, plugin_dirs)
         if errors:  # all-or-nothing: zero jobs were created (비전파)
             raise HTTPException(status_code=422, detail={"errors": errors})
 
