@@ -3,8 +3,10 @@
 Boots ``SimulationApp({"headless": True})`` FIRST (before any ``omni.*`` / ``isaacsim.*``
 import — LOCKED §7.7), opens the scene, spawns the robot at a fixed pose, pins
 ``physics_dt`` / ``rendering_dt`` / seed for determinism, runs the step loop, and
-closes cleanly to return VRAM/slots. All Isaac imports are deferred into ``boot()``
-so this module imports on a CPU host with no Isaac present.
+closes cleanly to return VRAM/slots. Boot also pins the R4 texture-streaming
+budget cap (see ``simulation_app_launch_config`` — the k>=2 OOM-trap guard).
+All Isaac imports are deferred into ``boot()`` so this module imports on a CPU
+host with no Isaac present.
 
 Reuses (does NOT re-invent) the P1 ``scripts/isaac_smoke/headless_smoke.py`` pattern:
 SimulationApp-first ordering + the EULA boot guard. That P1 file is a read-only
@@ -49,6 +51,65 @@ class SimConfig:
     physics_dt: float = 1.0 / 60.0
     rendering_dt: float = 1.0 / 60.0
     seed: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# R4: texture streaming budget cap (k>=2 prerequisite) — CPU-testable assembly.
+# --------------------------------------------------------------------------- #
+# By default every Isaac instance reserves 60% of TOTAL GPU memory for texture
+# streaming — the #1 multi-instance OOM trap (implementation-plan/
+# 06-risks-and-assumptions.md R4, "[OFFICIAL] Q5 gotchas"). The cap pins that
+# budget EXPLICITLY at boot so per-instance VRAM stays deterministic under
+# k-parallel scheduling instead of floating on an image default.
+#
+# Settings key [CANDIDATE — GPU-confirm at Wave 2 T4]: the Omniverse Kit RTX
+# resource-manager settings tree names the texture-streaming budget
+# ``/rtx-transient/resourcemanager/texturestreaming/memoryBudget`` (fraction of
+# total GPU memory, documented default 0.6 — matching R4's "60% of total"
+# description). No in-repo probe has dumped this carb subtree yet (no measured
+# anchor to cite — G-28), so ``boot()`` logs a pre-set read (``at_boot=``) AND
+# a post-set read-back (``readback=``): ``at_boot=none`` on the workstation
+# means this candidate key does not exist in the 5.1.0 build and must be
+# re-probed (surfaced assumption, task p4c4-T2 req 1 — non-blocking).
+TEXTURE_BUDGET_SETTING = "/rtx-transient/resourcemanager/texturestreaming/memoryBudget"
+# 0.6 is R4's PLAN POLICY value (60% cap), not a measured NFR (§2-4 untouched):
+# pinning the suspected image default makes the budget observable and tunable at
+# ONE constant when the P4-10 k-parallel VRAM measurement lands.
+TEXTURE_BUDGET_FRACTION = 0.6
+# Verbatim grep marker for T4/QA (G-26 prove-it-ran gate; pinned by CPU test).
+TEXTURE_BUDGET_LOG_MARKER = "texture_budget_applied="
+
+
+def simulation_app_launch_config() -> dict:
+    """SimulationApp launch config — headless + R4 texture budget cap (CPU-testable).
+
+    The cap rides the canonical kit CLI settings-override form (``--/path=value``
+    — the exact form R4's verification column names) via the launcher's
+    ``extra_args`` so it is present from renderer init, not patched in after.
+    """
+    return {
+        "headless": True,
+        "extra_args": [f"--{TEXTURE_BUDGET_SETTING}={TEXTURE_BUDGET_FRACTION}"],
+    }
+
+
+def texture_budget_log_line(at_boot: object, readback: object) -> str:
+    """One structured boot line proving the R4 cap — Wave 2 T4/QA grep gate.
+
+    ``at_boot`` = carb value right after SimulationApp boot (did the
+    ``extra_args`` override land / does the key exist at all?); ``readback`` =
+    value after the explicit belt-and-suspenders ``settings.set``. ``none``
+    (either field) is the loud signal that the candidate key is wrong for this
+    build — an observation, never an echo of intent (G-26).
+    """
+
+    def fmt(value: object) -> object:
+        return "none" if value is None else value
+
+    return (
+        f"[cv-runner] {TEXTURE_BUDGET_LOG_MARKER}{TEXTURE_BUDGET_FRACTION} "
+        f"at_boot={fmt(at_boot)} readback={fmt(readback)} key={TEXTURE_BUDGET_SETTING}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -215,8 +276,26 @@ class SimRuntime:
         # LOCKED §7.7 — SimulationApp before any omni.*/isaacsim.* import.
         from isaacsim import SimulationApp  # noqa: PLC0415 (deferred by design)
 
-        self.simulation_app = SimulationApp({"headless": True})
+        self.simulation_app = SimulationApp(simulation_app_launch_config())
+        self._apply_texture_budget()
         return self.simulation_app
+
+    def _apply_texture_budget(self) -> None:  # pragma: no cover - GPU path (T4 observes)
+        """R4 belt-and-suspenders: explicit carb set + read-back, one loud line.
+
+        The launch config already injects the cap as a boot-time ``--/...``
+        settings override (canonical form; covers init-time snapshot semantics).
+        The explicit set below covers an ``extra_args`` key being ignored by the
+        5.1.0 launcher; the pre-set read + post-set read-back make the log line
+        an observation (see ``texture_budget_log_line``).
+        """
+        import carb  # noqa: PLC0415 (legal only after SimulationApp)
+
+        settings = carb.settings.get_settings()
+        at_boot = settings.get(TEXTURE_BUDGET_SETTING)
+        settings.set(TEXTURE_BUDGET_SETTING, TEXTURE_BUDGET_FRACTION)
+        readback = settings.get(TEXTURE_BUDGET_SETTING)
+        print(texture_budget_log_line(at_boot, readback), flush=True)
 
     def load_scene(self) -> None:  # pragma: no cover - GPU path (T3 proves)
         """open_stage(sample scene) + locate pre-wired robot; pin dt/seed; reset.
