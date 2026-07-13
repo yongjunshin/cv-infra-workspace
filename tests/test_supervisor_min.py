@@ -17,6 +17,7 @@ import pytest
 
 from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
+    CACHE_SCRATCH_ROOT_ENV,
     JOB_SPEC_MOUNT,
     ORACLE_PLUGIN_DIR_ENV,
     RESULT_OUT_MOUNT,
@@ -98,9 +99,10 @@ class _FakeNetworks:
     def __init__(self, client):
         self._client = client
 
-    def create(self, name, driver=None):
+    def create(self, name, driver=None, labels=None):
         self._client.events.append(("network-create", name))
         self._client.network = FakeNetwork(name, self._client.events)
+        self._client.network_labels = labels
         return self._client.network
 
 
@@ -140,6 +142,7 @@ class FakeClient:
         self.runner = None
         self.sut = None
         self.network = None
+        self.network_labels = None  # labels passed to networks.create (R14 sweep target)
         self.networks = _FakeNetworks(self)
         self.containers = _FakeContainers(self)
 
@@ -604,6 +607,174 @@ def test_cache_root_resolved_to_host_absolute_path(tmp_path, monkeypatch):
     for host in cache_binds:
         assert Path(host).is_absolute()  # never a relative bind
         assert host.startswith(str((tmp_path / "rel-cache").resolve()))
+
+
+# --------------------------------------------------------------------------- #
+# (8b) D-B two-tier cache: shared base RO + per-job writable scratch (P4-15)
+# --------------------------------------------------------------------------- #
+
+# The D-B split, asserted verbatim (not derived from the module under test):
+# warm cache SETS (ov/GL/compute) come from the shared base read-only; the
+# always-written runtime dirs come from the per-job scratch, rw.
+EXPECTED_BASE_BINDS = {
+    "cache/kit": "/isaac-sim/kit/cache",
+    "cache/home": "/isaac-sim/.cache",
+    "cache/computecache": "/isaac-sim/.nv/ComputeCache",
+}
+EXPECTED_SCRATCH_BINDS = {
+    "logs": "/isaac-sim/.nvidia-omniverse/logs",
+    "data": "/isaac-sim/.local/share/ov/data",
+    "documents": "/isaac-sim/Documents",
+}
+
+
+@pytest.fixture()
+def cache_env_clear(monkeypatch):
+    """No ambient cache env bleeds into the assertions (both knobs)."""
+    monkeypatch.delenv(CACHE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(CACHE_SCRATCH_ROOT_ENV, raising=False)
+    return monkeypatch
+
+
+def make_two_tier_roots(tmp_path):
+    base = tmp_path / "cache-base"
+    base.mkdir()
+    scratch_root = tmp_path / "cache-scratch"
+    scratch_root.mkdir()
+    return base, scratch_root
+
+
+def test_two_tier_base_is_ro_and_scratch_is_per_job_rw(tmp_path, cache_env_clear):
+    put_result(tmp_path)
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    client = FakeClient()
+    scratch_seen = {}
+
+    def probe(container):  # scratch dirs must exist while the job runs (pre-spawn mkdir)
+        job_scratch = scratch_root / network_name_for(JOB_ID)
+        scratch_seen["dirs"] = sorted(
+            p.name for p in job_scratch.iterdir() if p.is_dir()  # created by the supervisor
+        )
+        return container.status == "running"
+
+    run_min(
+        tmp_path, client, cache_root=base, cache_scratch_root=scratch_root, readiness_probe=probe
+    )
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    volumes = runner_kwargs["volumes"]
+    assert len(volumes) == 8  # 2 seam + 3 base(ro) + 3 scratch(rw)
+    for subpath, bind in EXPECTED_BASE_BINDS.items():
+        assert volumes[str(base.resolve() / subpath)] == {"bind": bind, "mode": "ro"}
+    job_scratch = scratch_root.resolve() / network_name_for(JOB_ID)
+    for subpath, bind in EXPECTED_SCRATCH_BINDS.items():
+        assert volumes[str(job_scratch / subpath)] == {"bind": bind, "mode": "rw"}
+    assert scratch_seen["dirs"] == ["data", "documents", "logs"]  # pre-created (G-15)
+    assert not job_scratch.exists()  # D-B: discarded when the job ended
+    assert "volumes" not in sut_kwargs  # SUT stays a blackbox — no cache either tier
+
+
+def test_two_tier_scratch_paths_are_unique_per_job(tmp_path, cache_env_clear):
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    scratch_hosts: dict[str, set] = {}
+    for job_id in ("job-1", "job-2"):
+        put_result(tmp_path, job_id=job_id)
+        client = FakeClient()
+        run_job(
+            make_spec(job_id=job_id),
+            tmp_path,
+            RUNNER_IMAGE,
+            SUT_IMAGE,
+            client,
+            poll_interval_s=0.0,
+            cache_root=base,
+            cache_scratch_root=scratch_root,
+        )
+        (_, runner_kwargs), _ = client.run_calls
+        scratch_hosts[job_id] = {
+            host
+            for host, spec in runner_kwargs["volumes"].items()
+            if spec["mode"] == "rw" and host.startswith(str(scratch_root.resolve()))
+        }
+        assert len(scratch_hosts[job_id]) == 3
+    assert scratch_hosts["job-1"].isdisjoint(scratch_hosts["job-2"])  # 잡별 고유 경로
+
+
+def test_two_tier_scratch_discarded_even_when_spawn_raises(tmp_path, cache_env_clear):
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    client = FakeClient(raise_on_sut_run=RuntimeError("docker daemon fell over"))
+    outcome = run_min(tmp_path, client, cache_root=base, cache_scratch_root=scratch_root)
+    assert outcome.infra_error is not None
+    assert not (scratch_root / network_name_for(JOB_ID)).exists()  # finally-discard held
+
+
+def test_empty_cache_env_values_are_loud_not_silent_unset(tmp_path, cache_env_clear):
+    # G-26 변종: CV_ISAAC_CACHE_ROOT="" must never silently mean '0 cache
+    # mounts' (an all-cold run measured as warm); same for the scratch env.
+    client = FakeClient()
+    cache_env_clear.setenv(CACHE_ROOT_ENV, "")
+    with pytest.raises(ValueError, match="empty"):
+        run_min(tmp_path, client)
+    assert client.events == []  # loud + pre-resource
+
+    cache_env_clear.delenv(CACHE_ROOT_ENV, raising=False)
+    base, _ = make_two_tier_roots(tmp_path)
+    cache_env_clear.setenv(CACHE_SCRATCH_ROOT_ENV, "")
+    with pytest.raises(ValueError, match="empty"):
+        run_min(tmp_path, client, cache_root=base)
+    assert client.events == []
+
+
+def test_scratch_root_without_base_root_is_loud(tmp_path, cache_env_clear):
+    _, scratch_root = make_two_tier_roots(tmp_path)
+    client = FakeClient()
+    with pytest.raises(ValueError, match="without cache_root"):
+        run_min(tmp_path, client, cache_scratch_root=scratch_root)
+    assert client.events == []  # half-configured 2-tier never launches anything
+
+
+def test_missing_scratch_root_raises_before_any_resource(tmp_path, cache_env_clear):
+    base, _ = make_two_tier_roots(tmp_path)
+    client = FakeClient()
+    with pytest.raises(ValueError, match="cache_scratch_root"):
+        run_min(tmp_path, client, cache_root=base, cache_scratch_root=tmp_path / "nope")
+    assert client.events == []
+
+
+def test_runner_mounts_structured_log_is_assertable(tmp_path, cache_env_clear, capsys):
+    # G-26 feature-on gate: the spawn emits ONE structured line carrying the
+    # full mount spec (count / ro flags / paths) — tests and operators assert
+    # the cache actually engaged instead of trusting a silent no-op.
+    put_result(tmp_path)
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    plugin = tmp_path / "scenario-dir"
+    plugin.mkdir()
+    client = FakeClient()
+    run_min(
+        tmp_path,
+        client,
+        cache_root=base,
+        cache_scratch_root=scratch_root,
+        oracle_plugin_dir=str(plugin),
+    )
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("[cv-supervisor] runner-mounts ")
+    ]
+    assert len(lines) == 1  # one spawn, one line
+    logged = json.loads(lines[0].removeprefix("[cv-supervisor] runner-mounts "))
+    assert logged["job_id"] == JOB_ID
+    mounts = {entry["target"]: entry for entry in logged["mounts"]}
+    assert len(mounts) == 9  # 3 base + 3 scratch + plugin + spec + result
+    for bind in EXPECTED_BASE_BINDS.values():
+        assert mounts[bind]["mode"] == "ro"
+        assert mounts[bind]["source"].startswith(str(base.resolve()))
+    for bind in EXPECTED_SCRATCH_BINDS.values():
+        assert mounts[bind]["mode"] == "rw"
+        assert mounts[bind]["source"].startswith(str(scratch_root.resolve()))
+    assert mounts[str(plugin.resolve())]["mode"] == "ro"  # D-1 plugin bind rides the log too
+    assert mounts[JOB_SPEC_MOUNT]["mode"] == "ro"
+    assert mounts[RESULT_OUT_MOUNT]["mode"] == "rw"
 
 
 # --------------------------------------------------------------------------- #

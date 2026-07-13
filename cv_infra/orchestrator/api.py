@@ -29,8 +29,11 @@ scenario-adjacent ``module:Class`` oracles admit over REST too (the M8
 file-submit path re-admits its scenario dirs here). Absent field = previous
 behavior, unchanged; entry-point oracles resolve without any anchor.
 Same-host trusted-path assumption (MVP, M8 §8 g5): submitter and API share a
-filesystem, so the anchor is used as-is on THIS host. Admit-only this cycle —
-supervisor (real-runner) propagation is a GPU-cycle follow-up.
+filesystem, so the anchor is used as-is on THIS host. Beyond admit (p4c4, D-1
+wiring #3 잔여 반쪽): each request's anchor rides its fanned-out Jobs
+(``Job.oracle_plugin_dir``) so the production runner seam hands it to
+``run_job(oracle_plugin_dir=...)`` — ro mount + ``CV_ORACLE_PLUGIN_DIR``,
+runner-only.
 
 Submission is all-or-nothing (비전파): every request must admit before ANY job
 is created — one bad request rejects the whole envelope with a structured 422
@@ -67,10 +70,17 @@ Envelope supervision runs as an asyncio background task on the app's loop,
 single-flight across envelopes (an app-level lock): jobs WITHIN an envelope run
 k-parallel via ``ParallelSupervisor``; envelopes queue behind each other so the
 operator budget k is never exceeded globally. Cross-envelope parallel admission
-is the resident-service cycle's concern (P5 compose). Job state transitions are
-persisted through the Store (REQ-ORCH-011); the envelope->request registry is
-in-memory this cycle (restart re-attachment of envelopes rides the R14
-reconciliation cycle).
+is the resident-service cycle's concern (P5 compose).
+
+Persistence (p4c4 — in-memory 유실 해소): job state transitions persist through
+the Store (REQ-ORCH-011) as before; the envelope->request registry is now
+persisted at submit and the per-request ``RequestRollup``s + envelope
+``report_outcome`` (or crash ``error``) at completion. A status read for an
+envelope this process never saw (orchestrator restart) is served from the store
+— never recomputed from results, which did not survive. Envelope supervision
+itself is NOT resumed after a restart: ``supervisor.reconcile_at_restart``
+(R14) re-labels the orphaned jobs and marks the envelope failed-with-error, so
+the read stays loud rather than stuck 'running'.
 """
 
 from __future__ import annotations
@@ -121,8 +131,13 @@ def report_outcome_of(results: list[JobResult]) -> str:
 
 @dataclass
 class _EnvelopeRecord:
-    """In-memory registry entry for one submitted envelope (module docstring)."""
+    """In-process registry entry for one submitted envelope (module docstring).
 
+    The live view while this process supervises; the durable twin is the
+    store's envelope registry + rollups (written at submit / completion).
+    """
+
+    envelope_id: str
     request_ids: list[str]  # submission order
     jobs: list[Job]  # live objects — states mutate in place as the queue drives them
     results: list[JobResult] = field(default_factory=list)  # terminal, set when done
@@ -238,12 +253,40 @@ def create_app(
     drive_lock = asyncio.Lock()  # single-flight envelopes (module docstring)
     drive_tasks: set[asyncio.Task[None]] = set()  # strong refs — a bare create_task can be GC'd
 
+    def _persist_terminal(record: _EnvelopeRecord) -> None:
+        """Write-through at completion (p4c4 영속): rollups + envelope outcome.
+
+        A crashed supervision persists the error marker only (its results are
+        not trustworthy); a clean completion persists one rollup per request
+        plus the envelope-level ``report_outcome``.
+        """
+        if record.error is not None:
+            store.complete_envelope(record.envelope_id, error=record.error)
+            return
+        for rid in record.request_ids:
+            store.upsert_rollup(
+                roll_up(rid, [r for r in record.results if r.job.request_id == rid])
+            )
+        store.complete_envelope(
+            record.envelope_id, report_outcome=report_outcome_of(record.results)
+        )
+
     async def _drive(record: _EnvelopeRecord, supervisor: ParallelSupervisor) -> None:
         async with drive_lock:
             try:
                 record.results = await supervisor.run()
+            except asyncio.CancelledError:
+                # App/loop shutdown mid-envelope: leave the envelope 'running'
+                # in the store — reconcile_at_restart (R14) marks it on the
+                # next boot. Persisting a fabricated outcome from partial
+                # results here would be a lie.
+                raise
             except Exception as exc:  # loud on the status read, never swallowed
                 record.error = f"{type(exc).__name__}: {exc}"
+            try:
+                _persist_terminal(record)
+            except Exception as exc:  # persistence failure is loud too, never masked
+                record.error = record.error or f"persist failed: {type(exc).__name__}: {exc}"
             finally:
                 record.done = True
 
@@ -268,6 +311,14 @@ def create_app(
         envelope_id = f"env-{uuid.uuid4().hex[:12]}"
         request_ids = [f"{envelope_id}/r{i}" for i in range(len(documents))]
         jobs = fan_out_requests(list(zip(request_ids, repeats)))
+        anchor_of = dict(zip(request_ids, plugin_dirs, strict=True))
+        for job in jobs:
+            # D-1 wiring #3 (p4c4): the stage-5 anchor rides each fanned-out job
+            # so the runner seam can hand it to run_job(oracle_plugin_dir=...).
+            job.oracle_plugin_dir = anchor_of[job.request_id]
+        # Durable registry FIRST (p4c4 영속): a restart can then serve status for
+        # this envelope even though the in-memory record below dies with us.
+        store.record_envelope(envelope_id, request_ids, plugin_dirs)
         queue = JobQueue(  # persists every job QUEUED via the store (REQ-ORCH-011)
             jobs, store=store, max_attempts=max_attempts, retry_on_timeout=retry_on_timeout
         )
@@ -278,18 +329,49 @@ def create_app(
             allocator=allocator,
             job_timeout_s=job_timeout_s,
         )
-        record = _EnvelopeRecord(request_ids=request_ids, jobs=jobs)
+        record = _EnvelopeRecord(envelope_id=envelope_id, request_ids=request_ids, jobs=jobs)
         envelopes[envelope_id] = record
         task = asyncio.get_running_loop().create_task(_drive(record, supervisor))
         drive_tasks.add(task)
         task.add_done_callback(drive_tasks.discard)
         return {"envelope_id": envelope_id}
 
+    def _status_from_store(envelope_id: str) -> dict[str, Any]:
+        """Serve status for an envelope this process never saw (restart path, p4c4).
+
+        Everything comes from the persisted registry / jobs / rollups — never
+        recomputed from results (which did not survive the restart). A crash /
+        restart marker surfaces as the same loud 500 the in-memory path uses.
+        """
+        stored = store.load_envelope(envelope_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
+        if stored.error is not None:
+            raise HTTPException(
+                status_code=500, detail=f"envelope supervision crashed: {stored.error}"
+            )
+        position = {rid: pos for pos, rid in enumerate(stored.request_ids)}
+        jobs = sorted(
+            (job for job in store.load_jobs() if job.request_id in position),
+            key=lambda job: (position[job.request_id], job.repeat_index),
+        )
+        rollups = [
+            store.load_rollup(rid) or RequestRollup(request_id=rid)  # empty while running
+            for rid in stored.request_ids
+        ]
+        return _status_body(
+            envelope_id,
+            status=stored.status,
+            jobs=jobs,
+            rollups=rollups,
+            report_outcome=stored.report_outcome,
+        )
+
     @app.get("/envelopes/{envelope_id}")
     async def envelope_status(envelope_id: str) -> dict[str, Any]:
         record = envelopes.get(envelope_id)
         if record is None:
-            raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
+            return _status_from_store(envelope_id)
         if record.error is not None:
             raise HTTPException(
                 status_code=500, detail=f"envelope supervision crashed: {record.error}"
@@ -298,23 +380,42 @@ def create_app(
             roll_up(rid, [r for r in record.results if r.job.request_id == rid])
             for rid in record.request_ids
         ]
-        return {
-            "envelope_id": envelope_id,
-            "status": "completed" if record.done else "running",
-            "jobs": [
-                {
-                    "request_id": job.request_id,
-                    "repeat_index": job.repeat_index,
-                    "state": job.state.value,
-                    "attempt_count": job.attempt_count,
-                }
-                for job in record.jobs
-            ],
-            "rollups": [_rollup_dict(rollup) for rollup in rollups],
-            "report_outcome": report_outcome_of(record.results) if record.done else None,
-        }
+        return _status_body(
+            envelope_id,
+            status="completed" if record.done else "running",
+            jobs=record.jobs,
+            rollups=rollups,
+            report_outcome=report_outcome_of(record.results) if record.done else None,
+        )
 
     return app
+
+
+def _status_body(
+    envelope_id: str,
+    *,
+    status: str,
+    jobs: list[Job],
+    rollups: list[RequestRollup],
+    report_outcome: str | None,
+) -> dict[str, Any]:
+    """Assemble the pinned status wire shape (module docstring) — one builder for
+    both the in-memory and the restart/store read paths (no shape drift)."""
+    return {
+        "envelope_id": envelope_id,
+        "status": status,
+        "jobs": [
+            {
+                "request_id": job.request_id,
+                "repeat_index": job.repeat_index,
+                "state": job.state.value,
+                "attempt_count": job.attempt_count,
+            }
+            for job in jobs
+        ],
+        "rollups": [_rollup_dict(rollup) for rollup in rollups],
+        "report_outcome": report_outcome,
+    }
 
 
 def _rollup_dict(rollup: RequestRollup) -> dict[str, Any]:

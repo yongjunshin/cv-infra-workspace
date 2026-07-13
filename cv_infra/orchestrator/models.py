@@ -45,12 +45,19 @@ class Job:
     Identified by (request_id, repeat_index); repeat_index is unique within a request
     (0..repeats-1). PLACEHOLDER: shares with the M1 contract Job model in Phase 3 (no contract
     field duplication here). attempt_count backs the retry policy (REQ-ORCH-010).
+
+    ``oracle_plugin_dir`` (D-1 2026-07-11 wiring, p4c4): the per-request stage-5 custom-oracle
+    anchor (absolute host directory) riding the job so the production runner seam can hand it
+    to ``run_job(oracle_plugin_dir=...)`` — None = no anchor (entry-point oracles only). It is
+    request-level data denormalized onto the job (the job spec is self-contained) and is
+    persisted with the job (REQ-ORCH-011) so a restored/retried job keeps its anchor.
     """
 
     request_id: str
     repeat_index: int
     state: JobState = JobState.QUEUED
     attempt_count: int = 0
+    oracle_plugin_dir: str | None = None
 
 
 @dataclass

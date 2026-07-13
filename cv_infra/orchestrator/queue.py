@@ -94,9 +94,10 @@ class JobQueue:
 
         QUEUED jobs re-enter the queue; terminal jobs stay terminal (still
         visible via ``store.load_jobs()``). Jobs persisted as RUNNING are
-        in-flight orphans awaiting docker-label reconciliation (M3 §3.9, R14 —
-        a later cycle); they are NOT silently re-queued here because
-        RUNNING -> QUEUED is not a legal transition.
+        in-flight orphans and are NOT silently re-queued here (RUNNING ->
+        QUEUED is not a legal transition) — ``supervisor.reconcile_at_restart``
+        (M3 §3.9, R14) owns them: docker-label sweep first, then each orphan is
+        recorded as a FAILED attempt through the normal retry policy.
         """
         queued = [job for job in store.load_jobs() if job.state is JobState.QUEUED]
         return cls(
