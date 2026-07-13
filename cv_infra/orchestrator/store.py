@@ -4,7 +4,8 @@ One file, one writer: job state transitions (M3 §3.3), live ``ROS_DOMAIN_ID``
 allocations (M3 §3.6 D-O), the envelope->request registry and the per-request
 ``RequestRollup``s (p4c4 — the api.py registry is no longer memory-only) are
 persisted so an orchestrator restart restores state — ``load_jobs()`` returns
-every job with its state / ``attempt_count`` / stage-5 anchor,
+every job with its state / ``attempt_count`` / stage-5 anchor / canonical
+``job_spec`` (v3, p4c4 glue),
 ``domain_ids_in_use()`` returns live allocations, ``load_envelope()`` /
 ``load_rollup()`` restore the submit-surface view. RUNNING orphans left behind
 by a crash are re-labeled by ``supervisor.reconcile_at_restart`` (M3 §3.9, R14).
@@ -39,8 +40,9 @@ _BUSY_TIMEOUT_MS = 5_000
 
 # Stamped via PRAGMA user_version (module docstring). v1 = p4c1/p4c3 (jobs +
 # ros_domain_ids, unstamped = 0); v2 = p4c4 (jobs.oracle_plugin_dir + envelope
-# registry + rollups).
-_SCHEMA_VERSION = 2
+# registry + rollups); v3 = p4c4 glue (jobs.job_spec — the canonical JOB_SPEC
+# JSON riding each job, T1 report §7-1 (a) 재기동 대비 영속).
+_SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     state             TEXT    NOT NULL,
     attempt_count     INTEGER NOT NULL,
     oracle_plugin_dir TEXT,
+    job_spec          TEXT,
     PRIMARY KEY (request_id, repeat_index)
 );
 CREATE TABLE IF NOT EXISTS ros_domain_ids (
@@ -131,38 +134,42 @@ class Store:
             )
         with self._write_lock, self._conn:
             self._conn.executescript(_SCHEMA)
-            # v1 files (p4c1/p4c3) predate jobs.oracle_plugin_dir: additive
-            # in-place upgrade — CREATE IF NOT EXISTS cannot add a column.
+            # Older files predate the jobs columns below (v1: oracle_plugin_dir,
+            # v2: job_spec): additive in-place upgrade — CREATE IF NOT EXISTS
+            # cannot add a column.
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
-            if "oracle_plugin_dir" not in columns:
-                self._conn.execute("ALTER TABLE jobs ADD COLUMN oracle_plugin_dir TEXT")
+            for column in ("oracle_plugin_dir", "job_spec"):
+                if column not in columns:
+                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # -- jobs (REQ-ORCH-011: every transition is persisted) -------------------
 
     def upsert_job(self, job: Job) -> None:
-        """Persist the job's CURRENT state + attempt_count + anchor (insert or update)."""
+        """Persist the job's CURRENT state + attempt_count + anchor + spec (insert or update)."""
         with self._write_lock, self._conn:
             self._conn.execute(
                 "INSERT INTO jobs (request_id, repeat_index, state, attempt_count,"
-                " oracle_plugin_dir) VALUES (?, ?, ?, ?, ?)"
+                " oracle_plugin_dir, job_spec) VALUES (?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(request_id, repeat_index) DO UPDATE SET"
                 " state = excluded.state, attempt_count = excluded.attempt_count,"
-                " oracle_plugin_dir = excluded.oracle_plugin_dir",
+                " oracle_plugin_dir = excluded.oracle_plugin_dir,"
+                " job_spec = excluded.job_spec",
                 (
                     job.request_id,
                     job.repeat_index,
                     job.state.value,
                     job.attempt_count,
                     job.oracle_plugin_dir,
+                    json.dumps(job.job_spec, sort_keys=True) if job.job_spec is not None else None,
                 ),
             )
 
     def load_jobs(self) -> list[Job]:
         """Restore every persisted job (restart recovery input, M3 §3.9)."""
         rows = self._conn.execute(
-            "SELECT request_id, repeat_index, state, attempt_count, oracle_plugin_dir FROM jobs"
-            " ORDER BY request_id, repeat_index"
+            "SELECT request_id, repeat_index, state, attempt_count, oracle_plugin_dir, job_spec"
+            " FROM jobs ORDER BY request_id, repeat_index"
         ).fetchall()
         return [
             Job(
@@ -171,8 +178,9 @@ class Store:
                 state=JobState(state),
                 attempt_count=attempt_count,
                 oracle_plugin_dir=oracle_plugin_dir,
+                job_spec=json.loads(job_spec) if job_spec is not None else None,
             )
-            for request_id, repeat_index, state, attempt_count, oracle_plugin_dir in rows
+            for request_id, repeat_index, state, attempt_count, oracle_plugin_dir, job_spec in rows
         ]
 
     # -- ROS_DOMAIN_ID rows (M3 §3.6 D-O: allocated/released via SQLite) ------

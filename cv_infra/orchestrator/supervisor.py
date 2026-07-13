@@ -36,7 +36,10 @@ with ``--no-deps`` (DoD-P2-12). Tests inject a duck-typed fake client.
 Phase 4 layers ``ParallelSupervisor`` (end of module) on top: k-parallel asyncio
 supervision of the per-job seam via ``JobQueue`` + ``SlotAccountant`` +
 ``DomainIdAllocator``, plus ``reconcile_at_restart`` (R14 — label sweep +
-RUNNING-orphan re-label + domain-id/envelope reconciliation after a crash). The
+RUNNING-orphan re-label + domain-id/envelope reconciliation after a crash), plus
+``RunJobRunner`` (p4c4 glue — the production Runner seam wrapping this very
+``run_job`` for the REST path: JOB_SPEC off ``Job.job_spec``, outcome ->
+``JobResult`` fold, duck-typed ``job_timeout_s`` declaration). The
 single-runner ``run_job`` path above stays frozen (P2/P3 ``cv-infra run`` 계약).
 The pure isolation helpers (``allocate_ros_domain_id`` / ``network_name_for`` /
 ``ROS_DOMAIN_ID_SPACE``) moved verbatim to ``allocator.py`` (M3 §3.6 home) and
@@ -75,7 +78,7 @@ from cv_infra.orchestrator.allocator import (
     network_name_for as network_name_for,
 )
 from cv_infra.orchestrator.fake_runner import Runner
-from cv_infra.orchestrator.models import Job, JobResult, JobState
+from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.scheduler import SlotAccountant
 from cv_infra.orchestrator.store import Store, job_key
@@ -122,6 +125,16 @@ ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
 
 _TEARDOWN_STOP_TIMEOUT_S = 10  # graceful stop window before force-remove
 _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immediately)
+
+# Single source of the wall-clock runaway watchdog default (operational
+# placeholder, not an NFR claim — run_job docstring): run_job's signature and
+# the production ``RunJobRunner`` share this ONE constant (이중 정의 금지).
+DEFAULT_JOB_TIMEOUT_S = 1800.0
+
+# The watchdog kill's infra_error marker — producer = ``_supervise_until_runner_exit``,
+# consumer = ``_job_result_of`` (p4c4 glue: marker-prefixed infra_error classifies the
+# attempt TIMEOUT per the termination contract; shared constant, never a re-typed string).
+JOB_TIMEOUT_MARKER = "job timeout:"
 
 _GATE_READY = "ready"
 _GATE_EXITED = "exited"
@@ -282,7 +295,7 @@ def run_job(
     runner_gpus: bool = True,
     readiness_probe: ReadinessProbe | None = None,
     readiness_timeout_s: float = 120.0,
-    job_timeout_s: float = 1800.0,
+    job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
     sut_restart_limit: int = 1,
     poll_interval_s: float = 1.0,
 ) -> JobOutcome:
@@ -524,7 +537,8 @@ def _supervise_until_runner_exit(
             return _exit_code(runner), None
         if time.monotonic() >= deadline:
             return None, (
-                f"job timeout: runner still running after {job_timeout_s}s (teardown kills it)"
+                f"{JOB_TIMEOUT_MARKER} runner still running after {job_timeout_s}s"
+                " (teardown kills it)"
             )
         sut.reload()
         if sut.status == "exited":
@@ -710,6 +724,130 @@ class ParallelSupervisor:
         except Exception:
             # Runner crash boundary: this attempt failed; other jobs unaffected.
             return JobResult(job=job, state=JobState.FAILED, verdict=None)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 (p4c4 glue): production Runner seam — the frozen run_job driven per
+# fanned-out Job (T1 report §7-1 (b)).
+# --------------------------------------------------------------------------- #
+
+# Control-plane fold of the RECOVERED result.json ``verdict`` (the M1 canonical
+# key — nothing else is read; 재계산·재해석 금지, M4 경계와 동일 원칙).
+# "timeout" collapses to FAIL exactly like the runner/CLI exit fold
+# (contract/schema.py Verdict comment: the SUT missed the sim-time budget = a
+# SUT verdict, not infra; the fine-grained literal stays in result.json for M4).
+# "error" / unknown / unreadable are deliberately ABSENT: they stay verdict-less
+# (infra outcome -> rollup 'errored' territory, never a fabricated judgement).
+_RESULT_VERDICT_FOLD: dict[str, Verdict] = {
+    "pass": Verdict.PASS,
+    "fail": Verdict.FAIL,
+    "timeout": Verdict.FAIL,
+}
+
+
+class RunJobRunner:
+    """Production ``Runner`` seam: one fanned-out ``Job`` -> ``run_job`` -> ``JobResult``.
+
+    The p4c4 REST->runner glue: ``ParallelSupervisor`` drives this synchronous
+    seam per job on the executor pool; every call reuses the FROZEN ``run_job``
+    contract verbatim (signature unchanged) with the construction-time
+    operational knobs. CPU tests inject ``run_job_fn`` (duck-typed fake — G-20
+    주입식, never a module stub); production leaves it None (= the real
+    ``run_job``).
+
+    * ``job.job_spec`` (materialized by the api submit path, persisted with the
+      job) is the canonical JOB_SPEC passed by value; ``sut_image_ref`` comes
+      off that spec (same fold as ``cv_infra/cli/main.py`` line ``run_job(...,
+      job_spec["sut_image_ref"], ...)``). A spec-less job raises loud — a REST
+      job that lost its spec must never silently no-op (G-26); the
+      ``ParallelSupervisor`` crash boundary records that attempt FAILED.
+    * ``job.oracle_plugin_dir`` rides into ``run_job(oracle_plugin_dir=...)``
+      (D-1 wiring #3 — ro mount + ``CV_ORACLE_PLUGIN_DIR``, runner-only).
+    * ``job_timeout_s`` is a PUBLIC attribute — the duck-typed inner-watchdog
+      declaration the ``ParallelSupervisor`` coherence gate reads (p4c1 후속 ②)
+      — and the SAME attribute is what every ``run_job`` call receives (single
+      source, 이중 정의 금지; default = ``DEFAULT_JOB_TIMEOUT_S``).
+    """
+
+    def __init__(
+        self,
+        *,
+        out_dir: str | os.PathLike[str],
+        runner_image: str,
+        docker_client: Any = None,
+        runner_env: dict[str, str] | None = None,
+        cache_root: str | os.PathLike[str] | None = None,
+        cache_scratch_root: str | os.PathLike[str] | None = None,
+        runner_gpus: bool = True,
+        readiness_probe: ReadinessProbe | None = None,
+        job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+        run_job_fn: Callable[..., JobOutcome] | None = None,
+    ) -> None:
+        self.job_timeout_s = job_timeout_s  # public: coherence-gate contract (class docstring)
+        self._out_dir = Path(out_dir)
+        self._runner_image = runner_image
+        self._docker_client = docker_client
+        self._runner_env = runner_env
+        self._cache_root = cache_root
+        self._cache_scratch_root = cache_scratch_root
+        self._runner_gpus = runner_gpus
+        self._readiness_probe = readiness_probe
+        self._run_job = run_job_fn if run_job_fn is not None else run_job
+
+    def run(self, job: Job) -> JobResult:
+        spec = job.job_spec
+        if not spec:
+            raise ValueError(
+                f"job {job_key(job)} carries no job_spec — the REST submit path must"
+                " materialize the admitted request onto every fanned-out job"
+                " (api._job_spec_for); refusing a silent no-op run (G-26)"
+            )
+        outcome = self._run_job(
+            spec,
+            self._out_dir,
+            self._runner_image,
+            spec["sut_image_ref"],
+            self._docker_client,
+            runner_env=self._runner_env,
+            cache_root=self._cache_root,
+            cache_scratch_root=self._cache_scratch_root,
+            oracle_plugin_dir=job.oracle_plugin_dir,
+            runner_gpus=self._runner_gpus,
+            readiness_probe=self._readiness_probe,
+            job_timeout_s=self.job_timeout_s,
+        )
+        return _job_result_of(job, outcome)
+
+
+def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
+    """Fold one ``JobOutcome`` into the control-plane ``JobResult`` (p4c4 glue).
+
+    Precedence: ``infra_error`` first (TIMEOUT when it carries the
+    ``JOB_TIMEOUT_MARKER`` — the watchdog kill, termination contract 'timeout ⇒
+    kill+timeout'; anything else FAILED) -> missing result (FAILED,
+    belt-and-braces: run_job's invariant sets infra_error alongside) -> the
+    recovered result.json ``verdict`` key via ``_RESULT_VERDICT_FOLD``. The
+    recovered verdict OUTRANKS the informational ``runner_exit_code`` (the
+    runner exits 1 on a domain FAIL — same fold principle as
+    ``cv_infra/cli/main.py::_exit_from_outcome``). An unreadable / non-dict /
+    unknown-verdict result is an infra outcome: FAILED verdict-less, never a
+    fabricated domain judgement.
+    """
+    if outcome.infra_error is not None:
+        if outcome.infra_error.startswith(JOB_TIMEOUT_MARKER):
+            return JobResult(job=job, state=JobState.TIMEOUT, verdict=None)
+        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+    if outcome.result_path is None:
+        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+    try:
+        payload = json.loads(Path(outcome.result_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # unreadable / not JSON — includes JSONDecodeError
+        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+    raw_verdict = payload.get("verdict") if isinstance(payload, dict) else None
+    verdict = _RESULT_VERDICT_FOLD.get(raw_verdict) if isinstance(raw_verdict, str) else None
+    if verdict is None:
+        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+    return JobResult(job=job, state=JobState.COMPLETED, verdict=verdict)
 
 
 # --------------------------------------------------------------------------- #

@@ -33,7 +33,11 @@ filesystem, so the anchor is used as-is on THIS host. Beyond admit (p4c4, D-1
 wiring #3 잔여 반쪽): each request's anchor rides its fanned-out Jobs
 (``Job.oracle_plugin_dir``) so the production runner seam hands it to
 ``run_job(oracle_plugin_dir=...)`` — ro mount + ``CV_ORACLE_PLUGIN_DIR``,
-runner-only.
+runner-only. Likewise (p4c4 glue, T1 report §7-1 (a)) each ADMITTED request
+materializes into the canonical per-job JOB_SPEC (``_job_spec_for``) riding —
+and persisting with — its Jobs (``Job.job_spec``), so ``RunJobRunner`` drives
+the real ``run_job`` without ever re-admitting; the env-configured production
+wiring lives in ``serve.py``.
 
 Submission is all-or-nothing (비전파): every request must admit before ANY job
 is created — one bad request rejects the whole envelope with a structured 422
@@ -96,7 +100,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 
 from cv_infra.contract.errors import ContractError
-from cv_infra.contract.loader import load_request
+from cv_infra.contract.loader import AdmittedRequest, load_request
 from cv_infra.orchestrator.allocator import DomainIdAllocator
 from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.fanout import fan_out_requests
@@ -104,7 +108,7 @@ from cv_infra.orchestrator.models import Job, JobResult, RequestRollup, Verdict
 from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import SlotAccountant
-from cv_infra.orchestrator.store import Store
+from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import ParallelSupervisor
 
 _DOC_LINK = "M3-orchestrator.md §7 (submit wire — D-1 internal representation)"
@@ -207,16 +211,19 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
 
 def _admit_all(
     documents: list[dict[str, Any]], plugin_dirs: list[str | None]
-) -> tuple[list[int], list[dict[str, Any]]]:
+) -> tuple[list[AdmittedRequest], list[dict[str, Any]]]:
     """Run EVERY document through the M1 admit gate before any job exists.
 
-    Returns ``(per-request repeats, admit errors as annotation dicts)`` — a
+    Returns ``(admitted requests, admit errors as annotation dicts)`` — a
     non-empty error list means the whole envelope is rejected (all-or-nothing,
     비전파). One error per failing request (the loader raises its first
     violation), so a multi-bad envelope still reports every bad request.
     ``plugin_dirs`` (parsed, equal length) rides into stage 5 per request.
+    The ADMITTED models are kept (p4c4 glue, T1 report §7-1 (a)): they carry
+    the repeats axis AND materialize into the per-job canonical JOB_SPEC —
+    admit-then-discard would leave the production runner nothing to run.
     """
-    repeats: list[int] = []
+    admitted_requests: list[AdmittedRequest] = []
     errors: list[dict[str, Any]] = []
     for i, (doc, plugin_dir) in enumerate(zip(documents, plugin_dirs, strict=True)):
         # Canonical indented-JSON stream through the REAL M1 gate (module
@@ -227,8 +234,36 @@ def _admit_all(
         except ContractError as err:
             errors.append(err.to_annotation_dict())
             continue
-        repeats.append(admitted.request.execution_settings.repeats)
-    return repeats, errors
+        admitted_requests.append(admitted)
+    return admitted_requests, errors
+
+
+def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
+    """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict (p4c4 glue).
+
+    The wire shape is the frozen Phase-2 M3->M2 seam (supervisor JOB_SPEC file
+    -> runner ``resolve_job_spec_dict``): exact top-level key set ``{job_id,
+    scenario, sut_image_ref, interface, acceptance_criteria}`` with
+    ``sut.image_ref`` flattened (REQ-INTAKE-006). ``exclude_none=True`` keeps
+    "None = downstream default applies" fields ABSENT (a present-but-null
+    known-key param would defeat the oracle ``read_field`` fallback); free-form
+    custom-criterion params are not filtered, so explicit user nulls survive.
+
+    SOURCE OF TRUTH anchor (G-25): the envelope-less producer of this exact
+    shape is ``cv_infra/cli/main.py::_job_spec_from_request`` (M8, ``cv-infra
+    run``). This REST-path twin is kept verbatim-equal by the mechanical parity
+    guard ``tests/test_orchestrator_rest_glue.py`` — production M3 deliberately
+    does NOT import the M8 CLI plane (layer direction: M8 wraps M3).
+    """
+    return {
+        "job_id": job_id,
+        "scenario": request.scenario.model_dump(exclude_none=True),
+        "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
+        "interface": request.interface.model_dump(exclude_none=True),
+        "acceptance_criteria": [
+            criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
+        ],
+    }
 
 
 def create_app(
@@ -243,9 +278,10 @@ def create_app(
     """Build the submit-surface app around an injected store + runner seam.
 
     ``runner`` is the per-job blocking seam ``ParallelSupervisor`` drives
-    (CPU tests inject fakes; the production callable wraps ``run_job`` — P5
-    compose glue). ``k`` is the computed concurrency cap (``compute_k`` output
-    — never a constant); the queue policy knobs mirror ``JobQueue``.
+    (CPU tests inject fakes; production injects ``supervisor.RunJobRunner`` —
+    the env-configured wiring is ``serve.build_app``). ``k`` is the computed
+    concurrency cap (``compute_k`` output — never a constant); the queue
+    policy knobs mirror ``JobQueue``.
     """
     app = FastAPI(title="cv-infra orchestrator", docs_url=None, redoc_url=None)
     envelopes: dict[str, _EnvelopeRecord] = {}
@@ -304,18 +340,24 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail={"errors": [err.to_annotation_dict()]}
             ) from err
-        repeats, errors = _admit_all(documents, plugin_dirs)
+        admitted, errors = _admit_all(documents, plugin_dirs)
         if errors:  # all-or-nothing: zero jobs were created (비전파)
             raise HTTPException(status_code=422, detail={"errors": errors})
 
         envelope_id = f"env-{uuid.uuid4().hex[:12]}"
         request_ids = [f"{envelope_id}/r{i}" for i in range(len(documents))]
+        repeats = [a.request.execution_settings.repeats for a in admitted]
         jobs = fan_out_requests(list(zip(request_ids, repeats)))
         anchor_of = dict(zip(request_ids, plugin_dirs, strict=True))
+        admitted_of = dict(zip(request_ids, admitted, strict=True))
         for job in jobs:
             # D-1 wiring #3 (p4c4): the stage-5 anchor rides each fanned-out job
             # so the runner seam can hand it to run_job(oracle_plugin_dir=...).
             job.oracle_plugin_dir = anchor_of[job.request_id]
+            # p4c4 glue (T1 §7-1 (a)): the ADMITTED model materializes into the
+            # canonical per-job JOB_SPEC riding (and persisting with) the job —
+            # the production runner seam (RunJobRunner) drives run_job off it.
+            job.job_spec = _job_spec_for(admitted_of[job.request_id].request, job_key(job))
         # Durable registry FIRST (p4c4 영속): a restart can then serve status for
         # this envelope even though the in-memory record below dies with us.
         store.record_envelope(envelope_id, request_ids, plugin_dirs)
