@@ -34,7 +34,9 @@ RUN pip install --no-cache-dir uv==0.11.13 \
 # falls into one of two audited categories:
 #   * HOST_ONLY_DEPS      — host-side control plane (docker SDK = M3 supervisor
 #     spawn, pyyaml = M8 CLI); the runner, DDS-only and without docker.sock,
-#     never imports them.
+#     never imports them. p4c1~c3 additions audited host-only 2026-07-13 (import
+#     sites: orchestrator/{serve,api,scheduler}.py + cli/batch.py only) — image
+#     policy ruling: agent-comms question deployment-2026-07-13-p4-gpu-parallel.
 #   * BUNDLE_SUPPLIED_DEPS — deps the kit-prebundled interpreter ALREADY ships
 #     (D-4': pydantic stack, measured 2.11.7/core 2.33.2 on image #5, p3c1 probe
 #     bundled-pydantic.txt); the runner consumes contract.schema on that bundle.
@@ -47,7 +49,7 @@ RUN pip install --no-cache-dir uv==0.11.13 \
 # decision (extend an allowlist vs add a uv.lock-based constraints install step
 # before --no-deps) instead of silently clobbering the Isaac bundle pins (M5 §3.1).
 RUN set -eu; \
-    HOST_ONLY_DEPS='certifi charset-normalizer docker idna pywin32 pyyaml requests urllib3'; \
+    HOST_ONLY_DEPS='annotated-doc anyio certifi charset-normalizer click colorama docker fastapi h11 httpcore httpx idna nvidia-ml-py pywin32 pyyaml requests starlette urllib3 uvicorn'; \
     BUNDLE_SUPPLIED_DEPS='annotated-types pydantic pydantic-core typing-extensions typing-inspection'; \
     uv export --frozen --no-dev --no-emit-project --project /src > /tmp/runtime-deps.txt; \
     leftover=''; \
