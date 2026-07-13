@@ -3,7 +3,10 @@
 CPU-only: state-machine home move (queue.py, re-exported from scheduler), the
 retry policy (attempt_count++ / re-queue within max_attempts), SQLite(WAL)
 persistence of every transition, and restart restore through a FRESH Store
-object on the same file (DoD-P4-07 CPU 선행).
+object on the same file (DoD-P4-07 CPU 선행). p4c4 additions: schema-v2
+versioning + v1 in-place upgrade, the envelope->request registry and
+request-rollup persistence (api.py 유실 해소), and the job-riding stage-5
+anchor column.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import pytest
 
 import cv_infra.orchestrator.scheduler as scheduler_mod
 from cv_infra.orchestrator.fanout import fan_out
-from cv_infra.orchestrator.models import JobState
+from cv_infra.orchestrator.models import JobState, RequestRollup, Verdict
 from cv_infra.orchestrator.queue import IllegalTransitionError, JobQueue, transition
 from cv_infra.orchestrator.store import Store, job_key
 
@@ -215,3 +218,158 @@ def test_domain_id_rows_roundtrip_and_loud_accounting(tmp_path):
         assert store.domain_ids_in_use() == {}
         with pytest.raises(KeyError):
             store.release_domain_id("job-a")  # release without allocation is loud
+
+
+def test_release_all_domain_ids_clears_and_counts(tmp_path):
+    with Store(tmp_path / "cv.sqlite3") as store:
+        store.record_domain_id(5, "job-a")
+        store.record_domain_id(9, "job-b")
+        assert store.release_all_domain_ids() == 2  # restart reconciliation sweep
+        assert store.domain_ids_in_use() == {}
+        assert store.release_all_domain_ids() == 0  # idempotent on an empty table
+
+
+# --------------------------------------------------------------------------- #
+# (e) schema v2: user_version stamp + v1 file upgrades in place (p4c4 방침)
+# --------------------------------------------------------------------------- #
+
+# The EXACT v1 schema as shipped by p4c1 (store.py @ 1fcbc85) — a legacy file
+# fixture anchored to the released code, not to the current module (G-28).
+_V1_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    request_id    TEXT    NOT NULL,
+    repeat_index  INTEGER NOT NULL,
+    state         TEXT    NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    PRIMARY KEY (request_id, repeat_index)
+);
+CREATE TABLE IF NOT EXISTS ros_domain_ids (
+    domain_id INTEGER PRIMARY KEY,
+    job_id    TEXT NOT NULL UNIQUE
+);
+"""
+
+
+def _make_v1_file(db):
+    legacy = sqlite3.connect(str(db))
+    try:
+        legacy.executescript(_V1_SCHEMA)  # v1 files carry user_version 0 (never stamped)
+        legacy.execute(
+            "INSERT INTO jobs (request_id, repeat_index, state, attempt_count)"
+            " VALUES ('old-req', 0, 'completed', 1)"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+
+def test_v1_file_upgrades_in_place_and_keeps_rows(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    _make_v1_file(db)
+    with Store(db) as store:  # opening upgrades: adds the column + new tables + stamp
+        (job,) = store.load_jobs()
+        assert job.request_id == "old-req"
+        assert job.state is JobState.COMPLETED
+        assert job.oracle_plugin_dir is None  # v1 rows read back with a NULL anchor
+        store.record_envelope("env-1", ["r0"])  # new tables exist and accept writes
+        assert store.load_envelope("env-1") is not None
+    external = sqlite3.connect(str(db))
+    try:
+        assert external.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        external.close()
+
+
+def test_newer_schema_version_refuses_loudly(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    external = sqlite3.connect(str(db))
+    try:
+        external.execute("PRAGMA user_version = 99")
+        external.commit()
+    finally:
+        external.close()
+    with pytest.raises(RuntimeError, match="newer"):
+        Store(db)
+
+
+def test_job_oracle_plugin_dir_roundtrips_via_fresh_store(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    anchored, plain = fan_out(["req-a", "req-b"], repeats=1)
+    anchored.oracle_plugin_dir = "/abs/scenario-dir"
+    with Store(db) as store:
+        store.upsert_job(anchored)
+        store.upsert_job(plain)
+    with Store(db) as reopened:
+        by_key = {job_key(j): j for j in reopened.load_jobs()}
+        assert by_key["req-a:0"].oracle_plugin_dir == "/abs/scenario-dir"
+        assert by_key["req-b:0"].oracle_plugin_dir is None
+
+
+# --------------------------------------------------------------------------- #
+# (f) envelope->request registry + request rollups persist (p4c4 유실 해소)
+# --------------------------------------------------------------------------- #
+
+
+def test_envelope_registry_roundtrips_via_fresh_store(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    with Store(db) as store:
+        store.record_envelope("env-1", ["env-1/r0", "env-1/r1"], [None, "/abs/plugins"])
+    with Store(db) as reopened:  # 재기동: 새 객체·새 커넥션이 레지스트리를 복원
+        stored = reopened.load_envelope("env-1")
+        assert stored is not None
+        assert stored.request_ids == ["env-1/r0", "env-1/r1"]  # submission order
+        assert stored.oracle_plugin_dirs == [None, "/abs/plugins"]
+        assert stored.status == "running"
+        assert stored.report_outcome is None
+        assert stored.error is None
+        assert reopened.load_envelope("env-nope") is None
+
+
+def test_envelope_completion_persists_outcome_and_error_paths(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    with Store(db) as store:
+        store.record_envelope("env-ok", ["env-ok/r0"])
+        store.record_envelope("env-boom", ["env-boom/r0"])
+        store.complete_envelope("env-ok", report_outcome="pass")
+        store.complete_envelope("env-boom", error="RuntimeError: kaput")
+        with pytest.raises(KeyError):
+            store.complete_envelope("env-nope")  # completing an unknown envelope is loud
+    with Store(db) as reopened:
+        ok = reopened.load_envelope("env-ok")
+        assert (ok.status, ok.report_outcome, ok.error) == ("completed", "pass", None)
+        boom = reopened.load_envelope("env-boom")
+        assert (boom.status, boom.report_outcome, boom.error) == (
+            "completed",
+            None,
+            "RuntimeError: kaput",
+        )
+
+
+def test_fail_running_envelopes_marks_only_running(tmp_path):
+    with Store(tmp_path / "cv.sqlite3") as store:
+        store.record_envelope("env-done", ["env-done/r0"])
+        store.complete_envelope("env-done", report_outcome="pass")
+        store.record_envelope("env-live", ["env-live/r0"])
+        assert store.fail_running_envelopes("restarted") == 1
+        live = store.load_envelope("env-live")
+        assert (live.status, live.error) == ("completed", "restarted")
+        done = store.load_envelope("env-done")  # already-terminal envelope untouched
+        assert (done.status, done.report_outcome, done.error) == ("completed", "pass", None)
+
+
+def test_request_rollup_roundtrips_via_fresh_store(tmp_path):
+    db = tmp_path / "cv.sqlite3"
+    mixed = RequestRollup(
+        request_id="env-1/r0",
+        verdicts=[Verdict.PASS, Verdict.FAIL, Verdict.PASS],
+        flakiness=1 / 3,
+        verdict=Verdict.FAIL,
+    )
+    empty = RequestRollup(request_id="env-1/r1")  # all repeats verdict-less (infra)
+    with Store(db) as store:
+        store.upsert_rollup(mixed)
+        store.upsert_rollup(empty)
+    with Store(db) as reopened:
+        assert reopened.load_rollup("env-1/r0") == mixed  # verdict order preserved
+        assert reopened.load_rollup("env-1/r1") == empty
+        assert reopened.load_rollup("env-1/r9") is None

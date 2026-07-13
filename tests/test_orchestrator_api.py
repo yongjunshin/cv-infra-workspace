@@ -359,3 +359,95 @@ def test_oracle_plugin_dirs_wrapper_violations_are_structured_422(tmp_path):
                 assert error["expected"]  # structured, self-describing
                 assert "Traceback" not in response.text
         assert store.load_jobs() == []  # 비전파: no job from any rejected envelope
+
+
+def test_oracle_plugin_dirs_ride_jobs_to_the_runner_seam(tmp_path, plugin_import_state):
+    # D-1 wiring #3 잔여 반쪽 (p4c4): the per-request anchor rides each fanned-out
+    # Job so the runner seam receives it (production glue then hands it to
+    # run_job(oracle_plugin_dir=...)) — runner-limited by construction, and
+    # persisted with the job (a restored/retried job keeps its anchor).
+    class AnchorRecordingRunner:
+        def __init__(self) -> None:
+            self.seen: dict[str, str | None] = {}
+
+        def run(self, job: Job) -> JobResult:
+            self.seen[job.request_id.rsplit("/", 1)[-1]] = job.oracle_plugin_dir
+            return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+    runner = AnchorRecordingRunner()
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, runner, k=2)
+        with TestClient(app) as client:
+            response = client.post(
+                "/envelopes",
+                json={
+                    "requests": [_request_doc(), _custom_oracle_doc()],
+                    "oracle_plugin_dirs": [None, _PLUGIN_DIR],
+                },
+            )
+            assert response.status_code == 202, response.text
+            _wait_completed(client, response.json()["envelope_id"])
+        assert runner.seen == {"r0": None, "r1": _PLUGIN_DIR}
+        anchors = {j.request_id.rsplit("/", 1)[-1]: j.oracle_plugin_dir for j in store.load_jobs()}
+        assert anchors == {"r0": None, "r1": _PLUGIN_DIR}  # persisted, restart-safe
+
+
+# --------------------------------------------------------------------------- #
+# (e) p4c4 영속: registry/rollups survive a restart; restart reads stay honest
+# --------------------------------------------------------------------------- #
+
+
+def test_envelope_status_survives_orchestrator_restart(tmp_path):
+    # Full restart simulation: a NEW Store object (new connection) + a NEW app
+    # process that never saw the envelope must serve the SAME status body from
+    # the persisted registry/jobs/rollups (never recomputed from results).
+    db = tmp_path / "cv.sqlite3"
+    with Store(db) as store:
+        app = create_app(store, SuffixScriptedRunner({"r1:1": "fail-verdict"}), k=2)
+        with TestClient(app) as client:
+            envelope_id = _submit(client, [_request_doc(), _request_doc(repeats=3)])
+            before = _wait_completed(client, envelope_id)
+            assert before["report_outcome"] == "fail"
+    with Store(db) as reopened:  # 재기동
+        restarted_app = create_app(reopened, FakeRunner(), k=2)
+        with TestClient(restarted_app) as client:
+            response = client.get(f"/envelopes/{envelope_id}")
+            assert response.status_code == 200
+            after = response.json()
+            assert after == before  # jobs order, rollups (incl. flakiness), outcome — all equal
+            assert client.get("/envelopes/env-nope").status_code == 404  # unknown stays 404
+
+
+def test_restart_read_of_inflight_envelope_is_running_until_reconciled(tmp_path):
+    # An envelope the crash left 'running' reads honestly as running (jobs +
+    # empty rollup shapes, outcome null) until reconcile_at_restart marks it.
+    db = tmp_path / "cv.sqlite3"
+    with Store(db) as store:
+        store.record_envelope("env-live", ["env-live/r0"], [None])
+        store.upsert_job(Job(request_id="env-live/r0", repeat_index=0, state=JobState.RUNNING))
+    with Store(db) as reopened:
+        app = create_app(reopened, FakeRunner(), k=1)
+        with TestClient(app) as client:
+            body = client.get("/envelopes/env-live").json()
+            assert body["status"] == "running"
+            assert body["report_outcome"] is None
+            (job,) = body["jobs"]
+            assert (job["request_id"], job["state"]) == ("env-live/r0", "running")
+            (rollup,) = body["rollups"]  # empty shape, frozen keys — same as live path
+            assert set(rollup) == _ROLLUP_WIRE_KEYS
+            assert rollup["verdicts"] == [] and rollup["verdict"] is None
+
+
+def test_restart_marked_envelope_reads_loud_500(tmp_path):
+    # After reconcile_at_restart the marker surfaces exactly like an in-memory
+    # supervision crash: a loud 500, never a silent forever-'running'.
+    db = tmp_path / "cv.sqlite3"
+    with Store(db) as store:
+        store.record_envelope("env-crashed", ["env-crashed/r0"], [None])
+        assert store.fail_running_envelopes("orchestrator restarted mid-envelope") == 1
+    with Store(db) as reopened:
+        app = create_app(reopened, FakeRunner(), k=1)
+        with TestClient(app) as client:
+            response = client.get("/envelopes/env-crashed")
+            assert response.status_code == 500
+            assert "restarted" in response.json()["detail"]

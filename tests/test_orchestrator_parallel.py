@@ -15,6 +15,8 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from cv_infra.orchestrator.allocator import DomainIdAllocator
 from cv_infra.orchestrator.fanout import fan_out
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
@@ -292,3 +294,48 @@ def test_uniform_parallel_repeats_are_not_flaky():
     rollup = roll_up("req", results)
     assert rollup.verdict is Verdict.PASS
     assert rollup.flakiness == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# (g) dual-watchdog coherence: supervisor >= runner seam, 위반 조합 loud
+#     (p4c1 후속 ② — p4c4)
+# --------------------------------------------------------------------------- #
+
+
+class InnerWatchdogRunner(ScriptedRunner):
+    """Runner seam declaring its own container watchdog (the run_job wrapper
+    shape): ``job_timeout_s`` is the duck-typed attribute the coherence gate
+    reads at ParallelSupervisor construction."""
+
+    def __init__(self, job_timeout_s: float) -> None:
+        super().__init__()
+        self.job_timeout_s = job_timeout_s
+
+
+def make_supervisor(runner, job_timeout_s):
+    return ParallelSupervisor(
+        JobQueue(fan_out(["req"], repeats=1)),
+        SlotAccountant(k=1),
+        runner,
+        job_timeout_s=job_timeout_s,
+    )
+
+
+def test_supervisor_watchdog_shorter_than_runner_watchdog_is_loud():
+    with pytest.raises(ValueError, match="watchdog"):
+        make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), job_timeout_s=1.0)
+
+
+def test_supervisor_watchdog_equal_or_longer_is_accepted_and_runs():
+    # equal is the >= boundary; longer is the normal production shape
+    for outer in (5.0, 9.0):
+        supervisor = make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), outer)
+        (result,) = asyncio.run(supervisor.run())
+        assert result.state is JobState.COMPLETED
+
+
+def test_watchdog_gate_skips_when_either_side_is_undeclared():
+    # no outer watchdog: the inner one alone governs (nothing to strand)
+    make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), job_timeout_s=None)
+    # runner without the attribute (CPU fakes): outer alone governs — unchanged
+    make_supervisor(ScriptedRunner(), job_timeout_s=0.1)

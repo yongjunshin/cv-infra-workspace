@@ -35,10 +35,12 @@ with ``--no-deps`` (DoD-P2-12). Tests inject a duck-typed fake client.
 
 Phase 4 layers ``ParallelSupervisor`` (end of module) on top: k-parallel asyncio
 supervision of the per-job seam via ``JobQueue`` + ``SlotAccountant`` +
-``DomainIdAllocator``. The single-runner ``run_job`` path above stays frozen
-(P2/P3 ``cv-infra run`` 계약). The pure isolation helpers
-(``allocate_ros_domain_id`` / ``network_name_for`` / ``ROS_DOMAIN_ID_SPACE``)
-moved verbatim to ``allocator.py`` (M3 §3.6 home) and are re-exported here.
+``DomainIdAllocator``, plus ``reconcile_at_restart`` (R14 — label sweep +
+RUNNING-orphan re-label + domain-id/envelope reconciliation after a crash). The
+single-runner ``run_job`` path above stays frozen (P2/P3 ``cv-infra run`` 계약).
+The pure isolation helpers (``allocate_ros_domain_id`` / ``network_name_for`` /
+``ROS_DOMAIN_ID_SPACE``) moved verbatim to ``allocator.py`` (M3 §3.6 home) and
+are re-exported here.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 import time
 from collections.abc import Callable
@@ -75,7 +78,7 @@ from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.models import Job, JobResult, JobState
 from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.scheduler import SlotAccountant
-from cv_infra.orchestrator.store import job_key
+from cv_infra.orchestrator.store import Store, job_key
 
 # Container-side seam paths (M3 -> M2 env contract; 정본 = cv_infra/runner/main.py
 # resolve_job_spec_dict / resolve_result_path). JOB_SPEC is bind-mounted read-only
@@ -86,20 +89,29 @@ RESULT_OUT_MOUNT = "/cv/out"
 # FU-16 asset cache (decision 2026-07-09 D-1): mount the host Omniverse/asset cache into
 # the runner so the ~680 MB / 241-file scene closure downloads ONCE, not every job (T0
 # probe: 2nd receive 688 MB -> 1.29 MB — reports/deployment-2026-07-09-fu16-probe.md).
-# Bind paths are the MEASURED Isaac 5.1.0 on-disk layout (differs from 6.0, R2). All rw
-# single-layer: shared-RO base + per-job writable scratch (D-B, 2-tier) is deferred to
-# DoD-P4-15 (Phase 2 is single-job; the warm write is measured +117 KB).
+# Bind paths are the MEASURED Isaac 5.1.0 on-disk layout (differs from 6.0, R2).
 CACHE_ROOT_ENV = "CV_ISAAC_CACHE_ROOT"
 
-# (host subpath relative to cache root, container bind path)
-CACHE_MOUNTS: tuple[tuple[str, str], ...] = (
+# D-B two-tier cache (DoD-P4-15, p4c4): when a scratch root is ALSO given (arg or this
+# env), the six binds split — the three warm cache SETS (ov/GL/compute, D-B "복수 집합")
+# bind read-only from the shared base, and the three always-written runtime dirs bind rw
+# from a per-job scratch dir under this root (created per job, discarded at job end).
+# Base root alone keeps the frozen P2 single layer (all six rw).
+CACHE_SCRATCH_ROOT_ENV = "CV_ISAAC_CACHE_SCRATCH_ROOT"
+
+# (host subpath relative to the cache/scratch root, container bind path)
+CACHE_BASE_MOUNTS: tuple[tuple[str, str], ...] = (
     ("cache/kit", "/isaac-sim/kit/cache"),
     ("cache/home", "/isaac-sim/.cache"),
     ("cache/computecache", "/isaac-sim/.nv/ComputeCache"),
+)
+CACHE_SCRATCH_MOUNTS: tuple[tuple[str, str], ...] = (
     ("logs", "/isaac-sim/.nvidia-omniverse/logs"),
     ("data", "/isaac-sim/.local/share/ov/data"),
     ("documents", "/isaac-sim/Documents"),
 )
+# Frozen P2 single-tier contract (D-1 세칙 6종, order preserved verbatim).
+CACHE_MOUNTS: tuple[tuple[str, str], ...] = CACHE_BASE_MOUNTS + CACHE_SCRATCH_MOUNTS
 
 # D-1 custom-oracle plugin dir (decision 2026-07-11, wiring contract #3): the scenario
 # directory holding consumer oracle .py files is bind-mounted read-only at the SAME
@@ -144,33 +156,95 @@ def default_readiness_probe(runner_container: Any) -> bool:
     return getattr(runner_container, "status", None) == "running"
 
 
-def _cache_volumes(cache_root: str | os.PathLike[str] | None) -> dict[str, dict[str, str]]:
-    """Resolve the Isaac asset-cache root to docker ``volumes`` binds (FU-16 / D-1).
+def _env_path(name: str) -> str | None:
+    """Read an optional path env: None when unset, LOUD when set-but-empty.
 
-    Effective root = the ``cache_root`` argument (wins) or ``$CV_ISAAC_CACHE_ROOT``;
-    when neither is set there are ZERO cache mounts (today's behavior, backward compat).
-    A given-but-missing / non-directory root is a loud ``ValueError`` — the caller runs
-    this in the same seat as the ``job_id`` check, so it raises BEFORE any resource.
-
-    The root is resolved to a host ABSOLUTE path (``Path.resolve()``): the runner is
-    spawned via docker.sock, so ``-v`` binds resolve against the HOST daemon, not this
-    process's cwd (sibling-container hazard D-O/F5). Subdir existence is NOT required —
-    creating them + ``chown 1234:1234`` is M5 ``warm_cache.sh``'s job (G-15), never this
-    module's. All six binds are ``mode: rw`` single-layer (2-tier RO/scratch = P4-15).
+    An empty string is indistinguishable from unset under truthiness and would
+    silently mean "0 cache mounts" — the G-26 변종 that turns every measurement
+    cold while everyone believes it warm. Refuse to guess.
     """
-    root = cache_root or os.environ.get(CACHE_ROOT_ENV)
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError(
+            f"{name} is set but empty — unset it (no cache mounts) or set an absolute"
+            " host path; an empty value must never silently mean 'unset' (G-26)"
+        )
+    return value
+
+
+def _cache_volumes(
+    cache_root: str | os.PathLike[str] | None,
+    cache_scratch_root: str | os.PathLike[str] | None,
+    job_id: str,
+) -> tuple[dict[str, dict[str, str]], Path | None]:
+    """Resolve cache roots to docker ``volumes`` binds — single-tier (FU-16 / D-1)
+    or two-tier (D-B / DoD-P4-15). Returns ``(volumes, per-job scratch dir | None)``.
+
+    Effective roots = the arguments (win) or ``$CV_ISAAC_CACHE_ROOT`` /
+    ``$CV_ISAAC_CACHE_SCRATCH_ROOT`` (set-but-empty env raises — ``_env_path``);
+    when neither is set there are ZERO cache mounts (frozen P2 behavior).
+
+    * base root alone -> the frozen P2 single layer: all six binds ``rw``.
+    * base + scratch roots -> two-tier (D-B): the three warm cache SETS
+      (``CACHE_BASE_MOUNTS`` — ov/GL/compute) bind **read-only** from the shared
+      base, and the three always-written runtime dirs (``CACHE_SCRATCH_MOUNTS``)
+      bind ``rw`` from a per-job scratch dir ``<scratch_root>/<slug(job_id)>/``
+      created here (G-15 — dockerd would create missing dirs root-owned; the
+      slug is ``network_name_for``'s, flat + collision-free) and DISCARDED by
+      run_job's finally (D-B: 잡 종료 시 폐기, stateless).
+    * scratch root without a base root is a loud config error — a
+      half-configured two-tier cache would silently run all-cold (G-26).
+
+    A given-but-missing / non-directory root is a loud ``ValueError`` — the
+    caller runs this in the same seat as the ``job_id`` check, so it raises
+    BEFORE any docker resource. Roots are resolved to host ABSOLUTE paths
+    (``Path.resolve()``): the runner is spawned via docker.sock, so ``-v`` binds
+    resolve against the HOST daemon, not this process's cwd (sibling-container
+    hazard D-O/F5). BASE subdir existence is NOT required — creating them +
+    ``chown 1234:1234`` is M5 ``warm_cache.sh``'s job (G-15), never this
+    module's; per-job scratch subdirs are the one exception (job ids are
+    dynamic, so M5 cannot pre-create them).
+    """
+    root = cache_root or _env_path(CACHE_ROOT_ENV)
+    scratch_root = cache_scratch_root or _env_path(CACHE_SCRATCH_ROOT_ENV)
+    if scratch_root and not root:
+        raise ValueError(
+            "cache_scratch_root given without cache_root — a half-configured two-tier"
+            " cache (D-B) would silently run all-cold; give both roots or neither (G-26)"
+        )
     if not root:
-        return {}
+        return {}, None
     resolved = Path(root).resolve()
     if not resolved.is_dir():
         raise ValueError(
             f"cache_root {resolved} does not exist or is not a directory "
             f"(create + chown 1234:1234 is M5 warm_cache.sh's job, D-1)"
         )
-    return {
-        str(resolved / subpath): {"bind": container_path, "mode": "rw"}
-        for subpath, container_path in CACHE_MOUNTS
+    if scratch_root is None:
+        # Frozen P2 single layer (D-1 세칙): all six binds rw from the base.
+        return {
+            str(resolved / subpath): {"bind": container_path, "mode": "rw"}
+            for subpath, container_path in CACHE_MOUNTS
+        }, None
+    scratch_resolved = Path(scratch_root).resolve()
+    if not scratch_resolved.is_dir():
+        raise ValueError(
+            f"cache_scratch_root {scratch_resolved} does not exist or is not a directory "
+            f"(the scratch ROOT is host provisioning's job; per-job dirs are created here)"
+        )
+    job_scratch = scratch_resolved / network_name_for(job_id)
+    volumes = {
+        str(resolved / subpath): {"bind": container_path, "mode": "ro"}
+        for subpath, container_path in CACHE_BASE_MOUNTS
     }
+    for subpath, container_path in CACHE_SCRATCH_MOUNTS:
+        host_dir = job_scratch / subpath
+        host_dir.mkdir(parents=True, exist_ok=True)
+        host_dir.chmod(0o777)  # runner is non-root (uid 1234, R2 실측) — result-dir idiom
+        volumes[str(host_dir)] = {"bind": container_path, "mode": "rw"}
+    return volumes, job_scratch
 
 
 def _resolve_oracle_plugin_dir(oracle_plugin_dir: str | None) -> str | None:
@@ -203,6 +277,7 @@ def run_job(
     *,
     runner_env: dict[str, str] | None = None,
     cache_root: str | os.PathLike[str] | None = None,
+    cache_scratch_root: str | os.PathLike[str] | None = None,
     oracle_plugin_dir: str | None = None,
     runner_gpus: bool = True,
     readiness_probe: ReadinessProbe | None = None,
@@ -222,8 +297,12 @@ def run_job(
     ``cache_root`` (or ``$CV_ISAAC_CACHE_ROOT``) mounts the host Isaac asset cache into
     the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;
     unset = 0 cache mounts (backward compatible), a given-but-invalid root raises in the
-    same seat as ``job_id``. RO/2-tier caching (D-B) is deferred to DoD-P4-15 — the
-    ``rw`` single layer here is what Phase 2's single job needs (see ``_cache_volumes``).
+    same seat as ``job_id``. Adding ``cache_scratch_root`` (or
+    ``$CV_ISAAC_CACHE_SCRATCH_ROOT``) switches to the D-B two-tier layout (DoD-P4-15):
+    warm base sets read-only + per-job writable scratch discarded in the finally-teardown
+    (mount split, empty-env loudness and half-config errors: see ``_cache_volumes``).
+    The assembled runner mount spec is emitted as one structured stderr line per spawn
+    (``runner-mounts`` — the G-26 feature-on gate; tests and operators assert on it).
 
     ``oracle_plugin_dir`` (D-1 2026-07-11, wiring contract #3) is the consumer's
     scenario directory holding custom oracle ``.py`` files: when not None it is
@@ -243,7 +322,7 @@ def run_job(
         raise ValueError(f"sut_restart_limit must be >= 0, got {sut_restart_limit}")
     # Resolve cache mounts + oracle plugin dir up front: a bad path fails loud BEFORE
     # any network or container is created (same seat as the job_id check).
-    cache_volumes = _cache_volumes(cache_root)
+    cache_volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, job_id)
     plugin_dir = _resolve_oracle_plugin_dir(oracle_plugin_dir)
 
     client = docker_client
@@ -277,7 +356,9 @@ def run_job(
     infra_error: str | None = None
     try:
         net_name = network_name_for(job_id)
-        network = client.networks.create(net_name, driver="bridge")
+        # Networks carry the same reconciliation labels as the containers so the
+        # restart sweep (reconcile_at_restart, M3 §3.9) can find and remove them.
+        network = client.networks.create(net_name, driver="bridge", labels=labels)
 
         # Runner FIRST — the sim supplies /clock (G-19 supply order). Supervisor-owned
         # seam keys override operator runner_env on collision; everything else (e.g.
@@ -314,6 +395,16 @@ def run_job(
             from docker.types import DeviceRequest  # noqa: PLC0415
 
             runner_extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+        volumes = {
+            # Cache/plugin binds first so the seam mounts below win on any
+            # host-path collision (same principle as the seam env keys above).
+            # Plugin bind = SAME absolute path host->container, read-only (D-1).
+            **cache_volumes,
+            **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
+            str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
+            str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
+        }
+        _log_runner_mounts(job_id, volumes)
         runner_ct = client.containers.run(
             runner_image,
             detach=True,
@@ -321,15 +412,7 @@ def run_job(
             network=net_name,
             labels=labels,
             environment=environment,
-            volumes={
-                # Cache/plugin binds first so the seam mounts below win on any
-                # host-path collision (same principle as the seam env keys above).
-                # Plugin bind = SAME absolute path host->container, read-only (D-1).
-                **cache_volumes,
-                **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
-                str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
-                str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
-            },
+            volumes=volumes,
             **runner_extra,
         )
 
@@ -369,6 +452,37 @@ def run_job(
         return JobOutcome(job_id, None, runner_exit_code, f"{type(exc).__name__}: {exc}")
     finally:
         _teardown((sut_ct, runner_ct), network)
+        _discard_scratch(scratch_dir)  # D-B: per-job scratch dies with the job (stateless)
+
+
+def _log_runner_mounts(job_id: str, volumes: dict[str, dict[str, str]]) -> None:
+    """Feature-on gate (G-26): one structured stderr line per runner spawn.
+
+    Emits the FULL assembled mount spec (count, ro/rw mode, source/target paths)
+    so tests and operators can assert the cache/plugin mounts actually engaged —
+    a silent no-mount (all-cold measured as warm) is worse than a loud error.
+    Wave-2 GPU evidence additionally uses ``docker inspect`` (G-26 합의).
+    """
+    spec = [
+        {"source": source, "target": bind["bind"], "mode": bind["mode"]}
+        for source, bind in volumes.items()
+    ]
+    line = json.dumps({"job_id": job_id, "mounts": spec}, sort_keys=True)
+    print(f"[cv-supervisor] runner-mounts {line}", file=sys.stderr, flush=True)
+
+
+def _discard_scratch(scratch_dir: Path | None) -> None:
+    """Best-effort removal of the per-job scratch cache dir (D-B: 잡 종료 시 폐기).
+
+    Same discipline as ``_teardown``: failures surface on stderr but never mask
+    the job outcome. None (single-tier / no cache) is a no-op.
+    """
+    if scratch_dir is None:
+        return
+    try:
+        shutil.rmtree(scratch_dir)
+    except Exception as exc:
+        print(f"[cv-supervisor] scratch discard failed: {exc!r}", file=sys.stderr)
 
 
 def _gate_runner_ready(
@@ -489,6 +603,13 @@ class ParallelSupervisor:
       runner seam's own watchdog + finally-teardown (``run_job(job_timeout_s=)``)
       — this layer only classifies; sim-time mission timeouts stay M2-owned
       (D-F, never judged on wall-clock).
+    * **dual-watchdog coherence** (p4c1 후속 ②): this outer watchdog must be
+      **>= the runner seam's own container watchdog**, else ``wait_for`` fires
+      first and strands the executor thread + a live container until the inner
+      watchdog catches up. A runner seam that owns an inner watchdog declares
+      it via a ``job_timeout_s`` attribute (duck-typed — production run_job
+      wrappers MUST expose it); a violating combination raises at construction,
+      never silently.
     * **completion path**: the slot token and domain id are reclaimed FIRST,
       then the retry policy (``JobQueue.record_outcome``) decides re-queue vs
       terminal — a freed slot is immediately re-assignable to a waiting job
@@ -510,6 +631,18 @@ class ParallelSupervisor:
         allocator: DomainIdAllocator | None = None,
         job_timeout_s: float | None = None,
     ) -> None:
+        inner_watchdog_s = getattr(runner, "job_timeout_s", None)
+        if (
+            job_timeout_s is not None
+            and inner_watchdog_s is not None
+            and job_timeout_s < inner_watchdog_s
+        ):
+            raise ValueError(
+                f"supervisor watchdog ({job_timeout_s}s) is shorter than the runner seam's"
+                f" own container watchdog ({inner_watchdog_s}s) — the outer wait_for would"
+                " fire first and strand the executor thread + live container (p4c1 후속 ②:"
+                " ParallelSupervisor watchdog must be >= run_job's)"
+            )
         self._queue = queue
         self._slots = slots
         self._runner = runner
@@ -577,3 +710,94 @@ class ParallelSupervisor:
         except Exception:
             # Runner crash boundary: this attempt failed; other jobs unaffected.
             return JobResult(job=job, state=JobState.FAILED, verdict=None)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: crash reconciliation at orchestrator restart (M3 §3.9) — R14.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class RestartReconciliation:
+    """Observation record of one restart reconciliation — assertable, never silent (G-26).
+
+    Counts are best-effort attempts for the sweep halves (teardown failures
+    surface on stderr, ``_teardown`` discipline) and exact for the store halves.
+    """
+
+    containers_removed: int = 0
+    networks_removed: int = 0
+    orphans_requeued: int = 0
+    orphans_failed: int = 0
+    domain_ids_cleared: int = 0
+    envelopes_failed: int = 0
+
+
+_RESTART_ENVELOPE_ERROR = (
+    "orchestrator restarted mid-envelope: supervision was not resumed;"
+    " RUNNING jobs were reconciled per the retry policy (M3 §3.9, R14)"
+)
+
+
+def reconcile_at_restart(
+    store: Store,
+    docker_client: Any = None,
+    *,
+    max_attempts: int = 1,
+    retry_on_timeout: bool = True,
+) -> tuple[JobQueue, RestartReconciliation]:
+    """Reconcile a restarted orchestrator with what the crash left behind (R14).
+
+    Single-deployment assumption (LOCKED §7.3): at restart NO other orchestrator
+    supervises runners on this host, so every container/network carrying the
+    ``cv-infra.job_id`` label is stale (its supervising loop died with the
+    process) and every SQLite domain-id liveness row is stale once the sweep
+    ran. Steps, in this order:
+
+    1. **label sweep** (when a docker client is given): stop/remove every
+       container labeled ``LABEL_JOB_ID`` and remove every so-labeled per-job
+       network — teardown precedes any re-queue so a reconciled job can never
+       run twice concurrently (1잡=1러너=1결과 불변식).
+    2. **domain-id clear**: release every liveness row (stale by step 1) so
+       fresh allocations never collide with ghosts (M3 §3.6 D-O).
+    3. **RUNNING-orphan re-label** (task 2026-07-13 ① 시맨틱): a job persisted
+       RUNNING is the attempt the crash interrupted — it is recorded as a
+       FAILED attempt through the normal retry policy
+       (``JobQueue.record_outcome``): re-queued onto the returned queue while
+       attempts remain, else terminal ``failed``. Counting the interrupted
+       attempt keeps a poison job (one that kills the orchestrator) from
+       crash-looping forever; no job is lost on either path.
+    4. **envelope marker**: still-RUNNING envelopes are completed with a loud
+       ``error`` (envelope supervision is NOT resumed this cycle) — a 500 on
+       status reads beats an envelope stuck 'running' forever.
+
+    ``docker_client=None`` skips step 1 only (docker-free hosts / CPU tests);
+    production passes the real client. Returns the restored, driveable queue
+    plus the observation record.
+    """
+    report = RestartReconciliation()
+    if docker_client is not None:
+        report.containers_removed, report.networks_removed = _sweep_stale(docker_client)
+    report.domain_ids_cleared = store.release_all_domain_ids()
+    queue = JobQueue.restore(store, max_attempts=max_attempts, retry_on_timeout=retry_on_timeout)
+    for job in store.load_jobs():
+        if job.state is JobState.RUNNING:
+            if queue.record_outcome(job, JobState.FAILED):
+                report.orphans_requeued += 1
+            else:
+                report.orphans_failed += 1
+    report.envelopes_failed = store.fail_running_envelopes(_RESTART_ENVELOPE_ERROR)
+    return queue, report
+
+
+def _sweep_stale(client: Any) -> tuple[int, int]:
+    """Tear down every cv-infra-labeled container, then network (M3 §3.9 '정리' half)."""
+    containers = list(client.containers.list(all=True, filters={"label": LABEL_JOB_ID}))
+    _teardown(tuple(containers), None)  # containers first; networks below (members leave first)
+    networks = list(client.networks.list(filters={"label": LABEL_JOB_ID}))
+    for network in networks:
+        try:
+            network.remove()
+        except Exception as exc:
+            print(f"[cv-supervisor] sweep network remove failed: {exc!r}", file=sys.stderr)
+    return len(containers), len(networks)

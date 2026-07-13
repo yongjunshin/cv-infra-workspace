@@ -29,3 +29,6 @@ def test_run_job_labels_runner_and_sut_with_job_and_domain_ids(tmp_path):
     assert sut_kwargs["labels"] == expected  # both containers belong to the job
     # the labelled domain id is the very one injected into the containers' env
     assert runner_kwargs["environment"]["ROS_DOMAIN_ID"] == expected[LABEL_ROS_DOMAIN_ID]
+    # the per-job network carries the same labels (p4c4) so the restart sweep
+    # (reconcile_at_restart) can find and remove it alongside the containers
+    assert client.network_labels == expected
