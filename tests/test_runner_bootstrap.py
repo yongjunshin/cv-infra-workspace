@@ -1,13 +1,17 @@
-"""CPU unit tests for the FU-14 runner-side boot glue (ros_bridge bootstrap).
+"""CPU unit tests for the runner-side boot glue (ros_bridge bootstrap + R4 cap).
 
 Pins the ownership split (cycle-5 PM ruling): supervisor-injected
 ROS_DISTRO/RMW_IMPLEMENTATION are honored untouched; absent keys default from
 adapter_config; the image-internal jazzy paths (measured 2026-07-08 layout:
 ``<root>/exts/isaacsim.ros2.bridge/jazzy/{lib,rclpy}``) are ensured idempotently.
 Real bridge startup (no internal-fallback noise) is T3 workstation evidence.
+
+R4 (p4c4 T2): the texture-streaming budget cap's launch-config assembly and the
+loud boot log line are CPU-asserted here; the carb set/read-back itself is the
+GPU path (Wave 2 T4 observes ``at_boot=``/``readback=`` on the workstation).
 """
 
-from cv_infra.runner import ros_bridge
+from cv_infra.runner import ros_bridge, sim_runtime
 
 
 def _fake_isaac_root(tmp_path, ext_parent="exts", ext_name="isaacsim.ros2.bridge"):
@@ -144,3 +148,46 @@ def test_reexec_honors_explicit_argv():
             ["/isaac-sim/kit/python/bin/python3", "/cv/probes/scene_probe.py"],
         )
     ]
+
+
+# --------------------------------------------------------------------------- #
+# R4 texture streaming budget cap (sim_runtime boot glue, p4c4 T2).
+# --------------------------------------------------------------------------- #
+def test_launch_config_stays_headless():
+    # LOCKED §7.7 invariant preserved by the R4 change (the cap rides ALONGSIDE
+    # headless, never replaces it).
+    assert sim_runtime.simulation_app_launch_config()["headless"] is True
+
+
+def test_launch_config_carries_texture_budget_cap_arg():
+    # Full-literal pin: kit CLI settings-override form (`--/path=value` — the
+    # exact form R4's verification column names) with the CANDIDATE key + the
+    # R4 plan-policy 60% (0.6 fraction, NOT a measured NFR — §2-4 untouched).
+    # The key is a documented-default candidate awaiting GPU confirmation
+    # (Wave 2 T4) — see the anchor comment on TEXTURE_BUDGET_SETTING.
+    assert sim_runtime.simulation_app_launch_config()["extra_args"] == [
+        "--/rtx-transient/resourcemanager/texturestreaming/memoryBudget=0.6"
+    ]
+
+
+def test_texture_budget_fraction_is_r4_policy_value():
+    fraction = sim_runtime.TEXTURE_BUDGET_FRACTION
+    assert fraction == 0.6  # R4 plan policy (60% cap)
+    assert 0.0 < fraction <= 1.0  # fraction-of-total semantics, never MB
+
+
+def test_texture_budget_log_line_carries_grep_marker_and_readback():
+    line = sim_runtime.texture_budget_log_line(at_boot=0.6, readback=0.6)
+    # Verbatim grep gate for Wave 2 T4/QA (G-26 prove-it-ran): marker + value.
+    assert "texture_budget_applied=0.6" in line
+    assert line.startswith("[cv-runner] ")
+    assert "at_boot=0.6" in line and "readback=0.6" in line
+    assert f"key={sim_runtime.TEXTURE_BUDGET_SETTING}" in line
+
+
+def test_texture_budget_log_line_none_readback_is_loud():
+    # `none` = the candidate settings key does not exist in this build — the
+    # loud wrong-key signal (an observation, never an echo of intent).
+    line = sim_runtime.texture_budget_log_line(at_boot=None, readback=None)
+    assert "at_boot=none" in line and "readback=none" in line
+    assert "texture_budget_applied=0.6" in line  # requested policy still visible
