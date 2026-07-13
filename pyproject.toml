@@ -34,6 +34,10 @@ dependencies = [
     # server; nothing in cv_infra imports it yet (resident deployment = P5).
     "fastapi==0.139.0",
     "uvicorn==0.51.0",
+    # M8 batch-CLI REST client (cv_infra/cli/batch.py: submit/status/wait —
+    # REQ-INTAKE-001/003). Promoted dev -> runtime at p4c3 (pin unchanged);
+    # lazily imported via the batch module so --help stays dependency-free.
+    "httpx==0.28.1",
 ]
 
 # Console script (cross-team contract — verbatim pin, do not change).
@@ -57,8 +61,7 @@ dev = [
     "black==26.5.1",
     "pytest==9.1.1",
     "import-linter==2.12",
-    # starlette TestClient transport (tests/test_orchestrator_api.py) — test-only.
-    "httpx==0.28.1",
+    # httpx moved to [project.dependencies] at p4c3 (CLI REST client).
 ]
 
 [build-system]

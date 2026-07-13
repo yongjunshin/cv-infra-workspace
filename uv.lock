@@ -113,6 +113,7 @@ source = { editable = "." }
 dependencies = [
     { name = "docker" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "nvidia-ml-py" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -122,7 +123,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "black" },
-    { name = "httpx" },
     { name = "import-linter" },
     { name = "pytest" },
     { name = "ruff" },
@@ -132,6 +132,7 @@ dev = [
 requires-dist = [
     { name = "docker", specifier = "==7.1.0" },
     { name = "fastapi", specifier = "==0.139.0" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "nvidia-ml-py", specifier = "==13.610.43" },
     { name = "pydantic", specifier = "==2.11.7" },
     { name = "pyyaml", specifier = "==6.0.2" },
@@ -141,7 +142,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "black", specifier = "==26.5.1" },
-    { name = "httpx", specifier = "==0.28.1" },
     { name = "import-linter", specifier = "==2.12" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "ruff", specifier = "==0.15.19" },
