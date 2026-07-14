@@ -133,6 +133,7 @@ class Ros2Adapter(SimAdapter):
         self._clock_time_s = 0.0
         self._odom_fanout_done = False
         self._odom_relay = None  # (subscription, publishers) keep-alive
+        self._readiness_phase: str | None = None  # last barrier stage (p4c5 T1 trace)
 
     @property
     def goal_interface(self) -> GoalInterface:
@@ -152,6 +153,18 @@ class Ros2Adapter(SimAdapter):
     def sim_time_s(self) -> float:
         """Latest sim-time seen on /clock (mission clock domain, D-F)."""
         return self._clock_time_s
+
+    @property
+    def readiness_phase(self) -> str | None:
+        """Last stage the readiness barrier reached — the p4c5 T1 trace surface.
+
+        ``clock`` / ``active`` (timed out there) / ``ready`` / ``use_sim_time``
+        (barrier passed but the SUT contract failed to verify); None before
+        ``await_ready`` runs. Same vocabulary the timeout log line already prints
+        (contract preserved) — exposed so the boot trace can carry it as a field
+        without re-parsing stderr.
+        """
+        return self._readiness_phase
 
     # ------------------------------------------------------------------ #
     # SimAdapter interface — ROS bodies (bundled rclpy; T3 proves on GPU).
@@ -220,6 +233,7 @@ class Ros2Adapter(SimAdapter):
         ok, phase = readiness_sequence(
             clock_flowing, sut_active, time.monotonic, deadline, self._step_and_spin
         )
+        self._readiness_phase = phase
         if not ok:
             print(
                 f"[cv-runner] readiness barrier timed out at phase {phase!r} "
@@ -232,6 +246,7 @@ class Ros2Adapter(SimAdapter):
 
         verified = self._verify_use_sim_time()
         if verified is False:
+            self._readiness_phase = "use_sim_time"
             print(
                 "[cv-runner] SUT use_sim_time=false — sim-time mission budget "
                 "cannot hold (SUT launch must set use_sim_time:=true; verified, "
