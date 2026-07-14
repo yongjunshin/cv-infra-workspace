@@ -53,7 +53,12 @@ shape M4 consumes — renames frozen)::
       "status": "running" | "completed",        # completed = supervision done
       "jobs": [
         {"request_id": str, "repeat_index": int,
-         "state": "queued|running|completed|failed|timeout", "attempt_count": int},
+         "state": "queued|running|completed|failed|timeout", "attempt_count": int,
+         # last-attempt failure diagnostics (p4c5 실패 관측성; null when the job
+         # never ran / the last attempt was clean) — operational breadcrumbs, NOT
+         # domain detail: a bounded reason string + the runner's container exit
+         # code (137 = OOM-kill, 139 = segfault, ... vs a plain non-zero exit).
+         "runner_exit_code": int | null, "infra_error": str | null},
         ...
       ],
       "rollups": [   # one per request, submission order (empty verdicts while running)
@@ -442,7 +447,13 @@ def _status_body(
     report_outcome: str | None,
 ) -> dict[str, Any]:
     """Assemble the pinned status wire shape (module docstring) — one builder for
-    both the in-memory and the restart/store read paths (no shape drift)."""
+    both the in-memory and the restart/store read paths (no shape drift).
+
+    The job entries read straight off the ``Job`` objects, so the p4c5 failure
+    diagnostics surface identically on the live path (supervisor wrote them onto
+    the job) and the restart path (the store restored them) — one source, no
+    second assembler.
+    """
     return {
         "envelope_id": envelope_id,
         "status": status,
@@ -452,6 +463,8 @@ def _status_body(
                 "repeat_index": job.repeat_index,
                 "state": job.state.value,
                 "attempt_count": job.attempt_count,
+                "runner_exit_code": job.runner_exit_code,
+                "infra_error": job.infra_error,
             }
             for job in jobs
         ],

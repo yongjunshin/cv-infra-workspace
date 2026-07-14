@@ -136,6 +136,28 @@ DEFAULT_JOB_TIMEOUT_S = 1800.0
 # attempt TIMEOUT per the termination contract; shared constant, never a re-typed string).
 JOB_TIMEOUT_MARKER = "job timeout:"
 
+# Failure-reason hygiene (p4c5 관측성 + NEG, DoD-P4-13 정신). The reason a job failed is
+# an OPERATIONAL breadcrumb that rides the JobResult -> Job -> store -> status API: a
+# BOUNDED, single-line string authored by THIS module (docker/OS failure, watchdog kill,
+# collection violation, crash-boundary exception message). It is deliberately NOT a
+# channel for runner stderr dumps, consent/secret values or SUT domain detail — those
+# live in the runner logs and result.json (a different data source by design; the
+# operational view is never a filtered domain view). The cap makes that structural: an
+# accidentally large payload is truncated, not carried.
+_REASON_MAX_CHARS = 300
+_TRUNCATION_SUFFIX = "...(truncated)"
+
+
+def _reason(text: str | None) -> str | None:
+    """Normalize an infra reason to one bounded single-line diagnostic (None passthrough)."""
+    if text is None:
+        return None
+    collapsed = " ".join(text.split())  # newlines/indent collapse — one line, always
+    if len(collapsed) <= _REASON_MAX_CHARS:
+        return collapsed
+    return collapsed[: _REASON_MAX_CHARS - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+
+
 _GATE_READY = "ready"
 _GATE_EXITED = "exited"
 _GATE_TIMEOUT = "timeout"
@@ -640,8 +662,13 @@ class ParallelSupervisor:
       then the retry policy (``JobQueue.record_outcome``) decides re-queue vs
       terminal — a freed slot is immediately re-assignable to a waiting job
       (REQ-ORCH-006, REQ-EXEC-015 수신).
-    * **crash boundary**: a raising runner marks THAT attempt FAILED; other
-      in-flight jobs are unaffected (NFR-EXEC-004 받침).
+    * **crash boundary**: a raising runner marks THAT attempt FAILED — with the
+      exception message kept as the job's ``infra_error`` (p4c5: a swallowed
+      message left an untraceable bare ``failed``); other in-flight jobs are
+      unaffected (NFR-EXEC-004 받침).
+    * **failure diagnostics**: each terminal attempt's ``runner_exit_code`` +
+      ``infra_error`` are written back onto the ``Job``, so the queue's existing
+      persist (REQ-ORCH-011) carries them into SQLite and onto the status API.
 
     ``events`` is the observation log — ``("start"|"end", job_key)`` in
     wall-clock order — that makes slot re-assignment / cap invariants
@@ -705,6 +732,12 @@ class ParallelSupervisor:
                     self._allocator.release(key)
                 self.events.append(("end", key))
                 result = task.result()  # _run_one never raises (crash boundary inside)
+                # p4c5 실패 관측성: the attempt's diagnostics ride onto the job so
+                # ``record_outcome``'s persist (REQ-ORCH-011) writes them with the
+                # state — one write path, no new store call site. Last-attempt
+                # semantics: a clean retry resets them to None.
+                job.runner_exit_code = result.runner_exit_code
+                job.infra_error = result.infra_error
                 if not self._queue.record_outcome(job, result.state):
                     results.append(result)
         return results
@@ -722,7 +755,12 @@ class ParallelSupervisor:
             in_flight[loop.create_task(self._run_one(loop, job))] = job
 
     async def _run_one(self, loop: asyncio.AbstractEventLoop, job: Job) -> JobResult:
-        """One attempt: offload the blocking Runner seam; classify the outcome."""
+        """One attempt: offload the blocking Runner seam; classify the outcome.
+
+        Both boundaries below now carry their REASON (p4c5, T1.5 §8-2): a
+        swallowed crash-boundary message left a bare ``failed`` in the store with
+        nothing to trace. The classification itself is unchanged.
+        """
         try:
             attempt = loop.run_in_executor(None, self._runner.run, job)
             if self._job_timeout_s is None:
@@ -732,10 +770,26 @@ class ParallelSupervisor:
             # py3.11: asyncio.TimeoutError IS this builtin. The executor thread
             # may still be draining — the real seam's own watchdog kills the
             # container (run_job); classification is all the state machine needs.
-            return JobResult(job=job, state=JobState.TIMEOUT, verdict=None)
-        except Exception:
+            return JobResult(
+                job=job,
+                state=JobState.TIMEOUT,
+                verdict=None,
+                infra_error=_reason(
+                    f"{JOB_TIMEOUT_MARKER} supervisor watchdog fired after"
+                    f" {self._job_timeout_s}s (the runner seam's own watchdog kills"
+                    " the container)"
+                ),
+            )
+        except Exception as exc:
             # Runner crash boundary: this attempt failed; other jobs unaffected.
-            return JobResult(job=job, state=JobState.FAILED, verdict=None)
+            # The exception MESSAGE is the only trace of why (the seam raised
+            # instead of returning an outcome) — preserve it, bounded.
+            return JobResult(
+                job=job,
+                state=JobState.FAILED,
+                verdict=None,
+                infra_error=_reason(f"runner seam crashed: {type(exc).__name__}: {exc}"),
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -834,6 +888,28 @@ class RunJobRunner:
 def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
     """Fold one ``JobOutcome`` into the control-plane ``JobResult`` (p4c4 glue).
 
+    The state/verdict classification is ``_classify`` below — UNCHANGED. What
+    changes in p4c5 is that this fold no longer DROPS the outcome's diagnostics:
+    the runner's container exit code and the infra reason ride along on the
+    ``JobResult`` (informational — the classification never reads them back), so
+    ``ParallelSupervisor`` can persist them onto the job (store v4) and the
+    status API can show them. Before this, a runner hard-crash reached the store
+    as a bare ``failed`` and nobody could tell 137 (OOM-kill) from 139 (segfault)
+    from a plain exit 1 (history 2026-07-14 놀란 점 7 — 두 번 실증).
+    """
+    state, verdict = _classify(outcome)
+    return JobResult(
+        job=job,
+        state=state,
+        verdict=verdict,
+        runner_exit_code=outcome.runner_exit_code,
+        infra_error=_reason(outcome.infra_error),
+    )
+
+
+def _classify(outcome: JobOutcome) -> tuple[JobState, Verdict | None]:
+    """The frozen outcome->(state, verdict) table (p4c4 계약 — 의미론 불변).
+
     Precedence: ``infra_error`` first (TIMEOUT when it carries the
     ``JOB_TIMEOUT_MARKER`` — the watchdog kill, termination contract 'timeout ⇒
     kill+timeout'; anything else FAILED) -> missing result (FAILED,
@@ -843,23 +919,24 @@ def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
     runner exits 1 on a domain FAIL — same fold principle as
     ``cv_infra/cli/main.py::_exit_from_outcome``). An unreadable / non-dict /
     unknown-verdict result is an infra outcome: FAILED verdict-less, never a
-    fabricated domain judgement.
+    fabricated domain judgement. Classification reads the RAW ``infra_error``
+    (the marker prefix), never the display-normalized one.
     """
     if outcome.infra_error is not None:
         if outcome.infra_error.startswith(JOB_TIMEOUT_MARKER):
-            return JobResult(job=job, state=JobState.TIMEOUT, verdict=None)
-        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+            return JobState.TIMEOUT, None
+        return JobState.FAILED, None
     if outcome.result_path is None:
-        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+        return JobState.FAILED, None
     try:
         payload = json.loads(Path(outcome.result_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):  # unreadable / not JSON — includes JSONDecodeError
-        return JobResult(job=job, state=JobState.FAILED, verdict=None)
+        return JobState.FAILED, None
     raw_verdict = payload.get("verdict") if isinstance(payload, dict) else None
     verdict = _RESULT_VERDICT_FOLD.get(raw_verdict) if isinstance(raw_verdict, str) else None
     if verdict is None:
-        return JobResult(job=job, state=JobState.FAILED, verdict=None)
-    return JobResult(job=job, state=JobState.COMPLETED, verdict=verdict)
+        return JobState.FAILED, None
+    return JobState.COMPLETED, verdict
 
 
 # --------------------------------------------------------------------------- #
@@ -886,6 +963,16 @@ class RestartReconciliation:
 _RESTART_ENVELOPE_ERROR = (
     "orchestrator restarted mid-envelope: supervision was not resumed;"
     " RUNNING jobs were reconciled per the retry policy (M3 §3.9, R14)"
+)
+
+# The RUNNING-orphan's failure reason (p4c5): the interrupted attempt is recorded
+# FAILED — it now says why, like every other failure path (a bare 'failed' with no
+# reason is exactly the traceability gap this cycle closes). Same seat as the
+# envelope marker above; the runner exit code is genuinely unknown (the crash took
+# the supervising loop with it), so it stays None rather than being invented.
+_RESTART_ORPHAN_ERROR = (
+    "orchestrator crashed/restarted while this attempt was RUNNING;"
+    " its containers were swept and the attempt was recorded FAILED (M3 §3.9, R14)"
 )
 
 
@@ -932,6 +1019,8 @@ def reconcile_at_restart(
     queue = JobQueue.restore(store, max_attempts=max_attempts, retry_on_timeout=retry_on_timeout)
     for job in store.load_jobs():
         if job.state is JobState.RUNNING:
+            job.infra_error = _RESTART_ORPHAN_ERROR  # persisted by record_outcome below
+            job.runner_exit_code = None  # unknowable — never invented (p4c5)
             if queue.record_outcome(job, JobState.FAILED):
                 report.orphans_requeued += 1
             else:
