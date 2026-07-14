@@ -52,6 +52,8 @@ import asyncio
 import json
 import os
 import shutil
+import stat
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -95,14 +97,27 @@ RESULT_OUT_MOUNT = "/cv/out"
 # Bind paths are the MEASURED Isaac 5.1.0 on-disk layout (differs from 6.0, R2).
 CACHE_ROOT_ENV = "CV_ISAAC_CACHE_ROOT"
 
-# D-B two-tier cache (DoD-P4-15, p4c4): when a scratch root is ALSO given (arg or this
-# env), the six binds split — the three warm cache SETS (ov/GL/compute, D-B "복수 집합")
-# bind read-only from the shared base, and the three always-written runtime dirs bind rw
-# from a per-job scratch dir under this root (created per job, discarded at job end).
-# Base root alone keeps the frozen P2 single layer (all six rw).
+# D-B per-job cache seeding (DoD-P4-15, repaired p4c5): when a scratch root is ALSO given
+# (arg or this env), the shared warm base is a COPY SOURCE ONLY — the three warm cache
+# SETS (ov/GL/compute, D-B "복수 집합") are eagerly copied (``cp -a``) into a per-job
+# scratch dir under this root and bound rw from there, alongside the three always-written
+# runtime dirs; the base itself is never bound into any container (writes to the shared
+# tree: structurally 0). The per-job tree is discarded at job end (stateless).
+#
+# WHY NOT the ``:ro`` base bind this used to do (p4c4 D-B): a read-only mount does not
+# make the CUDA/Kit caches read-only — it DISABLES them (they cannot open their lock/index
+# files for write, so they fall back to recompiling everything). MEASURED on the
+# workstation (T4, reports/runner-2026-07-14-p4c5-experiments.md §E1/E2, identical warm
+# bytes, mount flag the only variable): ``robot_spawn`` 47s (ro) -> 1.05s (rw), job wall
+# 318s -> 104s at k=4, 8/8 pass, while the runner's own ``cache_delta`` showed
+# ``entries_added=0`` — the warm content was ALWAYS sufficient; only WRITABILITY was
+# missing. Seeding cost, measured: 1.07 s / 930 MB per job. R4 explicitly allows
+# "read-only 또는 copy-on-write"; this is the eager-copy CoW branch.
 CACHE_SCRATCH_ROOT_ENV = "CV_ISAAC_CACHE_SCRATCH_ROOT"
 
 # (host subpath relative to the cache/scratch root, container bind path)
+# In seeding mode these three are BOTH the base subpaths (copy sources under the shared
+# base root) AND the per-job destinations (same subpath under the job scratch dir).
 CACHE_BASE_MOUNTS: tuple[tuple[str, str], ...] = (
     ("cache/kit", "/isaac-sim/kit/cache"),
     ("cache/home", "/isaac-sim/.cache"),
@@ -215,38 +230,48 @@ def _cache_volumes(
     job_id: str,
 ) -> tuple[dict[str, dict[str, str]], Path | None]:
     """Resolve cache roots to docker ``volumes`` binds — single-tier (FU-16 / D-1)
-    or two-tier (D-B / DoD-P4-15). Returns ``(volumes, per-job scratch dir | None)``.
+    or per-job seeded (D-B / DoD-P4-15). Returns ``(volumes, per-job scratch | None)``.
 
     Effective roots = the arguments (win) or ``$CV_ISAAC_CACHE_ROOT`` /
     ``$CV_ISAAC_CACHE_SCRATCH_ROOT`` (set-but-empty env raises — ``_env_path``);
     when neither is set there are ZERO cache mounts (frozen P2 behavior).
 
-    * base root alone -> the frozen P2 single layer: all six binds ``rw``.
-    * base + scratch roots -> two-tier (D-B): the three warm cache SETS
-      (``CACHE_BASE_MOUNTS`` — ov/GL/compute) bind **read-only** from the shared
-      base, and the three always-written runtime dirs (``CACHE_SCRATCH_MOUNTS``)
-      bind ``rw`` from a per-job scratch dir ``<scratch_root>/<slug(job_id)>/``
-      created here (G-15 — dockerd would create missing dirs root-owned; the
-      slug is ``network_name_for``'s, flat + collision-free) and DISCARDED by
-      run_job's finally (D-B: 잡 종료 시 폐기, stateless).
-    * scratch root without a base root is a loud config error — a
-      half-configured two-tier cache would silently run all-cold (G-26).
+    * base root alone -> the frozen P2 single layer: all six binds ``rw`` from
+      the base. UNCHANGED (동결 계약).
+    * base + scratch roots -> per-job seeding (D-B, repaired p4c5): the three warm
+      cache SETS (``CACHE_BASE_MOUNTS`` — ov/GL/compute) are COPIED from the shared
+      base into ``<scratch_root>/<slug(job_id)>/<same subpath>`` and bound **rw**
+      from there; the three always-written runtime dirs (``CACHE_SCRATCH_MOUNTS``)
+      are created empty in the same per-job tree and bound **rw**. All six binds are
+      rw and every bind SOURCE lives under the per-job scratch — **the shared base is
+      never bound into any container**, so k parallel jobs cannot write to or corrupt
+      it (DoD-P4-15 불변식, now structural rather than mount-flag-dependent). The
+      whole per-job tree is DISCARDED by run_job's finally (stateless, NFR-EXEC-002).
+      The slug is ``network_name_for``'s (flat, docker-safe, collision-free); the
+      supervisor pre-creates every bind source (G-15 — dockerd would create missing
+      dirs root-owned).
+    * scratch root without a base root is a loud config error — a half-configured
+      cache would silently run all-cold (G-26).
 
     A given-but-missing / non-directory root is a loud ``ValueError`` — the
     caller runs this in the same seat as the ``job_id`` check, so it raises
     BEFORE any docker resource. Roots are resolved to host ABSOLUTE paths
     (``Path.resolve()``): the runner is spawned via docker.sock, so ``-v`` binds
     resolve against the HOST daemon, not this process's cwd (sibling-container
-    hazard D-O/F5). BASE subdir existence is NOT required — creating them +
-    ``chown 1234:1234`` is M5 ``warm_cache.sh``'s job (G-15), never this
-    module's; per-job scratch subdirs are the one exception (job ids are
-    dynamic, so M5 cannot pre-create them).
+    hazard D-O/F5).
+
+    Base subdir existence: NOT required in single-tier mode (frozen — creating +
+    ``chown 1234:1234`` is M5 ``warm_cache.sh``'s job, G-15). In seeding mode the
+    base subdirs are READ (copy sources), so a missing tier is a loud
+    ``ValueError``: it means the warm cache was never provisioned, and silently
+    seeding an empty tier would reproduce exactly the all-cold-believed-warm run
+    this repair exists to kill (G-26).
     """
     root = cache_root or _env_path(CACHE_ROOT_ENV)
     scratch_root = cache_scratch_root or _env_path(CACHE_SCRATCH_ROOT_ENV)
     if scratch_root and not root:
         raise ValueError(
-            "cache_scratch_root given without cache_root — a half-configured two-tier"
+            "cache_scratch_root given without cache_root — a half-configured per-job"
             " cache (D-B) would silently run all-cold; give both roots or neither (G-26)"
         )
     if not root:
@@ -270,8 +295,15 @@ def _cache_volumes(
             f"(the scratch ROOT is host provisioning's job; per-job dirs are created here)"
         )
     job_scratch = scratch_resolved / network_name_for(job_id)
+    try:
+        _seed_cache_tiers(job_id, resolved, job_scratch)
+    except Exception:
+        # A failed seed leaves no ~1 GB orphan behind the loud error (the finally-
+        # teardown never runs — this raises pre-resource, before run_job's try).
+        _discard_scratch(job_scratch)
+        raise
     volumes = {
-        str(resolved / subpath): {"bind": container_path, "mode": "ro"}
+        str(job_scratch / subpath): {"bind": container_path, "mode": "rw"}
         for subpath, container_path in CACHE_BASE_MOUNTS
     }
     for subpath, container_path in CACHE_SCRATCH_MOUNTS:
@@ -280,6 +312,110 @@ def _cache_volumes(
         host_dir.chmod(0o777)  # runner is non-root (uid 1234, R2 실측) — result-dir idiom
         volumes[str(host_dir)] = {"bind": container_path, "mode": "rw"}
     return volumes, job_scratch
+
+
+def _seed_cache_tiers(job_id: str, base_root: Path, job_scratch: Path) -> None:
+    """Copy the warm base cache tiers into this job's writable scratch (``cp -a``).
+
+    The repair's whole content (T4 실측, §E1/E4): the runner needs the warm cache
+    bytes AND the ability to write its lock/index files — a shared ``:ro`` mount
+    gives the first and silently kills the second, so every job recompiles its CUDA
+    kernels (~47 s/job, 32 cores saturated). An eager per-job copy gives both at a
+    measured 1.07 s / 930 MB.
+
+    ``cp -a`` (not ``shutil.copytree``) because ownership must survive the copy: the
+    runner is uid 1234 (R2 실측) and M5's ``warm_cache.sh provision`` chowns the base
+    tree to 1234:1234, so a preserving copy is writable by the runner while a
+    copytree (owned by whoever runs the control plane) would not be — the same silent
+    cache-off failure in a new costume. Preservation is then VERIFIED per tier (uid +
+    owner-write bit), so a non-preserving ``cp`` is loud, never silent (G-26).
+
+    Every failure raises (missing tier = unprovisioned warm cache; copy failure =
+    e.g. a full scratch filesystem — a partial copy must never be swallowed into a
+    silently-cold run). Emits ONE structured ``cache-seed`` stderr line with the
+    measured cost (seconds + bytes), the operator/QA-visible proof that the seeding
+    actually ran (G-26 feature-on gate, sibling of ``runner-mounts``).
+    """
+    started = time.monotonic()
+    tiers: list[dict[str, Any]] = []
+    for subpath, container_path in CACHE_BASE_MOUNTS:
+        source = base_root / subpath
+        if not source.is_dir():
+            raise ValueError(
+                f"cache base tier {source} does not exist or is not a directory — the warm"
+                " cache was never provisioned (M5 warm_cache.sh provision|warm); refusing to"
+                " seed an empty tier, which would run all-cold while measured as warm (G-26)"
+            )
+        destination = job_scratch / subpath
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # `cp -a src dst` with a NON-existent dst copies the tree AS dst (preserving the
+        # tier dir's own mode/ownership); an existing dst would nest it one level deeper.
+        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["cp", "-a", str(source), str(destination)],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not destination.is_dir():
+            raise RuntimeError(
+                f"cache seed failed for {source} -> {destination}"
+                f" (cp -a exit {completed.returncode}): {completed.stderr.strip()[:200]}"
+                " — a partial/absent per-job cache would run all-cold (disk full? base"
+                " unreadable?); the job is refused rather than measured wrong (G-26)"
+            )
+        _assert_runner_writable(source, destination)
+        tiers.append(
+            {
+                "source": str(source),
+                "target": container_path,
+                "bytes": _tree_bytes(destination),
+            }
+        )
+    seconds = time.monotonic() - started
+    line = json.dumps(
+        {
+            "job_id": job_id,
+            "seconds": round(seconds, 3),
+            "bytes": sum(int(tier["bytes"]) for tier in tiers),
+            "tiers": tiers,
+        },
+        sort_keys=True,
+    )
+    print(f"[cv-supervisor] cache-seed {line}", file=sys.stderr, flush=True)
+
+
+def _assert_runner_writable(source: Path, destination: Path) -> None:
+    """Loud guard: the seeded tier must be writable by the same uid as the base (G-15).
+
+    ``cp -a`` preserves ownership only for a privileged copier; GNU cp already exits
+    non-zero otherwise, but a non-GNU ``cp`` might not — and a copy the runner cannot
+    write is a cache that turns itself OFF (silently, at 47 s/job). Cheap structural
+    check on the tier dir: same owner as the base tier + owner-write bit set.
+    """
+    src_stat = source.stat()
+    dst_stat = destination.stat()
+    if dst_stat.st_uid != src_stat.st_uid:
+        raise RuntimeError(
+            f"cache seed did not preserve ownership: {destination} is uid {dst_stat.st_uid},"
+            f" base {source} is uid {src_stat.st_uid} — the runner (uid 1234, R2 실측) could"
+            " not write its cache lock/index files and the cache would be silently DISABLED"
+            " (T4 §E1); run the control plane with a `cp -a`-capable (root) identity"
+        )
+    if not dst_stat.st_mode & stat.S_IWUSR:
+        raise RuntimeError(
+            f"seeded cache tier {destination} is not owner-writable (mode"
+            f" {stat.filemode(dst_stat.st_mode)}) — the cache would be silently DISABLED;"
+            " the base tier must be writable by its owner (M5 warm_cache.sh chown 1234:1234)"
+        )
+
+
+def _tree_bytes(root: Path) -> int:
+    """Sum the file bytes actually on disk under ``root`` (seed-cost evidence)."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            total += os.lstat(os.path.join(dirpath, name)).st_size
+    return total
 
 
 def _resolve_oracle_plugin_dir(oracle_plugin_dir: str | None) -> str | None:
@@ -333,11 +469,16 @@ def run_job(
     the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;
     unset = 0 cache mounts (backward compatible), a given-but-invalid root raises in the
     same seat as ``job_id``. Adding ``cache_scratch_root`` (or
-    ``$CV_ISAAC_CACHE_SCRATCH_ROOT``) switches to the D-B two-tier layout (DoD-P4-15):
-    warm base sets read-only + per-job writable scratch discarded in the finally-teardown
-    (mount split, empty-env loudness and half-config errors: see ``_cache_volumes``).
-    The assembled runner mount spec is emitted as one structured stderr line per spawn
-    (``runner-mounts`` — the G-26 feature-on gate; tests and operators assert on it).
+    ``$CV_ISAAC_CACHE_SCRATCH_ROOT``) switches to the D-B per-job layout (DoD-P4-15,
+    repaired p4c5): the warm base tiers are COPIED into a per-job scratch tree (``cp -a``,
+    measured 1.07 s / 930 MB) and all six binds are rw from that tree — the shared base is
+    a copy source only and is never bound into a container (writes to it: structurally 0),
+    and the tree is discarded in the finally-teardown (stateless). A ``:ro`` base bind
+    does not make the CUDA/Kit cache read-only, it DISABLES it (T4 실측: 47 s of CUDA JIT
+    per job) — see ``CACHE_SCRATCH_ROOT_ENV`` / ``_seed_cache_tiers``. Each spawn emits
+    TWO structured stderr lines (the G-26 feature-on gates; tests and operators assert on
+    them): ``cache-seed`` (seed cost: seconds + bytes per tier) and ``runner-mounts``
+    (the full assembled mount spec — count, ro/rw mode, source/target).
 
     ``oracle_plugin_dir`` (D-1 2026-07-11, wiring contract #3) is the consumer's
     scenario directory holding custom oracle ``.py`` files: when not None it is
@@ -519,10 +660,13 @@ def _log_runner_mounts(job_id: str, volumes: dict[str, dict[str, str]]) -> None:
 
 
 def _discard_scratch(scratch_dir: Path | None) -> None:
-    """Best-effort removal of the per-job scratch cache dir (D-B: 잡 종료 시 폐기).
+    """Best-effort removal of the per-job scratch tree (D-B: 잡 종료 시 폐기).
 
-    Same discipline as ``_teardown``: failures surface on stderr but never mask
-    the job outcome. None (single-tier / no cache) is a no-op.
+    Removes BOTH halves of the per-job tree — the seeded cache copies and the
+    runtime scratch dirs (they share one root, ``<scratch_root>/<slug>/``) — so a
+    job leaves ~1 GB of disk behind for exactly as long as it runs (stateless,
+    NFR-EXEC-002). Same discipline as ``_teardown``: failures surface on stderr but
+    never mask the job outcome. None (single-tier / no cache) is a no-op.
     """
     if scratch_dir is None:
         return
