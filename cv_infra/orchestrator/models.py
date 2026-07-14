@@ -60,6 +60,16 @@ class Job:
     self-contained, so the production runner seam (``supervisor.RunJobRunner``) drives
     ``run_job(job_spec, ...)`` without re-admitting, and a restored/retried job keeps its
     spec (persisted, REQ-ORCH-011). None = CPU-skeleton jobs driven by fake runners only.
+
+    ``runner_exit_code`` / ``infra_error`` (p4c5 실패 관측성): the diagnostics of this job's
+    MOST RECENT terminal attempt, written back by ``ParallelSupervisor`` from the attempt's
+    ``JobResult`` and persisted with the job (store v4) so a FAILED job says WHY in the
+    store and on the status API — a runner hard-crash (137 OOM-kill / 139 segfault) is no
+    longer indistinguishable from a plain non-zero exit (history 2026-07-14 놀란 점 7: both
+    were dropped in the ``supervisor._job_result_of`` fold). Both are None for a job that
+    never ran an attempt, and a later CLEAN attempt resets them to None (last-attempt
+    semantics). Operational breadcrumbs only — bounded reason string + exit code, never a
+    runner stderr dump, consent value or SUT domain detail (``supervisor._reason``).
     """
 
     request_id: str
@@ -68,6 +78,8 @@ class Job:
     attempt_count: int = 0
     oracle_plugin_dir: str | None = None
     job_spec: dict[str, Any] | None = None
+    runner_exit_code: int | None = None
+    infra_error: str | None = None
 
 
 @dataclass
@@ -77,11 +89,19 @@ class JobResult:
     NOT the M1 Verification Result (domain matrix / recording / per-criteria detail) — only the
     terminal JobState + rollup verdict the control plane needs. Real result.json parsing lands in
     Phase 2/3.
+
+    ``runner_exit_code`` / ``infra_error`` (p4c5) carry the attempt's diagnostics ALONGSIDE the
+    classification — they are INFORMATIONAL: the state/verdict fold
+    (``supervisor._job_result_of``) is computed exactly as before and never reads them back
+    (verdict fold 의미론 불변). ``ParallelSupervisor`` writes them onto the Job, whence they
+    persist (store v4) and surface on the status API.
     """
 
     job: Job
     state: JobState
     verdict: Verdict | None = None
+    runner_exit_code: int | None = None
+    infra_error: str | None = None
 
 
 @dataclass

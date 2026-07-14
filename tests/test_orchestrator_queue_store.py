@@ -4,10 +4,11 @@ CPU-only: state-machine home move (queue.py, re-exported from scheduler), the
 retry policy (attempt_count++ / re-queue within max_attempts), SQLite(WAL)
 persistence of every transition, and restart restore through a FRESH Store
 object on the same file (DoD-P4-07 CPU 선행). p4c4 additions: schema
-versioning + v1/v2 in-place upgrades (current stamp v3 — jobs.job_spec, the
-p4c4 REST glue), the envelope->request registry and request-rollup persistence
-(api.py 유실 해소), and the job-riding stage-5 anchor / canonical job_spec
-columns.
+versioning + v1/v2/v3 in-place upgrades, the envelope->request registry and
+request-rollup persistence (api.py 유실 해소), and the job-riding stage-5 anchor
+/ canonical job_spec columns. p4c5 (실패 관측성): current stamp **v4** —
+jobs.runner_exit_code + jobs.infra_error (the last terminal attempt's
+diagnostics) roundtrip through a fresh Store, and a v3 file upgrades in place.
 """
 
 from __future__ import annotations
@@ -267,6 +268,24 @@ CREATE TABLE IF NOT EXISTS ros_domain_ids (
 );
 """
 
+# The EXACT v3 jobs shape as shipped by p4c4 T1.5 (store.py @ db2d72d) — v3 files
+# carry job_spec but predate the p4c5 failure diagnostics (same anchoring).
+_V3_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    request_id        TEXT    NOT NULL,
+    repeat_index      INTEGER NOT NULL,
+    state             TEXT    NOT NULL,
+    attempt_count     INTEGER NOT NULL,
+    oracle_plugin_dir TEXT,
+    job_spec          TEXT,
+    PRIMARY KEY (request_id, repeat_index)
+);
+CREATE TABLE IF NOT EXISTS ros_domain_ids (
+    domain_id INTEGER PRIMARY KEY,
+    job_id    TEXT NOT NULL UNIQUE
+);
+"""
+
 
 def _make_v1_file(db):
     legacy = sqlite3.connect(str(db))
@@ -298,9 +317,10 @@ def test_v1_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert job.state is JobState.COMPLETED
         assert job.oracle_plugin_dir is None  # v1 rows read back with a NULL anchor
         assert job.job_spec is None  # ... and a NULL spec (v3 column, p4c4 glue)
+        assert (job.runner_exit_code, job.infra_error) == (None, None)  # ... v4 (p4c5)
         store.record_envelope("env-1", ["r0"])  # new tables exist and accept writes
         assert store.load_envelope("env-1") is not None
-    assert _stamped_version(db) == 3
+    assert _stamped_version(db) == 4
 
 
 def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
@@ -324,7 +344,38 @@ def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert job.job_spec is None
         job.job_spec = {"job_id": "v2-req:0", "sut_image_ref": "img:1"}
         store.upsert_job(job)  # the new column accepts writes
-    assert _stamped_version(db) == 3
+    assert _stamped_version(db) == 4
+
+
+def test_v3_file_upgrades_in_place_and_keeps_rows(tmp_path):
+    # A p4c4-T1.5 file (job_spec, no failure diagnostics) opens, gains the v4
+    # columns in place and keeps its rows — same additive 방침 as v1/v2.
+    db = tmp_path / "cv.sqlite3"
+    legacy = sqlite3.connect(str(db))
+    try:
+        legacy.executescript(_V3_JOBS_SCHEMA)
+        legacy.execute(
+            "INSERT INTO jobs (request_id, repeat_index, state, attempt_count,"
+            " oracle_plugin_dir, job_spec) VALUES ('v3-req', 0, 'failed', 1, '/abs/anchor',"
+            ' \'{"job_id": "v3-req:0"}\')'
+        )
+        legacy.execute("PRAGMA user_version = 3")
+        legacy.commit()
+    finally:
+        legacy.close()
+    with Store(db) as store:
+        (job,) = store.load_jobs()
+        assert job.oracle_plugin_dir == "/abs/anchor"  # v3 data survives verbatim
+        assert job.job_spec == {"job_id": "v3-req:0"}
+        # A pre-p4c5 'failed' row has no diagnostics — exactly the gap this
+        # schema version closes (they read back NULL, never fabricated).
+        assert (job.runner_exit_code, job.infra_error) == (None, None)
+        job.runner_exit_code, job.infra_error = 137, "runner container hard-crashed"
+        store.upsert_job(job)  # the new columns accept writes
+    with Store(db) as reopened:
+        (job,) = reopened.load_jobs()
+        assert (job.runner_exit_code, job.infra_error) == (137, "runner container hard-crashed")
+    assert _stamped_version(db) == 4
 
 
 def test_newer_schema_version_refuses_loudly(tmp_path):
@@ -373,6 +424,27 @@ def test_job_spec_roundtrips_via_fresh_store(tmp_path):
         assert by_key["req-a:0"].job_spec == spec  # deep equality incl. explicit null param
         assert by_key["req-b:0"].job_spec is None
         assert by_key["req-b:0"].oracle_plugin_dir is None
+
+
+@pytest.mark.parametrize("exit_code", [137, 139, 1])  # OOM-kill / segfault / plain failure
+def test_failure_diagnostics_roundtrip_via_fresh_store(tmp_path, exit_code):
+    # p4c5 실패 관측성: the last terminal attempt's runner exit code + infra
+    # reason ride the job row and restore IDENTICAL through a fresh Store — a
+    # crash (137/139) is now distinguishable from a plain non-zero exit in the
+    # file, which is what the p4c4 발견 ② tracing needs. A clean job keeps both None.
+    db = tmp_path / "cv.sqlite3"
+    crashed, clean = fan_out(["req-a", "req-b"], repeats=1)
+    crashed.state = JobState.FAILED
+    crashed.runner_exit_code = exit_code
+    crashed.infra_error = "expected exactly 1 result.json under /out/result, found 0 (REQ-EXEC-013)"
+    with Store(db) as store:
+        store.upsert_job(crashed)
+        store.upsert_job(clean)
+    with Store(db) as reopened:
+        by_key = {job_key(j): j for j in reopened.load_jobs()}
+        assert by_key["req-a:0"].runner_exit_code == exit_code
+        assert by_key["req-a:0"].infra_error == crashed.infra_error
+        assert (by_key["req-b:0"].runner_exit_code, by_key["req-b:0"].infra_error) == (None, None)
 
 
 # --------------------------------------------------------------------------- #

@@ -17,6 +17,11 @@ CPU-only, fakes are all INJECTED duck-typed seams (G-20 — no module stubs):
   production app -> fake ``run_job`` (pass/fail/timeout/crash mix) -> rollup ->
   status/report_outcome 왕복, over a ``ProcessBoundaryTransport`` (관용구 출처:
   tests/test_cli_batch.py — in-process E2E의 공허-통과 차단, G-28).
+* (f) 실패 관측성 (p4c5): the runner's container exit code + the infra reason
+  survive the fold, the store (v4) and a fresh process's status read — 137
+  (OOM-kill) vs 139 (segfault) vs a plain non-zero exit are distinguishable from
+  the API alone (p4c4 발견 ②가 막혔던 지점). NEG: the reason is a bounded
+  single-line breadcrumb — no stderr dump, no consent value, no domain detail.
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.scheduler import SlotAccountant
 from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import (
+    _REASON_MAX_CHARS,  # NEG 가드: 사유 문자열 상한 (테스트가 상수를 재타이핑하지 않게)
+    _TRUNCATION_SUFFIX,
     DEFAULT_JOB_TIMEOUT_S,
     JOB_TIMEOUT_MARKER,
     JobOutcome,
@@ -224,6 +231,72 @@ def test_real_run_job_timeout_message_carries_the_marker(tmp_path):
     outcome = run_min(tmp_path, client, job_timeout_s=0.0)
     assert outcome.infra_error is not None
     assert outcome.infra_error.startswith(JOB_TIMEOUT_MARKER)
+
+
+# --- p4c5 실패 관측성: the fold PRESERVES the diagnostics (유실 지점 ①/②) ------
+
+
+@pytest.mark.parametrize("exit_code", [137, 139, 1])  # OOM-kill / segfault / plain failure
+def test_real_run_job_recovers_a_crashed_runners_exit_code(tmp_path, exit_code):
+    """Positive control (G-28): the REAL run_job already recovers the container
+    exit code of a runner that died mid-run and pairs it with the REQ-EXEC-013
+    collection reason — this is the producer shape the crash fixtures below
+    reuse (137 vs 139 vs 1 is exactly what p4c4 발견 ② could not tell apart)."""
+    client = FakeClient(
+        runner_statuses=("running", "running", "exited"),
+        runner_exit_code=exit_code,
+        sut_statuses=("running",) * 5,
+    )
+    outcome = run_min(tmp_path, client)  # no result.json is ever written -> collection violation
+    assert outcome.runner_exit_code == exit_code
+    assert outcome.result_path is None
+    assert outcome.infra_error is not None and "REQ-EXEC-013" in outcome.infra_error
+
+
+@pytest.mark.parametrize("exit_code", [137, 139, 1])
+def test_fold_carries_the_runner_exit_code_and_reason(tmp_path, exit_code):
+    """유실 지점 ②: the JobOutcome->JobResult fold no longer drops the crash
+    evidence — state/verdict classification is unchanged (FAILED, verdict-less),
+    but the exit code + reason now ride the JobResult (and thence the store)."""
+    job = _specced_job()
+    reason = "expected exactly 1 result.json under /out/req-a-0/result, found 0 (REQ-EXEC-013)"
+    crashed = JobOutcome("req-a:0", None, exit_code, reason)
+    result = _runner_with(crashed, tmp_path).run(job)
+    assert (result.state, result.verdict) == (JobState.FAILED, None)  # fold 의미론 불변
+    assert result.runner_exit_code == exit_code
+    assert result.infra_error == reason
+
+
+def test_fold_carries_diagnostics_on_the_verdict_bearing_paths_too(tmp_path):
+    """A recovered verdict still OUTRANKS the exit code (frozen), and the exit
+    code is now visible ALONGSIDE it: the runner's exit 1 on a domain FAIL is
+    informational, never a state change."""
+    job = _specced_job()
+    passed = _runner_with(_result_outcome(tmp_path, "req-a:0", '{"verdict": "pass"}', 0), tmp_path)
+    result = passed.run(job)
+    assert (result.state, result.verdict) == (JobState.COMPLETED, Verdict.PASS)
+    assert (result.runner_exit_code, result.infra_error) == (0, None)
+    failed = _runner_with(_result_outcome(tmp_path, "req-a:0", '{"verdict": "fail"}', 1), tmp_path)
+    result = failed.run(job)
+    assert (result.state, result.verdict) == (JobState.COMPLETED, Verdict.FAIL)
+    assert (result.runner_exit_code, result.infra_error) == (1, None)
+
+
+def test_folded_reason_is_a_bounded_single_line_diagnostic(tmp_path):
+    """NEG (DoD-P4-13 정신): the reason is an operational breadcrumb, NOT a
+    channel for a runner stderr dump. A large multi-line payload is collapsed to
+    one line and truncated at the cap — the leak is structurally bounded, not
+    politely discouraged."""
+    dump = "APIError: boom\n" + "\n".join(
+        f"  runner stderr line {i} secret-ish" for i in range(200)
+    )
+    result = _runner_with(JobOutcome("req-a:0", None, 139, dump), tmp_path).run(_specced_job())
+    assert result.infra_error is not None
+    assert len(result.infra_error) <= _REASON_MAX_CHARS
+    assert "\n" not in result.infra_error
+    assert result.infra_error.endswith(_TRUNCATION_SUFFIX)
+    assert result.infra_error.startswith("APIError: boom")  # the head — the actionable part
+    assert "runner stderr line 199" not in result.infra_error  # the dump did NOT ride along
 
 
 def test_run_job_receives_the_frozen_seam_args_off_the_job(tmp_path):
@@ -524,6 +597,17 @@ def _scripted_run_job(behaviors: dict[str, str], calls: dict[str, dict]):
         }
         suffix = job_id.rsplit("/", 1)[-1].split(":")[0]
         behavior = behaviors.get(suffix, "pass")
+        if behavior.startswith("hard-crash:"):
+            # The runner CONTAINER died mid-run (137 OOM-kill / 139 segfault):
+            # non-zero exit + no result.json. Producer-anchored shape (G-28) —
+            # test_real_run_job_recovers_a_crashed_runners_exit_code pins that the
+            # REAL run_job returns exactly this pair.
+            return JobOutcome(
+                job_id,
+                None,
+                int(behavior.split(":", 1)[1]),
+                f"expected exactly 1 result.json under {out_dir}/result, found 0 (REQ-EXEC-013)",
+            )
         if behavior == "crash":
             raise RuntimeError("simulated runner-seam crash (P4-11 mix)")
         if behavior == "watchdog-timeout":
@@ -674,3 +758,81 @@ def test_e2e_mixed_outcomes_with_a_crash_runner_stay_isolated(monkeypatch, tmp_p
     assert states == {"r0": "completed", "r1": "completed", "r2": "timeout", "r3": "failed"}
     verdicts = {r["request_id"].rsplit("/", 1)[-1]: r["verdict"] for r in body["rollups"]}
     assert verdicts == {"r0": "pass", "r1": "fail", "r2": None, "r3": None}
+    # p4c5: the two failure paths now SAY WHY — the crashed seam's exception
+    # message survived the crash boundary, the watchdog kill carries its marker.
+    jobs = {j["request_id"].rsplit("/", 1)[-1]: j for j in body["jobs"]}
+    assert "simulated runner-seam crash" in jobs["r3"]["infra_error"]
+    assert jobs["r2"]["infra_error"].startswith(JOB_TIMEOUT_MARKER)
+
+
+# --------------------------------------------------------------------------- #
+# (f) 실패 관측성 (p4c5): the crash evidence reaches the store + the status API
+#     (p4c4 발견 ②의 추적 장애 — history 2026-07-14 놀란 점 7)
+# --------------------------------------------------------------------------- #
+
+#: The status wire's job entry — EXACT key set (operational breadcrumbs only; no
+#: job_spec / scenario / consent / domain detail rides this view).
+_STATUS_JOB_KEYS = {
+    "request_id",
+    "repeat_index",
+    "state",
+    "attempt_count",
+    "runner_exit_code",
+    "infra_error",
+}
+
+
+def test_e2e_runner_crash_reaches_the_status_api_and_a_fresh_store(monkeypatch, tmp_path, capsys):
+    """The whole seam a p4c4 크래시 추적이 필요로 했던 것: two runner containers
+    die with DIFFERENT exit codes (137 OOM-kill vs 139 segfault) + no result;
+    the codes and reasons land on the status API AND in SQLite, so a fresh
+    process (new Store, new app) still reads why. NEG: the operator consent
+    value never rides this view (positive control below proves it WAS configured).
+    """
+    envelope = _write_envelope_tree(
+        tmp_path,
+        {f"s{i}.yaml": _CANONICAL_TEXT for i in range(3)},
+        "apiVersion: cv-infra/v1\n"
+        "requests:\n" + "".join(f"  - scenario: scenarios/s{i}.yaml\n" for i in range(3)),
+    )
+    calls: dict[str, dict] = {}
+    behaviors = {"r0": "hard-crash:137", "r1": "hard-crash:139", "r2": "pass"}
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2", ACCEPT_EULA="operator-consent-token")
+    app = serve.build_app(config, run_job_fn=_scripted_run_job(behaviors, calls))
+    _wire_batch(monkeypatch, ProcessBoundaryTransport(app, _E2E_ORACLE_MODULE))
+
+    assert main(["submit", str(envelope), "--wait"]) == EXIT_INFRA  # errored 우선 (불변)
+    envelope_id = capsys.readouterr().out.strip().splitlines()[0]
+    # Positive control (비공허): the consent value REALLY was handed to the runner
+    # seam — so its absence from the operational view below is a guard, not luck.
+    assert calls[f"{envelope_id}/r0:0"]["runner_env"] == {"ACCEPT_EULA": "operator-consent-token"}
+
+    assert main(["status", envelope_id]) == EXIT_PASS
+    raw_status = capsys.readouterr().out
+    body = json.loads(raw_status)
+    jobs = {j["request_id"].rsplit("/", 1)[-1]: j for j in body["jobs"]}
+    assert all(set(job) == _STATUS_JOB_KEYS for job in body["jobs"])  # shape drift 0
+    # 137 vs 139 vs a clean exit are now DISTINGUISHABLE from the API alone.
+    assert (jobs["r0"]["state"], jobs["r0"]["runner_exit_code"]) == ("failed", 137)
+    assert (jobs["r1"]["state"], jobs["r1"]["runner_exit_code"]) == ("failed", 139)
+    assert "REQ-EXEC-013" in jobs["r0"]["infra_error"]  # ... and they say why
+    assert (jobs["r2"]["state"], jobs["r2"]["runner_exit_code"]) == ("completed", 0)
+    assert jobs["r2"]["infra_error"] is None  # a clean job carries no reason
+    # NEG (DoD-P4-13 정신): no consent value, no secret, no domain detail on the
+    # operational view — and no runner-log payload smuggled through infra_error.
+    assert "operator-consent-token" not in raw_status
+    assert all(len(j["infra_error"] or "") <= _REASON_MAX_CHARS for j in body["jobs"])
+
+    # 새 Store 객체 복원 (파일이 기록이다): a fresh process reads the same evidence,
+    # both from the store directly and through the store-served status path.
+    with Store(config.store_path) as reopened:
+        persisted = {job_key(j).rsplit("/", 1)[-1]: j for j in reopened.load_jobs()}
+    assert (persisted["r0:0"].runner_exit_code, persisted["r1:0"].runner_exit_code) == (137, 139)
+    assert "REQ-EXEC-013" in persisted["r0:0"].infra_error
+    assert "operator-consent-token" not in (persisted["r0:0"].infra_error or "")
+
+    restarted = serve.build_app(_serve_config(tmp_path, CV_MAX_CONCURRENT="2"))
+    with TestClient(restarted) as client:
+        restored = client.get(f"/envelopes/{envelope_id}").json()  # _status_from_store path
+    restored_jobs = {j["request_id"].rsplit("/", 1)[-1]: j for j in restored["jobs"]}
+    assert restored_jobs == jobs  # 동일 shape·동일 증거, 다른 프로세스 (단일 조립기)

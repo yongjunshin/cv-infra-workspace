@@ -117,6 +117,11 @@ def test_running_orphan_with_exhausted_budget_is_terminal_failed(tmp_path):
         (persisted,) = reopened.load_jobs()
         assert persisted.state is JobState.FAILED  # failed-with-label, not lost
         assert persisted.attempt_count == 1
+        # p4c5: the terminal orphan SAYS WHY (a reason-less 'failed' is the very
+        # traceability gap this cycle closes); the exit code is unknowable here,
+        # so it stays None — never invented.
+        assert "restarted" in persisted.infra_error
+        assert persisted.runner_exit_code is None
 
 
 def test_reconcile_without_orphans_is_a_no_op_on_jobs(tmp_path):

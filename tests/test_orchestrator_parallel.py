@@ -24,7 +24,7 @@ from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import SlotAccountant
 from cv_infra.orchestrator.store import Store, job_key
-from cv_infra.orchestrator.supervisor import ParallelSupervisor
+from cv_infra.orchestrator.supervisor import JOB_TIMEOUT_MARKER, ParallelSupervisor
 
 # --------------------------------------------------------------------------- #
 # fakes (thread-run via the supervisor's run_in_executor offload)
@@ -224,6 +224,63 @@ def test_crash_fails_only_that_job_others_unaffected():
     by_key = {job_key(r.job): r for r in results}
     assert by_key["boom:0"].state is JobState.FAILED
     assert by_key["ok:0"].state is JobState.COMPLETED
+
+
+def test_crash_boundary_keeps_the_exception_message_and_persists_it(tmp_path):
+    """p4c5 (T1.5 §8-2): the crash boundary used to SWALLOW the exception message
+    — a bare 'failed' with nothing to trace. The message now rides the JobResult,
+    lands on the Job and persists (store v4); the classification is unchanged."""
+    db = tmp_path / "cv.sqlite3"
+    jobs = fan_out(["boom", "ok"], repeats=1)
+    with Store(db) as store:
+        results, _, _, _ = run_supervisor(
+            jobs, ScriptedRunner({"boom:0": "crash"}), k=2, store=store
+        )
+    by_key = {job_key(r.job): r for r in results}
+    assert by_key["boom:0"].state is JobState.FAILED
+    assert "RuntimeError: scripted crash for boom:0" in by_key["boom:0"].infra_error
+    assert by_key["boom:0"].runner_exit_code is None  # the seam raised — no container exit code
+    assert (by_key["ok:0"].infra_error, by_key["ok:0"].runner_exit_code) == (None, None)
+    with Store(db) as reopened:  # 새 Store 객체: the reason is IN THE FILE
+        persisted = {job_key(j): j for j in reopened.load_jobs()}
+    assert "scripted crash for boom:0" in persisted["boom:0"].infra_error
+    assert persisted["ok:0"].infra_error is None
+
+
+def test_watchdog_timeout_records_its_reason_and_a_clean_retry_clears_it(tmp_path):
+    """The outer watchdog's TIMEOUT says why (marker-prefixed), and last-attempt
+    semantics hold: a job that RECOVERS on retry carries no stale reason."""
+
+    class SlowThenPassRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, job: Job) -> JobResult:
+            self.calls += 1
+            if self.calls == 1:
+                time.sleep(0.5)
+            return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+    db = tmp_path / "cv.sqlite3"
+    (slow,) = fan_out(["req"], repeats=1)
+    with Store(db) as store:
+        (result,), _, _, _ = run_supervisor(
+            [slow], SlowThenPassRunner(), k=1, store=store, max_attempts=2, job_timeout_s=0.1
+        )
+    assert result.state is JobState.COMPLETED  # attempt 2 recovered
+    assert (result.infra_error, result.runner_exit_code) == (None, None)  # no stale reason
+    with Store(db) as reopened:
+        (persisted,) = reopened.load_jobs()
+    assert persisted.attempt_count == 2
+    assert persisted.infra_error is None  # the failed attempt-1 reason was superseded
+
+    # ... and a job that STAYS timed out keeps the watchdog reason (marker).
+    (stuck,) = fan_out(["stuck"], repeats=1)
+    (timed_out,), _, _, _ = run_supervisor(
+        [stuck], ScriptedRunner({"stuck:0": "sleep:0.5"}), k=1, job_timeout_s=0.1
+    )
+    assert timed_out.state is JobState.TIMEOUT
+    assert timed_out.infra_error.startswith(JOB_TIMEOUT_MARKER)
 
 
 # --------------------------------------------------------------------------- #
