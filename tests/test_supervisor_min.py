@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -680,13 +681,26 @@ def test_cache_root_resolved_to_host_absolute_path(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# (8b) D-B two-tier cache: shared base RO + per-job writable scratch (P4-15)
+# (8b) D-B per-job cache seeding: warm base = copy SOURCE only, per-job copies rw
+#      (DoD-P4-15 — repaired p4c5)
 # --------------------------------------------------------------------------- #
 
-# The D-B split, asserted verbatim (not derived from the module under test):
-# warm cache SETS (ov/GL/compute) come from the shared base read-only; the
-# always-written runtime dirs come from the per-job scratch, rw.
-EXPECTED_BASE_BINDS = {
+# MEASURED ANCHOR (G-28 — the external system's real behavior, not our code's guess):
+# a ``:ro`` bind of the warm base does NOT make the CUDA/Kit caches read-only, it
+# DISABLES them (they cannot open their lock/index files for write, so every job
+# recompiles its CUDA kernels). Identical warm bytes, mount flag the only variable:
+# robot_spawn 47s (ro) vs 1.05s (rw); k=4 job wall 318s -> 104s, 8/8 pass; the
+# runner's own cache_delta showed entries_added=0 (the warm CONTENT was always
+# sufficient — only WRITABILITY was missing). Seeding cost: 1.07s / 930MB per job.
+# Evidence: agent-comms/reports/runner-2026-07-14-p4c5-experiments.md §E1/E2/E4
+# (workstation ~/cv-infra-p2-out/p4c5/{E1,E2,E4}/).
+#
+# So: the three warm tiers are COPIED into the per-job scratch and bound rw from
+# there, the three runtime dirs are created empty and bound rw, and the shared base
+# is never bound into any container — DoD-P4-15's "공유 캐시 쓰기/손상 0" becomes
+# structural instead of mount-flag-dependent. Asserted verbatim below (never derived
+# from the module under test).
+EXPECTED_SEEDED_BINDS = {
     "cache/kit": "/isaac-sim/kit/cache",
     "cache/home": "/isaac-sim/.cache",
     "cache/computecache": "/isaac-sim/.nv/ComputeCache",
@@ -696,6 +710,7 @@ EXPECTED_SCRATCH_BINDS = {
     "data": "/isaac-sim/.local/share/ov/data",
     "documents": "/isaac-sim/Documents",
 }
+WARM_BYTES = b"warm-cache-bytes"  # one file per warm tier — makes the seed-cost log exact
 
 
 @pytest.fixture()
@@ -707,24 +722,43 @@ def cache_env_clear(monkeypatch):
 
 
 def make_two_tier_roots(tmp_path):
+    """A PROVISIONED warm base (what M5 ``warm_cache.sh warm`` leaves) + a scratch root.
+
+    The base tiers now carry content because the supervisor READS them (copy source);
+    an empty/absent tier is a loud config error, not a silent cold run.
+    """
     base = tmp_path / "cache-base"
-    base.mkdir()
     scratch_root = tmp_path / "cache-scratch"
     scratch_root.mkdir()
+    for subpath in EXPECTED_SEEDED_BINDS:
+        tier = base / subpath
+        tier.mkdir(parents=True)
+        (tier / "warm.bin").write_bytes(WARM_BYTES)
     return base, scratch_root
 
 
-def test_two_tier_base_is_ro_and_scratch_is_per_job_rw(tmp_path, cache_env_clear):
+def tree_snapshot(root: Path) -> dict[str, bytes]:
+    """Content snapshot of a tree (P4-15: the shared base must be byte-identical after)."""
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_seeding_binds_six_rw_copies_and_never_the_shared_base(tmp_path, cache_env_clear):
     put_result(tmp_path)
     base, scratch_root = make_two_tier_roots(tmp_path)
     client = FakeClient()
-    scratch_seen = {}
+    seen = {}
 
-    def probe(container):  # scratch dirs must exist while the job runs (pre-spawn mkdir)
+    def probe(container):  # what the runner sees WHILE it runs (seed + mkdir are pre-spawn)
         job_scratch = scratch_root / network_name_for(JOB_ID)
-        scratch_seen["dirs"] = sorted(
-            p.name for p in job_scratch.iterdir() if p.is_dir()  # created by the supervisor
+        seen["tiers"] = sorted(p.name for p in (job_scratch / "cache").iterdir() if p.is_dir())
+        seen["runtime"] = sorted(
+            p.name for p in job_scratch.iterdir() if p.is_dir() and p.name != "cache"
         )
+        seen["warm"] = (job_scratch / "cache" / "kit" / "warm.bin").read_bytes()
         return container.status == "running"
 
     run_min(
@@ -732,18 +766,60 @@ def test_two_tier_base_is_ro_and_scratch_is_per_job_rw(tmp_path, cache_env_clear
     )
     (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
     volumes = runner_kwargs["volumes"]
-    assert len(volumes) == 8  # 2 seam + 3 base(ro) + 3 scratch(rw)
-    for subpath, bind in EXPECTED_BASE_BINDS.items():
-        assert volumes[str(base.resolve() / subpath)] == {"bind": bind, "mode": "ro"}
     job_scratch = scratch_root.resolve() / network_name_for(JOB_ID)
-    for subpath, bind in EXPECTED_SCRATCH_BINDS.items():
+    assert len(volumes) == 8  # 2 seam + 3 seeded cache + 3 runtime scratch
+    for subpath, bind in {**EXPECTED_SEEDED_BINDS, **EXPECTED_SCRATCH_BINDS}.items():
         assert volumes[str(job_scratch / subpath)] == {"bind": bind, "mode": "rw"}
-    assert scratch_seen["dirs"] == ["data", "documents", "logs"]  # pre-created (G-15)
-    assert not job_scratch.exists()  # D-B: discarded when the job ended
-    assert "volumes" not in sut_kwargs  # SUT stays a blackbox — no cache either tier
+    # P4-15, structurally: the shared base is a copy SOURCE — it appears in the
+    # container spec neither rw nor ro. And NO cache bind may be read-only: a cache
+    # the runner cannot write is a cache that turns itself OFF (measured anchor above).
+    assert not any(source.startswith(str(base.resolve())) for source in volumes)
+    assert not any(spec["mode"] == "ro" for spec in volumes.values() if "isaac-sim" in spec["bind"])
+    assert seen["tiers"] == ["computecache", "home", "kit"]  # seeded BEFORE the spawn
+    assert seen["warm"] == WARM_BYTES  # ...carrying the warm content, not an empty tier
+    assert seen["runtime"] == ["data", "documents", "logs"]  # pre-created (G-15)
+    assert not job_scratch.exists()  # per-job tree discarded when the job ended (stateless)
+    assert "volumes" not in sut_kwargs  # SUT stays a blackbox — no cache at all
 
 
-def test_two_tier_scratch_paths_are_unique_per_job(tmp_path, cache_env_clear):
+def test_runner_writes_hit_the_copy_and_leave_the_shared_base_byte_identical(
+    tmp_path, cache_env_clear
+):
+    """DoD-P4-15 실질 불변식: the job writes its cache freely; the shared base is unchanged.
+
+    The fake runner does what the REAL one does (T4 cache_delta: in-place updates of
+    lock/index/material_cache.json, entries_added=0) — write into the mounted cache.
+    Pre-repair this write attempt hit a ``:ro`` mount and the cache silently disabled
+    itself; now it lands in the per-job copy and the base never sees it.
+    """
+    put_result(tmp_path)
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    before = tree_snapshot(base)
+    client = FakeClient()
+    wrote = {}
+
+    def probe(container):
+        job_scratch = scratch_root / network_name_for(JOB_ID)
+        (job_scratch / "cache" / "kit" / "warm.bin").write_bytes(b"rewritten-in-place")
+        (job_scratch / "cache" / "computecache" / "kernel.cubin").write_bytes(b"jit-output")
+        # Read back INSIDE the job — the per-job tree is gone by the time we assert.
+        wrote["kit"] = (job_scratch / "cache" / "kit" / "warm.bin").read_bytes()
+        wrote["cc"] = (job_scratch / "cache" / "computecache" / "kernel.cubin").read_bytes()
+        return container.status == "running"
+
+    outcome = run_min(
+        tmp_path, client, cache_root=base, cache_scratch_root=scratch_root, readiness_probe=probe
+    )
+    # Both halves, or the assertion is vacuous: the write LANDED (the mount the runner
+    # got is writable — the whole repair) ...
+    assert outcome.infra_error is None
+    assert wrote == {"kit": b"rewritten-in-place", "cc": b"jit-output"}
+    # ... and it landed in the COPY: the shared base is byte-identical (DoD-P4-15
+    # 공유 캐시 쓰기/손상 0 — structural, since the base is never even mounted).
+    assert tree_snapshot(base) == before
+
+
+def test_seeded_and_scratch_paths_are_unique_per_job(tmp_path, cache_env_clear):
     base, scratch_root = make_two_tier_roots(tmp_path)
     scratch_hosts: dict[str, set] = {}
     for job_id in ("job-1", "job-2"):
@@ -765,7 +841,7 @@ def test_two_tier_scratch_paths_are_unique_per_job(tmp_path, cache_env_clear):
             for host, spec in runner_kwargs["volumes"].items()
             if spec["mode"] == "rw" and host.startswith(str(scratch_root.resolve()))
         }
-        assert len(scratch_hosts[job_id]) == 3
+        assert len(scratch_hosts[job_id]) == 6  # 3 seeded + 3 runtime, all per-job
     assert scratch_hosts["job-1"].isdisjoint(scratch_hosts["job-2"])  # 잡별 고유 경로
 
 
@@ -774,7 +850,79 @@ def test_two_tier_scratch_discarded_even_when_spawn_raises(tmp_path, cache_env_c
     client = FakeClient(raise_on_sut_run=RuntimeError("docker daemon fell over"))
     outcome = run_min(tmp_path, client, cache_root=base, cache_scratch_root=scratch_root)
     assert outcome.infra_error is not None
-    assert not (scratch_root / network_name_for(JOB_ID)).exists()  # finally-discard held
+    # finally-discard held — the ~1GB seeded copy dies with the job on the exception path
+    assert not (scratch_root / network_name_for(JOB_ID)).exists()
+
+
+def test_missing_base_tier_is_loud_and_leaves_no_partial_scratch(tmp_path, cache_env_clear):
+    # The seeding mode READS the base tiers, so an unprovisioned tier (M5
+    # warm_cache.sh never ran) must be loud: seeding an empty tier would run
+    # all-cold while every dashboard says warm (G-26 — the exact failure class
+    # this repair closes).
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    shutil.rmtree(base / "cache" / "computecache")
+    client = FakeClient()
+    with pytest.raises(ValueError, match="cache base tier"):
+        run_min(tmp_path, client, cache_root=base, cache_scratch_root=scratch_root)
+    assert client.events == []  # loud + pre-resource (no network, no container)
+    assert not (scratch_root / network_name_for(JOB_ID)).exists()  # partial seed discarded
+
+
+def test_unwritable_seed_is_loud_not_a_silently_disabled_cache(tmp_path, cache_env_clear):
+    # G-15 + the repair's whole point: a copy the runner (uid 1234) cannot WRITE is a
+    # cache that turns itself off — 47s of CUDA JIT per job, and nothing in the logs
+    # but a 1-line EROFS (T4 §E1). ``cp -a`` preserves the base's ownership/mode, so an
+    # unwritable base tier yields an unwritable copy: refuse loudly instead of running a
+    # cold job that every dashboard reports as warm.
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    (base / "cache" / "kit").chmod(0o500)  # r-x: readable (copyable) but not writable
+    client = FakeClient()
+    try:
+        with pytest.raises(RuntimeError, match="not owner-writable"):
+            run_min(tmp_path, client, cache_root=base, cache_scratch_root=scratch_root)
+        assert client.events == []  # loud + pre-resource
+    finally:
+        (base / "cache" / "kit").chmod(0o700)  # let tmp_path teardown remove the tree
+
+
+def test_cache_seed_cost_is_logged_per_job(tmp_path, cache_env_clear, capsys):
+    # G-26 feature-on gate #2: a per-job copy is invisible in the mount spec (it
+    # looks like any rw bind), so the seeding emits its own structured line with the
+    # MEASURED cost — operators see the price (1.07s/930MB on the workstation) and QA
+    # verifies "the seeding actually ran" from a file, never from narration.
+    put_result(tmp_path)
+    base, scratch_root = make_two_tier_roots(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, cache_root=base, cache_scratch_root=scratch_root)
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("[cv-supervisor] cache-seed ")
+    ]
+    assert len(lines) == 1  # one job, one seed
+    logged = json.loads(lines[0].removeprefix("[cv-supervisor] cache-seed "))
+    assert logged["job_id"] == JOB_ID
+    assert logged["seconds"] >= 0.0
+    assert logged["bytes"] == 3 * len(WARM_BYTES)  # bytes measured ON DISK after the copy
+    assert [tier["target"] for tier in logged["tiers"]] == list(EXPECTED_SEEDED_BINDS.values())
+    for tier in logged["tiers"]:
+        assert tier["source"].startswith(str(base.resolve()))  # base = copy SOURCE only
+        assert tier["bytes"] == len(WARM_BYTES)
+
+
+def test_single_tier_never_seeds_and_never_logs_a_seed(tmp_path, cache_env_clear, capsys):
+    # 동결 P2 계약: base root ALONE keeps the six rw binds pointing AT the base — no
+    # copy, no seed line, no scratch dir. The repair must not leak into that path.
+    put_result(tmp_path)
+    base, _ = make_two_tier_roots(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, cache_root=base)
+    (_, runner_kwargs), _ = client.run_calls
+    volumes = runner_kwargs["volumes"]
+    assert len(volumes) == 8  # 2 seam + 6 cache, all from the base itself
+    for subpath, bind in EXPECTED_CACHE_BINDS.items():
+        assert volumes[str(base.resolve() / subpath)] == {"bind": bind, "mode": "rw"}
+    assert "cache-seed" not in capsys.readouterr().err
 
 
 def test_empty_cache_env_values_are_loud_not_silent_unset(tmp_path, cache_env_clear):
@@ -835,13 +983,12 @@ def test_runner_mounts_structured_log_is_assertable(tmp_path, cache_env_clear, c
     logged = json.loads(lines[0].removeprefix("[cv-supervisor] runner-mounts "))
     assert logged["job_id"] == JOB_ID
     mounts = {entry["target"]: entry for entry in logged["mounts"]}
-    assert len(mounts) == 9  # 3 base + 3 scratch + plugin + spec + result
-    for bind in EXPECTED_BASE_BINDS.values():
-        assert mounts[bind]["mode"] == "ro"
-        assert mounts[bind]["source"].startswith(str(base.resolve()))
-    for bind in EXPECTED_SCRATCH_BINDS.values():
+    assert len(mounts) == 9  # 3 seeded cache + 3 runtime scratch + plugin + spec + result
+    for bind in {**EXPECTED_SEEDED_BINDS, **EXPECTED_SCRATCH_BINDS}.values():
+        # every cache bind: rw, sourced from the PER-JOB tree (never the shared base)
         assert mounts[bind]["mode"] == "rw"
         assert mounts[bind]["source"].startswith(str(scratch_root.resolve()))
+        assert not mounts[bind]["source"].startswith(str(base.resolve()))
     assert mounts[str(plugin.resolve())]["mode"] == "ro"  # D-1 plugin bind rides the log too
     assert mounts[JOB_SPEC_MOUNT]["mode"] == "ro"
     assert mounts[RESULT_OUT_MOUNT]["mode"] == "rw"
