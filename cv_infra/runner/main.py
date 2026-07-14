@@ -284,9 +284,27 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     (RecorderUnavailable — pending M5 MCAP routing) or a capture failure leaves
     the canonical artifact field None + a stderr warning instead of poisoning the
     verdict with error.
+
+    Instrumentation stance (p4c5 T1, ``boot_trace``): the phase markers + cache
+    census below OBSERVE only — boot order, cache mode and every setting are
+    unchanged, and an instrumentation failure degrades to one loud line
+    (``observe``), never to a lost job.
     """
     from cv_infra.contract.schema import Artifacts
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
+    from cv_infra.runner.boot_trace import (
+        PHASE_ADAPTER_WIRE,
+        PHASE_MISSION,
+        PHASE_MISSION_START,
+        PHASE_ROS_BRIDGE_READY,
+        PHASE_SIMULATION_APP_INIT,
+        PHASE_SUT_READINESS_WAIT,
+        BootTrace,
+        emit_cache_delta,
+        emit_cache_probe,
+        install_readonly_error_counter,
+        observe,
+    )
     from cv_infra.runner.recording import RosbagRecorder, VideoRecorder, plan_artifacts
     from cv_infra.runner.ros_bridge import (
         bootstrap_bridge_env,
@@ -323,12 +341,17 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     validate_oracle_params(oracles, criteria)  # D-1 (b): pre-boot params gate
     engine = EvaluationEngine(oracles)
 
+    # p4c5 T1 boot instrumentation (DIAGNOSTIC ONLY — no behavior change): the phase
+    # tracer is handed to SimRuntime so the scene-load / robot-spawn / first-frame
+    # boundaries only it can see are timed on the same clock as main's phases.
+    trace = BootTrace()
     sim = SimRuntime(
         SimConfig(
             scene_ref=request.scenario.scene,
             robot_usd_ref=request.scenario.robot,
             seed=request.scenario.seed,
-        )
+        ),
+        trace=trace,
     )
     # The adapter's readiness/mission loops must keep the sim stepping (the sim IS
     # the /clock source — G-19), so it gets the step function as a dependency.
@@ -336,6 +359,8 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     rosbag = None
     video = None
     sampler = None
+    cache_before = None
+    erofs_counter = None
     try:
         # step 0.5: FU-14 boot glue — BEFORE SimulationApp so the bridge extension
         # sees ROS_DISTRO/RMW/LD_LIBRARY_PATH; supervisor-injected keys win, absent
@@ -346,9 +371,17 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # start — when bootstrap had to prepend it, re-exec once pre-boot so the
         # bridge's shared libs resolve (idempotent: marker present after re-exec).
         reexec_for_bridge_lib(bootstrap)
+        # Instrumentation starts AFTER the possible re-exec (G-23) so the cache
+        # census is emitted once, by the process that actually boots Isaac.
+        erofs_counter = observe("erofs counter", install_readonly_error_counter)
+        cache_before = observe("cache probe", emit_cache_probe)  # H1: warm? writable?
+        trace.begin(PHASE_SIMULATION_APP_INIT)
         sim.boot()  # step 1: SimulationApp first
+        trace.end(PHASE_SIMULATION_APP_INIT)
         _ = honored_env()  # step 2: honor M3-injected env
+        trace.begin(PHASE_ROS_BRIDGE_READY)
         enable_bridge(sim.simulation_app)  # step 2: enable bridge
+        trace.end(PHASE_ROS_BRIDGE_READY)
         chassis_path = read_field(criteria, "chassis_path", "")
         excluded_paths = read_field(criteria, "collision_excluded_paths", []) or []
         sampler = PhysicsTelemetrySampler(chassis_path, excluded_paths)
@@ -365,17 +398,35 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
         sim.load_scene()  # step 3: scene/spawn/dt/seed (+ telemetry pre-bind)
+        trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
-        if not adapter.await_ready(timeout_s=READINESS_TIMEOUT_S):  # step 5
+        trace.end(PHASE_ADAPTER_WIRE)
+        # The barrier is where k=4 died 8/8 (p4c4 발견 ①). Its begin line is streamed
+        # BEFORE the wait, so even a job killed mid-wait names the phase it hung in;
+        # the end line carries the same phase/clock_count vocabulary the timeout log
+        # already used (contract preserved), ok= included.
+        trace.begin(PHASE_SUT_READINESS_WAIT, timeout_s=READINESS_TIMEOUT_S)
+        ready = adapter.await_ready(timeout_s=READINESS_TIMEOUT_S)  # step 5
+        trace.end(
+            PHASE_SUT_READINESS_WAIT,
+            ok=ready,
+            readiness_phase=adapter.readiness_phase,
+            clock_count=adapter.clock_count,
+        )
+        if not ready:
             raise RuntimeError("SUT readiness barrier timed out")
+        trace.begin(PHASE_MISSION_START)
         artifact_plan = plan_artifacts(result_path.parent)
         sampler.attach(sim.world)  # step 6: telemetry (callbacks only; bound above)
         rosbag = _start_quiet(RosbagRecorder(artifact_plan, adapter_config))  # step 6: MCAP
         video = _start_quiet(VideoRecorder(artifact_plan))  # step 7: mp4
         if video is not None:
             sim.on_step.append(video.capture_frame)
+        trace.end(PHASE_MISSION_START)  # its elapsed_s IS the boot->mission wall
         # step 8: mission on the sim-time budget (D-F; wall runaway watchdog = M3).
+        trace.begin(PHASE_MISSION)
         outcome = adapter.drive_mission(request.scenario.goal, timeout_s=request.scenario.timeout_s)
+        trace.end(PHASE_MISSION, outcome=outcome.status)
         print(f"[cv-runner] mission outcome: {outcome}", flush=True)
 
         sampler.detach()
@@ -431,6 +482,11 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         write_result(build_result_dict(job_id, VERDICT_ERROR, [], {}), result_path)
         return EXIT_PLATFORM
     finally:
+        # Diagnostics FIRST (p4c5 T1): the boot fold + the cache write-side delta must
+        # land on EVERY path — above all the barrier-timeout path k=4 dies on, where a
+        # success-only emission would be blind to exactly the failure being diagnosed.
+        observe("boot summary", trace.emit_summary)
+        observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
         if sampler is not None:
             sampler.detach()
         for recorder in (rosbag, video):  # failure paths: no child proc/writer leak

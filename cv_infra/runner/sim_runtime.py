@@ -22,6 +22,12 @@ import random
 import time
 from dataclasses import dataclass
 
+from cv_infra.runner.boot_trace import (
+    PHASE_FIRST_RENDER_FRAME,
+    PHASE_ROBOT_SPAWN,
+    PHASE_SCENE_LOAD,
+)
+
 
 class EulaNotAcceptedError(RuntimeError):
     """Raised when the runtime operator consent env is absent (LOCKED §8, NEG-2)."""
@@ -257,7 +263,7 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
 class SimRuntime:
     """Wraps the SimulationApp / World lifecycle. Isaac bodies are deferred-import."""
 
-    def __init__(self, config: SimConfig) -> None:
+    def __init__(self, config: SimConfig, trace: object | None = None) -> None:
         self.config = config
         self.simulation_app = None  # set by boot()
         self.world = None  # set by load_scene()
@@ -269,6 +275,19 @@ class SimRuntime:
         # probe-03: tensor-view wrappers — telemetry's SingleRigidPrim — must be
         # created pre-reset or the cached simulation view is already invalid).
         self.pre_reset: list = []
+        # p4c5 T1: optional boot_trace.BootTrace — the scene-load / robot-spawn /
+        # first-render-frame phase boundaries only this class can see. None = no
+        # instrumentation (behavior identical; the runner works untraced).
+        self.trace = trace
+        self._first_step_traced = False
+
+    def _phase_begin(self, phase: str, **fields) -> None:
+        if self.trace is not None:
+            self.trace.begin(phase, **fields)
+
+    def _phase_end(self, phase: str, **fields) -> None:
+        if self.trace is not None:
+            self.trace.end(phase, **fields)
 
     def boot(self) -> object:
         """Instantiate SimulationApp FIRST, then it is legal to import omni/isaacsim."""
@@ -324,10 +343,12 @@ class SimRuntime:
                 )
             scene_path = root + scene_path
 
+        self._phase_begin(PHASE_SCENE_LOAD)
         t0 = time.monotonic()
         if not omni.usd.get_context().open_stage(scene_path):
             raise RuntimeError(f"open_stage failed for {scene_path!r}")
         self.simulation_app.update()
+        self._phase_end(PHASE_SCENE_LOAD)
         # P2-09 cold/warm attribution: report how long the runner actually spent
         # loading the scene (open_stage + first app pump). Lets the cold penalty be
         # split into asset-download vs shader/compute-compile terms. The resolved
@@ -338,6 +359,11 @@ class SimRuntime:
             flush=True,
         )
 
+        # robot_spawn (p4c5 T1) = World ctor + seed pins + robot-prim resolve +
+        # pre_reset hooks + world.reset() — i.e. everything that materializes the
+        # robot/physics scene. A block INSIDE reset() (pipeline/PhysX warm-up) lands
+        # here; a block in the first stepped frame lands in first_render_frame.
+        self._phase_begin(PHASE_ROBOT_SPAWN)
         # Determinism pins (REQ-EXEC-003, LOCKED §6): seed before physics init;
         # fixed dt on the World. numpy is legal here (post-SimulationApp, D-C).
         random.seed(self.config.seed)
@@ -367,6 +393,7 @@ class SimRuntime:
         for hook in self.pre_reset:
             hook(self.world)
         self.world.reset()
+        self._phase_end(PHASE_ROBOT_SPAWN, robot_prim=self.robot_prim_path)
 
     def enable_declared_sensors(self, topics) -> list[str]:  # pragma: no cover - GPU path
         """FU-17 GPU wrapper: pre_reset hook body over the LIVE stage.
@@ -418,11 +445,25 @@ class SimRuntime:
             scale=np.array([float(spec.get("width", 1.2)), float(spec.get("depth", 0.4)), height]),
         )
 
-    def step(self, render: bool = True) -> None:  # pragma: no cover - GPU path
-        """One fixed-dt step (render=True: Nova Carter RTX lidar needs off-screen render)."""
+    def step(self, render: bool = True) -> None:
+        """One fixed-dt step (render=True: Nova Carter RTX lidar needs off-screen render).
+
+        The FIRST step is traced (p4c5 T1): p4c4 measured a ~190 s block before the
+        first frame at k=4 while the GPU idled, and the begin/end pair around this
+        one call is what tells "the first rendered frame blocked" apart from "the
+        SUT never came up" — the barrier's step-and-spin pumps this very call, so
+        the phase nests inside ``sut_readiness_wait`` by construction. Steady-state
+        cost of the instrumentation = one bool test per step.
+        """
         if self.world is None:
             raise RuntimeError("load_scene() must run before step()")
+        first = not self._first_step_traced
+        if first:
+            self._first_step_traced = True
+            self._phase_begin(PHASE_FIRST_RENDER_FRAME, render=render)
         self.world.step(render=render)
+        if first:
+            self._phase_end(PHASE_FIRST_RENDER_FRAME)
         for callback in self.on_step:
             callback()
 
