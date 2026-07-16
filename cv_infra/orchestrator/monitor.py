@@ -274,6 +274,28 @@ def build_operational_record(store: Store) -> OperationalRecord:
 # Jinja2/SPA/chart lib (신규 의존 금지).
 # --------------------------------------------------------------------------- #
 
+#: /monitor auto-refresh cadence (``<meta http-equiv=refresh>``) — a DISPLAY-layer
+#: constant for one-glance freshness (NFR-MONITOR-001), NOT an NFR threshold M6
+#: owns; the projection/``/monitor.json``/CLI stay byte-identical regardless.
+DASHBOARD_REFRESH_S = 10
+
+#: Inline stylesheet for the one-glance view — readability only (table
+#: borders/padding, header emphasis, pass/fail/error count color). Everything is
+#: INLINE: no CDN font/JS/chart lib, no external resource (신규 의존/외부 리소스
+#: 금지 — M6 §3.6). Display-layer only; carries zero data.
+_DASHBOARD_CSS = (
+    "body{font-family:system-ui,-apple-system,sans-serif;margin:1.25rem;color:#1a1a1a}"
+    "h1{font-size:1.25rem;margin:0 0 .4rem}"
+    "p.health,p.resources{margin:.2rem 0;font-family:ui-monospace,monospace;font-size:.9rem}"
+    "table{border-collapse:collapse;width:100%;font-size:.9rem}"
+    "th,td{border:1px solid #bbb;padding:.3rem .5rem;text-align:left}"
+    "thead th{background:#2c3e50;color:#fff}"
+    "tbody tr:nth-child(even){background:#f4f6f8}"
+    "td.pass{color:#1a7f37}"
+    "td.fail{color:#b5341a;font-weight:600}"
+    "td.error{color:#8250df;font-weight:600}"
+)
+
 
 def _cell(value: object) -> str:
     return html.escape("-" if value is None else str(value))
@@ -318,11 +340,13 @@ def render_dashboard_html(record: OperationalRecord) -> str:
     body = "".join(rows) if rows else "<tr><td colspan='9'>no requests yet</td></tr>"
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
-        "<title>cv-infra operational monitor</title></head><body>"
+        f"<meta http-equiv='refresh' content='{DASHBOARD_REFRESH_S}'>"
+        "<title>cv-infra operational monitor</title>"
+        f"<style>{_DASHBOARD_CSS}</style></head><body>"
         "<h1>cv-infra operational monitor</h1>"
         f"<p>generated_at={_cell(record.generated_at)}</p>"
         f"{header}"
-        "<table border='1'><thead><tr>"
+        "<table><thead><tr>"
         "<th>envelope</th><th>request</th><th>status</th><th>report_outcome</th>"
         "<th>pass</th><th>fail</th><th>error</th><th>flakiness</th><th>broken jobs</th>"
         "</tr></thead><tbody>"

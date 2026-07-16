@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 from cv_infra.orchestrator.api import create_app
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.monitor import (
+    DASHBOARD_REFRESH_S,
     MonitorHealth,
     MonitorJob,
     MonitorRequest,
@@ -42,6 +43,7 @@ from cv_infra.orchestrator.monitor import (
     ResourceHealthSampler,
     build_operational_record,
     nvml_snapshot,
+    render_dashboard_html,
 )
 from cv_infra.orchestrator.store import OperationalJobRow, Store
 
@@ -276,6 +278,64 @@ def test_batch8_surfaces_running_then_terminal_counts(tmp_path):
             assert "queue_depth=" in page
             assert "running_k=" in page
             assert envelope_id in page  # the request rows rendered
+            # the served page auto-refreshes + styles itself INLINE (no CDN/JS).
+            assert "<meta http-equiv='refresh'" in page  # NFR-MONITOR-001 freshness
+            assert "<style>" in page and "</style>" in page  # inline readability CSS
+            assert "http://" not in page and "https://" not in page  # 외부 리소스 0
+            assert "<script" not in page.lower()  # no SPA/JS (M6 §3.6)
+
+
+# --------------------------------------------------------------------------- #
+# (2b) display layer: the one-glance page auto-refreshes + is fully self-contained
+# (인라인 CSS + meta refresh; no external resource/JS — a DISPLAY change only, the
+# projection/JSON contract stays byte-identical, tested by (1)).
+# --------------------------------------------------------------------------- #
+
+
+def _sample_record() -> OperationalRecord:
+    """A minimal hand-built record so the assertions target the TEMPLATE, not data."""
+    return OperationalRecord(
+        generated_at="2026-07-16T00:00:00+00:00",
+        health=MonitorHealth(orchestrator_up=True, gpu_reachable=False, last_sample_at=None),
+        resources=MonitorResources(
+            queue_depth=0,
+            running_k=0,
+            over_launch_count=0,
+            vram_used_mib=None,
+            vram_total_mib=None,
+            gpu_util_pct=None,
+        ),
+        requests=[
+            MonitorRequest(
+                envelope_id="env-1",
+                request_id="env-1/r0",
+                submitted_at=None,
+                envelope_status="completed",
+                report_outcome="passed",
+                pass_count=1,
+                fail_count=0,
+                error_count=0,
+                flakiness=0.0,
+                jobs=[],
+            )
+        ],
+    )
+
+
+def test_dashboard_html_auto_refreshes_and_is_fully_self_contained():
+    page = render_dashboard_html(_sample_record())
+
+    # auto-refresh via meta (NFR-MONITOR-001 one-glance freshness) — no JS timer.
+    assert 5 <= DASHBOARD_REFRESH_S <= 15  # a sane display cadence (task 핀 5~15s)
+    assert f"<meta http-equiv='refresh' content='{DASHBOARD_REFRESH_S}'>" in page
+
+    # readability CSS is INLINE (a <style> block), never an external stylesheet.
+    assert "<style>" in page and "</style>" in page
+
+    # zero external resource / JS — every byte is inline (CDN/폰트/JS 금지, M6 §3.6).
+    assert "http://" not in page and "https://" not in page
+    assert "<script" not in page.lower()
+    assert "src=" not in page and "href=" not in page
 
 
 # --------------------------------------------------------------------------- #
