@@ -21,8 +21,11 @@ Write discipline (M3 §3.8 R-DB): WAL allows concurrent readers but serializes
 writers, so every write goes through this ONE connection guarded by a
 process-level lock, plus ``PRAGMA busy_timeout`` so a competing writer waits out
 a lock instead of failing ``database is locked``. M4 baseline writes arrive
-through this same Store API later (LOCKED §7.13) — the baseline table itself is
-deliberately NOT created here (M4 scope; no speculative schema). Stdlib only.
+through this same Store API (LOCKED §7.13): the ``request_baselines`` table
+(v6, p5c1) + its ``upsert_baseline`` / ``load_baseline`` accessors live here so
+the single writer stays single (M4 ``report/baseline.py`` calls them, never
+touches SQLite directly), keeping the C-1 baseline home inside cv-infra's own
+store (no separate DB service, C-2). Stdlib only.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from cv_infra.orchestrator.models import Job, JobState, RequestRollup, Verdict
 
@@ -61,8 +65,12 @@ def _now_iso() -> str:
 # v5 = p4c6 M6 운영뷰 (envelopes.submitted_at + jobs.started_at/ended_at operational
 # timestamps + the resource_health_sample latest-row snapshot the sampler upserts —
 # all ADDITIVE, the operational read model's inputs, M6 §3.2/§3.4). Time-series
-# retention of samples is post-MVP (one latest row only — 과설계 금지).
-_SCHEMA_VERSION = 5
+# retention of samples is post-MVP (one latest row only — 과설계 금지);
+# v6 = p5c1 M4 회귀 baseline (request_baselines — the request-level baseline table
+# M4 SR-21/C-1 owns, keyed by request_identity_key; ADDITIVE new table via
+# CREATE IF NOT EXISTS so every older file gains it transparently on open, no ALTER
+# needed. This is the ONLY baseline home — LOCKED §7.13 cv-infra 내부 SQLite 한정).
+_SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -112,6 +120,14 @@ CREATE TABLE IF NOT EXISTS resource_health_sample (
     queue_depth       INTEGER NOT NULL,
     running_k         INTEGER NOT NULL,
     over_launch_count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS request_baselines (
+    request_identity_key TEXT PRIMARY KEY,
+    sut_ref              TEXT NOT NULL,
+    verdict              TEXT NOT NULL,
+    key_metrics          TEXT,
+    established_at       TEXT NOT NULL,
+    source_result_ref    TEXT
 );
 """
 
@@ -177,6 +193,28 @@ class ResourceSample:
     queue_depth: int
     running_k: int
     over_launch_count: int
+
+
+@dataclass
+class BaselineRow:
+    """Store-row view of one request-level regression baseline (M4 SR-21, C-1).
+
+    Keyed by ``request_identity_key`` (M4 ``regression.identity_key`` — the
+    scenario+criteria+settings normalized hash, SUT excluded), so a later run of
+    the SAME request with only a different SUT matches this row and its verdict
+    can be compared (pass->fail = regression). ``sut_ref`` / ``established_at``
+    record WHICH SUT version and WHEN the baseline was captured (NFR-REPORT-001
+    식별성). ``key_metrics`` is a free JSON map (declared-metric snapshot);
+    ``source_result_ref`` optionally points back at the establishing result.
+    The store is the ONLY home of this row (LOCKED §7.13 C-1) — M4 writes it
+    exclusively through ``upsert_baseline`` (single writer)."""
+
+    request_identity_key: str
+    sut_ref: str
+    verdict: str
+    key_metrics: dict[str, Any] = field(default_factory=dict)
+    established_at: str = ""
+    source_result_ref: str | None = None
 
 
 def job_key(job: Job) -> str:
@@ -579,6 +617,56 @@ class Store:
             verdicts=[Verdict(v) for v in json.loads(verdicts)],
             flakiness=flakiness,
             verdict=Verdict(verdict) if verdict is not None else None,
+        )
+
+    # -- request-level regression baselines (SR-21 / C-1 — p5c1, M4 write path) --
+
+    def upsert_baseline(self, row: BaselineRow) -> None:
+        """Persist one request's regression baseline (insert or update; v6).
+
+        The SINGLE writer of the C-1 baseline home (LOCKED §7.13) — M4
+        ``report/baseline.py`` routes every establish/advance through here so the
+        write stays serialized (module docstring, R-DB). No CI/git/network path
+        touches this row; the ONLY source is a prior cv-infra run's result."""
+        with self._write_lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO request_baselines (request_identity_key, sut_ref, verdict,"
+                " key_metrics, established_at, source_result_ref) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(request_identity_key) DO UPDATE SET sut_ref = excluded.sut_ref,"
+                " verdict = excluded.verdict, key_metrics = excluded.key_metrics,"
+                " established_at = excluded.established_at,"
+                " source_result_ref = excluded.source_result_ref",
+                (
+                    row.request_identity_key,
+                    row.sut_ref,
+                    row.verdict,
+                    (
+                        json.dumps(row.key_metrics, sort_keys=True)
+                        if row.key_metrics is not None
+                        else None
+                    ),
+                    row.established_at,
+                    row.source_result_ref,
+                ),
+            )
+
+    def load_baseline(self, request_identity_key: str) -> BaselineRow | None:
+        """Restore one request's baseline (None when never established — skip 신호)."""
+        row = self._conn.execute(
+            "SELECT sut_ref, verdict, key_metrics, established_at, source_result_ref"
+            " FROM request_baselines WHERE request_identity_key = ?",
+            (request_identity_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        sut_ref, verdict, key_metrics, established_at, source_result_ref = row
+        return BaselineRow(
+            request_identity_key=request_identity_key,
+            sut_ref=sut_ref,
+            verdict=verdict,
+            key_metrics=json.loads(key_metrics) if key_metrics is not None else {},
+            established_at=established_at,
+            source_result_ref=source_result_ref,
         )
 
     # -- lifecycle -------------------------------------------------------------
