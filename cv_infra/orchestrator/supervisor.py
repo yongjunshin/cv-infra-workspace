@@ -456,6 +456,7 @@ def run_job(
     job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
     sut_restart_limit: int = 1,
     poll_interval_s: float = 1.0,
+    ros_domain_id: int | None = None,
 ) -> JobOutcome:
     """Run ONE verification job end-to-end and return its ``JobOutcome`` (D-2 seam).
 
@@ -486,6 +487,15 @@ def run_job(
     via ``CV_ORACLE_PLUGIN_DIR=<that path>`` — runner-only, never the SUT (blackbox
     no-leak invariant); the runner sys.path's it before evaluation (M2). None = no
     mount, no env; a missing directory raises loud (G-26, ``_resolve_oracle_plugin_dir``).
+
+    ``ros_domain_id`` (p4c6 §7-1 allocator 정합): the ``ROS_DOMAIN_ID`` to stamp on both
+    containers (env + reconcile labels). None (the default) keeps the FROZEN single-run
+    fallback — a pure-hash id from ``allocate_ros_domain_id(job_id)`` (P2 ``cv-infra run``
+    계약 불변). Under the orchestrator, admission's store-backed collision-avoiding
+    ``DomainIdAllocator`` is the SINGLE source for the concurrent-job domain set (M3 §3.6);
+    it passes the allocated id here so run_job does NOT re-derive a colliding pure-hash id
+    (the p4c5 defect: k>=~6 동시 admission에서 두 잡이 같은 도메인 — cross-talk은 잡별 전용
+    브리지+host_net=0으로 구조 차단되나 "잡별 고유 도메인" 하위 불변식이 확률적 파손).
 
     Infra failures (docker/spawn/collection) are returned as ``infra_error``, never
     raised; a missing ``job_id`` is a seam-contract violation and raises ValueError
@@ -531,7 +541,10 @@ def run_job(
     spec_path = job_dir / "job_spec.json"
     spec_path.write_text(json.dumps(job_spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    domain_id = allocate_ros_domain_id(job_id)
+    # p4c6 §7-1: honor the admission-allocated id when given (the store-backed
+    # collision-avoiding source), else fall back to the pure-hash derivation
+    # (frozen single-run path). The label/env below then carry the ACTUAL id.
+    domain_id = ros_domain_id if ros_domain_id is not None else allocate_ros_domain_id(job_id)
     # Crash-reconciliation labels (M3 §3.9, R14): both containers carry the job id
     # and its live domain id so a restarted orchestrator can re-attach in-flight
     # jobs and restore allocations from `docker ps` instead of re-assigning.
@@ -894,7 +907,11 @@ class ParallelSupervisor:
             key = job_key(job)
             self._queue.mark_running(job)
             if self._allocator is not None:
-                self._allocator.allocate(key)
+                # p4c6 §7-1: the allocated id RIDES the job to run_job (the single
+                # source for the concurrent-job domain set) — run_job no longer
+                # re-derives a colliding pure-hash id. Re-set on every admission
+                # (a retry re-allocates); None when no allocator (fallback path).
+                job.ros_domain_id = self._allocator.allocate(key)
             self.events.append(("start", key))
             in_flight[loop.create_task(self._run_one(loop, job))] = job
 
@@ -959,11 +976,12 @@ class RunJobRunner:
     """Production ``Runner`` seam: one fanned-out ``Job`` -> ``run_job`` -> ``JobResult``.
 
     The p4c4 REST->runner glue: ``ParallelSupervisor`` drives this synchronous
-    seam per job on the executor pool; every call reuses the FROZEN ``run_job``
-    contract verbatim (signature unchanged) with the construction-time
-    operational knobs. CPU tests inject ``run_job_fn`` (duck-typed fake — G-20
-    주입식, never a module stub); production leaves it None (= the real
-    ``run_job``).
+    seam per job on the executor pool; every call reuses ``run_job`` with the
+    construction-time operational knobs. The FROZEN positional contract (5 args)
+    is unchanged; p4c6 added ONE keyword-only ``ros_domain_id`` (default None, so
+    every existing caller is unaffected). CPU tests inject ``run_job_fn``
+    (duck-typed fake — G-20 주입식, never a module stub); production leaves it None
+    (= the real ``run_job``).
 
     * ``job.job_spec`` (materialized by the api submit path, persisted with the
       job) is the canonical JOB_SPEC passed by value; ``sut_image_ref`` comes
@@ -973,6 +991,11 @@ class RunJobRunner:
       ``ParallelSupervisor`` crash boundary records that attempt FAILED.
     * ``job.oracle_plugin_dir`` rides into ``run_job(oracle_plugin_dir=...)``
       (D-1 wiring #3 — ro mount + ``CV_ORACLE_PLUGIN_DIR``, runner-only).
+    * ``job.ros_domain_id`` (p4c6 §7-1) — the id ``ParallelSupervisor._admit``
+      allocated from the store-backed collision-avoiding ``DomainIdAllocator`` —
+      rides into ``run_job(ros_domain_id=...)`` so the container env/label carries
+      the ALLOCATED id, not a re-derived colliding pure-hash one. None (a job with
+      no allocator) => run_job's frozen pure-hash fallback.
     * ``job_timeout_s`` is a PUBLIC attribute — the duck-typed inner-watchdog
       declaration the ``ParallelSupervisor`` coherence gate reads (p4c1 후속 ②)
       — and the SAME attribute is what every ``run_job`` call receives (single
@@ -1025,6 +1048,9 @@ class RunJobRunner:
             runner_gpus=self._runner_gpus,
             readiness_probe=self._readiness_probe,
             job_timeout_s=self.job_timeout_s,
+            # p4c6 §7-1: hand run_job the admission-allocated id (None when no
+            # allocator is attached -> run_job's pure-hash fallback).
+            ros_domain_id=job.ros_domain_id,
         )
         return _job_result_of(job, outcome)
 

@@ -70,6 +70,18 @@ class Job:
     never ran an attempt, and a later CLEAN attempt resets them to None (last-attempt
     semantics). Operational breadcrumbs only — bounded reason string + exit code, never a
     runner stderr dump, consent value or SUT domain detail (``supervisor._reason``).
+
+    ``ros_domain_id`` (p4c6 §7-1 allocator 정합): the CURRENT attempt's ``ROS_DOMAIN_ID``,
+    allocated at admission by the store-backed collision-avoiding ``DomainIdAllocator``
+    (M3 §3.6, the SINGLE source of truth for the concurrent-job domain set) and carried onto
+    the job so ``ParallelSupervisor`` -> ``RunJobRunner`` hands it verbatim to
+    ``run_job(ros_domain_id=...)`` instead of run_job re-deriving a PURE-HASH id with no
+    collision avoidance (the p4c5 defect: k>=~6 동시 admission에서 두 잡이 같은 도메인).
+    NOT part of ``job_spec`` — a container-env/label seam value, not job명세 (D-2 계약 동결).
+    Transient in-flight carrier: NOT persisted (the store restores live ids from the
+    ``ros_domain_ids`` table + container labels at restart, M3 §3.9) and re-set on every
+    admission; None = no allocator attached (single-run / CPU-fake path -> run_job pure-hash
+    fallback, P2 ``cv-infra run`` 계약 불변).
     """
 
     request_id: str
@@ -80,6 +92,7 @@ class Job:
     job_spec: dict[str, Any] | None = None
     runner_exit_code: int | None = None
     infra_error: str | None = None
+    ros_domain_id: int | None = None
 
 
 @dataclass
