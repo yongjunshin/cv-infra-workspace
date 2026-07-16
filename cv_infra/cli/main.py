@@ -77,13 +77,16 @@ _CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 # --- sub-command surface (REQ-INTAKE-003) ----------------------------------
 # ``run`` is implemented (Phase 2, D-2); ``submit``/``status``/``wait`` are
 # implemented (Phase 4 batch surface — cv_infra/cli/batch.py, lazily imported);
-# ``report``/``selftest`` stay reserved placeholders (P5) so the full contract
-# surface remains visible via ``cv-infra --help``.
+# ``monitor`` is implemented (Phase 4 operational-view surface —
+# cv_infra/cli/monitor.py, lazily imported); ``report``/``selftest`` stay reserved
+# placeholders (P5) so the full contract surface remains visible via
+# ``cv-infra --help``.
 _SUBCOMMANDS: dict[str, str] = {
     "run": "Run a single scenario end-to-end (supervisor co-spawns SUT + runner; envelope-less).",
     "submit": "Submit a RequestEnvelope YAML (scenario file refs) to the orchestrator [--wait].",
     "status": "Show progress of an async envelope by id (informational; never gates on verdict).",
     "wait": "Block until an envelope reaches a terminal aggregated verdict (exit 0/1/3).",
+    "monitor": "Show the operational view (queue/resources/health + rollup); informational.",
     "report": "Print the aggregated report for an envelope (informational).",
     "selftest": "Run the built-in stub round-trip (no external SUT).",
 }
@@ -98,7 +101,7 @@ _EXIT_CODE_EPILOG = (
     "  2  CONTRACT  contract/validation error (bad YAML, unsupported apiVersion)\n"
     "  3  INFRA     infrastructure error (orchestrator down, EULA not accepted)\n"
     "\n"
-    "'run' (P2) and 'submit'/'status'/'wait' (P4) are implemented; "
+    "'run' (P2) and 'submit'/'status'/'wait'/'monitor' (P4) are implemented; "
     "'report'/'selftest' are reserved (P5)."
 )
 
@@ -176,6 +179,8 @@ def _build_parser() -> argparse.ArgumentParser:
             _add_run_arguments(sub)
         elif name in _BATCH_COMMANDS:
             _add_batch_arguments(name, sub)
+        elif name == "monitor":
+            _add_api_argument(sub)  # operational-view read: only the orchestrator base URL
     return parser
 
 
@@ -408,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return EXIT_CONTRACT
 
-    if args.command == "run" or args.command in _BATCH_COMMANDS:
+    if args.command == "run" or args.command in _BATCH_COMMANDS or args.command == "monitor":
         if extra:
             print(
                 f"cv-infra {args.command}: unrecognized argument(s): {' '.join(extra)}",
@@ -418,6 +423,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _cmd_run(args)
+
+    if args.command == "monitor":
+        try:
+            # Lazy import (mirrors the batch idiom below): the operational-view
+            # surface pulls httpx — the --help and run paths must never load it.
+            from cv_infra.cli import monitor
+        except ImportError as exc:
+            print(
+                f"cv-infra monitor: operational-view surface unavailable ({_one_line(exc)}) — "
+                "platform build incomplete; this is an infrastructure error, "
+                "not a SUT verdict",
+                file=sys.stderr,
+            )
+            return EXIT_INFRA
+        return monitor.cmd_monitor(args)
 
     if args.command in _BATCH_COMMANDS:
         try:
