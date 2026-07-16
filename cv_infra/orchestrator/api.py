@@ -110,6 +110,7 @@ from cv_infra.orchestrator.allocator import DomainIdAllocator
 from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.fanout import fan_out_requests
 from cv_infra.orchestrator.models import Job, JobResult, RequestRollup, Verdict
+from cv_infra.orchestrator.monitor import register as register_monitor
 from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import SlotAccountant
@@ -435,6 +436,10 @@ def create_app(
             report_outcome=report_outcome_of(record.results) if record.done else None,
         )
 
+    # M6 operational view (DoD-P4-12/13): read-only projection surfaces on the
+    # SAME app (no separate server). Routes only — the resident sampler is wired
+    # in production (serve.build_app), never on the TestClient path.
+    register_monitor(app, store)
     return app
 
 

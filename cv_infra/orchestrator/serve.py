@@ -50,6 +50,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from cv_infra.orchestrator.api import create_app
+from cv_infra.orchestrator.monitor import ResourceHealthSampler, attach_sampler
 from cv_infra.orchestrator.scheduler import PynvmlVramGauge, VramGauge, compute_k
 from cv_infra.orchestrator.store import Store
 from cv_infra.orchestrator.supervisor import (
@@ -156,6 +157,7 @@ def build_app(
     docker_client: Any = None,
     vram_gauge: VramGauge | None = None,
     run_job_fn: Callable[..., Any] | None = None,
+    start_sampler: bool = False,
 ) -> FastAPI:
     """Compose the production app: store -> reconcile (R14) -> k -> runner -> api.
 
@@ -164,6 +166,10 @@ def build_app(
     None (= ``PynvmlVramGauge`` when the VRAM guard is configured, the real
     ``run_job``). ``docker_client=None`` skips only the label sweep half of
     reconciliation (docker-free CPU tests) — ``reconcile_at_restart`` 계약.
+
+    ``start_sampler`` (default False — the CPU-test path stays poller-free) wires
+    the M6 resource/health sampler as a background task; ``main`` passes True so
+    the resident deployment populates VRAM/util (NVML absent -> loud-once degrade).
     """
     store = Store(config.store_path)  # process-lifetime (the app owns it from here)
     _, reconciliation = reconcile_at_restart(store, docker_client)
@@ -186,6 +192,9 @@ def build_app(
         run_job_fn=run_job_fn,
     )
     app = create_app(store, runner, k=k)
+    if start_sampler:
+        # M6 §3.4: the resident deployment's SOLE periodic NVML poller.
+        attach_sampler(app, ResourceHealthSampler(store))
     _log_serve_config(config, k=k, job_timeout_s=runner.job_timeout_s, recon=reconciliation)
     return app
 
@@ -237,7 +246,7 @@ def main() -> int:
 
     import docker  # noqa: PLC0415
 
-    app = build_app(config, docker_client=docker.from_env())
+    app = build_app(config, docker_client=docker.from_env(), start_sampler=True)
     uvicorn.run(app, host=config.host, port=config.port)
     return 0
 
