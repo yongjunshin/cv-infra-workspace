@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-07-16T02:26:53.560521+00:00",
+  "health": { "orchestrator_up": true, "gpu_reachable": false, "last_sample_at": "2026-07-16T02:26:53.553532+00:00" },
+  "resources": { "queue_depth": 0, "running_k": 0, "over_launch_count": 0,
+                 "vram_used_mib": null, "vram_total_mib": null, "gpu_util_pct": null },
+  "requests": [
+    { "envelope_id": "env-a95d204e4481", "request_id": "env-a95d204e4481/r0",
+      "submitted_at": "2026-07-16T02:26:53.388584+00:00", "envelope_status": "completed",
+      "report_outcome": "errored", "pass_count": 1, "fail_count": 1, "error_count": 0, "flakiness": 0.5,
+      "jobs": [
+        { "job_id": "env-a95d204e4481/r0:0", "repeat_index": 0, "state": "completed", "attempt_count": 1,
+          "started_at": "2026-07-16T02:26:53.425001+00:00", "ended_at": "2026-07-16T02:26:53.470171+00:00",
+          "duration_s": 0.04517, "error_category": null, "runner_exit_code": null, "infra_error": null },
+        { "job_id": "env-a95d204e4481/r0:1", "repeat_index": 1, "state": "completed", "attempt_count": 1,
+          "started_at": "2026-07-16T02:26:53.437386+00:00", "ended_at": "2026-07-16T02:26:53.458363+00:00",
+          "duration_s": 0.020977, "error_category": null, "runner_exit_code": null, "infra_error": null } ] },
+    { "envelope_id": "env-a95d204e4481", "request_id": "env-a95d204e4481/r1",
+      "submitted_at": "2026-07-16T02:26:53.388584+00:00", "envelope_status": "completed",
+      "report_outcome": "errored", "pass_count": 1, "fail_count": 0, "error_count": 0, "flakiness": 0.0,
+      "jobs": [
+        { "job_id": "env-a95d204e4481/r1:0", "repeat_index": 0, "state": "completed", "attempt_count": 1,
+          "started_at": "2026-07-16T02:26:53.480183+00:00", "ended_at": "2026-07-16T02:26:53.510754+00:00",
+          "duration_s": 0.030571, "error_category": null, "runner_exit_code": null, "infra_error": null } ] },
+    { "envelope_id": "env-a95d204e4481", "request_id": "env-a95d204e4481/r2",
+      "submitted_at": "2026-07-16T02:26:53.388584+00:00", "envelope_status": "completed",
+      "report_outcome": "errored", "pass_count": 0, "fail_count": 0, "error_count": 1, "flakiness": null,
+      "jobs": [
+        { "job_id": "env-a95d204e4481/r2:0", "repeat_index": 0, "state": "failed", "attempt_count": 1,
+          "started_at": "2026-07-16T02:26:53.492057+00:00", "ended_at": "2026-07-16T02:26:53.522588+00:00",
+          "duration_s": 0.030531, "error_category": "runner-crash", "runner_exit_code": 137,
+          "infra_error": "expected exactly 1 result.json under /out/.../result, found 0 (REQ-EXEC-013)" } ] } ]
+}
