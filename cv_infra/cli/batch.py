@@ -8,11 +8,13 @@ aggregated verdict and folds it into the exit-code contract, ``status`` is a
 purely informational read. Lazily imported by ``main`` dispatch only — the
 ``--help`` path never loads httpx/fastapi/pydantic.
 
-Exit-code mapping — M8 single source (LOCKED §9 / D-I, M8-D11)
----------------------------------------------------------------
-``REPORT_OUTCOME_EXIT`` maps the envelope-level ``report_outcome`` literal the
-orchestrator aggregates (imported from ``cv_infra.orchestrator.api`` — never
-re-defined here) to the process exit code::
+Exit-code mapping — single source in ``cli/exit_codes.py`` (LOCKED §9 / D-I, M8-D11)
+-----------------------------------------------------------------------------------
+``REPORT_OUTCOME_EXIT`` / ``exit_code_for_report_outcome`` are imported from the
+dependency-0 leaf ``cv_infra.cli.exit_codes`` (재정의 금지 — the M4
+``report/github.py`` renderer imports that SAME module for the exit→conclusion
+half of the contract). The fold maps the envelope-level ``report_outcome``
+literal the orchestrator aggregates to the process exit code::
 
     report_outcome   exit   meaning
     --------------   ----   -------------------------------------------------
@@ -69,13 +71,18 @@ from typing import Any
 
 import httpx
 
-from cv_infra.cli.main import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS, _one_line
-from cv_infra.contract.errors import ANNOTATION_KEYS, ContractError
-from cv_infra.orchestrator.api import (
-    REPORT_OUTCOME_ERRORED,
-    REPORT_OUTCOME_FAIL,
-    REPORT_OUTCOME_PASS,
+from cv_infra.cli.exit_codes import (
+    EXIT_CONTRACT,
+    EXIT_INFRA,
+    EXIT_PASS,
+    exit_code_for_report_outcome,
 )
+from cv_infra.cli.exit_codes import (
+    REPORT_OUTCOME_EXIT as REPORT_OUTCOME_EXIT,  # re-exported (test back-compat, 재정의 금지)
+)
+from cv_infra.cli.main import _one_line
+from cv_infra.contract.errors import ANNOTATION_KEYS, ContractError
+from cv_infra.orchestrator.api import REPORT_OUTCOME_ERRORED
 
 #: Default orchestrator base URL (MVP topology: CLI and orchestrator share the
 #: host — M8 §8 cicd-g5). Overridden by ``CV_INFRA_API`` env or ``--api``.
@@ -92,29 +99,6 @@ _POLL_INTERVAL_S = 1.0
 #: server-side acceptance landed (Wave 2 merge, cycle p4-batch-cli); the gate
 #: stays as an explicit escape hatch (both states unit-pinned).
 _INCLUDE_ORACLE_PLUGIN_DIRS = True
-
-#: ``report_outcome`` literal -> exit code. THE M8 single source (D-I) —
-#: literals imported from ``cv_infra.orchestrator.api`` (재정의 금지), exit
-#: constants from ``cv_infra.cli.main`` (the Phase-0 contract). See the module
-#: docstring for the priority/scope semantics.
-REPORT_OUTCOME_EXIT: dict[str, int] = {
-    REPORT_OUTCOME_PASS: EXIT_PASS,
-    REPORT_OUTCOME_FAIL: EXIT_FAIL,
-    REPORT_OUTCOME_ERRORED: EXIT_INFRA,
-}
-
-
-def exit_code_for_report_outcome(outcome: Any) -> int:
-    """Pure fold: terminal ``report_outcome`` -> process exit code.
-
-    Unknown or absent outcomes fold to ``EXIT_INFRA`` (3), NEVER to FAIL —
-    the same rule ``main._VERDICT_EXIT`` applies to unknown verdicts (a value
-    we cannot interpret is a platform problem, not a SUT judgement).
-    """
-    if isinstance(outcome, str) and outcome in REPORT_OUTCOME_EXIT:
-        return REPORT_OUTCOME_EXIT[outcome]
-    return EXIT_INFRA
-
 
 # --- seams (module docstring) ------------------------------------------------
 
@@ -340,3 +324,149 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     """``cv-infra status <envelope_id> [--api URL]`` — informational (exit 0)."""
     return asyncio.run(_status_async(args))
+
+
+# --- report: informational review surface (D-O, M8 §3.2 / §3.7) --------------
+# A thin client over the M4 VerificationReport the orchestrator assembles +
+# persists and serves at ``GET /envelopes/{id}/report``. A FETCHED report
+# ALWAYS exits 0 even when the report itself says fail (a query must never gate
+# CI by itself — D-O); only an infra/lookup problem (unreachable / unknown id /
+# not-terminal / crash) exits 3. exit 1 and 2 are structurally unreachable on
+# this path — an informational read is never a SUT verdict nor a contract error.
+
+
+def _matrix_view(report: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a VerificationReport JSON into ``report.matrix.render_text``'s
+    ``build_matrix`` shape (the report row carries a richer rollup than the P4
+    preview table). The report JSON rollup exposes ``flaky`` (bool), not the
+    ``flakiness`` float the P4 column formats, so that column renders ``-`` here
+    — the full per-row detail stays available via ``--json``. Fields read here
+    are anchored to the canonical fixture
+    (``tests/test_report_verification_report.py``)."""
+    summary = report.get("summary", {})
+    rows: list[dict[str, Any]] = []
+    for row in report.get("matrix", []):
+        rollup = row.get("rollup", {})
+        verdicts = rollup.get("verdicts", [])
+        rows.append(
+            {
+                "request_id": row.get("request_id"),
+                "verdict": rollup.get("verdict"),
+                "flakiness": None,
+                "jobs": rollup.get("repeats", len(verdicts)),
+                "counts": {"pass": verdicts.count("pass"), "fail": verdicts.count("fail")},
+            }
+        )
+    return {
+        "matrix": rows,
+        "summary": {
+            "total": summary.get("total", len(rows)),
+            "passed": summary.get("passed", 0),
+            "failed": summary.get("failed", 0),
+            "errored": summary.get("errored", 0),
+        },
+    }
+
+
+def _render_baseline(report: dict[str, Any]) -> None:
+    """C-1 baseline boundary messaging (M8 §3.7, LOCKED §13).
+
+    baseline lives ONLY in cv-infra's internal SQLite — consumer CI/git history
+    is never consulted (REQ-REPORT-006). Absent baseline = regression check
+    *skip(정상)*, never a failure (REQ-REPORT-004); regressed = which request
+    got worse against which SUT/date (NFR-REPORT-001).
+    """
+    bsum = report.get("baseline_summary") or {}
+    absent = bsum.get("absent", 0)
+    regressed = bsum.get("regressed", 0)
+    if absent:
+        print(
+            f"baseline: {absent} request(s) had no baseline — regression check skipped "
+            "(normal for a first run / new SUT, not a failure)."
+        )
+    if regressed:
+        print(f"baseline: {regressed} request(s) regressed vs baseline:")
+        for row in report.get("matrix", []):
+            reg = row.get("regression") or {}
+            if reg.get("status") == "regressed":
+                print(
+                    f"  {reg.get('detail')} — vs SUT {reg.get('baseline_sut_ref')} "
+                    f"(baseline established {reg.get('baseline_established_at')})"
+                )
+    elif not absent:
+        print("baseline: no regressions vs the established baseline.")
+
+
+def _render_report(report: dict[str, Any]) -> None:
+    """Human-readable review render: header + the M4 matrix table + the
+    domain/outcome line + C-1 baseline messaging (D-O informational)."""
+    from cv_infra.report.matrix import render_text
+
+    summary = report.get("summary", {})
+    print(
+        f"Verification report — envelope {report.get('envelope_id')} "
+        f"(trigger={report.get('trigger_source')}, generated {report.get('generated_at')})"
+    )
+    print(render_text(_matrix_view(report)))
+    print(
+        f"outcome: verdict={summary.get('verdict')} "
+        f"report_outcome={summary.get('report_outcome')}"
+    )
+    _render_baseline(report)
+
+
+def _report_not_ready(args: argparse.Namespace, response: httpx.Response) -> int:
+    """Render a 409 (report not servable yet): the envelope is not terminal or
+    its supervision crashed (contract pin, decision p5c2). Both are infra
+    conditions (3); not-terminal points the user at ``cv-infra wait``."""
+    detail: Any = {}
+    body = _body_json(response)
+    if isinstance(body, dict) and isinstance(body.get("detail"), dict):
+        detail = body["detail"]
+    reason = detail.get("reason")
+    if reason == "not-terminal":
+        status = detail.get("status")
+        suffix = f" (status={status})" if status else ""
+        return _infra(
+            "report",
+            f"envelope {args.envelope_id} is not terminal yet{suffix}; block on it with "
+            f"'cv-infra wait {args.envelope_id}' to get the verdict",
+        )
+    if reason == "supervision-error":
+        return _infra("report", f"envelope supervision crashed: {detail.get('error')}")
+    return _infra("report", f"envelope report unavailable (409): {response.text}")
+
+
+async def _report_async(args: argparse.Namespace) -> int:
+    async with _make_client(_resolve_api(args.api)) as client:
+        try:
+            response = await client.get(f"/envelopes/{args.envelope_id}/report")
+        except httpx.HTTPError as exc:
+            return _infra("report", f"orchestrator unreachable: {_one_line(exc)}")
+        if response.status_code == 404:
+            # A missing envelope on an informational read is a lookup/infra
+            # condition (3), NOT a contract error (2): report never returns 1/2.
+            return _infra(
+                "report",
+                f"unknown envelope id {args.envelope_id!r} — use the id printed by "
+                "'cv-infra submit' against the same orchestrator (--api)",
+            )
+        if response.status_code == 409:
+            return _report_not_ready(args, response)
+        if response.status_code != 200:
+            return _infra("report", f"unexpected orchestrator response {response.status_code}")
+        body = _body_json(response)
+        if not isinstance(body, dict):
+            return _infra("report", "orchestrator returned a non-JSON report body")
+        if args.json:
+            print(json.dumps(body, indent=2))
+        else:
+            _render_report(body)
+        return EXIT_PASS  # informational: a fail report NEVER rides this exit (D-O)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """``cv-infra report <envelope_id> [--json] [--api URL]`` — informational
+    review surface (D-O). Fetch the M4 report; exit 0 on any served report
+    (even a failing one), exit 3 only on an infra/lookup problem."""
+    return asyncio.run(_report_async(args))
