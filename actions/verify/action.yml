@@ -1,0 +1,163 @@
+# Composite action (M8 §3.3, LOCKED §11) — "submit + wait + publish" bundled as
+# ONE reusable step for the advanced path: drop it into any job the caller owns
+# (they pick `runs-on: [self-hosted, cv-infra-gpu]`). Mirrors the entry-topology
+# philosophy of the reusable workflow (.github/workflows/verify.yml) but WITHOUT a
+# job wrapper — the two call models are intentionally kept separate (never mixed).
+#
+# AUTHORED + STATICALLY VERIFIED this cycle (p5c3); a live run is observed in p5c4.
+#
+# Advanced-path usage (caller's job):
+#
+#   jobs:
+#     verify:
+#       runs-on: [self-hosted, cv-infra-gpu]
+#       permissions: { checks: write, pull-requests: write, contents: read }
+#       steps:
+#         - uses: <org>/cv-infra-workspace/actions/verify@v1
+#           with:
+#             sut_image: ghcr.io/.../robot@sha256:...   # image REF only (R10)
+#             scenarios: scenarios/*.yaml
+#
+# SECURITY (R10 / D-J): the SUT enters as an image REF only (never built/run from
+# source on the GPU box); this action does NO `actions/checkout`. The caller MUST use
+# the plain `pull_request` trigger (never its privileged base-context variant) and
+# keep PR-head robot source off the GPU. PINS (§2-7): `uses:` are immutable SHAs
+# (trailing comment = the semver tag).
+
+name: "cv-infra verify"
+description: "Submit scenarios to cv-infra, await the terminal verdict, and publish Check/comment/artifacts."
+
+inputs:
+  sut_image:
+    description: "Pre-built SUT image REFERENCE only (ghcr.io/.../robot@sha256:...). Ref-only boundary (R10)."
+    required: true
+  scenarios:
+    description: "Scenario path/glob handed to `cv-infra submit` (D-K glob->envelope synthesis)."
+    required: false
+    default: "scenarios/*.yaml"
+  api:
+    description: "Orchestrator base URL (empty = the CLI default: same-host 127.0.0.1:8000)."
+    required: false
+    default: ""
+  timeout_s:
+    description: "Max seconds to await the terminal aggregated verdict; exceeded => exit 3."
+    required: false
+    default: "3600"
+  github_token:
+    description: "Token for Checks/PR-comment posting (default: the job's GITHUB_TOKEN — same repo)."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # Submit + wait: the exit code IS the terminal aggregated verdict (0/1/2/3,
+    # M8-D11). `set +e` + captured code keeps publishing on failure; the final
+    # step re-exits it so the caller's job reflects the verdict.
+    - name: Submit and await verdict
+      id: verify
+      shell: bash
+      env:
+        CV_INFRA_SUT_IMAGE: ${{ inputs.sut_image }}
+        CV_INFRA_API: ${{ inputs.api }}
+      run: |
+        set +e
+        # D-K: `cv-infra submit <glob> …` synthesizes the size-N envelope (CLI-owned).
+        # --trigger-source ci-cd records CI provenance (REQ-INTAKE-003); --wait folds
+        # the terminal aggregated verdict into the exit code.
+        out=$(cv-infra submit ${{ inputs.scenarios }} --trigger-source ci-cd --wait \
+                --timeout "${{ inputs.timeout_s }}" 2> submit.err)
+        code=$?
+        cat submit.err >&2
+        echo "code=${code}" >> "$GITHUB_OUTPUT"
+        if [ "${code}" -eq 2 ]; then
+          echo "have_report=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        env_id=$(printf '%s\n' "${out}" | head -n1)
+        if cv-infra report "${env_id}" --json > report.json 2>> submit.err; then
+          echo "have_report=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "have_report=false" >> "$GITHUB_OUTPUT"
+        fi
+        exit 0
+
+    # report JSON -> the four github.py payloads (glue imports the M4 renderers).
+    - name: Render publish payloads
+      if: always() && steps.verify.outputs.have_report == 'true'
+      shell: bash
+      run: python -m cv_infra.cli.publish_glue publish report.json payloads
+
+    # Step summary = the shared body verbatim ($GITHUB_STEP_SUMMARY, no action).
+    - name: Write step summary
+      if: always() && steps.verify.outputs.have_report == 'true'
+      shell: bash
+      run: cat payloads/step-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+    # Exit-2 contract errors -> inline YAML annotations (§3.5). Errors JSON = p5c4.
+    - name: Annotate contract errors (exit 2)
+      if: always() && steps.verify.outputs.code == '2'
+      shell: bash
+      run: |
+        if [ -f errors.json ]; then
+          python -m cv_infra.cli.publish_glue annotate errors.json
+        fi
+
+    # Post the Check Run + upsert the sticky PR comment via github-script (the
+    # sanctioned Checks/Comments API client — no API reimplemented).
+    - name: Publish Check Run and sticky comment
+      if: always() && steps.verify.outputs.have_report == 'true'
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const { owner, repo } = context.repo;
+          // (1) Check Run — conclusion comes straight from the payload (github.py
+          // folded it from the exit-code single source; exit 3 -> neutral, D-I).
+          const check = JSON.parse(fs.readFileSync('payloads/check-run.json', 'utf8'));
+          const head_sha = context.payload.pull_request?.head?.sha || context.sha;
+          await github.rest.checks.create({
+            owner, repo, head_sha,
+            name: check.name, status: check.status,
+            conclusion: check.conclusion, output: check.output,
+          });
+          // (2) Sticky PR comment — upsert in place by the marker (first line of the
+          // rendered body = STICKY_COMMENT_MARKER) so repeat pushes never pile up
+          // new comments (P5-14 in-place).
+          if (context.issue.number) {
+            const body = fs.readFileSync('payloads/sticky-comment.md', 'utf8');
+            const marker = body.split('\n', 1)[0];
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: context.issue.number, body,
+              });
+            }
+          }
+
+    # Artifacts (결정 #1/2/3): report.json + selected rosbag/video (the manifest
+    # already applied selection/size-cap; per-path plan finalized in p5c4).
+    - name: Upload verification artifacts
+      if: always() && steps.verify.outputs.have_report == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      with:
+        name: cv-infra-verification-results
+        path: |
+          report.json
+          payloads/
+        if-no-files-found: warn
+
+    # Reflect the CLI verdict as the step status (infra=neutral nuance rides the
+    # Check Run conclusion; the step status is the coarse gate).
+    - name: Reflect verdict
+      if: always()
+      shell: bash
+      run: exit ${{ steps.verify.outputs.code }}
