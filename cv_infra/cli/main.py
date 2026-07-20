@@ -148,6 +148,19 @@ def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
             action="store_true",
             help="block until the terminal aggregated verdict and exit 0/1/3 (M8-D11)",
         )
+        sub.add_argument(
+            # Provenance of the trigger, recorded verbatim on the wire (REQ-INTAKE-003):
+            # the GitHub Action passes 'ci-cd', humans keep the default 'human-manual'.
+            # CI and human runs are otherwise identical (same CLI, same semantics —
+            # M8 §3.1). The two choices ARE the M1 ``RequestEnvelope.trigger_source``
+            # Literal (contract/schema.py, the SoT); hardcoded here because the --help
+            # path must stay dependency-free (no contract import to build the parser).
+            "--trigger-source",
+            choices=("human-manual", "ci-cd"),
+            default="human-manual",
+            help="who triggered this run (default: human-manual; the Action passes ci-cd). "
+            "Recorded verbatim by the orchestrator (REQ-INTAKE-003).",
+        )
     else:
         sub.add_argument("envelope_id", help="envelope id printed by 'cv-infra submit'")
     if name in ("submit", "wait"):

@@ -49,7 +49,12 @@ Seams (G-17 — M1 T1 lands ``contract/envelope.py`` in parallel)
   the scenario file's parent dir, absolute — the stage-5 custom-oracle
   anchor, same-host trusted path per api.py) is ON since the M3 server
   acceptance landed (Wave 2); ``_INCLUDE_ORACLE_PLUGIN_DIRS`` stays as the
-  explicit escape hatch.
+  explicit escape hatch. ``trigger_source`` (REQ-INTAKE-003) rides as an
+  OPTIONAL top-level key: the CLI carries the ``--trigger-source`` flag value
+  verbatim EXCEPT the default (human-manual), which is OMITTED so the server
+  default applies (verbatim p5c3 data contract: "부재/기본 시 키 생략 허용") — a
+  plain human ``submit`` stays byte-identical to the pre-p5c3 wire, and only a
+  non-default (ci-cd, set by the Action) records provenance on the wire.
 * ``_make_client`` builds the httpx ``AsyncClient`` (tests inject an
   ``ASGITransport`` over the real FastAPI app here). The command bodies are
   async for exactly this reason; each command is one ``asyncio.run``.
@@ -100,6 +105,13 @@ _POLL_INTERVAL_S = 1.0
 #: stays as an explicit escape hatch (both states unit-pinned).
 _INCLUDE_ORACLE_PLUGIN_DIRS = True
 
+#: The wire trigger_source default (REQ-INTAKE-003). MIRRORS the M1
+#: ``RequestEnvelope.trigger_source`` Literal default AND
+#: ``api._DEFAULT_TRIGGER_SOURCE`` (kept as a bare string so this batch module
+#: does not import the contract/orchestrator just for its default) — a value
+#: equal to this is OMITTED from the POST body so the server default applies.
+_DEFAULT_TRIGGER_SOURCE = "human-manual"
+
 # --- seams (module docstring) ------------------------------------------------
 
 
@@ -133,13 +145,29 @@ def _resolve_api(flag_value: str | None) -> str:
     return flag_value or os.environ.get(_API_ENV) or _DEFAULT_API
 
 
-def _wire_body(envelope: Any) -> dict[str, Any]:
+def _wire_trigger_source(flag: str) -> str | None:
+    """Fold the ``--trigger-source`` flag to the wire value (REQ-INTAKE-003).
+
+    The default (human-manual) folds to ``None`` = OMITTED from the body (the
+    server default applies — verbatim p5c3 data contract); a non-default value
+    (ci-cd, set by the Action) rides verbatim so the orchestrator records the
+    provenance. Pure so the omission rule is unit-pinned without the ASGI wiring.
+    """
+    return None if flag == _DEFAULT_TRIGGER_SOURCE else flag
+
+
+def _wire_body(envelope: Any, trigger_source: str | None = None) -> dict[str, Any]:
     """LoadedEnvelope -> wire-v2 POST body (raw docs verbatim, D-1 internal
     representation). ``oracle_plugin_dirs`` (equal-length stage-5 anchors) is
-    emitted by default — see the module gate ``_INCLUDE_ORACLE_PLUGIN_DIRS``."""
+    emitted by default — see the module gate ``_INCLUDE_ORACLE_PLUGIN_DIRS``.
+    ``trigger_source`` rides as an OPTIONAL top-level key iff provided (non-None):
+    the caller passes ``_wire_trigger_source(args.trigger_source)`` so the default
+    (human-manual) is omitted and only a ci-cd trigger records provenance."""
     body: dict[str, Any] = {"requests": [ref.raw_doc for ref in envelope.requests]}
     if _INCLUDE_ORACLE_PLUGIN_DIRS:
         body["oracle_plugin_dirs"] = [ref.oracle_plugin_dir for ref in envelope.requests]
+    if trigger_source is not None:
+        body["trigger_source"] = trigger_source
     return body
 
 
@@ -243,9 +271,10 @@ async def _poll_until_terminal(
 
 async def _submit_async(envelope: Any, args: argparse.Namespace) -> int:
     api = _resolve_api(args.api)
+    wire_trigger = _wire_trigger_source(args.trigger_source)
     async with _make_client(api) as client:
         try:
-            response = await client.post("/envelopes", json=_wire_body(envelope))
+            response = await client.post("/envelopes", json=_wire_body(envelope, wire_trigger))
         except httpx.HTTPError as exc:
             return _infra("submit", f"orchestrator unreachable at {api}: {_one_line(exc)}")
         if response.status_code == 422:
