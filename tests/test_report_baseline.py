@@ -90,10 +90,11 @@ def test_baseline_persists_across_store_reopen(tmp_path):
     with Store(db) as reopened:  # fresh connection = restart
         row = find_baseline(reopened, _KEY)
         assert row is not None and row.verdict == "pass"
-    # the baseline lives in cv-infra's OWN sqlite file (C-1), stamped v6.
+    # the baseline lives in cv-infra's OWN sqlite file (C-1), stamped v7
+    # (v7 = p5c2 M4 envelope_reports table — additive, version-pin tracks the bump).
     external = sqlite3.connect(str(db))
     try:
-        assert external.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert external.execute("PRAGMA user_version").fetchone()[0] == 7
         (count,) = external.execute("SELECT COUNT(*) FROM request_baselines").fetchone()
         assert count == 1
     finally:
