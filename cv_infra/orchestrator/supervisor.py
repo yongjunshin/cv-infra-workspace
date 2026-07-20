@@ -1055,6 +1055,28 @@ class RunJobRunner:
         return _job_result_of(job, outcome)
 
 
+def _read_result_doc(result_path: Path | None) -> dict[str, Any] | None:
+    """Read the runner-emitted result.json for ADDITIVE capture (p5c3 — honest absence).
+
+    The report row consumes each repeat's declared ``metrics`` map + ``artifacts``
+    paths off the runner's result.json (M4 ``aggregate``); this reads that doc so
+    ``_job_result_of`` can carry it on the ``JobResult`` ALONGSIDE the classification.
+    Purely informational — ``_classify`` below is frozen and still reads only the
+    ``verdict`` key (verdict 날조 0). A missing / unreadable / non-dict result (fake-runner
+    path, REQ-EXEC-013 collection violation, corrupt file) returns None, so the report keeps
+    its existing empty ``{}``/None (현행 동작 회귀 0) — never a fabricated value, never loud
+    (the classification already recorded the outcome; a second read for capture must not
+    raise). The same ``(OSError, ValueError)`` guard ``_classify`` uses (JSONDecodeError ⊂
+    ValueError)."""
+    if result_path is None:
+        return None
+    try:
+        payload = json.loads(Path(result_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # unreadable / not JSON — includes JSONDecodeError
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
     """Fold one ``JobOutcome`` into the control-plane ``JobResult`` (p4c4 glue).
 
@@ -1066,6 +1088,14 @@ def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
     status API can show them. Before this, a runner hard-crash reached the store
     as a bare ``failed`` and nobody could tell 137 (OOM-kill) from 139 (segfault)
     from a plain exit 1 (history 2026-07-14 놀란 점 7 — 두 번 실증).
+
+    p5c3 adds a second ADDITIVE ride-along: the runner's result.json doc + its host
+    path (``_read_result_doc``) so ``api._result_wire`` emits real ``metrics``/``artifacts``
+    into the report row instead of empty placeholders (P5-02/P5-10). Same discipline as
+    the diagnostics above — informational only, the classification never reads them, and an
+    absent/unreadable result is honest ``None`` (회귀 0). The doc is read a SECOND time here
+    (``_classify`` reads it for the verdict) to keep ``_classify`` frozen — a terminal-fold,
+    once-per-job read of a tiny file.
     """
     state, verdict = _classify(outcome)
     return JobResult(
@@ -1074,6 +1104,8 @@ def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
         verdict=verdict,
         runner_exit_code=outcome.runner_exit_code,
         infra_error=_reason(outcome.infra_error),
+        result_doc=_read_result_doc(outcome.result_path),
+        result_json_path=str(outcome.result_path) if outcome.result_path is not None else None,
     )
 
 

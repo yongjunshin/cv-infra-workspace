@@ -108,6 +108,19 @@ class JobResult:
     (``supervisor._job_result_of``) is computed exactly as before and never reads them back
     (verdict fold 의미론 불변). ``ParallelSupervisor`` writes them onto the Job, whence they
     persist (store v4) and surface on the status API.
+
+    ``result_doc`` / ``result_json_path`` (p5c3 Result 캡처) carry the runner-emitted
+    result.json ADDITIVELY so the report row surfaces real per-repeat ``metrics`` +
+    ``artifacts`` paths instead of empty placeholders (P5-02/P5-10). ``result_doc`` is the
+    parsed result.json dict (M1 Result wire shape — ``metrics`` map + ``artifacts{mcap,mp4}``,
+    consumed VERBATIM by ``api._result_wire`` -> M4 ``aggregate``); ``result_json_path`` is the
+    host RESULT_OUT path to that file (the report's ``result_json`` ride-along). Both are ALSO
+    informational: the state/verdict fold never reads them (verdict 날조 0, ``_classify`` 불변).
+    Both are ``None`` on the honest-absence paths — a fake-runner outcome, a collection
+    violation (0 or 2+ result.json), or an unreadable/non-dict file — where the report keeps
+    its existing empty ``{}``/None (현행 동작 회귀 0). NOT persisted to the store (the durable
+    twin is the assembled report itself, store v7 — real values already ride into it at
+    completion, restart-surviving).
     """
 
     job: Job
@@ -115,6 +128,8 @@ class JobResult:
     verdict: Verdict | None = None
     runner_exit_code: int | None = None
     infra_error: str | None = None
+    result_doc: dict[str, Any] | None = None
+    result_json_path: str | None = None
 
 
 @dataclass
