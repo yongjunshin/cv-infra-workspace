@@ -22,16 +22,25 @@ from cv_infra.orchestrator.models import JobResult, RequestRollup, Verdict
 def roll_up(request_id: str, results: list[JobResult]) -> RequestRollup:
     """Roll up repeated-job results for ``request_id`` into a ``RequestRollup``.
 
-    Collects each result's verdict (skipping results that carry no verdict,
+    Orders the results by ``repeat_index`` FIRST (canonical order invariant),
+    then collects each result's verdict (skipping results that carry no verdict,
     e.g. an errored/timed-out job) and attaches:
 
+    * ``verdicts`` — the surviving per-repeat verdicts in ``repeat_index`` order.
+      This is the SINGLE constructor of ``RequestRollup.verdicts``, so every
+      surface that goes through ``roll_up`` (live status API, persisted report,
+      restart read) sees the SAME list regardless of the completion order the
+      caller passes in (``record.results`` is supervisor完료 순서, non-deterministic
+      at k>1). ``verdict``/``flakiness`` are order-independent — this sort is a
+      pure canonicalisation of the list-order field, no domain-result change.
     * ``verdict`` — any-fail=fail (module docstring). All repeats verdict-less
       leaves ``verdict=None``: an infra outcome, not a domain judgement —
       exit-code 3 territory (M8 매핑), never mapped to pass/fail here.
     * ``flakiness`` — repeat-disagreement metric (see ``_flakiness``), surfaced
       separately from the verdict.
     """
-    verdicts = [r.verdict for r in results if r.verdict is not None]
+    ordered = sorted(results, key=lambda r: r.job.repeat_index)
+    verdicts = [r.verdict for r in ordered if r.verdict is not None]
     return RequestRollup(
         request_id=request_id,
         verdicts=verdicts,
