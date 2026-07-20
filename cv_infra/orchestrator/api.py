@@ -90,6 +90,17 @@ envelope this process never saw (orchestrator restart) is served from the store
 itself is NOT resumed after a restart: ``supervisor.reconcile_at_restart``
 (R14) re-labels the orphaned jobs and marks the envelope failed-with-error, so
 the read stays loud rather than stuck 'running'.
+
+Report + baseline seam (p5c2, SR-19/SR-21 handoff): at CLEAN completion
+``_persist_terminal`` assembles the M4 ``VerificationReport`` server-side
+(``report.aggregate.build_report`` — M4 code called, never modified), persists it
+(store v7) so ``GET /envelopes/{id}/report`` serves the durable twin
+restart-surviving, and ONLY THEN advances the request-level regression baselines
+from the report rows (``report.baseline.update_baseline`` — advance-on-pass,
+전달-not-재도출). The order is invariant: the report's regression judgement compares
+against the PRE-advance baseline (advancing first would let a request regress
+against itself). The baseline is the C-1 internal store (LOCKED §7.13) — no CI/git
+path is touched. A crashed envelope assembles no report and writes no baseline.
 """
 
 from __future__ import annotations
@@ -116,6 +127,8 @@ from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import SlotAccountant
 from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import ParallelSupervisor
+from cv_infra.report.aggregate import RequestReportInput, build_report
+from cv_infra.report.baseline import update_baseline
 
 _DOC_LINK = "M3-orchestrator.md §7 (submit wire — D-1 internal representation)"
 
@@ -123,6 +136,16 @@ _DOC_LINK = "M3-orchestrator.md §7 (submit wire — D-1 internal representation
 REPORT_OUTCOME_PASS = "pass"
 REPORT_OUTCOME_FAIL = "fail"
 REPORT_OUTCOME_ERRORED = "errored"
+
+#: Envelope ``trigger_source`` recorded verbatim into the assembled report
+#: (REQ-INTAKE-003). The D-1 internal submit wire (module docstring) does NOT yet
+#: carry the formal ``trigger_source`` — that lands with the M8 batch-CLI
+#: RequestEnvelope contract; until then every REST submission records this
+#: documented default (CI/CD is THE primary trigger) so ``build_report`` reads a
+#: recorded value rather than RE-DERIVING one at report time (재도출 금지). When the
+#: formal envelope threads it through the wire, this default is replaced by the
+#: submitted value — the seam already reads it off the record, not this constant.
+_DEFAULT_TRIGGER_SOURCE = "ci-cd"
 
 
 def report_outcome_of(results: list[JobResult]) -> str:
@@ -144,12 +167,21 @@ class _EnvelopeRecord:
     """In-process registry entry for one submitted envelope (module docstring).
 
     The live view while this process supervises; the durable twin is the
-    store's envelope registry + rollups (written at submit / completion).
+    store's envelope registry + rollups + assembled report (written at submit /
+    completion).
+
+    ``request_dumps`` (p5c2 report seam) keeps each request's M1 wire dump
+    (``model_dump(mode="json", by_alias=True)``) captured AT SUBMIT — the report
+    assembly at completion consumes it for the identity key / sut_ref / scenario
+    (전달-not-재도출). ``trigger_source`` is the envelope provenance recorded verbatim
+    into the report (``_DEFAULT_TRIGGER_SOURCE`` until the formal wire carries it).
     """
 
     envelope_id: str
     request_ids: list[str]  # submission order
     jobs: list[Job]  # live objects — states mutate in place as the queue drives them
+    request_dumps: dict[str, dict[str, Any]] = field(default_factory=dict)  # request_id->dump
+    trigger_source: str = _DEFAULT_TRIGGER_SOURCE
     results: list[JobResult] = field(default_factory=list)  # terminal, set when done
     done: bool = False
     error: str | None = None  # supervision crash (loud 500 on status reads)
@@ -272,6 +304,50 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
     }
 
 
+def _result_wire(result: JobResult) -> dict[str, Any]:
+    """One terminal ``JobResult`` -> the minimal per-repeat Result wire dict the
+    report consumes (``aggregate._select_artifacts`` / ``_metrics``).
+
+    The control-plane fold (``supervisor._job_result_of``) recovers only the
+    result.json ``verdict`` — the domain metrics / artifact paths are NOT carried
+    on the control plane, so this dict exposes the verdict verbatim (PASS/FAIL ->
+    ``"pass"``/``"fail"``; verdict-less errored job -> ``None``, classified as a
+    failure-class artifact + skipped for the domain judgement, never a fabricated
+    verdict) with empty metrics/artifacts. ``result_json``/``mcap_bytes`` ride-alongs
+    are supplied by the M8/persistence plane, absent here by default
+    (aggregate.RequestReportInput docstring)."""
+    return {
+        "job_id": job_key(result.job),
+        "verdict": result.verdict.value if result.verdict is not None else None,
+        "metrics": {},
+        "artifacts": {},
+    }
+
+
+def _report_inputs(record: _EnvelopeRecord) -> list[RequestReportInput]:
+    """Assemble the per-request report inputs from the terminal record (전달-not-재도출).
+
+    One ``RequestReportInput`` per request in SUBMISSION order: the captured M1
+    request wire dump, the ``roll_up`` of its per-repeat results (M3 SR-10 산출
+    그대로), and the per-repeat Result wire dumps IN REPEAT ORDER. The rollup here
+    is the SAME value persisted below (computed once, consumed by both the report
+    and ``upsert_rollup`` — no divergent second aggregation)."""
+    inputs: list[RequestReportInput] = []
+    for rid in record.request_ids:
+        repeats = sorted(
+            (r for r in record.results if r.job.request_id == rid),
+            key=lambda r: r.job.repeat_index,
+        )
+        inputs.append(
+            RequestReportInput(
+                request=record.request_dumps[rid],
+                rollup=roll_up(rid, repeats),
+                results=[_result_wire(r) for r in repeats],
+            )
+        )
+    return inputs
+
+
 def create_app(
     store: Store,
     runner: Runner,
@@ -296,19 +372,46 @@ def create_app(
     drive_tasks: set[asyncio.Task[None]] = set()  # strong refs — a bare create_task can be GC'd
 
     def _persist_terminal(record: _EnvelopeRecord) -> None:
-        """Write-through at completion (p4c4 영속): rollups + envelope outcome.
+        """Write-through at completion (p4c4 영속 + p5c2 report/baseline seam).
 
-        A crashed supervision persists the error marker only (its results are
-        not trustworthy); a clean completion persists one rollup per request
-        plus the envelope-level ``report_outcome``.
+        A crashed supervision persists the error marker only — NO report is
+        assembled and NO baseline is written (its results are not trustworthy).
+
+        A clean completion (순서 불변식):
+          ① assemble the VerificationReport server-side (``build_report`` reads the
+             PRE-advance baseline for the regression judgement — C-1 internal store
+             the only source);
+          ② persist it (store v7) so ``GET /envelopes/{id}/report`` survives restart;
+          ③ ONLY THEN advance baselines from the report rows (전달-not-재도출: the
+             advance-on-pass / errored-skip / fail-no-overwrite policy is owned by
+             ``update_baseline``; the seam passes row values, never re-deriving) —
+             advancing BEFORE ① would let a request regress against itself;
+          ④ persist the per-request rollups + envelope ``report_outcome`` (unchanged
+             — the job-level fold M8 keys exit off).
         """
         if record.error is not None:
             store.complete_envelope(record.envelope_id, error=record.error)
             return
-        for rid in record.request_ids:
-            store.upsert_rollup(
-                roll_up(rid, [r for r in record.results if r.job.request_id == rid])
+        inputs = _report_inputs(record)
+        report = build_report(
+            inputs,
+            store,
+            envelope_id=record.envelope_id,
+            trigger_source=record.trigger_source,  # 봉투 기록값 verbatim (재도출 금지)
+            max_mcap_bytes=None,  # 잡별 상한 TBD (결정 #2) — 수치 하드코딩 금지
+        )
+        store.save_report(record.envelope_id, report)  # ② 영속 BEFORE ③ advance
+        for row in report["matrix"]:  # ③ advance-on-pass — values off the report rows
+            update_baseline(
+                store,
+                request_identity_key=row["request_identity_key"],
+                sut_ref=row["sut_ref"],
+                verdict=row["rollup"]["verdict"],
+                key_metrics=row["metrics"],
+                established_at=report["generated_at"],
             )
+        for inp in inputs:  # ④ rollups + outcome (unchanged job-level fold)
+            store.upsert_rollup(inp.rollup)
         store.complete_envelope(
             record.envelope_id, report_outcome=report_outcome_of(record.results)
         )
@@ -377,7 +480,19 @@ def create_app(
             allocator=allocator,
             job_timeout_s=job_timeout_s,
         )
-        record = _EnvelopeRecord(envelope_id=envelope_id, request_ids=request_ids, jobs=jobs)
+        record = _EnvelopeRecord(
+            envelope_id=envelope_id,
+            request_ids=request_ids,
+            jobs=jobs,
+            # Capture each request's M1 wire dump AT SUBMIT (p5c2 report seam): the
+            # completion-time assembly consumes it for identity_key/sut_ref/scenario
+            # (전달-not-재도출) — the admitted models would otherwise be gone by then.
+            request_dumps={
+                rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
+                for rid in request_ids
+            },
+            trigger_source=_DEFAULT_TRIGGER_SOURCE,
+        )
         envelopes[envelope_id] = record
         task = asyncio.get_running_loop().create_task(_drive(record, supervisor))
         drive_tasks.add(task)
@@ -434,6 +549,31 @@ def create_app(
             jobs=record.jobs,
             rollups=rollups,
             report_outcome=report_outcome_of(record.results) if record.done else None,
+        )
+
+    @app.get("/envelopes/{envelope_id}/report")
+    async def envelope_report(envelope_id: str) -> dict[str, Any]:
+        """Serve the DURABLE assembled VerificationReport (p5c2, 재시작 생존).
+
+        Always the persisted twin (never re-assembled): a completed envelope's
+        report was written by ``_persist_terminal`` and is returned verbatim (200).
+        Absence is disambiguated off the envelope registry — unknown -> 404 (same
+        body as ``GET /envelopes/{id}``); a supervision-crash marker -> 409
+        supervision-error; a still-in-flight envelope -> 409 not-terminal.
+        """
+        report = store.load_report(envelope_id)
+        if report is not None:
+            return report
+        stored = store.load_envelope(envelope_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
+        if stored.error is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "supervision-error", "error": stored.error},
+            )
+        raise HTTPException(
+            status_code=409, detail={"reason": "not-terminal", "status": stored.status}
         )
 
     # M6 operational view (DoD-P4-12/13): read-only projection surfaces on the

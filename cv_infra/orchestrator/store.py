@@ -69,8 +69,14 @@ def _now_iso() -> str:
 # v6 = p5c1 M4 회귀 baseline (request_baselines — the request-level baseline table
 # M4 SR-21/C-1 owns, keyed by request_identity_key; ADDITIVE new table via
 # CREATE IF NOT EXISTS so every older file gains it transparently on open, no ALTER
-# needed. This is the ONLY baseline home — LOCKED §7.13 cv-infra 내부 SQLite 한정).
-_SCHEMA_VERSION = 6
+# needed. This is the ONLY baseline home — LOCKED §7.13 cv-infra 내부 SQLite 한정);
+# v7 = p5c2 M4 리포트 영속 (envelope_reports — the server-side-assembled
+# VerificationReport JSON per envelope the api _persist_terminal writes at clean
+# completion, keyed by envelope_id; ADDITIVE new table via CREATE IF NOT EXISTS so
+# ``GET /envelopes/{id}/report`` serves the durable report AFTER an orchestrator
+# restart, never re-assembling from results that did not survive — same 영속본
+# 서빙 discipline as the rollups/registry above).
+_SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -128,6 +134,10 @@ CREATE TABLE IF NOT EXISTS request_baselines (
     key_metrics          TEXT,
     established_at       TEXT NOT NULL,
     source_result_ref    TEXT
+);
+CREATE TABLE IF NOT EXISTS envelope_reports (
+    envelope_id TEXT PRIMARY KEY,
+    report_json TEXT NOT NULL
 );
 """
 
@@ -668,6 +678,36 @@ class Store:
             established_at=established_at,
             source_result_ref=source_result_ref,
         )
+
+    # -- envelope report (v7 — server-side-assembled VerificationReport 영속) -----
+
+    def save_report(self, envelope_id: str, report: dict[str, Any]) -> None:
+        """Persist one envelope's assembled VerificationReport JSON (insert or update).
+
+        Written by the api ``_persist_terminal`` seam at clean completion AFTER the
+        report is assembled and BEFORE baselines advance (순서 불변식). Serialized
+        canonically (sort_keys) through the single writer so the durable twin is
+        served verbatim by ``GET /envelopes/{id}/report`` — restart-surviving, never
+        re-assembled from results that did not survive."""
+        with self._write_lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO envelope_reports (envelope_id, report_json) VALUES (?, ?)"
+                " ON CONFLICT(envelope_id) DO UPDATE SET report_json = excluded.report_json",
+                (envelope_id, json.dumps(report, sort_keys=True)),
+            )
+
+    def load_report(self, envelope_id: str) -> dict[str, Any] | None:
+        """Restore one envelope's persisted VerificationReport (None when never saved).
+
+        ``None`` distinguishes "no report yet" (still running / crashed pre-report)
+        from a served report — the route maps it to 404/409 accordingly."""
+        row = self._conn.execute(
+            "SELECT report_json FROM envelope_reports WHERE envelope_id = ?",
+            (envelope_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
     # -- lifecycle -------------------------------------------------------------
 
