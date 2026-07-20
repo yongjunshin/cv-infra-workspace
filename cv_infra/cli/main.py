@@ -14,8 +14,9 @@ BEFORE the supervisor is ever invoked; a deprecated ``apiVersion`` warns on
 stderr and the run continues (M8-D4/D5). Phase 4 added the batch surface
 ``submit``/``status``/``wait`` (``cv_infra/cli/batch.py``, lazily imported —
 envelope submit to the M3 REST surface + terminal aggregated-verdict exit,
-M8-D11); ``report``/``selftest`` and GitHub integration land in later Phases
-(M8 Sec.5).
+M8-D11); Phase 5 wires ``report`` (informational review — a thin client over
+the M4 VerificationReport the orchestrator serves, D-O); ``selftest`` and the
+GitHub publish integration land in later Phases (M8 Sec.5).
 
 Exit-code contract (LOCKED Sec.9 — exercised standalone at DoD-P2-07)::
 
@@ -43,17 +44,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from cv_infra.cli.exit_codes import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS
+
 # NO top-level cv_infra.contract / third-party imports: the --help and
 # placeholder sub-command paths must stay dependency-free (REQ-INTAKE-003/005).
-# The M1 loader (pydantic + pyyaml) is imported lazily inside the run path.
-
-# --- exit-code contract slots (LOCKED Sec.9) -------------------------------
-# The 0/1 verdict branching + 2 (bad input, M1 friendly prose) + 3 (infra)
-# paths are all wired for ``run`` (DoD-P2-07 + DoD-P3 friendly errors).
-EXIT_PASS = 0
-EXIT_FAIL = 1
-EXIT_CONTRACT = 2
-EXIT_INFRA = 3
+# ``cv_infra.cli.exit_codes`` (above) is the sole first-party import — a
+# stdlib-only leaf holding the exit-code contract's single source (LOCKED §9);
+# the ``EXIT_*`` constants are re-exported from here for back-compat (call
+# sites still do ``from cv_infra.cli.main import EXIT_PASS``). The M1 loader
+# (pydantic + pyyaml) is imported lazily inside the run path.
 
 # result.json verdict -> exit code. The RECOVERED result.json verdict OUTRANKS
 # the runner container's exit code (which is informational only) — same fold as
@@ -78,16 +77,17 @@ _CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 # ``run`` is implemented (Phase 2, D-2); ``submit``/``status``/``wait`` are
 # implemented (Phase 4 batch surface — cv_infra/cli/batch.py, lazily imported);
 # ``monitor`` is implemented (Phase 4 operational-view surface —
-# cv_infra/cli/monitor.py, lazily imported); ``report``/``selftest`` stay reserved
-# placeholders (P5) so the full contract surface remains visible via
-# ``cv-infra --help``.
+# cv_infra/cli/monitor.py, lazily imported); ``report`` is implemented (Phase 5
+# informational review — cv_infra/cli/batch.py, lazily imported); ``selftest``
+# stays a reserved placeholder (P5) so the full contract surface remains visible
+# via ``cv-infra --help``.
 _SUBCOMMANDS: dict[str, str] = {
     "run": "Run a single scenario end-to-end (supervisor co-spawns SUT + runner; envelope-less).",
     "submit": "Submit a RequestEnvelope YAML (scenario file refs) to the orchestrator [--wait].",
     "status": "Show progress of an async envelope by id (informational; never gates on verdict).",
     "wait": "Block until an envelope reaches a terminal aggregated verdict (exit 0/1/3).",
     "monitor": "Show the operational view (queue/resources/health + rollup); informational.",
-    "report": "Print the aggregated report for an envelope (informational).",
+    "report": "Print the aggregated report for an envelope id (informational; --json for raw).",
     "selftest": "Run the built-in stub round-trip (no external SUT).",
 }
 
@@ -101,8 +101,8 @@ _EXIT_CODE_EPILOG = (
     "  2  CONTRACT  contract/validation error (bad YAML, unsupported apiVersion)\n"
     "  3  INFRA     infrastructure error (orchestrator down, EULA not accepted)\n"
     "\n"
-    "'run' (P2) and 'submit'/'status'/'wait'/'monitor' (P4) are implemented; "
-    "'report'/'selftest' are reserved (P5)."
+    "'run' (P2), 'submit'/'status'/'wait'/'monitor' (P4) and 'report' (P5) are "
+    "implemented; 'selftest' is reserved (P5)."
 )
 
 
@@ -162,6 +162,17 @@ def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
     _add_api_argument(sub)
 
 
+def _add_report_arguments(sub: argparse.ArgumentParser) -> None:
+    """Argument schema for the Phase-5 ``report`` command (cv_infra/cli/batch.py)."""
+    sub.add_argument("envelope_id", help="envelope id printed by 'cv-infra submit'")
+    sub.add_argument(
+        "--json",
+        action="store_true",
+        help="print the raw VerificationReport JSON to stdout (default: human-readable render)",
+    )
+    _add_api_argument(sub)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cv-infra",
@@ -181,6 +192,8 @@ def _build_parser() -> argparse.ArgumentParser:
             _add_batch_arguments(name, sub)
         elif name == "monitor":
             _add_api_argument(sub)  # operational-view read: only the orchestrator base URL
+        elif name == "report":
+            _add_report_arguments(sub)
     return parser
 
 
@@ -413,7 +426,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return EXIT_CONTRACT
 
-    if args.command == "run" or args.command in _BATCH_COMMANDS or args.command == "monitor":
+    if (
+        args.command == "run"
+        or args.command in _BATCH_COMMANDS
+        or args.command in ("monitor", "report")
+    ):
         if extra:
             print(
                 f"cv-infra {args.command}: unrecognized argument(s): {' '.join(extra)}",
@@ -438,6 +455,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return EXIT_INFRA
         return monitor.cmd_monitor(args)
+
+    if args.command == "report":
+        try:
+            # Lazy import (mirrors the batch idiom below): the report surface is
+            # a thin client over the orchestrator REST report endpoint and pulls
+            # httpx — the --help and run paths must never load it.
+            from cv_infra.cli import batch
+        except ImportError as exc:
+            print(
+                f"cv-infra report: report surface unavailable ({_one_line(exc)}) — "
+                "platform build incomplete; this is an infrastructure error, "
+                "not a SUT verdict",
+                file=sys.stderr,
+            )
+            return EXIT_INFRA
+        return batch.cmd_report(args)
 
     if args.command in _BATCH_COMMANDS:
         try:
