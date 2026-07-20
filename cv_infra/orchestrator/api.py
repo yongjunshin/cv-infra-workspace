@@ -13,9 +13,10 @@ Wire format (D-1 wire v2, decisions/2026-07-13-p4c2-envelope-contract-timing.md)
 the JSON body ``{"requests": [...], "oracle_plugin_dirs": [...]}`` is an
 INTERNAL representation — the user-facing RequestEnvelope contract (YAML
 schema, apiVersion, friendly file errors) freezes with the M8 batch-CLI submit
-cycle together with M1; this module adapts to it then. Wrapper keys other than
-these two are not interpreted this cycle (formal envelope semantics, e.g.
-``trigger_source``, land with that contract). Each request document IS
+cycle together with M1; this module adapts to it then. One formal envelope key
+IS now threaded (p5c3): an optional top-level ``"trigger_source"`` records human
+vs CI provenance (REQ-INTAKE-003 — ``_parse_envelope``); the remaining wrapper
+keys are still not interpreted this cycle. Each request document IS
 validated NOW: it goes through the full M1 6-stage admit gate
 (``contract.loader.load_request`` — no contract bypass; the JSON document is
 fed to the loader as a canonical indented-JSON stream, which any YAML loader
@@ -111,12 +112,13 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import FastAPI, HTTPException, Request
 
 from cv_infra.contract.errors import ContractError
 from cv_infra.contract.loader import AdmittedRequest, load_request
+from cv_infra.contract.schema import RequestEnvelope
 from cv_infra.orchestrator.allocator import DomainIdAllocator
 from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.fanout import fan_out_requests
@@ -138,18 +140,23 @@ REPORT_OUTCOME_FAIL = "fail"
 REPORT_OUTCOME_ERRORED = "errored"
 
 #: Envelope ``trigger_source`` recorded verbatim into the assembled report
-#: (REQ-INTAKE-003). The D-1 internal submit wire (module docstring) does NOT yet
-#: carry the formal ``trigger_source`` — that lands with the M8 batch-CLI
-#: RequestEnvelope contract; until then every REST submission records this
-#: documented default so ``build_report`` reads a recorded value rather than
-#: RE-DERIVING one at report time (재도출 금지). The default is ``human-manual``
-#: (M8 §3.1: 기본값 human-manual; the Action switches it to ``ci-cd`` via
-#: ``--trigger-source ci-cd``) — the only current submit path is the batch CLI
-#: (no Action yet), so a ``ci-cd`` default would falsely record a human submission
-#: as CI provenance. When the formal envelope threads it through the wire, this
-#: default is replaced by the submitted value — the seam already reads it off the
-#: record, not this constant.
+#: (REQ-INTAKE-003). The submit wire now carries an optional top-level
+#: ``trigger_source`` (p5c3, ``_parse_envelope``): the SUBMITTED value wins and is
+#: recorded so ``build_report`` reads a recorded value rather than RE-DERIVING one at
+#: report time (재도출 금지). When ABSENT the recorded value is this documented default
+#: ``human-manual`` (M8 §3.1: 기본값 human-manual; the Action passes
+#: ``--trigger-source ci-cd``) — a bare REST/CLI submission with no provenance is a
+#: human one, never falsely CI. The seam already reads it off the record, not this
+#: constant.
 _DEFAULT_TRIGGER_SOURCE = "human-manual"
+
+#: The legal ``trigger_source`` wire values — DERIVED from the M1
+#: ``RequestEnvelope.trigger_source`` ``Literal`` so this wrapper-level check stays in
+#: lockstep with the contract (M1 Literal 정합; never a hand-copied set that could drift,
+#: G-25). An illegal submitted value is a 422 wrapper violation (``_parse_envelope``).
+_TRIGGER_SOURCES: tuple[str, ...] = get_args(
+    RequestEnvelope.model_fields["trigger_source"].annotation
+)
 
 
 def report_outcome_of(results: list[JobResult]) -> str:
@@ -207,16 +214,41 @@ def _wire_error(
     )
 
 
-def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
-    """Validate the internal wire wrapper -> (request documents, stage-5 anchors).
+def _trigger_source_of(body: dict[str, Any]) -> str:
+    """Parse the optional top-level ``trigger_source`` (p5c3, REQ-INTAKE-003).
+
+    Absent (or explicit null) -> the documented default ``human-manual``
+    (``_DEFAULT_TRIGGER_SOURCE``); a present value must be one of the M1
+    ``RequestEnvelope`` literals (``_TRIGGER_SOURCES``) or it is a 422 wrapper
+    violation (M1 Literal 정합, same 8-key shape as an admit error). The submitted
+    value wins — the record carries it verbatim into the report (재도출 금지)."""
+    trigger_source = body.get("trigger_source")
+    if trigger_source is None:  # absent or explicit null -> documented default
+        return _DEFAULT_TRIGGER_SOURCE
+    if trigger_source not in _TRIGGER_SOURCES:
+        raise _wire_error(
+            "trigger_source",
+            f"one of {list(_TRIGGER_SOURCES)} (REQ-INTAKE-003 provenance), or absent"
+            f" for the default {_DEFAULT_TRIGGER_SOURCE!r}",
+            repr(trigger_source),
+            example='{"requests": [{...}], "trigger_source": "ci-cd"}',
+        )
+    return trigger_source
+
+
+def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None], str]:
+    """Validate the internal wire wrapper -> (request documents, stage-5 anchors,
+    trigger_source).
 
     Wrapper-only checks (each document's validation is the M1 loader's):
     the body must be a JSON object whose ``"requests"`` is a non-empty list
     of objects. ``"oracle_plugin_dirs"`` (wire v2, optional) must — when
     present — be an equal-length list of ``null`` (no anchor) or absolute
     directory path strings; absent/null field means no anchors (previous
-    behavior, unchanged). Anchors are same-host trusted paths (module
-    docstring — MVP, M8 §8 g5). Violations raise ``ContractError`` (422).
+    behavior, unchanged). ``"trigger_source"`` (p5c3, optional) is parsed by
+    ``_trigger_source_of`` (absent -> ``human-manual``, illegal -> 422). Anchors
+    are same-host trusted paths (module docstring — MVP, M8 §8 g5). Violations
+    raise ``ContractError`` (422).
     """
     if not isinstance(body, dict):
         raise _wire_error("(document)", 'a JSON object body {"requests": [...]}', repr(body))
@@ -230,9 +262,10 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
     for i, doc in enumerate(requests):
         if not isinstance(doc, dict):
             raise _wire_error(f"requests[{i}]", "a Verification Request object", repr(doc))
+    trigger_source = _trigger_source_of(body)
     plugin_dirs = body.get("oracle_plugin_dirs")
     if plugin_dirs is None:  # field absent (or explicit null): no anchors — unchanged path
-        return requests, [None] * len(requests)
+        return requests, [None] * len(requests), trigger_source
     if not isinstance(plugin_dirs, list) or len(plugin_dirs) != len(requests):
         raise _wire_error(
             "oracle_plugin_dirs",
@@ -248,7 +281,7 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None]]:
                 repr(anchor),
                 example=_ANCHOR_EXAMPLE,
             )
-    return requests, plugin_dirs
+    return requests, plugin_dirs, trigger_source
 
 
 def _admit_all(
@@ -309,23 +342,36 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
 
 
 def _result_wire(result: JobResult) -> dict[str, Any]:
-    """One terminal ``JobResult`` -> the minimal per-repeat Result wire dict the
-    report consumes (``aggregate._select_artifacts`` / ``_metrics``).
+    """One terminal ``JobResult`` -> the per-repeat Result wire dict the report
+    consumes (``aggregate._select_artifacts`` / ``_metrics``).
 
-    The control-plane fold (``supervisor._job_result_of``) recovers only the
-    result.json ``verdict`` — the domain metrics / artifact paths are NOT carried
-    on the control plane, so this dict exposes the verdict verbatim (PASS/FAIL ->
-    ``"pass"``/``"fail"``; verdict-less errored job -> ``None``, classified as a
-    failure-class artifact + skipped for the domain judgement, never a fabricated
-    verdict) with empty metrics/artifacts. ``result_json``/``mcap_bytes`` ride-alongs
-    are supplied by the M8/persistence plane, absent here by default
-    (aggregate.RequestReportInput docstring)."""
-    return {
+    p5c3 Result 캡처: when the control-plane fold captured the runner's result.json
+    (``JobResult.result_doc`` — ``supervisor._job_result_of``), this emits that doc's
+    declared ``metrics`` map + ``artifacts`` (``{mcap, mp4}``) VERBATIM (재계산·키 가공 0)
+    plus the host ``result_json`` path, so the report row shows real values (P5-02/P5-10).
+    No doc — a fake-runner outcome, a collection violation, an unreadable file — keeps the
+    previous empty ``{}`` (정직한 부재, 회귀 0); the ``result_json`` ride-along is emitted
+    only when a path exists (optional per ``aggregate.RequestReportInput`` — absent by
+    default, consumed via ``.get``), so the fake path stays byte-identical.
+
+    The ``verdict`` stays the CONTROL-PLANE folded verdict (PASS/FAIL ->
+    ``"pass"``/``"fail"``; verdict-less errored/timeout job -> ``None``, classified a
+    failure-class artifact) — the doc's OWN verdict is deliberately never re-surfaced
+    (verdict 날조 0, ``_classify`` 불변); the doc rides only for metrics/artifacts. The
+    ``mcap_bytes`` size-cap ride-along stays the M8 plane (aggregate docstring), absent here.
+    """
+    doc = result.result_doc
+    metrics = doc.get("metrics") if isinstance(doc, dict) else None
+    artifacts = doc.get("artifacts") if isinstance(doc, dict) else None
+    wire: dict[str, Any] = {
         "job_id": job_key(result.job),
         "verdict": result.verdict.value if result.verdict is not None else None,
-        "metrics": {},
-        "artifacts": {},
+        "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+        "artifacts": dict(artifacts) if isinstance(artifacts, dict) else {},
     }
+    if result.result_json_path is not None:
+        wire["result_json"] = result.result_json_path  # optional ride-along (path to result.json)
+    return wire
 
 
 def _report_inputs(record: _EnvelopeRecord) -> list[RequestReportInput]:
@@ -443,7 +489,7 @@ def create_app(
     async def submit_envelope(request: Request) -> dict[str, str]:
         try:
             body = await request.json()
-            documents, plugin_dirs = _parse_envelope(body)
+            documents, plugin_dirs, trigger_source = _parse_envelope(body)
         except json.JSONDecodeError as exc:
             err = _wire_error("(document)", "a JSON body", str(exc))
             raise HTTPException(
@@ -495,7 +541,7 @@ def create_app(
                 rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
                 for rid in request_ids
             },
-            trigger_source=_DEFAULT_TRIGGER_SOURCE,
+            trigger_source=trigger_source,  # p5c3: submitted value (or default), recorded verbatim
         )
         envelopes[envelope_id] = record
         task = asyncio.get_running_loop().create_task(_drive(record, supervisor))
