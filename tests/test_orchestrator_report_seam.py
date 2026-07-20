@@ -96,7 +96,9 @@ def test_report_200_is_the_assembled_verification_report(tmp_path):
             assert report["apiVersion"] == "cv-infra/v1"
             assert report["kind"] == "VerificationReport"
             assert report["envelope_id"] == envelope_id
-            assert report["trigger_source"] == "ci-cd"  # recorded default (재도출 아님)
+            # recorded default (재도출 아님) = human-manual (M8 §3.1: Action switches
+            # to ci-cd; the only current submit path is the batch CLI, no Action).
+            assert report["trigger_source"] == "human-manual"
             assert report["summary"]["report_outcome"] == "pass"
             (row,) = report["matrix"]
             assert row["sut_ref"] == "carter-sut:p2"  # from the request wire dump

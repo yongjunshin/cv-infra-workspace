@@ -141,11 +141,15 @@ REPORT_OUTCOME_ERRORED = "errored"
 #: (REQ-INTAKE-003). The D-1 internal submit wire (module docstring) does NOT yet
 #: carry the formal ``trigger_source`` — that lands with the M8 batch-CLI
 #: RequestEnvelope contract; until then every REST submission records this
-#: documented default (CI/CD is THE primary trigger) so ``build_report`` reads a
-#: recorded value rather than RE-DERIVING one at report time (재도출 금지). When the
-#: formal envelope threads it through the wire, this default is replaced by the
-#: submitted value — the seam already reads it off the record, not this constant.
-_DEFAULT_TRIGGER_SOURCE = "ci-cd"
+#: documented default so ``build_report`` reads a recorded value rather than
+#: RE-DERIVING one at report time (재도출 금지). The default is ``human-manual``
+#: (M8 §3.1: 기본값 human-manual; the Action switches it to ``ci-cd`` via
+#: ``--trigger-source ci-cd``) — the only current submit path is the batch CLI
+#: (no Action yet), so a ``ci-cd`` default would falsely record a human submission
+#: as CI provenance. When the formal envelope threads it through the wire, this
+#: default is replaced by the submitted value — the seam already reads it off the
+#: record, not this constant.
+_DEFAULT_TRIGGER_SOURCE = "human-manual"
 
 
 def report_outcome_of(results: list[JobResult]) -> str:
