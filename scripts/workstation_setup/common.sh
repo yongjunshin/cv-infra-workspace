@@ -113,11 +113,19 @@ readonly CV_GH_RUNNER_VERSION="2.335.1"       # pinned 2026-07-03 (then-latest o
 # (`<!-- BEGIN SHA linux-x64 -->` marker) — an UPSTREAM-stated checksum, not a
 # first-download measurement. Mismatch at install time = hard die.
 readonly CV_GH_RUNNER_TARBALL_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
-readonly CV_GH_RUNNER_REPO_URL="https://github.com/yongjunshin/cv-infra-workspace"  # repo-level target (decision §1)
-readonly CV_GH_RUNNER_NAME="etri6000-cv-infra"
+# Registration TARGET params (decision 2026-07-21-e2e-user-runner-provisioning:
+# a SECOND same-machine repo-level runner for cv-infra-user). Env-overridable,
+# defaulting to the original WORKSPACE runner — a plain no-env re-run is
+# byte-identical to the pre-parameterization behavior (idempotent no-op on the
+# existing runner). The version/sha256 pins above and the label set below are
+# deliberately NOT parameters: every runner on this host runs the same pinned
+# binary with the same `cv-infra-gpu` label (decision 2026-07-03 §2/§3 hardening
+# applies identically to each registration).
+readonly CV_GH_RUNNER_REPO_URL="${CV_GH_RUNNER_REPO_URL:-https://github.com/yongjunshin/cv-infra-workspace}"  # repo-level target (decision §1)
+readonly CV_GH_RUNNER_NAME="${CV_GH_RUNNER_NAME:-etri6000-cv-infra}"
 readonly CV_GH_RUNNER_LABELS="cv-infra-gpu"   # effective label set: [self-hosted, Linux, X64, cv-infra-gpu]
 readonly CV_GH_RUNNER_HOME="${CV_GH_RUNNER_HOME:-$HOME/cv-infra-gh-runner}"
-readonly CV_GH_RUNNER_SERVICE="cv-infra-gh-runner"
+readonly CV_GH_RUNNER_SERVICE="${CV_GH_RUNNER_SERVICE:-cv-infra-gh-runner}"
 
 # ---------------------------------------------------------------------------
 # --- driver R580 realignment pins (M5) ---

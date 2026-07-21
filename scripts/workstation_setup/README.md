@@ -295,6 +295,51 @@ gh api repos/yongjunshin/cv-infra-workspace/actions/runners \
 ssh cv-infra-ws 'systemctl is-active cv-infra-gh-runner && systemctl is-enabled cv-infra-gh-runner'
 ```
 
+### Second runner (`cv-infra-user`, P5 consumer E2E)
+
+Decision `2026-07-21-e2e-user-runner-provisioning`: the same machine also serves
+the consumer repo via a **second repo-level runner** — own home, own systemd
+unit, same pinned binary, same `cv-infra-gpu` label, same 2026-07-03 hardening.
+The registration target is env-parameterized (defaults = the workspace runner
+above, so a plain no-env run is unchanged):
+
+| Env | Workspace default | `cv-infra-user` runner |
+|---|---|---|
+| `CV_GH_RUNNER_REPO_URL` | `https://github.com/yongjunshin/cv-infra-workspace` | `https://github.com/yongjunshin/cv-infra-user` |
+| `CV_GH_RUNNER_NAME` | `etri6000-cv-infra` | `etri6000-cv-infra-user` |
+| `CV_GH_RUNNER_HOME` | `~/cv-infra-gh-runner` | `~/cv-infra-gh-runner-user` |
+| `CV_GH_RUNNER_SERVICE` | `cv-infra-gh-runner` | `cv-infra-gh-runner-user` |
+
+```bash
+# one shot, local machine (token for the USER repo, piped — never persisted):
+gh api -X POST repos/yongjunshin/cv-infra-user/actions/runners/registration-token --jq .token \
+  | ssh cv-infra-ws 'IFS= read -r RUNNER_REG_TOKEN; export RUNNER_REG_TOKEN
+                     CV_GH_RUNNER_REPO_URL=https://github.com/yongjunshin/cv-infra-user \
+                     CV_GH_RUNNER_NAME=etri6000-cv-infra-user \
+                     CV_GH_RUNNER_HOME=$HOME/cv-infra-gh-runner-user \
+                     CV_GH_RUNNER_SERVICE=cv-infra-gh-runner-user \
+                     bash /tmp/cv-runner-setup/register_gh_runner.sh'
+```
+
+CI jobs find the host-plane `cv-infra` CLI via the runner's `.path` file (the
+runner passes `.path` as the job PATH and `.env` as extra env — PATH is all the
+CLI needs; console-script shebangs point into the venv). Prepend the host venv
+bin **in every runner home**, then restart the services (idempotent — skip if
+already present):
+
+```bash
+ssh cv-infra-ws 'for h in ~/cv-infra-gh-runner ~/cv-infra-gh-runner-user; do
+                   grep -q "cv-infra-host-venv" "$h/.path" || \
+                     printf "%s\n" "$HOME/cv-infra-host-venv/bin:$(head -n1 "$h/.path")" > "$h/.path"
+                 done
+                 sudo -n systemctl restart cv-infra-gh-runner cv-infra-gh-runner-user'
+```
+
+Verify (`status=online`, label `cv-infra-gpu`) with the same `gh api .../actions/runners`
+check against **each** repo; teardown mirrors the workspace teardown below with the
+`-user` names. Pin refresh (next section) must be re-run **per runner home** (the
+version marker lives in each `CV_GH_RUNNER_HOME`).
+
 ### Pin refresh (accepted maintenance)
 
 GitHub may refuse jobs from runners **>30 days** behind the minimum supported version
