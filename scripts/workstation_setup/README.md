@@ -321,11 +321,13 @@ gh api -X POST repos/yongjunshin/cv-infra-user/actions/runners/registration-toke
                      bash /tmp/cv-runner-setup/register_gh_runner.sh'
 ```
 
-CI jobs find the host-plane `cv-infra` CLI via the runner's `.path` file (the
-runner passes `.path` as the job PATH and `.env` as extra env — PATH is all the
-CLI needs; console-script shebangs point into the venv). Prepend the host venv
-bin **in every runner home**, then restart the services (idempotent — skip if
-already present):
+CI jobs find the host-plane `cv-infra` CLI via the runner's `.path` file. The
+loading mechanism is the unit's `ExecStart=<home>/bin/runsvc.sh`, which exports
+`.path` as the service PATH at **service start** (`run.sh` does NOT load
+`.path` — dead file, exit 127 in jobs; F1 root cause). `.env` is read by the
+runner process itself; PATH is all the CLI needs (console-script shebangs point
+into the venv). Prepend the host venv bin **in every runner home**, then
+restart the services (idempotent — skip if already present):
 
 ```bash
 ssh cv-infra-ws 'for h in ~/cv-infra-gh-runner ~/cv-infra-gh-runner-user; do

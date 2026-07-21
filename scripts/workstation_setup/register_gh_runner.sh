@@ -25,7 +25,12 @@
 #
 # sudo surface: `sudo -n install` + `sudo -n systemctl` only (both in the
 # /etc/sudoers.d/cv-infra whitelist). GitHub's ./svc.sh is deliberately NOT used —
-# it shells out to sudo paths outside the whitelist.
+# it shells out to sudo paths outside the whitelist. The unit's ExecStart is the
+# distribution's bin/runsvc.sh (same file svc.sh would install): it exports the
+# runner-home `.path` file into the job plane and forwards SIGTERM/SIGINT to the
+# listener. ExecStart=run.sh does NEITHER — `.path` never reaches jobs
+# (`cv-infra: command not found`, exit 127) and stops orphan the listener
+# (F1 root cause, questions/user-2026-07-21-runner-path-blocker option A).
 set -euo pipefail
 
 export CV_STEP=runner
@@ -125,7 +130,7 @@ Wants=network-online.target
 [Service]
 User=etri
 WorkingDirectory=${CV_GH_RUNNER_HOME}
-ExecStart=${CV_GH_RUNNER_HOME}/run.sh
+ExecStart=${CV_GH_RUNNER_HOME}/bin/runsvc.sh
 Restart=always
 RestartSec=10
 KillMode=process
