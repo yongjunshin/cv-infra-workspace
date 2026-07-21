@@ -62,6 +62,36 @@ Seams (G-17 — M1 T1 lands ``contract/envelope.py`` in parallel)
 API base resolution: ``--api`` flag > ``CV_INFRA_API`` env > 127.0.0.1:8000
 (current MVP topology = same host, M8 §8 cicd-g5). Polling cadence is the one
 module constant ``_POLL_INTERVAL_S`` — no config layer.
+
+p5c4 CLI gaps G1/G2/G3 (the surface the p5c3 workflows actually consume)
+------------------------------------------------------------------------
+* **G1 (D-K)** ``submit`` also accepts >=1 scenario YAML paths/globs and
+  synthesizes ONE size-N envelope from them (``_load_submission`` dispatch:
+  a single non-glob arg whose document carries a top-level ``requests`` key is
+  the unchanged envelope-file surface; everything else runs ``load_request``
+  per scenario and folds into the frozen ``LoadedEnvelope`` shape — contract
+  models reused verbatim, nothing re-implemented). Scenario order is a
+  CONTRACT: resolved paths, lexicographic, deduplicated (G-39-1 canonical at
+  the generation point); error ``source_path`` keeps the AS-GIVEN spelling
+  (checkout-relative in CI — the D-L annotation ``file=``). Measured consumer
+  form (both p5c3 workflows):
+  ``cv-infra submit ${{ inputs.scenarios }} --trigger-source ci-cd --wait``.
+* **G2 (ref-only)** the SUT image ref is injected into every submitted
+  request's ``sut.image_ref`` ON THE WIRE only (``_wire_doc`` copy — the
+  loaded envelope and the scenario files are never rewritten). Priority:
+  ``--sut-image`` flag > ``CV_INFRA_SUT_IMAGE`` env > the scenario value; the
+  workflows hand ``inputs.sut_image`` down as that env (measured:
+  ``env: CV_INFRA_SUT_IMAGE: ${{ inputs.sut_image }}`` on the submit step).
+  A ref STRING travels verbatim — never pulled or inspected (R10 boundary).
+* **G3 (annotate feed)** an exit-2 submit also writes the machine-readable
+  8-key error list (D-L 1:1, client reject AND server-422 entries) to
+  ``--errors-json PATH``; without the flag the path defaults to
+  ``./errors.json`` ONLY under ``GITHUB_ACTIONS`` — the composite's measured
+  consumption form (``if [ -f errors.json ]; then python -m
+  cv_infra.cli.publish_glue annotate errors.json; fi``). Standalone stays
+  side-effect free unless the flag opts in (LOCKED §10 — no CI-only
+  capability: the flag IS the standalone equivalent). A stale file from a
+  reused self-hosted workspace is cleared before any outcome is known.
 """
 
 from __future__ import annotations
@@ -72,6 +102,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -112,6 +143,26 @@ _INCLUDE_ORACLE_PLUGIN_DIRS = True
 #: equal to this is OMITTED from the POST body so the server default applies.
 _DEFAULT_TRIGGER_SOURCE = "human-manual"
 
+#: G2 env fallback for ``--sut-image`` — the p5c3 workflows hand
+#: ``inputs.sut_image`` down as exactly this env on the submit step (measured:
+#: ``CV_INFRA_SUT_IMAGE: ${{ inputs.sut_image }}`` in both
+#: ``.github/workflows/verify.yml`` and ``actions/verify/action.yml``).
+_SUT_IMAGE_ENV = "CV_INFRA_SUT_IMAGE"
+
+#: G3: GitHub Actions sets this env (``true``) in every step; its presence (any
+#: non-empty value) turns the errors-JSON default ON at the fixed CWD name the
+#: composite annotate step probes (``[ -f errors.json ]`` — measured form).
+_GITHUB_ACTIONS_ENV = "GITHUB_ACTIONS"
+_CI_ERRORS_JSON = "errors.json"
+
+#: Glob metacharacters that force the scenario-synthesis route (G1): a quoted
+#: glob arrives verbatim, and bash passes a NO-MATCH pattern through literally.
+_GLOB_MAGIC = frozenset("*?[")
+
+#: doc_link for CLI-side synthesis errors (the M8-owned surface — envelope- and
+#: scenario-level violations keep their M1 loader doc links untouched).
+_SYNTH_DOC_LINK = "M8-cicd-integration-and-dx.md §3.1 (glob→envelope synthesis — D-K)"
+
 # --- seams (module docstring) ------------------------------------------------
 
 
@@ -145,6 +196,148 @@ def _resolve_api(flag_value: str | None) -> str:
     return flag_value or os.environ.get(_API_ENV) or _DEFAULT_API
 
 
+def _resolve_sut_image(flag_value: str | None) -> str | None:
+    """``--sut-image`` flag > ``CV_INFRA_SUT_IMAGE`` env > None (G2 priority).
+
+    ``None`` = no injection, the scenario value stands. Empty values fall
+    through: an empty env string means "unset", never "inject the empty ref"
+    (G-26's empty-string trap — same fold as ``_resolve_api``).
+    """
+    return flag_value or os.environ.get(_SUT_IMAGE_ENV) or None
+
+
+def _resolve_errors_json(flag_value: str | None) -> Path | None:
+    """``--errors-json`` flag > the CI default > None (G3 emission target).
+
+    None = standalone invocation: exit 2 leaves NO file behind (harmless by
+    default; the flag is the standalone opt-in). Under GitHub Actions the
+    default is the fixed CWD name the composite annotate step probes.
+    """
+    if flag_value:
+        return Path(flag_value)
+    if os.environ.get(_GITHUB_ACTIONS_ENV):
+        return Path(_CI_ERRORS_JSON)
+    return None
+
+
+# --- G1: scenario paths/globs -> size-N envelope synthesis (D-K, CLI-owned) ---
+
+
+def _expand_scenarios(sources: list[str]) -> list[tuple[Path, str]]:
+    """N path/glob args -> deterministic ``(resolved, as_given)`` pairs (G1).
+
+    Globs are expanded HERE too — the workflows pass the pattern unquoted (the
+    runner shell usually expands it first), but a no-match pattern arrives
+    literally and a quoted glob verbatim. The resulting order is a CONTRACT:
+    lexicographic by RESOLVED absolute path, exact duplicates dropped (G-39-1
+    — canonical at the ONE generation point, so requests[i] is the same
+    scenario on every machine no matter how the paths were spelled).
+
+    ``as_given`` keeps the consumer's spelling (in CI: a checkout-relative
+    ``scenarios/x.yaml``) — it becomes the error ``source_path`` so the
+    annotation ``::error file=..`` lands on the PR diff's file (D-L:
+    consumer-repo-root relative); ``resolved`` is the read/anchor/sort
+    canonical. On a duplicate, the first spelling wins (argv order).
+    """
+    import glob
+
+    by_resolved: dict[Path, str] = {}
+    for source in sources:
+        if any(ch in _GLOB_MAGIC for ch in source):
+            matches = glob.glob(source, recursive=True)
+            if not matches:
+                raise ContractError(
+                    expected="a glob matching at least one scenario YAML file",
+                    got=repr(source),
+                    example="cv-infra submit scenarios/*.yaml",
+                    doc_link=_SYNTH_DOC_LINK,
+                )
+        else:
+            matches = [source]
+        for given in matches:
+            by_resolved.setdefault(Path(given).resolve(), given)
+    return sorted(by_resolved.items(), key=lambda item: str(item[0]))
+
+
+def _synthesize_envelope(sources: list[str]) -> Any:
+    """>=1 scenario paths/globs -> ONE in-memory size-N envelope (G1, D-K).
+
+    Reuses the EXISTING M1 pieces verbatim — each scenario runs the 6-stage
+    ``load_request`` gate (parent dir = the stage-5 custom-oracle anchor,
+    mirroring ``envelope._load_ref``) and the results fold into the frozen
+    ``LoadedEnvelope``/``LoadedRequestRef`` shapes; no contract model is
+    modified or re-implemented. One read feeds BOTH views (the ``_load_ref``
+    idiom): the gate sees the exact text (scenario-file line/col stays exact)
+    and ``raw_doc`` is the wire canonical. ``api_version`` is the CLI's own
+    current ``API_VERSION`` — there is no envelope file to resolve one from,
+    and the field never rides the wire (``_wire_body`` sends raw docs only).
+    """
+    import io
+
+    import yaml
+
+    from cv_infra.contract.apiversion import API_VERSION
+    from cv_infra.contract.envelope import LoadedEnvelope, LoadedRequestRef
+    from cv_infra.contract.loader import load_request
+
+    refs = []
+    for resolved, given in _expand_scenarios(sources):
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ContractError(
+                expected="a path to an existing scenario YAML file",
+                got=f"{given!r} (resolved: {resolved})",
+                example="cv-infra submit scenarios/*.yaml",
+                doc_link=_SYNTH_DOC_LINK,
+                source_path=given,
+            ) from exc
+        # source_path = the AS-GIVEN spelling (D-L annotation ``file=`` — in CI
+        # the checkout-relative glob match); anchors stay resolved absolute.
+        admitted = load_request(
+            io.StringIO(text), source_path=given, plugin_dir=str(resolved.parent)
+        )
+        refs.append(
+            LoadedRequestRef(
+                admitted=admitted,
+                raw_doc=yaml.safe_load(text),
+                scenario_path=str(resolved),
+                oracle_plugin_dir=str(resolved.parent),
+            )
+        )
+    return LoadedEnvelope(api_version=API_VERSION, requests=tuple(refs))
+
+
+def _is_envelope_doc(source: str) -> bool:
+    """Sniff: a top-level ``requests`` mapping key = a RequestEnvelope file.
+
+    Unambiguous for any admittable input — a scenario document can never carry
+    ``requests`` (its schema forbids extra keys). Unreadable or unparseable
+    files fall to the scenario route, whose loader errors stay friendly
+    (exit 2) either way.
+    """
+    import yaml
+
+    try:
+        doc = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return False
+    return isinstance(doc, dict) and "requests" in doc
+
+
+def _load_submission(sources: list[str]) -> Any:
+    """G1 dispatch: ONE envelope file -> the M1 envelope loader (surface
+    unchanged since p4c3); anything else (a glob / >=2 paths / a scenario
+    file) -> CLI-side size-N synthesis (D-K)."""
+    if (
+        len(sources) == 1
+        and not any(ch in _GLOB_MAGIC for ch in sources[0])
+        and _is_envelope_doc(sources[0])
+    ):
+        return _load_envelope(sources[0])
+    return _synthesize_envelope(sources)
+
+
 def _wire_trigger_source(flag: str) -> str | None:
     """Fold the ``--trigger-source`` flag to the wire value (REQ-INTAKE-003).
 
@@ -156,14 +349,35 @@ def _wire_trigger_source(flag: str) -> str | None:
     return None if flag == _DEFAULT_TRIGGER_SOURCE else flag
 
 
-def _wire_body(envelope: Any, trigger_source: str | None = None) -> dict[str, Any]:
+def _wire_doc(doc: dict[str, Any], sut_image: str | None) -> dict[str, Any]:
+    """Inject the resolved SUT image REF into one request doc (G2) — by COPY.
+
+    ``None`` = the scenario value stands and the doc is returned untouched
+    (byte-identical wire to the pre-p5c4 form). The override never rewrites
+    the loaded envelope or the scenario file — only the wire submission
+    carries the injected ref, and the ref is a STRING passed through verbatim:
+    never pulled, inspected or resolved here (R10 ref-only boundary).
+    """
+    if sut_image is None:
+        return doc
+    sut = doc.get("sut")
+    return {**doc, "sut": {**(sut if isinstance(sut, dict) else {}), "image_ref": sut_image}}
+
+
+def _wire_body(
+    envelope: Any, trigger_source: str | None = None, sut_image: str | None = None
+) -> dict[str, Any]:
     """LoadedEnvelope -> wire-v2 POST body (raw docs verbatim, D-1 internal
     representation). ``oracle_plugin_dirs`` (equal-length stage-5 anchors) is
     emitted by default — see the module gate ``_INCLUDE_ORACLE_PLUGIN_DIRS``.
     ``trigger_source`` rides as an OPTIONAL top-level key iff provided (non-None):
     the caller passes ``_wire_trigger_source(args.trigger_source)`` so the default
-    (human-manual) is omitted and only a ci-cd trigger records provenance."""
-    body: dict[str, Any] = {"requests": [ref.raw_doc for ref in envelope.requests]}
+    (human-manual) is omitted and only a ci-cd trigger records provenance.
+    ``sut_image`` (G2, resolved by ``_resolve_sut_image``) overrides every
+    request's ``sut.image_ref`` on the emitted copy — see ``_wire_doc``."""
+    body: dict[str, Any] = {
+        "requests": [_wire_doc(ref.raw_doc, sut_image) for ref in envelope.requests]
+    }
     if _INCLUDE_ORACLE_PLUGIN_DIRS:
         body["oracle_plugin_dirs"] = [ref.oracle_plugin_dir for ref in envelope.requests]
     if trigger_source is not None:
@@ -174,13 +388,15 @@ def _wire_body(envelope: Any, trigger_source: str | None = None) -> dict[str, An
 # --- rendering helpers --------------------------------------------------------
 
 
-def _render_rejection(command: str, response: httpx.Response) -> None:
+def _render_rejection(command: str, response: httpx.Response) -> list[dict[str, Any]]:
     """Render the orchestrator's structured 422 as M1 friendly prose.
 
     The 422 detail is ``{"errors": [<8-key ContractError annotation dict>,
     ...]}`` (api.py, all-or-nothing admit) — each entry is re-hydrated into a
     ``ContractError`` so stderr shows EXACTLY the prose a local rejection
     would (M1 owns the format, the CLI invents none; raw traceback 0).
+    Returns the dict entries verbatim — ``cmd_submit``'s G3 emission writes
+    the SAME list the prose rendered (one parse, two views).
     """
     entries: Any = None
     try:
@@ -189,13 +405,54 @@ def _render_rejection(command: str, response: httpx.Response) -> None:
         pass
     if not isinstance(entries, list) or not entries:
         print(f"cv-infra {command}: envelope rejected (422): {response.text}", file=sys.stderr)
-        return
+        return []
+    dict_entries: list[dict[str, Any]] = []
     for entry in entries:
         if isinstance(entry, dict):
             kwargs = {k: entry[k] for k in ANNOTATION_KEYS if entry.get(k) is not None}
             print(f"cv-infra {command}: {ContractError(**kwargs)}", file=sys.stderr)
+            dict_entries.append(entry)
         else:
             print(f"cv-infra {command}: {entry}", file=sys.stderr)
+    return dict_entries
+
+
+# --- G3: machine-readable exit-2 errors (the composite annotate step's feed) --
+
+
+def _clear_stale_errors_json(path: Path | None) -> None:
+    """Drop a previous run's errors file BEFORE any outcome is known.
+
+    A self-hosted runner reuses its workspace and the GPU job does NO
+    checkout-clean (R10 — inputs arrive as an artifact), while the annotate
+    step keys on bare file existence: a stale file would replay old
+    annotations on any later exit-2. Best-effort (an un-unlinkable path never
+    changes the verdict)."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _emit_errors_json(path: Path | None, entries: list[dict[str, Any]]) -> None:
+    """Write the 8-key annotation-dict list (G3) — the exact shape
+    ``publish_glue.render_annotations`` consumes (composite annotate step:
+    ``python -m cv_infra.cli.publish_glue annotate errors.json``).
+
+    ``path`` None = standalone invocation: no file side effect. Best-effort:
+    an unwritable path warns on stderr and never masks the exit-2 verdict.
+    """
+    if path is None or not entries:
+        return
+    try:
+        path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"cv-infra submit: could not write errors JSON to {path}: {_one_line(exc)}",
+            file=sys.stderr,
+        )
 
 
 def _infra(command: str, message: str) -> int:
@@ -269,18 +526,24 @@ async def _poll_until_terminal(
         await asyncio.sleep(_POLL_INTERVAL_S)
 
 
-async def _submit_async(envelope: Any, args: argparse.Namespace) -> int:
+async def _submit_async(
+    envelope: Any, args: argparse.Namespace, errors_json: Path | None = None
+) -> int:
     api = _resolve_api(args.api)
     wire_trigger = _wire_trigger_source(args.trigger_source)
+    sut_image = _resolve_sut_image(args.sut_image)
     async with _make_client(api) as client:
         try:
-            response = await client.post("/envelopes", json=_wire_body(envelope, wire_trigger))
+            response = await client.post(
+                "/envelopes", json=_wire_body(envelope, wire_trigger, sut_image)
+            )
         except httpx.HTTPError as exc:
             return _infra("submit", f"orchestrator unreachable at {api}: {_one_line(exc)}")
         if response.status_code == 422:
             # Server-side re-rejection (the server re-runs the M1 admit gate —
-            # authoritative even after client pre-validation passed).
-            _render_rejection("submit", response)
+            # authoritative even after client pre-validation passed). G3: the
+            # 8-key entries feed the annotate step too.
+            _emit_errors_json(errors_json, _render_rejection("submit", response))
             return EXIT_CONTRACT
         if response.status_code != 202:
             return _infra("submit", f"unexpected orchestrator response {response.status_code}")
@@ -327,22 +590,29 @@ async def _status_async(args: argparse.Namespace) -> int:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    """``cv-infra submit <envelope.yaml> [--wait] [--timeout N] [--api URL]``.
+    """``cv-infra submit <envelope.yaml | scenario/globs...> [--wait] [--sut-image REF]
+    [--errors-json PATH] [--timeout N] [--api URL]``.
 
-    Client-side pre-validation FIRST (M1 ``load_envelope`` via the adapter
-    seam): a rejected envelope renders the M1 friendly prose + exit 2 and the
-    orchestrator is never contacted (NFR-INTAKE-001/003 정신). Accepted ->
-    wire-v2 POST; ``--wait`` joins the shared terminal-verdict poll.
+    Client-side pre-validation FIRST (G1 ``_load_submission``: the M1 envelope
+    loader for an envelope file, per-scenario ``load_request`` synthesis for
+    paths/globs — D-K): a rejected submission renders the M1 friendly prose +
+    exit 2 and the orchestrator is never contacted (NFR-INTAKE-001/003 정신),
+    with the 8-key machine view emitted for the annotate step when enabled
+    (G3). Accepted -> wire-v2 POST (G2 SUT-image injection on the emitted
+    copy); ``--wait`` joins the shared terminal-verdict poll.
     """
+    errors_json = _resolve_errors_json(args.errors_json)
+    _clear_stale_errors_json(errors_json)
     if args.timeout is not None and not args.wait:
         print("cv-infra submit: --timeout requires --wait", file=sys.stderr)
         return EXIT_CONTRACT
     try:
-        envelope = _load_envelope(args.envelope)
+        envelope = _load_submission(args.sources)
     except ContractError as err:
         print(f"cv-infra submit: {err}", file=sys.stderr)
+        _emit_errors_json(errors_json, [err.to_annotation_dict()])
         return EXIT_CONTRACT
-    return asyncio.run(_submit_async(envelope, args))
+    return asyncio.run(_submit_async(envelope, args, errors_json))
 
 
 def cmd_wait(args: argparse.Namespace) -> int:

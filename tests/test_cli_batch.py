@@ -52,6 +52,19 @@ def _request_doc() -> dict:
     return copy.deepcopy(_CANONICAL_DOC)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ci_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G2/G3 (p5c4): ``cmd_submit`` now reads CV_INFRA_SUT_IMAGE / GITHUB_ACTIONS.
+
+    A real GitHub runner (the platform CI itself runs under
+    ``GITHUB_ACTIONS=true``) or a dev shell must not leak them into the wire
+    assertions here — without this, every exit-2 submit test would drop an
+    ``errors.json`` into the CI checkout CWD and any ambient SUT-image env
+    would rewrite the pinned wire bodies."""
+    monkeypatch.delenv("CV_INFRA_SUT_IMAGE", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+
 # --- verbatim T1 stub shapes (task data contract — LoadedEnvelope/RequestRef) --
 
 

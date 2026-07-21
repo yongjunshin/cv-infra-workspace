@@ -83,7 +83,7 @@ _CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 # via ``cv-infra --help``.
 _SUBCOMMANDS: dict[str, str] = {
     "run": "Run a single scenario end-to-end (supervisor co-spawns SUT + runner; envelope-less).",
-    "submit": "Submit a RequestEnvelope YAML (scenario file refs) to the orchestrator [--wait].",
+    "submit": "Submit a RequestEnvelope YAML or scenario paths/globs to the orchestrator [--wait].",
     "status": "Show progress of an async envelope by id (informational; never gates on verdict).",
     "wait": "Block until an envelope reaches a terminal aggregated verdict (exit 0/1/3).",
     "monitor": "Show the operational view (queue/resources/health + rollup); informational.",
@@ -140,8 +140,37 @@ def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
     """Argument schema for the Phase-4 batch commands (cv_infra/cli/batch.py)."""
     if name == "submit":
         sub.add_argument(
-            "envelope",
-            help="RequestEnvelope YAML path (scenario file-reference list, decision p4c3 D-2)",
+            # D-K (M8 §3.1, p5c4 G1): ONE RequestEnvelope YAML (decision p4c3
+            # D-2, unchanged surface), OR >=1 scenario YAML paths/globs the CLI
+            # folds into a size-N envelope — deterministic lexicographic path
+            # order (G-39-1: canonical at the generation point).
+            "sources",
+            nargs="+",
+            metavar="<envelope.yaml | scenario.yaml ...>",
+            help="RequestEnvelope YAML path, or >=1 scenario YAML paths/globs — the CLI "
+            "synthesizes a size-N envelope from scenario paths (D-K; deterministic "
+            "lexicographic path order)",
+        )
+        sub.add_argument(
+            # G2 (p5c4): SUT image REF injection. Priority: this flag >
+            # $CV_INFRA_SUT_IMAGE env (the workflows' hand-off) > the scenario
+            # value. A ref STRING only — never pulled or inspected (R10).
+            "--sut-image",
+            default=None,
+            metavar="REF",
+            help="SUT image reference injected into every submitted scenario's "
+            "sut.image_ref (priority: flag > $CV_INFRA_SUT_IMAGE > scenario value; "
+            "ref string only — never pulled or inspected, R10 ref-only)",
+        )
+        sub.add_argument(
+            # G3 (p5c4): machine-readable exit-2 errors for the composite
+            # annotate step (8-key list, D-L 1:1). Standalone default: OFF.
+            "--errors-json",
+            default=None,
+            metavar="PATH",
+            help="on a contract error (exit 2) also write the machine-readable 8-key "
+            "error list to PATH (default: ./errors.json only when $GITHUB_ACTIONS is "
+            "set — the annotate step's consumption form; standalone default: off)",
         )
         sub.add_argument(
             "--wait",
