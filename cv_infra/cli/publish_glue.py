@@ -17,10 +17,16 @@ It holds NO GitHub token and opens NO socket — the real API calls / uploads ar
 it drags only ``github.py`` (stdlib + ``cli.exit_codes`` leaf) and ``errors.py``
 (stdlib-only), so it runs on the GPU box without the server/network graph.
 
-Invoked by ``actions/verify`` (composite) as::
+Invoked by ``actions/verify`` (composite) / the reusable ``verify.yml`` as::
 
     python -m cv_infra.cli.publish_glue publish <report.json> <out-dir>
     python -m cv_infra.cli.publish_glue annotate <errors.json>
+    python -m cv_infra.cli.publish_glue stage-artifacts <report.json> <staging-dir>
+
+``stage-artifacts`` copies the artifact manifest's ``uploads[]`` (the curated
+per-run MCAP/mp4/result.json paths) into a staging dir ``actions/upload-artifact``
+then uploads — the dynamic path list lives in JSON and cannot be a static YAML
+``path:``, so a TESTED Python step gathers the bytes first (no brittle shell/jq).
 
 The REAL trigger / posting is observed in p5c4 (this cycle authors + statically
 verifies the plumbing — no live GitHub run is claimed).
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -149,7 +156,81 @@ def render_annotations(data: Any) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# entry point (invoked by actions/verify composite)
+# (3) stage-artifacts — manifest uploads[] -> a staging dir upload-artifact takes
+# --------------------------------------------------------------------------- #
+def _fs_safe(value: Any) -> str:
+    """A single filesystem path segment (no separators; ``None`` -> ``unknown``)."""
+    text = "unknown" if value is None else str(value)
+    return text.replace("/", "_").replace("\\", "_") or "unknown"
+
+
+def _entry_id(entry: dict[str, Any]) -> str:
+    """A human label for a skip warning (request/repeat/kind)."""
+    return f"{entry.get('request_id')}/repeat-{entry.get('repeat_index')}/{entry.get('kind')}"
+
+
+def _staging_relpath(entry: dict[str, Any], src: Path) -> Path:
+    """Deterministic, collision-free layout for one upload entry:
+    ``<request_id>/repeat-<repeat_index>/<kind><suffix>``.
+
+    ``(request_id, repeat_index, kind)`` is unique across ``uploads`` (each kind
+    appears at most once per selected entry — ``github._classify_entry``), so the
+    kind alone names the file (the source suffix is preserved). Path separators in
+    the request id are neutralised so a slashy id can never escape the staging dir.
+    """
+    request = _fs_safe(entry.get("request_id"))
+    kind = str(entry.get("kind") or "artifact")
+    return Path(request) / f"repeat-{entry.get('repeat_index')}" / f"{kind}{src.suffix}"
+
+
+def stage_uploads(uploads: list[dict[str, Any]], staging_dir: Path) -> dict[str, int]:
+    """Copy each ``uploads[]`` entry's ``path`` into ``staging_dir`` under a stable
+    layout. ONLY the curated ``uploads`` are staged — ``missing``/``excluded`` never
+    reach here (결정 #1/#2 curation was already applied when the manifest was built).
+
+    Defensive (T2 is aligning the producer to host-resolvable absolute paths): an
+    entry whose ``path`` is absent/empty, or does not resolve to an existing file
+    (a container-internal path unresolvable on the host, or a stray relative path),
+    is SKIPPED with a stderr warning — a missing byte never fails the upload/job.
+    Returns ``{"staged", "skipped"}``.
+    """
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged = 0
+    skipped = 0
+    for entry in uploads:
+        path = entry.get("path")
+        if not path:
+            print(f"stage-artifacts: skip (no path) {_entry_id(entry)}", file=sys.stderr)
+            skipped += 1
+            continue
+        src = Path(path)
+        if not src.is_file():
+            print(f"stage-artifacts: skip (unresolved path) {path}", file=sys.stderr)
+            skipped += 1
+            continue
+        dest = staging_dir / _staging_relpath(entry, src)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        staged += 1
+    return {"staged": staged, "skipped": skipped}
+
+
+def stage_artifacts(report: dict[str, Any], staging_dir: Path) -> dict[str, int]:
+    """Stage the artifact-manifest ``uploads[]`` for ``actions/upload-artifact``.
+
+    The manifest is the SINGLE SOURCE of what to upload — this IMPORTS
+    ``github.render_artifact_manifest`` (never re-selects/re-classifies) and copies
+    only its ``uploads`` into ``staging_dir``. The staging step exists because
+    ``upload-artifact``'s ``path:`` is static YAML and cannot read the manifest's
+    dynamic per-run path list; gathering the curated bytes into one dir first is
+    the sanctioned pattern (no path is fetched from a socket — files only).
+    """
+    manifest = github.render_artifact_manifest(report)
+    return stage_uploads(manifest.get("uploads") or [], staging_dir)
+
+
+# --------------------------------------------------------------------------- #
+# entry point (invoked by actions/verify composite / reusable verify.yml)
 # --------------------------------------------------------------------------- #
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -162,6 +243,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pub.add_argument("out_dir", help="directory the payload files are written into")
     ann = sub.add_parser("annotate", help="render M1 error objects as ::error:: workflow commands")
     ann.add_argument("errors", help="path to the errors JSON (list or M3 422 body)")
+    stage = sub.add_parser(
+        "stage-artifacts",
+        help="copy the artifact manifest's uploads[] paths into a staging dir for upload-artifact",
+    )
+    stage.add_argument("report", help="path to the report JSON (cv-infra report <id> --json)")
+    stage.add_argument("staging_dir", help="directory the curated artifact files are staged into")
     return parser
 
 
@@ -171,6 +258,11 @@ def main(argv: list[str] | None = None) -> int:
         report = json.loads(Path(args.report).read_text(encoding="utf-8"))
         for name, path in write_payloads(report, Path(args.out_dir)).items():
             print(f"{name}={path}", file=sys.stderr)  # provenance only; stdout stays clean
+        return 0
+    if args.mode == "stage-artifacts":
+        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        summary = stage_artifacts(report, Path(args.staging_dir))
+        print(f"staged={summary['staged']} skipped={summary['skipped']}")
         return 0
     # annotate: emit each ::error:: to stdout so the runner surfaces it inline.
     data = json.loads(Path(args.errors).read_text(encoding="utf-8"))
