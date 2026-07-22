@@ -143,8 +143,18 @@ runs:
             }
           }
 
-    # Artifacts (결정 #1/2/3): report.json + selected rosbag/video (the manifest
-    # already applied selection/size-cap; per-path plan finalized in p5c4).
+    # Stage the manifest's curated artifact bytes (결정 #1/2/3): the glue already
+    # applied selection/size-cap into payloads/artifact-manifest.json — its uploads[]
+    # carry the per-run host paths (MCAP/mp4/result.json). upload-artifact's path: is
+    # static YAML and cannot read that dynamic list, so a TESTED Python step copies
+    # only the curated uploads into artifacts/ (missing/excluded NOT staged).
+    - name: Stage curated artifacts
+      if: always() && steps.verify.outputs.have_report == 'true'
+      shell: bash
+      run: python -m cv_infra.cli.publish_glue stage-artifacts report.json artifacts
+
+    # Artifacts (결정 #1/2/3): report.json + payloads/ + the staged artifacts/ tree
+    # (result.json + selected rosbag/video). if-no-files-found=warn: empty stage OK.
     - name: Upload verification artifacts
       if: always() && steps.verify.outputs.have_report == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -153,6 +163,7 @@ runs:
         path: |
           report.json
           payloads/
+          artifacts/
         if-no-files-found: warn
 
     # Reflect the CLI verdict as the step status (infra=neutral nuance rides the

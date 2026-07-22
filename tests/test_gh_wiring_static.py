@@ -63,6 +63,19 @@ def _runs(steps: list[dict[str, Any]]) -> str:
     return "\n".join(step["run"] for step in steps if isinstance(step, dict) and "run" in step)
 
 
+def _steps(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """The step list for either entry topology (reusable workflow job / composite)."""
+    return doc["jobs"]["verify"]["steps"] if "jobs" in doc else doc["runs"]["steps"]
+
+
+def _upload_step(doc: dict[str, Any]) -> dict[str, Any]:
+    return next(
+        s
+        for s in _steps(doc)
+        if isinstance(s, dict) and str(s.get("uses", "")).startswith("actions/upload-artifact")
+    )
+
+
 def _stub_envelope(docs: list[dict[str, Any]]) -> SimpleNamespace:
     reqs = [
         SimpleNamespace(raw_doc=doc, oracle_plugin_dir=f"/abs/consumer/scenarios{i}")
@@ -177,6 +190,115 @@ def test_write_payloads_emits_four_named_files(tmp_path):
     assert sticky.startswith(github.STICKY_COMMENT_MARKER)
     manifest = json.loads(paths[publish_glue.ARTIFACT_MANIFEST_FILE].read_text(encoding="utf-8"))
     assert set(manifest) == {"policy", "uploads", "missing", "excluded"}
+
+
+# --------------------------------------------------------------------------- #
+# (B2) stage-artifacts — manifest uploads[] -> staging dir (P5-02 완결)
+# --------------------------------------------------------------------------- #
+def _report_with_artifacts(tmp_path) -> dict[str, Any]:
+    """A report whose manifest yields uploads (2 present paths) + missing (mp4 None)
+    + excluded (size-capped mcap). Real files exist on disk for the upload paths so
+    ``stage-artifacts`` can copy them (host-resolvable absolute paths, T2 contract)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    result0 = src / "r0.json"
+    result0.write_text("{}", encoding="utf-8")
+    mcap0 = src / "r0.mcap"
+    mcap0.write_bytes(b"\x00mcap")
+    result2 = src / "r2.json"
+    result2.write_text("{}", encoding="utf-8")
+    return {
+        "matrix": [
+            {
+                "request_id": "req-a",
+                "artifacts": {
+                    "policy": "failing-all + one-representative-pass",
+                    "selected": [
+                        {  # failure repeat 0: result.json + mcap uploaded, mp4 missing
+                            "repeat_index": 0,
+                            "role": "failure",
+                            "verdict": "fail",
+                            "result_json": str(result0),
+                            "rosbag_mcap": str(mcap0),
+                            "recording_mp4": None,
+                            "excluded": [],
+                            "warnings": [],
+                        },
+                        {  # rep-pass repeat 2: result.json uploaded, mcap size-excluded
+                            "repeat_index": 2,
+                            "role": "representative-pass",
+                            "verdict": "pass",
+                            "result_json": str(result2),
+                            "rosbag_mcap": None,
+                            "recording_mp4": None,
+                            "excluded": ["rosbag_mcap"],
+                            "warnings": ["MCAP 상한 초과 — 업로드 제외"],
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+
+
+def _staged_relpaths(staging_dir) -> set[str]:
+    return {
+        p.relative_to(staging_dir).as_posix()
+        for p in staging_dir.rglob("*")
+        if p.is_file()
+    }
+
+
+def test_stage_artifacts_stages_only_uploads(tmp_path):
+    report = _report_with_artifacts(tmp_path)
+    staging = tmp_path / "artifacts"
+    summary = publish_glue.stage_artifacts(report, staging)
+    # (a) only the 3 uploads[] paths are staged, under the deterministic layout.
+    assert _staged_relpaths(staging) == {
+        "req-a/repeat-0/result_json.json",
+        "req-a/repeat-0/rosbag_mcap.mcap",
+        "req-a/repeat-2/result_json.json",
+    }
+    assert summary == {"staged": 3, "skipped": 0}
+    # (b) missing (mp4) + excluded (size-capped mcap) are NOT staged (결정 #1/#2).
+    assert not any("recording_mp4" in p for p in _staged_relpaths(staging))
+    assert "req-a/repeat-2/rosbag_mcap.mcap" not in _staged_relpaths(staging)
+    # bytes copied verbatim.
+    assert (staging / "req-a/repeat-0/rosbag_mcap.mcap").read_bytes() == b"\x00mcap"
+
+
+def test_stage_artifacts_layout_is_deterministic(tmp_path):
+    report = _report_with_artifacts(tmp_path)
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    publish_glue.stage_artifacts(report, first)
+    publish_glue.stage_artifacts(report, second)
+    assert _staged_relpaths(first) == _staged_relpaths(second)
+
+
+def test_stage_uploads_skips_none_and_absent_path_non_fatal(tmp_path):
+    # An upload entry with path=None and one whose absolute path does not resolve on
+    # the host (container-internal / stale) are both SKIPPED with a warning — never
+    # fatal (§5c defensive; T2 aligns the producer to host paths).
+    present = tmp_path / "present.json"
+    present.write_text("{}", encoding="utf-8")
+    uploads = [
+        {"request_id": "r", "repeat_index": 0, "kind": "result_json", "path": None},
+        {"request_id": "r", "repeat_index": 1, "kind": "rosbag_mcap", "path": "/nonexist/x.mcap"},
+        {"request_id": "r", "repeat_index": 2, "kind": "result_json", "path": str(present)},
+    ]
+    staging = tmp_path / "artifacts"
+    summary = publish_glue.stage_uploads(uploads, staging)
+    assert summary == {"staged": 1, "skipped": 2}
+    assert _staged_relpaths(staging) == {"r/repeat-2/result_json.json"}
+
+
+def test_stage_artifacts_empty_report_is_empty_dir(tmp_path):
+    # No matrix -> no uploads -> an empty (created) staging dir, no error.
+    staging = tmp_path / "artifacts"
+    assert publish_glue.stage_artifacts({}, staging) == {"staged": 0, "skipped": 0}
+    assert staging.is_dir()
+    assert _staged_relpaths(staging) == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +468,28 @@ def test_no_floating_tag_and_no_pull_request_target(path):
     text = path.read_text(encoding="utf-8")
     assert not _FLOATING.search(text)  # no @main/@master/@latest (§2-7)
     assert "pull_request_target" not in text  # R10/D-J: base-secret fork-PR RCE pattern
+
+
+@pytest.mark.parametrize("path", [_VERIFY_WORKFLOW, _VERIFY_ACTION])
+def test_stages_curated_artifacts_then_uploads_staging_dir(path):
+    # P5-02 완결: both entry topologies stage the manifest uploads[] via the tested
+    # Python glue, then upload artifacts/ ALONGSIDE report.json + payloads/ (retained).
+    doc = _load(path)
+    runs = _runs(_steps(doc))
+    assert "publish_glue stage-artifacts report.json artifacts" in runs
+    upload_path = _upload_step(doc)["with"]["path"]
+    assert "report.json" in upload_path  # report retained
+    assert "payloads/" in upload_path  # Check/comment/manifest payloads retained
+    assert "artifacts/" in upload_path  # staged MCAP/mp4/result.json now uploaded
+
+
+@pytest.mark.parametrize("path", [_VERIFY_WORKFLOW, _VERIFY_ACTION])
+def test_stage_step_gated_on_have_report(path):
+    doc = _load(path)
+    stage = next(
+        s for s in _steps(doc) if isinstance(s, dict) and "stage-artifacts" in str(s.get("run", ""))
+    )
+    assert stage["if"] == "always() && steps.verify.outputs.have_report == 'true'"
 
 
 @pytest.mark.parametrize("path", [_VERIFY_WORKFLOW, _VERIFY_ACTION])
