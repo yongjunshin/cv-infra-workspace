@@ -55,10 +55,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cv_infra.orchestrator.allocator import (
@@ -145,6 +146,37 @@ _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immed
 # placeholder, not an NFR claim — run_job docstring): run_job's signature and
 # the production ``RunJobRunner`` share this ONE constant (이중 정의 금지).
 DEFAULT_JOB_TIMEOUT_S = 1800.0
+
+# (a)+(b) transport-gap repair (p5c5 T2, history 2026-07-21 놀란점 3): the SUT/runner
+# image pull is UPSTREAM of every existing watchdog. The wall-clock ``job_timeout_s``
+# only starts inside ``_supervise_until_runner_exit`` — AFTER the SUT container is
+# created — and ``containers.run`` pulls a missing image implicitly and BLOCKING, so a
+# wedged GHCR layer pull hung a live E2E 37 min+ with no watchdog firing, while the runner
+# meanwhile ran its mission against an absent SUT. ``run_job`` now makes both images PRESENT
+# before starting any container (so the runner never begins its mission with the SUT image
+# still pulling — the order gate), bounding the pull by a progress-LIVENESS watchdog.
+#
+# PLACEHOLDER default (operational, not an NFR claim — SAME discipline as
+# ``DEFAULT_JOB_TIMEOUT_S``): this is a no-PROGRESS window, NOT a total-pull cap. An active
+# pull emits a docker progress event per layer chunk far more often than this, so a
+# slow-but-moving 784 MB layer never trips it; a truly wedged registry connection terminates
+# the job in minutes, not the 37 min+ measured. The exact value pends T3 workstation
+# measurement of real GHCR pull progress cadence (실측-후-기입) — parameterized so it stays
+# tunable, never a magic constant asserted as measured.
+DEFAULT_PULL_STALL_TIMEOUT_S = 300.0
+
+# Floor for the pull-monitor poll when ``poll_interval_s`` is 0 (the CPU-test knob for the
+# tight readiness/supervise loops would hot-spin the pull monitor otherwise).
+_PULL_MONITOR_MIN_INTERVAL_S = 0.05
+
+
+class ImagePullStalled(RuntimeError):
+    """A registry image pull made no progress within the liveness window (T2 a).
+
+    Raised inside ``run_job``'s infra boundary, so it surfaces as an ``infra_error``
+    (classified FAILED — a finite terminal state) rather than an unbounded hang.
+    """
+
 
 # The watchdog kill's infra_error marker — producer = ``_supervise_until_runner_exit``,
 # consumer = ``_job_result_of`` (p4c4 glue: marker-prefixed infra_error classifies the
@@ -439,6 +471,101 @@ def _resolve_oracle_plugin_dir(oracle_plugin_dir: str | None) -> str | None:
     return str(resolved)
 
 
+def _log_image_ensure(image: str, kind: str, status: str, **extra: Any) -> None:
+    """Feature-on gate (G-26): one structured stderr line per image-present step.
+
+    So T3/QA/operators can assert the pull-present gate actually engaged (present /
+    pulled / stalled / skipped) from a file, never from narration — the same idiom as
+    ``runner-mounts`` / ``cache-seed``.
+    """
+    line = json.dumps({"image": image, "kind": kind, "status": status, **extra}, sort_keys=True)
+    print(f"[cv-supervisor] image-ensure {line}", file=sys.stderr, flush=True)
+
+
+def _image_present(images: Any, image: str) -> bool:
+    """Is ``image`` present in the LOCAL image store? (no registry round-trip).
+
+    ``images.get`` raises ``ImageNotFound`` when the tag is absent locally — matched by
+    class NAME so the module (and its CPU tests) stay 100% docker-free, exactly like the
+    duck-typed fake docker CLIENT the seam already relies on. Any OTHER error (a genuine
+    daemon fault) propagates to run_job's infra boundary rather than being read as absent.
+    """
+    try:
+        images.get(image)
+    except Exception as exc:
+        if type(exc).__name__ in ("ImageNotFound", "NotFound"):
+            return False
+        raise
+    return True
+
+
+def _pull_with_liveness(
+    client: Any, image: str, *, kind: str, stall_timeout_s: float, poll_interval_s: float
+) -> None:
+    """Pull ``image`` (streaming), failing if no pull PROGRESS arrives within
+    ``stall_timeout_s`` (T2 a). A blocking pull cannot be cancelled, so a stall abandons
+    the daemon drain thread behind a loud ``ImagePullStalled`` rather than hanging the job
+    forever. Progress-based, NOT a total cap: a large but progressing layer keeps resetting
+    the window, so only a genuinely wedged connection trips it (history 2026-07-21 놀란점 3).
+    A registry/daemon error mid-pull is re-raised (surfaced as infra_error upstream).
+    """
+    progress = {"at": time.monotonic()}  # dict item assign = atomic under the GIL
+    finished = threading.Event()
+    box: dict[str, Exception] = {}
+
+    def _drain() -> None:
+        try:
+            for _event in client.api.pull(image, stream=True, decode=True):
+                progress["at"] = time.monotonic()  # any progress event resets the window
+        except Exception as exc:  # registry/daemon fault mid-pull — carry it back
+            box["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=_drain, name=f"cv-pull-{kind}", daemon=True)
+    thread.start()
+    wait_s = poll_interval_s if poll_interval_s > 0 else _PULL_MONITOR_MIN_INTERVAL_S
+    while not finished.wait(wait_s):
+        if time.monotonic() - progress["at"] >= stall_timeout_s:
+            raise ImagePullStalled(
+                f"{kind} image {image} pull made no progress for {stall_timeout_s}s"
+                " — the registry pull is stalled; the job is failed in finite time instead"
+                " of hanging forever (history 2026-07-21 놀란점 3, T2 a)"
+            )
+    if "error" in box:
+        raise box["error"]
+
+
+def _ensure_image_present(
+    client: Any, image: str, *, kind: str, stall_timeout_s: float, poll_interval_s: float
+) -> str:
+    """Make ``image`` present locally BEFORE any container starts (T2 a+b).
+
+    Returns the outcome (``"present"`` | ``"pulled"`` | ``"unknown"``). ``ImagePullStalled``
+    (or a re-raised registry/daemon error) on failure — caught by run_job's infra boundary,
+    so a stalled/failed pull is a FINITE ``infra_error`` (FAILED) instead of the unbounded
+    hang the implicit ``containers.run`` pull produced. For the SUT this doubles as the
+    order gate: the runner container is not started until its image is present, so the
+    runner never runs its mission against an absent SUT (no mission-timeout masquerade).
+
+    A duck-typed client with no ``images`` API is the legacy CPU fake (it never touches a
+    registry): nothing to pull or gate — logged (not silent), then skipped. Real docker
+    clients always expose ``images`` + ``api``, so that branch is CPU-test-only.
+    """
+    images = getattr(client, "images", None)
+    if images is None:
+        _log_image_ensure(image, kind, "no-images-api")
+        return "unknown"
+    if _image_present(images, image):
+        _log_image_ensure(image, kind, "present")
+        return "present"
+    _pull_with_liveness(
+        client, image, kind=kind, stall_timeout_s=stall_timeout_s, poll_interval_s=poll_interval_s
+    )
+    _log_image_ensure(image, kind, "pulled")
+    return "pulled"
+
+
 def run_job(
     job_spec: dict[str, Any],
     out_dir: Path,
@@ -454,6 +581,7 @@ def run_job(
     readiness_probe: ReadinessProbe | None = None,
     readiness_timeout_s: float = 120.0,
     job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+    pull_stall_timeout_s: float = DEFAULT_PULL_STALL_TIMEOUT_S,
     sut_restart_limit: int = 1,
     poll_interval_s: float = 1.0,
     ros_domain_id: int | None = None,
@@ -465,6 +593,15 @@ def run_job(
     placeholders (parameterized, not NFR claims): ``readiness_timeout_s`` covers the
     measured Isaac cold boot (~67.5s) with margin, ``job_timeout_s`` is a wall-clock
     runaway watchdog (the sim-time budget lives in the scenario, M1 §3.2).
+
+    Before any container is created BOTH images are made present (T2 a+b): a stalled
+    registry pull is bounded by a progress-liveness watchdog (``pull_stall_timeout_s`` — a
+    no-PROGRESS window, not a total cap) so a wedged pull fails the job in finite time
+    instead of hanging inside ``containers.run``'s implicit pull (history 2026-07-21
+    놀란점 3), and the SUT image being present GATES the runner start so the runner never
+    runs its mission against a still-pulling SUT. A stall/failure surfaces as
+    ``infra_error`` (FAILED), never a raise. A duck-typed client without an ``images`` API
+    (legacy CPU fake) skips the gate — logged, not silent.
 
     ``cache_root`` (or ``$CV_ISAAC_CACHE_ROOT``) mounts the host Isaac asset cache into
     the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;
@@ -556,6 +693,27 @@ def run_job(
     result_path: Path | None = None
     infra_error: str | None = None
     try:
+        # (a)+(b) T2: make BOTH images present BEFORE creating any docker resource. This
+        # bounds the pull by a progress-liveness watchdog (a wedged pull fails the job in
+        # finite time instead of hanging inside the implicit ``containers.run`` pull —
+        # history 놀란점 3), and gates start ORDER: the SUT image must be present before
+        # the runner container starts, so the runner never begins its mission against a
+        # still-pulling SUT. A stall/failure raises here and is absorbed as infra_error by
+        # the boundary below (FAILED — finite), with no container/network left behind.
+        _ensure_image_present(
+            client,
+            runner_image,
+            kind="runner",
+            stall_timeout_s=pull_stall_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        _ensure_image_present(
+            client,
+            sut_image,
+            kind="sut",
+            stall_timeout_s=pull_stall_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
         # Networks carry the same reconciliation labels as the containers so the
         # restart sweep (reconcile_at_restart, M3 §3.9) can find and remove them.
         # net_name was computed above (it also names the bind-safe job_dir).
@@ -1074,7 +1232,55 @@ def _read_result_doc(result_path: Path | None) -> dict[str, Any] | None:
         payload = json.loads(Path(result_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):  # unreadable / not JSON — includes JSONDecodeError
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    # (c) T2: the runner writes mcap/mp4 as CONTAINER-frame paths (under RESULT_OUT =
+    # RESULT_OUT_MOUNT); rewrite them to host-resolvable absolute paths so T1's uploader
+    # can stage them, consistent with ``result_json`` (already a host path). The RESULT_OUT
+    # dir is the parent of this result.json on the host (M2 ``resolve_result_path``:
+    # result.json lives directly under RESULT_OUT), which is the host side of the bind.
+    return _hostify_artifact_paths(payload, Path(result_path).parent)
+
+
+def _hostify_artifact_paths(doc: dict[str, Any], result_out_host_root: Path) -> dict[str, Any]:
+    """Rewrite the runner's CONTAINER-frame artifact paths to HOST-resolvable ones (T2 c).
+
+    The runner writes ``artifacts.mcap`` / ``artifacts.mp4`` as absolute paths under
+    ``RESULT_OUT`` (= ``RESULT_OUT_MOUNT`` inside the container), which is bind-mounted to
+    ``result_out_host_root`` on the host — so ``/cv/out/<rel>`` maps to
+    ``<host_root>/<rel>``. T1's uploader (``aggregate._select_artifacts`` ->
+    ``render_artifact_manifest``) stages off the HOST, so it needs the host path; before
+    this it got the raw container path and could not find the file. Field NAMES stay
+    unchanged (mcap/mp4) — only the value FRAME is corrected. A path NOT under the mount is
+    left verbatim (honest — never guess a mapping we cannot prove; G-26), and None stays
+    None (정직한 부재). Returns a NEW doc (input not mutated); a no-op returns it unchanged.
+    """
+    artifacts = doc.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return doc
+    rewritten = dict(artifacts)
+    changed = False
+    for key in ("mcap", "mp4"):
+        container_path = artifacts.get(key)
+        if isinstance(container_path, str) and container_path:
+            host_path = _container_to_host_path(container_path, result_out_host_root)
+            if host_path != container_path:
+                rewritten[key] = host_path
+                changed = True
+    if not changed:
+        return doc
+    new_doc = dict(doc)
+    new_doc["artifacts"] = rewritten
+    return new_doc
+
+
+def _container_to_host_path(container_path: str, result_out_host_root: Path) -> str:
+    """Map a ``RESULT_OUT_MOUNT``-relative container path to its host bind-mount path."""
+    try:
+        rel = PurePosixPath(container_path).relative_to(RESULT_OUT_MOUNT)
+    except ValueError:
+        return container_path  # not under the runner's RESULT_OUT mount — leave verbatim
+    return str(result_out_host_root.joinpath(*rel.parts))
 
 
 def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
