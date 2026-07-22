@@ -448,7 +448,11 @@ def create_app(
             store,
             envelope_id=record.envelope_id,
             trigger_source=record.trigger_source,  # 봉투 기록값 verbatim (재도출 금지)
-            max_mcap_bytes=None,  # 잡별 상한 TBD (결정 #2) — 수치 하드코딩 금지
+            # 잡별 상한 = 32 MiB provisional (결정 #2 · 실측-후-기입 §2-4). T3 p5c5 실측:
+            # 실 p5c4 bag 레이트 ~34–38 KB/s 상수 → 최악(scenario timeout 120s) ≈ 4.5–8 MB;
+            # 32 MiB는 4–7x 마진(정상 bag 미제외)·폭주(raw PointCloud2 >GB) 아래(오설정 bag 제외+경고).
+            # 실 120s consent 미션으로 확정 권고(decisions/2026-07-16-p5-artifact-return.md 결정2).
+            max_mcap_bytes=32 * 1024 * 1024,
         )
         store.save_report(record.envelope_id, report)  # ② 영속 BEFORE ③ advance
         for row in report["matrix"]:  # ③ advance-on-pass — values off the report rows
