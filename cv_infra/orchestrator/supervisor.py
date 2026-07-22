@@ -150,19 +150,49 @@ DEFAULT_JOB_TIMEOUT_S = 1800.0
 # (a)+(b) transport-gap repair (p5c5 T2, history 2026-07-21 놀란점 3): the SUT/runner
 # image pull is UPSTREAM of every existing watchdog. The wall-clock ``job_timeout_s``
 # only starts inside ``_supervise_until_runner_exit`` — AFTER the SUT container is
-# created — and ``containers.run`` pulls a missing image implicitly and BLOCKING, so a
-# wedged GHCR layer pull hung a live E2E 37 min+ with no watchdog firing, while the runner
+# created — and ``containers.run`` pulls a missing image implicitly and BLOCKING, so a slow
+# GHCR layer pull hung a live E2E 37 min+ with no watchdog firing, while the runner
 # meanwhile ran its mission against an absent SUT. ``run_job`` now makes both images PRESENT
 # before starting any container (so the runner never begins its mission with the SUT image
 # still pulling — the order gate), bounding the pull by a progress-LIVENESS watchdog.
 #
-# PLACEHOLDER default (operational, not an NFR claim — SAME discipline as
-# ``DEFAULT_JOB_TIMEOUT_S``): this is a no-PROGRESS window, NOT a total-pull cap. An active
-# pull emits a docker progress event per layer chunk far more often than this, so a
-# slow-but-moving 784 MB layer never trips it; a truly wedged registry connection terminates
-# the job in minutes, not the 37 min+ measured. The exact value pends T3 workstation
-# measurement of real GHCR pull progress cadence (실측-후-기입) — parameterized so it stays
-# tunable, never a magic constant asserted as measured.
+# PREMISE CORRECTION (p5c6 T0 진단, reports/deployment-2026-07-22-p5c6-stall-diag.md): the
+# p5c5 comment here called that pull "wedged" and anchored on a "~85 MB stall point". BOTH
+# are disproved — that pull SUCCEEDED (`~/cv-infra-ci/logs/sut-pull.log`: `Status: Downloaded
+# newer image`) and the only original record (`relay/bigblob.log`) shows 37 DIFFERENT interruption
+# offsets (1.4 MB ~ 183 MB), i.e. probabilistic, not a byte threshold. The measured mechanism
+# is PATH QUALITY: our GHCR blob is never resident on the Fastly IAD shield (`x-cache: MISS`,
+# hits=0), so every pull is a trans-Pacific origin fetch running 0.06~11 MB/s and collapsing
+# to ~0.1 MB/s for minutes. **The pull does not die, it legitimately crawls** — so this window
+# must be a no-PROGRESS window and must NEVER be a throughput floor (a throughput criterion
+# false-kills exactly the crawl that T0 measured completing: same blob, 784,530,364 B in
+# 71.07 s on a good draw, and 37 resumes to completion on a bad one).
+#
+# 실측-후-기입 (§2-4) — the value below is DERIVED, no longer a placeholder. Two measured
+# inputs, worst case composed:
+#   (I1) docker emits a pull progress event every ``min(512 KiB, 1% of layer)`` of RECEIVED
+#        bytes (emitter sits inside the layer reader — no bytes, no event), rate-capped by a
+#        ~100 ms throttle. LOCALLY MEASURED (docker 29.6.2, node:22, 58.6 MB layer): every
+#        observed byte delta >= 524288 with min 540672 = the 512 KiB floor plus one read
+#        chunk; median inter-event wall gap 0.095 s = the throttle. Event-DRIVEN, not a
+#        heartbeat (only ONE ``Waiting`` event across 5.4 s; max gap 0.834 s >> 100 ms), so a
+#        genuinely dead connection emits nothing and IS caught. Our SUT layer is 543~784 MB,
+#        so 1% > 512 KiB and the floor is exactly 512 KiB.
+#   (I2) worst SUSTAINED GHCR throughput measured at the target site: 1,315,639 B / 20 s =
+#        65,782 B/s = 0.06 MB/s (T0 `~/cv-infra-p2-out/p5c6/stall-diag/edge-matrix.log`).
+# => worst legitimate inter-event gap = 524288 / 65782 = 7.97 s. Layer concurrency does not
+#    widen it: the window is GLOBAL (any layer's event resets it), so the aggregate byte rate
+#    divided by 512 KiB is the event rate regardless of ``max-concurrent-downloads``.
+# => plus a CONSERVATIVE allowance for docker's download retry backoff, which T0 saw exercised
+#    37 times on this path: documented daemon defaults are 5 attempts with ``retries * 5`` s
+#    delay (5+10+15+20 = 50 s). Docker emits a "Retrying in Ns" status each second during it
+#    (which would reset the window), but that was NOT verified here — so it is counted as if
+#    fully SILENT.
+_PULL_WORST_NO_EVENT_GAP_S = 60.0  # ~= 7.97 (I1/I2 crawl) + 50 (silent-retry allowance)
+
+# Operational default = the measured worst case with a 5x margin. NOT an NFR claim and NOT a
+# total-pull cap (a cold origin fetch of 784 MB at 0.1 MB/s is ~2.2 h and is ALLOWED to run —
+# see the wall-clock note in ``run_job``); it bounds only "the registry stopped sending".
 DEFAULT_PULL_STALL_TIMEOUT_S = 300.0
 
 # Floor for the pull-monitor poll when ``poll_interval_s`` is 0 (the CPU-test knob for the
@@ -509,7 +539,8 @@ def _pull_with_liveness(
     the window, so only a genuinely wedged connection trips it (history 2026-07-21 놀란점 3).
     A registry/daemon error mid-pull is re-raised (surfaced as infra_error upstream).
     """
-    progress = {"at": time.monotonic()}  # dict item assign = atomic under the GIL
+    started = time.monotonic()
+    progress = {"at": started, "events": 0}  # dict item assign = atomic under the GIL
     finished = threading.Event()
     box: dict[str, Exception] = {}
 
@@ -517,6 +548,7 @@ def _pull_with_liveness(
         try:
             for _event in client.api.pull(image, stream=True, decode=True):
                 progress["at"] = time.monotonic()  # any progress event resets the window
+                progress["events"] += 1
         except Exception as exc:  # registry/daemon fault mid-pull — carry it back
             box["error"] = exc
         finally:
@@ -527,8 +559,15 @@ def _pull_with_liveness(
     wait_s = poll_interval_s if poll_interval_s > 0 else _PULL_MONITOR_MIN_INTERVAL_S
     while not finished.wait(wait_s):
         if time.monotonic() - progress["at"] >= stall_timeout_s:
+            # Carry the CRAWL-vs-DEAD discriminator into the reason string: T0 could not
+            # decide whether the 37 min+ hang was 0 B/s or a ~0.1 MB/s crawl because no
+            # such evidence was retained (G-24 재발 방지). ``events`` > 0 with a long
+            # elapsed = the registry WAS talking and then went silent; ``events`` == 0 =
+            # it never started (auth/manifest wedge).
             raise ImagePullStalled(
                 f"{kind} image {image} pull made no progress for {stall_timeout_s}s"
+                f" (progress events seen: {progress['events']},"
+                f" pull elapsed: {time.monotonic() - started:.1f}s)"
                 " — the registry pull is stalled; the job is failed in finite time instead"
                 " of hanging forever (history 2026-07-21 놀란점 3, T2 a)"
             )
@@ -596,12 +635,24 @@ def run_job(
 
     Before any container is created BOTH images are made present (T2 a+b): a stalled
     registry pull is bounded by a progress-liveness watchdog (``pull_stall_timeout_s`` — a
-    no-PROGRESS window, not a total cap) so a wedged pull fails the job in finite time
-    instead of hanging inside ``containers.run``'s implicit pull (history 2026-07-21
-    놀란점 3), and the SUT image being present GATES the runner start so the runner never
-    runs its mission against a still-pulling SUT. A stall/failure surfaces as
+    no-PROGRESS window, not a total cap) so a pull whose registry went SILENT fails the job
+    in finite time instead of hanging inside ``containers.run``'s implicit pull (history
+    2026-07-21 놀란점 3), and the SUT image being present GATES the runner start so the
+    runner never runs its mission against a still-pulling SUT. A stall/failure surfaces as
     ``infra_error`` (FAILED), never a raise. A duck-typed client without an ``images`` API
     (legacy CPU fake) skips the gate — logged, not silent.
+
+    WALL-CLOCK GAP (p5c6 T3 감사, 미해소 — PM 판단 대기): the pull phase is bounded by that
+    liveness window ALONE. ``job_timeout_s`` below starts only in
+    ``_supervise_until_runner_exit``, i.e. AFTER both containers exist, and the outer
+    ``ParallelSupervisor(job_timeout_s=...)`` ``wait_for`` — the only bound that DOES span
+    the pull — defaults to None and production never sets it (``create_app`` default,
+    ``serve.py`` does not pass one). So a legitimately CRAWLING pull (T0 측정: ~0.1 MB/s for
+    minutes, worst case ~2.2 h for 784 MB) is unbounded here BY DESIGN — killing it would
+    discard a pull that T0 measured completing. Whether an operator-visible wall-clock cap
+    on the pull phase should exist is a POLICY call (how long may a cold fetch run before we
+    fall back to degraded pre-staging?), not a liveness call, and is deliberately NOT
+    decided in this module.
 
     ``cache_root`` (or ``$CV_ISAAC_CACHE_ROOT``) mounts the host Isaac asset cache into
     the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;

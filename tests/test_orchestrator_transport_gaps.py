@@ -18,6 +18,13 @@ Three surgical fixes, all provable without docker/GPU against duck-typed fakes:
 The pull watchdog runs a daemon drain thread; a stalling fake blocks on an Event the test
 releases in teardown so no thread lingers. Stdlib + pytest only (no docker import — the
 image-absent exception is duck-typed by class NAME, exactly like the fake docker client).
+
+p5c6 T3 adds the **anti-false-kill pair** to (a): T0's diagnosis
+(reports/deployment-2026-07-22-p5c6-stall-diag.md) disproved the premise this watchdog was
+built on — the pull does not WEDGE, it legitimately CRAWLS (0.06~0.1 MB/s for minutes, then
+completes). So "kills a dead pull" alone is the wrong success criterion; the paired
+criterion "does NOT kill a live-but-slow pull" is now asserted at the shipped threshold
+ratio, and is mutation-provable (shrinking the constant fails it).
 """
 
 from __future__ import annotations
@@ -25,11 +32,13 @@ from __future__ import annotations
 import inspect
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from cv_infra.orchestrator.supervisor import (
+    _PULL_WORST_NO_EVENT_GAP_S,
     DEFAULT_PULL_STALL_TIMEOUT_S,
     RESULT_OUT_MOUNT,
     ImagePullStalled,
@@ -89,6 +98,26 @@ def _stalling_pull(release: threading.Event):
             release.wait()  # blocks the first next(); test releases it in teardown
             return
             yield  # unreachable — makes this a generator
+
+        return _gen()
+
+    return _make
+
+
+def _crawling_pull(n_events: int, cadence_s: float):
+    """A pull that is SLOW but ALIVE: `n_events` progress events, `cadence_s` apart.
+
+    This is the shape T0 actually measured on the GHCR path (0.06~0.1 MB/s crawl, minutes
+    long, completing) — the case the watchdog must NOT kill. Unlike ``_healthy_pull`` it
+    spans several stall windows in wall time, so it is only survivable when the window is
+    genuinely wider than the inter-event gap (non-vacuous: see the module docstring).
+    """
+
+    def _make():
+        def _gen():
+            for i in range(n_events):
+                time.sleep(cadence_s)
+                yield {"status": "Downloading", "id": "layer0", "progressDetail": {"current": i}}
 
         return _gen()
 
@@ -171,6 +200,74 @@ def test_pull_with_liveness_completes_when_progress_flows():
     # generous window: a healthy (progressing) pull must NOT be false-killed.
     _pull_with_liveness(client, SUT_IMAGE, kind="sut", stall_timeout_s=5.0, poll_interval_s=0.01)
     assert client.api.pull_calls == [SUT_IMAGE]
+
+
+# --------------------------------------------------------------------------- #
+# p5c6 T3 — anti-FALSE-KILL pair (G-35 쌍 규율)
+#
+# ``test_pull_with_liveness_completes_when_progress_flows`` above is NOT a false-kill
+# guard: its fake completes instantly, so it holds for ANY positive window — it survives
+# even an absurdly aggressive threshold (vacuous). The pair below replays the SHIPPED
+# derivation (DEFAULT_PULL_STALL_TIMEOUT_S vs the measured _PULL_WORST_NO_EVENT_GAP_S),
+# time-compressed 600x, against the shape T0 actually measured: a pull that CRAWLS at
+# 0.06~0.1 MB/s for minutes and COMPLETES. The compression factor is fixed on purpose —
+# shrinking the shipped constant shrinks the test window WITHOUT shrinking the crawl
+# cadence, so an aggressive threshold makes the functional test fail (mutation-provable).
+# --------------------------------------------------------------------------- #
+
+_COMPRESSION = 1 / 600.0
+_TEST_WINDOW_S = DEFAULT_PULL_STALL_TIMEOUT_S * _COMPRESSION  # 0.5 s at the shipped value
+_TEST_CRAWL_CADENCE_S = _PULL_WORST_NO_EVENT_GAP_S * _COMPRESSION  # 0.1 s
+_TEST_POLL_S = 0.01
+
+
+def test_slow_but_progressing_pull_is_not_false_killed():
+    """(기능) A crawling-but-ALIVE pull must SURVIVE the watchdog.
+
+    T0 measured this exact shape completing (the same 784,530,364 B blob finished in
+    71.07 s on a good draw and via 37 resumes on a bad one), so killing it would discard
+    a pull that was going to succeed.
+    """
+    client = TransportFakeClient(
+        pull_script={SUT_IMAGE: _crawling_pull(n_events=15, cadence_s=_TEST_CRAWL_CADENCE_S)}
+    )
+    started = time.monotonic()
+    _pull_with_liveness(
+        client,
+        SUT_IMAGE,
+        kind="sut",
+        stall_timeout_s=_TEST_WINDOW_S,
+        poll_interval_s=_TEST_POLL_S,
+    )
+    # Non-vacuity: the pull really did outlive SEVERAL stall windows (an instantly
+    # completing fake would satisfy the call above at any threshold).
+    assert time.monotonic() - started > _TEST_WINDOW_S * 2
+
+
+def test_truly_dead_pull_still_dies_in_finite_time_at_the_same_window():
+    """(안전) The twin of the test above at the SAME window: a registry that goes silent
+    is still terminated, so the functional guard cannot be satisfied by simply disabling
+    the watchdog (G-35 — a safety negative is true when the feature is off; a functional
+    landing assertion is not)."""
+    release = threading.Event()
+    client = TransportFakeClient(pull_script={SUT_IMAGE: _stalling_pull(release)})
+    started = time.monotonic()
+    try:
+        with pytest.raises(ImagePullStalled) as err:
+            _pull_with_liveness(
+                client,
+                SUT_IMAGE,
+                kind="sut",
+                stall_timeout_s=_TEST_WINDOW_S,
+                poll_interval_s=_TEST_POLL_S,
+            )
+    finally:
+        release.set()
+    elapsed = time.monotonic() - started
+    assert _TEST_WINDOW_S <= elapsed < _TEST_WINDOW_S * 10  # finite, bounded by the window
+    # The crawl-vs-dead discriminator is RETAINED in the reason (G-24 재발 방지: T0 could
+    # not tell whether the 37 min+ hang was 0 B/s or a crawl — no evidence was kept).
+    assert "progress events seen: 0" in str(err.value)
 
 
 def test_pull_registry_error_mid_stream_is_surfaced():
@@ -267,8 +364,13 @@ def test_legacy_fake_without_images_api_is_backward_compatible(tmp_path, capsys)
     assert len(lines) == 2 and all("no-images-api" in line for line in lines)
 
 
-def test_default_pull_stall_timeout_is_a_documented_placeholder():
-    # non-drift guard: run_job's default is the single module constant (실측-후-기입).
+def test_default_pull_stall_timeout_is_derived_from_measurement():
+    # 실측-후-기입 (§2-4, p5c6 T3): the shipped default is the MEASURED worst legitimate
+    # no-event gap with the documented 5x margin — derivation, measured inputs and 증적
+    # paths live on the constant in supervisor.py. Machine-checked so the margin cannot
+    # erode silently back into the false-kill zone.
+    assert DEFAULT_PULL_STALL_TIMEOUT_S >= _PULL_WORST_NO_EVENT_GAP_S * 5
+    # non-drift guard: run_job's default is the single module constant.
     assert inspect.signature(run_job).parameters["pull_stall_timeout_s"].default == (
         DEFAULT_PULL_STALL_TIMEOUT_S
     )
