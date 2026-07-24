@@ -31,11 +31,16 @@ production caller of the T1 reconciliation) -> app -> ONE structured
 ``serve-config`` stderr line (G-26 feature-on: k, mounts roots, consent key
 NAMES, reconciliation counts — assertable, never silent) -> uvicorn.
 
-No OUTER ``ParallelSupervisor`` watchdog is configured here (``job_timeout_s``
-stays None on ``create_app``): the production seam's own container watchdog
-(``run_job`` + ``RunJobRunner``'s TIMEOUT fold) owns the kill AND the
-classification, and an outer wait_for equal to the inner value would fire
-first and strand the executor thread (the p4c1 coherence gate's hazard).
+The OUTER ``ParallelSupervisor`` wall-clock watchdog IS configured here (p5c7 T2,
+decision 2026-07-24 D-2): ``build_app`` passes ``job_timeout_s=config.outer_wallclock_s``
+(default ``DEFAULT_OUTER_WALLCLOCK_S``, env ``CV_OUTER_WALLCLOCK_S``) to ``create_app`` — it
+is the ONLY bound that spans the image pull, which the inner ``run_job`` container watchdog
+does not cover (it starts only after both containers exist). Leaving it None used to make a
+legitimately crawling GHCR pull unbounded, hard-killed only by the CI job timeout's
+UNCLASSIFIED kill. The default is strictly > the inner watchdog (its measured derivation +
+surfaced assumptions live on the constant), so it satisfies the strict coherence gate; an
+env override that is <= the inner watchdog is refused loud by that gate (an equal outer
+wait_for fires first and strands the executor thread — the p4c1 coherence hazard).
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ from cv_infra.orchestrator.store import Store
 from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
     CACHE_SCRATCH_ROOT_ENV,
+    DEFAULT_OUTER_WALLCLOCK_S,
     RestartReconciliation,
     RunJobRunner,
     reconcile_at_restart,
@@ -69,6 +75,10 @@ MAX_CONCURRENT_ENV = "CV_MAX_CONCURRENT"
 VRAM_PER_INSTANCE_ENV = "CV_VRAM_PER_INSTANCE_MB"
 BIND_HOST_ENV = "CV_BIND_HOST"
 BIND_PORT_ENV = "CV_BIND_PORT"
+#: Outer wall-clock cap over the WHOLE job (pull(s) + mission) — the ONLY bound that spans the
+#: image pull (p5c7 T2, D-2). Unset = ``DEFAULT_OUTER_WALLCLOCK_S`` (MEASURED derivation on the
+#: constant); an override must stay strictly > the inner watchdog or the coherence gate refuses.
+OUTER_WALLCLOCK_ENV = "CV_OUTER_WALLCLOCK_S"
 
 _REQUIRED_ENVS = (STORE_PATH_ENV, OUT_DIR_ENV, RUNNER_IMAGE_ENV, MAX_CONCURRENT_ENV)
 
@@ -96,6 +106,7 @@ class ServeConfig:
     consent_env: dict[str, str]
     host: str
     port: int
+    outer_wallclock_s: float  # outer wall-clock cap over pull(s)+mission (default on unset)
 
 
 def _get(environ: Mapping[str, str], name: str) -> str | None:
@@ -137,6 +148,7 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
             " for store/artifacts/image/budget"
         )
     port = _number(environ, BIND_PORT_ENV, int)
+    outer_wallclock_s = _number(environ, OUTER_WALLCLOCK_ENV, float)
     return ServeConfig(
         store_path=required[STORE_PATH_ENV],
         out_dir=required[OUT_DIR_ENV],
@@ -148,6 +160,10 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
         consent_env={k: environ[k] for k in CONSENT_ENV_KEYS if k in environ},
         host=_get(environ, BIND_HOST_ENV) or _DEFAULT_BIND_HOST,
         port=port if port is not None else _DEFAULT_BIND_PORT,
+        # unset optional = documented default (T1 관례); set-but-empty/non-numeric = loud above.
+        outer_wallclock_s=(
+            outer_wallclock_s if outer_wallclock_s is not None else DEFAULT_OUTER_WALLCLOCK_S
+        ),
     )
 
 
@@ -191,16 +207,30 @@ def build_app(
         cache_scratch_root=config.cache_scratch_root,
         run_job_fn=run_job_fn,
     )
-    app = create_app(store, runner, k=k)
+    # p5c7 T2 (D-2): wire the OUTER wall-clock cap — the only bound spanning the image pull.
+    # It rides create_app -> ParallelSupervisor, whose strict coherence gate refuses an
+    # outer_wallclock_s that is not > the runner's inner watchdog (loud at first submit).
+    app = create_app(store, runner, k=k, job_timeout_s=config.outer_wallclock_s)
     if start_sampler:
         # M6 §3.4: the resident deployment's SOLE periodic NVML poller.
         attach_sampler(app, ResourceHealthSampler(store))
-    _log_serve_config(config, k=k, job_timeout_s=runner.job_timeout_s, recon=reconciliation)
+    _log_serve_config(
+        config,
+        k=k,
+        inner_watchdog_s=runner.job_timeout_s,
+        outer_wallclock_s=config.outer_wallclock_s,
+        recon=reconciliation,
+    )
     return app
 
 
 def _log_serve_config(
-    config: ServeConfig, *, k: int, job_timeout_s: float, recon: RestartReconciliation
+    config: ServeConfig,
+    *,
+    k: int,
+    inner_watchdog_s: float,
+    outer_wallclock_s: float,
+    recon: RestartReconciliation,
 ) -> None:
     """Feature-on gate (G-26): ONE structured stderr line summarizing the boot.
 
@@ -219,7 +249,8 @@ def _log_serve_config(
             "cache_root": config.cache_root,
             "cache_scratch_root": config.cache_scratch_root,
             "consent_env_present": sorted(config.consent_env),
-            "job_timeout_s": job_timeout_s,
+            "job_timeout_s": inner_watchdog_s,  # inner container watchdog (run_job / RunJobRunner)
+            "outer_wallclock_s": outer_wallclock_s,  # outer cap over pull(s)+mission (p5c7 T2)
             "reconciliation": {
                 "containers_removed": recon.containers_removed,
                 "networks_removed": recon.networks_removed,

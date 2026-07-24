@@ -26,6 +26,7 @@ CPU-only, fakes are all INJECTED duck-typed seams (G-20 — no module stubs):
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import io
 import json
@@ -53,6 +54,7 @@ from cv_infra.orchestrator.supervisor import (
     _REASON_MAX_CHARS,  # NEG 가드: 사유 문자열 상한 (테스트가 상수를 재타이핑하지 않게)
     _TRUNCATION_SUFFIX,
     DEFAULT_JOB_TIMEOUT_S,
+    DEFAULT_OUTER_WALLCLOCK_S,
     JOB_TIMEOUT_MARKER,
     JobOutcome,
     ParallelSupervisor,
@@ -348,22 +350,148 @@ def test_spec_less_job_is_loud_never_a_silent_noop(tmp_path):
 
 
 def test_wrapper_declares_its_watchdog_to_the_coherence_gate(tmp_path):
-    """T1 워치독 정합 게이트 계약 (b): the production wrapper's ``job_timeout_s``
-    attribute IS the duck-typed declaration — a shorter outer watchdog is
-    rejected at construction, the default equals run_job's single constant."""
+    """T1 워치독 정합 게이트 계약 (b, strict-ened p5c7 T2): the production wrapper's
+    ``job_timeout_s`` attribute IS the duck-typed declaration — an outer watchdog
+    that is NOT strictly greater (shorter OR equal) is rejected at construction,
+    the default equals run_job's single constant."""
     runner = RunJobRunner(out_dir=tmp_path, runner_image="r:t")
     assert runner.job_timeout_s == DEFAULT_JOB_TIMEOUT_S
-    queue = JobQueue(fan_out(["r"], repeats=1))
-    with pytest.raises(ValueError, match="watchdog"):
-        ParallelSupervisor(
-            queue, SlotAccountant(k=1), runner, job_timeout_s=DEFAULT_JOB_TIMEOUT_S - 1
-        )
-    ParallelSupervisor(  # outer >= inner (or None, serve.py's choice) is accepted
+    for outer in (DEFAULT_JOB_TIMEOUT_S - 1, DEFAULT_JOB_TIMEOUT_S):  # shorter AND equal now raise
+        with pytest.raises(ValueError, match="strictly greater"):
+            ParallelSupervisor(
+                JobQueue(fan_out(["r"], repeats=1)),
+                SlotAccountant(k=1),
+                runner,
+                job_timeout_s=outer,
+            )
+    ParallelSupervisor(  # outer strictly > inner (or None, serve.py's choice) is accepted
         JobQueue(fan_out(["r2"], repeats=1)),
         SlotAccountant(k=1),
         runner,
-        job_timeout_s=DEFAULT_JOB_TIMEOUT_S,
+        job_timeout_s=DEFAULT_JOB_TIMEOUT_S + 1,
     )
+
+
+# --------------------------------------------------------------------------- #
+# p5c7 T2 — outer wall-clock cap over pull(s)+mission (decision 2026-07-24 D-2).
+# The fix wires serve.build_app -> create_app -> ParallelSupervisor.job_timeout_s,
+# the ONLY bound that spans the image pull (the inner container watchdog starts
+# only AFTER both containers exist, so it never covers the pull). Three proofs:
+#   (1) pull-cover: a run_job hung/crawling in the pull phase terminates in FINITE
+#       time classified INFRA (verdict-less TIMEOUT), NEVER a SUT verdict (P5-13);
+#   (2) strict gate at the shipped values (outer <= inner refused);
+#   (3) anti-false-kill, MUTATION-proven (G-35): a pull+mission completing WITHIN
+#       the cap passes, and the SAME fake flips to TIMEOUT below the threshold.
+# --------------------------------------------------------------------------- #
+
+
+def _blocking_pull_run_job_fn(block_s: float):
+    """A run_job stand-in that BLOCKS ``block_s`` inside the image-pull phase — the
+    window UPSTREAM of the inner container watchdog that had no wall-clock cap. It
+    returns a NON-marker infra_error, so if the outer watchdog did NOT fire first the
+    fold would read FAILED, not TIMEOUT — the state assertion is therefore non-vacuous."""
+
+    def _fn(*args, **kwargs):
+        time.sleep(block_s)  # bounded so asyncio.run joins the executor thread quickly
+        return JobOutcome(args[0]["job_id"], None, None, "pull returned after the outer cap")
+
+    return _fn
+
+
+def _completing_pull_run_job_fn(crawl_s: float, result_path: Path):
+    """A run_job stand-in whose pull+mission COMPLETES after ``crawl_s`` (a slow but
+    LIVE crawl) and returns a real pass result — the shape the cap must NOT kill."""
+
+    def _fn(*args, **kwargs):
+        time.sleep(crawl_s)
+        return JobOutcome(args[0]["job_id"], result_path, 0, None)
+
+    return _fn
+
+
+def _outer_run(runner: RunJobRunner, *, outer_wallclock_s: float) -> JobResult:
+    supervisor = ParallelSupervisor(
+        JobQueue([_specced_job()]), SlotAccountant(k=1), runner, job_timeout_s=outer_wallclock_s
+    )
+    (result,) = asyncio.run(supervisor.run())
+    return result
+
+
+def test_outer_wallclock_bounds_a_hung_pull_to_a_finite_infra_outcome(tmp_path):
+    """(1)+(4): a run_job hung in the pull phase is terminated by the WIRED outer
+    wall-clock in finite time (무한 running 0), and the outcome is infra (verdict-less
+    TIMEOUT), never mistaken for a SUT judgement (exit-1, P5-13). inner scaled down (a
+    real crawl is upstream of it anyway); outer strictly > inner so the strict gate
+    accepts it, and both tiny so the test is fast."""
+    runner = RunJobRunner(
+        out_dir=tmp_path,
+        runner_image="r:t",
+        job_timeout_s=0.01,
+        run_job_fn=_blocking_pull_run_job_fn(block_s=0.3),
+    )
+    started = time.monotonic()
+    result = _outer_run(runner, outer_wallclock_s=0.05)
+    elapsed = time.monotonic() - started
+    assert result.state is JobState.TIMEOUT  # watchdog won (a returned outcome would be FAILED)
+    assert elapsed < 5.0  # finite — no unbounded hang
+    assert result.verdict is None  # NOT a SUT verdict — errored/exit-3 territory (P5-13)
+    assert result.infra_error is not None and JOB_TIMEOUT_MARKER in result.infra_error
+
+
+def test_shipped_outer_default_passes_the_strict_gate_but_equal_inner_is_refused(tmp_path):
+    """(2) strict gate at the SHIPPED values: the production RunJobRunner (inner =
+    DEFAULT_JOB_TIMEOUT_S) with the shipped outer default constructs, but an outer set
+    EQUAL to the inner is refused — the p4c1 hazard the strict-ening closes."""
+    runner = RunJobRunner(out_dir=tmp_path, runner_image="r:t")  # inner = DEFAULT_JOB_TIMEOUT_S
+    assert DEFAULT_OUTER_WALLCLOCK_S > runner.job_timeout_s  # the shipped default is coherent
+    ParallelSupervisor(  # so it constructs
+        JobQueue([_specced_job()]),
+        SlotAccountant(k=1),
+        runner,
+        job_timeout_s=DEFAULT_OUTER_WALLCLOCK_S,
+    )
+    with pytest.raises(ValueError, match="strictly greater"):
+        ParallelSupervisor(
+            JobQueue([_specced_job()]),
+            SlotAccountant(k=1),
+            runner,
+            job_timeout_s=runner.job_timeout_s,  # outer == inner
+        )
+
+
+def test_outer_wallclock_does_not_false_kill_a_pull_that_completes_in_time(tmp_path):
+    """(3) anti-false-kill, MUTATION-proven (G-35). The SAME slow-but-completing crawl
+    PASSES under a cap ABOVE it and is KILLED under a cap BELOW it — so the guard is not
+    vacuous (a completing fake would satisfy 'passes' at ANY positive threshold otherwise)."""
+    result_json = tmp_path / "result.json"
+    result_json.write_text(json.dumps({"job_id": "req-a:0", "verdict": "pass"}), encoding="utf-8")
+    crawl_s = 0.2
+
+    def _runner():  # inner tiny; a fresh runner per run (single-use queue/spec)
+        return RunJobRunner(
+            out_dir=tmp_path,
+            runner_image="r:t",
+            job_timeout_s=0.01,
+            run_job_fn=_completing_pull_run_job_fn(crawl_s, result_json),
+        )
+
+    # cap ABOVE the crawl: completes with its real domain verdict (not killed).
+    passed = _outer_run(_runner(), outer_wallclock_s=crawl_s * 5)
+    assert passed.state is JobState.COMPLETED and passed.verdict is Verdict.PASS
+    # MUTATION: cap BELOW the crawl -> the identical fake is killed (verdict-less TIMEOUT).
+    killed = _outer_run(_runner(), outer_wallclock_s=crawl_s / 4)
+    assert killed.state is JobState.TIMEOUT and killed.verdict is None
+
+
+def test_serve_config_wires_the_outer_wallclock_env_override(tmp_path):
+    """The env override rides config -> build_app -> the ParallelSupervisor watchdog: an
+    operator on a fast link can tighten the 'fall back to pre-staging' deadline, but the
+    value still flows as the outer cap (asserted via the boot log + the config field)."""
+    override = str(DEFAULT_JOB_TIMEOUT_S + 500)  # a coherent (> inner) custom deadline
+    config = _serve_config(tmp_path, CV_OUTER_WALLCLOCK_S=override)
+    assert config.outer_wallclock_s == float(override)
+    # unset = documented default (T1 관례)
+    assert _serve_config(tmp_path).outer_wallclock_s == DEFAULT_OUTER_WALLCLOCK_S
 
 
 # --------------------------------------------------------------------------- #
@@ -422,6 +550,8 @@ def test_missing_required_envs_are_reported_together():
         {"CV_MAX_CONCURRENT": "eight"},
         {"CV_VRAM_PER_INSTANCE_MB": " "},
         {"CV_BIND_PORT": "http"},
+        {"CV_OUTER_WALLCLOCK_S": ""},  # p5c7 T2: set-but-empty outer cap is loud
+        {"CV_OUTER_WALLCLOCK_S": "soon"},  # non-numeric is loud
     ],
 )
 def test_bad_env_values_are_loud(overrides):
@@ -501,7 +631,11 @@ def test_build_app_computes_k_and_emits_the_serve_config_line(tmp_path, capsys):
     assert body["k"] == 4  # min(max_concurrent 8, floor(35000/8000)=4)
     assert body["max_concurrent"] == 8
     assert body["runner_image"] == "runner:test"
-    assert body["job_timeout_s"] == DEFAULT_JOB_TIMEOUT_S  # the wrapper's declaration, 1 source
+    assert body["job_timeout_s"] == DEFAULT_JOB_TIMEOUT_S  # inner watchdog, the wrapper's decl
+    # p5c7 T2: the outer wall-clock cap is wired + logged (operator-visible), and it is
+    # strictly greater than the inner watchdog (satisfies the strict coherence gate).
+    assert body["outer_wallclock_s"] == DEFAULT_OUTER_WALLCLOCK_S
+    assert body["outer_wallclock_s"] > body["job_timeout_s"]
     assert body["consent_env_present"] == ["ACCEPT_EULA"]
     assert "operator-consent-token" not in err  # value never rides any log (G-21)
 
