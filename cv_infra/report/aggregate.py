@@ -36,7 +36,7 @@ from cv_infra.report.regression import STATUS_REGRESSED, identity_key, judge_reg
 #: Artifact selection policy provenance (decisions/2026-07-16-p5-artifact-return.md).
 _ARTIFACT_POLICY = (
     "failures-all + representative-pass-1 (결정 #1); per-job MCAP 상한 초과 시 제외+경고,"
-    " 부분 bag 트렁케이션 금지 (결정 #2, 상한 수치 TBD 실측 후); retention = GitHub Actions"
+    " 부분 bag 트렁케이션 금지 (결정 #2, 상한 = 32 MiB provisional); retention = GitHub Actions"
     " 기본값 재사용 (결정 #3). 실제 업로드/용량 측정은 M8 plane."
 )
 
@@ -73,8 +73,8 @@ def build_report(
     """Assemble the VerificationReport dict (§3.4) for one envelope.
 
     ``store`` is the internal cv-infra store — the ONLY baseline source (C-1).
-    ``max_mcap_bytes`` is the per-job MCAP cap (결정 #2); ``None`` = cap not set
-    (TBD 실측 후) -> no exclusions. This function is READ-ONLY w.r.t. baselines;
+    ``max_mcap_bytes`` is the per-job MCAP cap (결정 #2, 32 MiB provisional in api.py);
+    ``None`` = no cap -> no exclusions. This function is READ-ONLY w.r.t. baselines;
     advancing them for future runs is a separate ``baseline.update_baseline`` call.
     """
     generated_at = generated_at or datetime.now(UTC).isoformat()
@@ -242,8 +242,9 @@ def _select_artifacts(results: list[dict[str, Any]], max_mcap_bytes: int | None)
 def _apply_mcap_cap(entry: dict[str, Any], size_bytes: int | None, cap_bytes: int | None) -> None:
     """결정 #2: over-cap MCAP -> exclude from upload + warn (no truncation).
 
-    No-op when the cap is unset (TBD 실측 후) or the size is unknown (M8 measures on
-    its plane) — this cycle expresses the POLICY, not a hardcoded 상한 수치."""
+    No-op when the cap is unset (caller passed ``None``) or the size is unknown (M8
+    measures on its plane) — this file expresses the POLICY and receives the cap as a
+    param (32 MiB provisional wired in api.py), never hardcoding 상한 수치 here."""
     if cap_bytes is None or size_bytes is None:
         return
     if entry["rosbag_mcap"] is not None and size_bytes > cap_bytes:
