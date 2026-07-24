@@ -383,12 +383,19 @@ def test_supervisor_watchdog_shorter_than_runner_watchdog_is_loud():
         make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), job_timeout_s=1.0)
 
 
-def test_supervisor_watchdog_equal_or_longer_is_accepted_and_runs():
-    # equal is the >= boundary; longer is the normal production shape
-    for outer in (5.0, 9.0):
-        supervisor = make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), outer)
-        (result,) = asyncio.run(supervisor.run())
-        assert result.state is JobState.COMPLETED
+def test_supervisor_watchdog_equal_to_runner_watchdog_is_loud():
+    # strict-ened p5c7 T2: EQUAL is now refused (an equal outer wait_for fires at the same
+    # instant the inner would, before the inner can kill -> executor thread + live container
+    # stranded). Previously this pair was silently accepted (the p4c1 후속 ② hazard).
+    with pytest.raises(ValueError, match="strictly greater"):
+        make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), job_timeout_s=5.0)
+
+
+def test_supervisor_watchdog_strictly_longer_is_accepted_and_runs():
+    # strictly > inner is the normal production shape (the only accepted combination now).
+    supervisor = make_supervisor(InnerWatchdogRunner(job_timeout_s=5.0), job_timeout_s=9.0)
+    (result,) = asyncio.run(supervisor.run())
+    assert result.state is JobState.COMPLETED
 
 
 def test_watchdog_gate_skips_when_either_side_is_undeclared():

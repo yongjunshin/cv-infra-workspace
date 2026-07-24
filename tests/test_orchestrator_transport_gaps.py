@@ -38,7 +38,10 @@ from pathlib import Path
 import pytest
 
 from cv_infra.orchestrator.supervisor import (
+    _PULL_WORST_CRAWL_S,
     _PULL_WORST_NO_EVENT_GAP_S,
+    DEFAULT_JOB_TIMEOUT_S,
+    DEFAULT_OUTER_WALLCLOCK_S,
     DEFAULT_PULL_STALL_TIMEOUT_S,
     RESULT_OUT_MOUNT,
     ImagePullStalled,
@@ -375,6 +378,20 @@ def test_default_pull_stall_timeout_is_derived_from_measurement():
         DEFAULT_PULL_STALL_TIMEOUT_S
     )
     assert DEFAULT_PULL_STALL_TIMEOUT_S > 0
+
+
+def test_default_outer_wallclock_is_derived_and_strictly_over_inner():
+    # 실측-후-기입 (§2-4, p5c7 T2 / decision 2026-07-24 D-2): the outer wall-clock cap =
+    # the worst legitimate single-image crawl (largest SUT layer / worst SUSTAINED trough,
+    # from p5c6 T0 preserved evidence) + the inner mission budget. Machine-checked so the
+    # derivation cannot erode: (a) it stays STRICTLY > the inner watchdog — else the strict
+    # coherence gate would refuse the shipped production default; (b) the crawl term is the
+    # measured worst case and stays ABOVE the 0.1 MB/s / 2.2 h canonical (more conservative,
+    # so it will not false-kill the crawl T0 measured completing).
+    assert DEFAULT_OUTER_WALLCLOCK_S == _PULL_WORST_CRAWL_S + DEFAULT_JOB_TIMEOUT_S
+    assert DEFAULT_OUTER_WALLCLOCK_S > DEFAULT_JOB_TIMEOUT_S  # strict coherence gate holds
+    assert _PULL_WORST_CRAWL_S == 784_530_364 / 65_782  # (M1 largest layer) / (M2 0.06 MB/s trough)
+    assert _PULL_WORST_CRAWL_S > 784_530_364 / 100_000  # > 2.2 h (0.1 MB/s canonical) => headroom
 
 
 # --------------------------------------------------------------------------- #

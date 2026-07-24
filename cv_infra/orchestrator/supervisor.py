@@ -191,13 +191,62 @@ DEFAULT_JOB_TIMEOUT_S = 1800.0
 _PULL_WORST_NO_EVENT_GAP_S = 60.0  # ~= 7.97 (I1/I2 crawl) + 50 (silent-retry allowance)
 
 # Operational default = the measured worst case with a 5x margin. NOT an NFR claim and NOT a
-# total-pull cap (a cold origin fetch of 784 MB at 0.1 MB/s is ~2.2 h and is ALLOWED to run —
-# see the wall-clock note in ``run_job``); it bounds only "the registry stopped sending".
+# total-pull cap: it bounds only "the registry stopped sending". A cold origin fetch of the
+# 784 MB layer legitimately CRAWLS (~0.1 MB/s for minutes) and is ALLOWED to run — up to the
+# TOTAL wall-clock cap the outer watchdog now enforces (``DEFAULT_OUTER_WALLCLOCK_S`` below,
+# wired by serve.py — p5c7 T2, D-2; previously the crawl was unbounded, run_job WALL-CLOCK note).
 DEFAULT_PULL_STALL_TIMEOUT_S = 300.0
 
 # Floor for the pull-monitor poll when ``poll_interval_s`` is 0 (the CPU-test knob for the
 # tight readiness/supervise loops would hot-spin the pull monitor otherwise).
 _PULL_MONITOR_MIN_INTERVAL_S = 0.05
+
+# --- outer wall-clock cap over the WHOLE job = pull(s) + mission (p5c7 T2, decision
+# 2026-07-24 D-2 옵션 b) --------------------------------------------------------------------
+#
+# The pull phase had NO wall-clock cap: ``job_timeout_s`` (inner, above) starts only inside
+# ``_supervise_until_runner_exit`` AFTER both containers exist, and the ONLY bound that spans
+# the pull — the outer ``ParallelSupervisor(job_timeout_s=)`` wait_for — was never wired in
+# production (``serve.build_app`` did not pass it -> None -> OFF). So a legitimately CRAWLING
+# GHCR pull (T0: ~0.1 MB/s for minutes) was unbounded, hard-killed only by the CI job timeout's
+# UNCLASSIFIED kill. serve.py now wires this default; a crawl past it is classified TIMEOUT
+# (verdict-less infra -> errored/exit-3, never a SUT fail — P5-13), replacing that unclassified
+# hard-kill.
+#
+# 실측-후-기입 (§2-4) — DERIVED from p5c6 T0 PRESERVED evidence (workstation
+# ``~/cv-infra-p2-out/p5c6/stall-diag/``, indexed by ``EVIDENCE-INDEX.md``), NOT a placeholder:
+#   (M1) largest SUT layer = 784,530,364 B (``A-manifest.log``) — the blob that crawled AND
+#        completed (``run1.nohup`` control: full blob in 71.07 s on a good draw; ``relay/
+#        bigblob.log``: 37 range-resumes to completion on a bad one). Killing a pull shorter
+#        than its legitimate crawl would discard exactly what T0 measured completing.
+#   (M2) worst SUSTAINED GHCR throughput measured = 1,315,639 B / 20 s = 65,782 B/s = 0.06 MB/s
+#        (``edge-matrix.log`` round 2, edge 185.199.108.154). This is the TROUGH: no measured
+#        pull actually sat there for its whole duration (they RAMP 10.46 -> 82.49 MB/s,
+#        ``longitudinal.log``; the reproduced collapse ``run2-final-state.log`` still averaged
+#        193 MB / 170 s = 1.14 MB/s), so applying the trough to the WHOLE largest layer is a
+#        pessimistic UPPER bound on a legitimate crawl — it will not false-kill a real one.
+# => worst legitimate single-image crawl = (M1) / (M2) = 784,530,364 / 65,782 ~= 11,927 s ~= 3.31 h.
+_PULL_WORST_CRAWL_S = 784_530_364 / 65_782  # ~= 11927 s (M1 / M2)
+#
+# ASSUMPTIONS SURFACED (karpathy — this deadline is a TRADE-OFF, not a fact):
+#   * the pull wall-clock is dominated by the LARGEST single layer at the worst per-flow
+#     trough; the SUT's smaller layers download concurrently (docker max-concurrent-downloads)
+#     and overlap it, and a fresh flow keeps its own bandwidth (``concurrent-probe.log``:
+#     1.32 MB/s WHILE run2 crawled), so they do not extend the wall-clock beyond the big layer.
+#   * exactly ONE image is a cold trans-Pacific GHCR crawl in production: the SUT (the consumer
+#     publishes it to GHCR). The runner (Isaac) image is workstation-built / pre-staged
+#     (``_ensure_image_present`` returns "present", no pull). If BOTH were cold GHCR crawls the
+#     pull term would need doubling — an operator on that footing raises ``CV_OUTER_WALLCLOCK_S``.
+#   * too SHORT false-kills the crawl T0 measured completing (D-2 c: "답은 deadline이지 처리율
+#     바닥이 아니다"); too LONG delays the fall-back to degraded pre-staging. 0.06 MB/s (vs the
+#     0.1 MB/s / 2.2 h canonical) builds in ~4,082 s of headroom that also absorbs the readiness
+#     gate (120 s) + spawn, so the cap needs no separate readiness term.
+#
+# Operational default (NOT an NFR claim): worst legitimate crawl + the inner mission budget, so
+# a genuine crawl-THEN-full-mission is never false-killed. > the inner watchdog by construction,
+# so it satisfies the strict coherence gate (``ParallelSupervisor.__init__``). env-overridable
+# (``CV_OUTER_WALLCLOCK_S``) but any override must stay strictly > the inner watchdog.
+DEFAULT_OUTER_WALLCLOCK_S = _PULL_WORST_CRAWL_S + DEFAULT_JOB_TIMEOUT_S  # ~= 13727 s ~= 3.81 h
 
 
 class ImagePullStalled(RuntimeError):
@@ -642,17 +691,20 @@ def run_job(
     ``infra_error`` (FAILED), never a raise. A duck-typed client without an ``images`` API
     (legacy CPU fake) skips the gate — logged, not silent.
 
-    WALL-CLOCK GAP (p5c6 T3 감사, 미해소 — PM 판단 대기): the pull phase is bounded by that
-    liveness window ALONE. ``job_timeout_s`` below starts only in
-    ``_supervise_until_runner_exit``, i.e. AFTER both containers exist, and the outer
-    ``ParallelSupervisor(job_timeout_s=...)`` ``wait_for`` — the only bound that DOES span
-    the pull — defaults to None and production never sets it (``create_app`` default,
-    ``serve.py`` does not pass one). So a legitimately CRAWLING pull (T0 측정: ~0.1 MB/s for
-    minutes, worst case ~2.2 h for 784 MB) is unbounded here BY DESIGN — killing it would
-    discard a pull that T0 measured completing. Whether an operator-visible wall-clock cap
-    on the pull phase should exist is a POLICY call (how long may a cold fetch run before we
-    fall back to degraded pre-staging?), not a liveness call, and is deliberately NOT
-    decided in this module.
+    WALL-CLOCK CAP (p5c6 T3 감사 -> p5c7 T2 수리, decision 2026-07-24 D-2): the pull phase is
+    bounded by that liveness window PLUS the outer wall-clock cap. ``job_timeout_s`` below
+    starts only in ``_supervise_until_runner_exit``, i.e. AFTER both containers exist, so it
+    never covers the pull; the bound that DOES span the pull is the outer
+    ``ParallelSupervisor(job_timeout_s=...)`` ``wait_for``, and ``serve.build_app`` now wires it
+    to ``DEFAULT_OUTER_WALLCLOCK_S`` (env ``CV_OUTER_WALLCLOCK_S``) — previously it passed None
+    (watchdog OFF) and a legitimately CRAWLING pull (T0 측정: ~0.1 MB/s for minutes) was hard-
+    killed only by the CI job timeout's UNCLASSIFIED kill. The cap = the worst legitimate crawl
+    T0 measured completing + the inner mission budget (see ``DEFAULT_OUTER_WALLCLOCK_S`` for the
+    measured derivation + surfaced assumptions), so a real crawl-then-mission is NOT false-killed;
+    a pull that crawls PAST the cap is classified TIMEOUT (verdict-less infra outcome ->
+    errored/exit-3, never a SUT judgement — P5-13). The POLICY question (how long may a cold
+    fetch run before we fall back to degraded pre-staging?) is answered by that operator-tunable
+    deadline, NOT by the liveness window (which bounds only "the registry went silent").
 
     ``cache_root`` (or ``$CV_ISAAC_CACHE_ROOT``) mounts the host Isaac asset cache into
     the runner (FU-16 / D-1) so the scene closure downloads once instead of every job;
@@ -1017,13 +1069,14 @@ class ParallelSupervisor:
       runner seam's own watchdog + finally-teardown (``run_job(job_timeout_s=)``)
       — this layer only classifies; sim-time mission timeouts stay M2-owned
       (D-F, never judged on wall-clock).
-    * **dual-watchdog coherence** (p4c1 후속 ②): this outer watchdog must be
-      **>= the runner seam's own container watchdog**, else ``wait_for`` fires
-      first and strands the executor thread + a live container until the inner
-      watchdog catches up. A runner seam that owns an inner watchdog declares
-      it via a ``job_timeout_s`` attribute (duck-typed — production run_job
-      wrappers MUST expose it); a violating combination raises at construction,
-      never silently.
+    * **dual-watchdog coherence** (p4c1 후속 ②, strict-ened p5c7 T2): this outer
+      watchdog must be **strictly > the runner seam's own container watchdog**,
+      else ``wait_for`` fires first (an EQUAL outer fires at the same instant the
+      inner would, before the inner can kill) and strands the executor thread + a
+      live container until the inner watchdog catches up. A runner seam that owns
+      an inner watchdog declares it via a ``job_timeout_s`` attribute (duck-typed
+      — production run_job wrappers MUST expose it); a violating combination
+      (outer <= inner) raises at construction, never silently.
     * **completion path**: the slot token and domain id are reclaimed FIRST,
       then the retry policy (``JobQueue.record_outcome``) decides re-queue vs
       terminal — a freed slot is immediately re-assignable to a waiting job
@@ -1054,13 +1107,14 @@ class ParallelSupervisor:
         if (
             job_timeout_s is not None
             and inner_watchdog_s is not None
-            and job_timeout_s < inner_watchdog_s
+            and job_timeout_s <= inner_watchdog_s
         ):
             raise ValueError(
-                f"supervisor watchdog ({job_timeout_s}s) is shorter than the runner seam's"
-                f" own container watchdog ({inner_watchdog_s}s) — the outer wait_for would"
-                " fire first and strand the executor thread + live container (p4c1 후속 ②:"
-                " ParallelSupervisor watchdog must be >= run_job's)"
+                f"supervisor watchdog ({job_timeout_s}s) is not strictly greater than the"
+                f" runner seam's own container watchdog ({inner_watchdog_s}s) — an equal or"
+                " shorter outer wait_for fires first and strands the executor thread + live"
+                " container (p4c1 후속 ②, strict-ened p5c7 T2: ParallelSupervisor watchdog"
+                " must be strictly > run_job's)"
             )
         self._queue = queue
         self._slots = slots
