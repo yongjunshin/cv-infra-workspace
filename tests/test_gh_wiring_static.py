@@ -242,11 +242,7 @@ def _report_with_artifacts(tmp_path) -> dict[str, Any]:
 
 
 def _staged_relpaths(staging_dir) -> set[str]:
-    return {
-        p.relative_to(staging_dir).as_posix()
-        for p in staging_dir.rglob("*")
-        if p.is_file()
-    }
+    return {p.relative_to(staging_dir).as_posix() for p in staging_dir.rglob("*") if p.is_file()}
 
 
 def test_stage_artifacts_stages_only_uploads(tmp_path):
