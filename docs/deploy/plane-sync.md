@@ -115,10 +115,43 @@ peel을 대조하고, 어긋나면 loud fail(exit 3, fail-closed). **읽기 대�
       `runner_image`·`max_concurrent`·`cache_root`·`consent_env_present`가 재기동 전과
       동일 ② `GET /monitor.json` 200 + `gpu_reachable` 관찰값 기록 ③ 같은 응답의
       `requests[]`에 이전 봉투가 그대로 보이는지(= store 연속성).
-      **[VERIFY]** 정확한 재기동 **명령줄**은 여전히 미확정이다 — 2026-08-03 T1은 위
-      3제약과 부팅 env 계약(`serve-config` 한 줄에 값이 전부 있다)까지 실측했으나,
-      consent 값이 운영자 소유라 **실집행하지 못했다**. 다음 운영자 실행 때 그 명령을
-      여기에 확정 기입한다(발명 금지 — G-24).
+      **확정 명령줄**(2026-08-03 운영자 실집행·PM 확인 — 이전 `[VERIFY]` 해소). 값은
+      전부 재기동 **전** `serve-config`에서 그대로 옮긴 것이고, `<consent>` 2곳만
+      운영자가 실행 시점에 채운다(Isaac 엔트리포인트 `license.sh`가 보는 값 — 저장소에
+      리터럴로 박지 않는다, NEG-2):
+
+      ```bash
+      docker stop -t 30 <old-serve-container>          # 비파괴: stop만, rm 금지
+      docker run -d --name <new-serve-container> --gpus all \
+        -e NVIDIA_DRIVER_CAPABILITIES=utility -p 127.0.0.1:8000:8000 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v <src-root>:<src-root> -v <out-root>:<out-root> -v <ci-root>:<ci-root> \
+        -v <cache-root>:<cache-root>:ro \
+        -v <runner-work>:<runner-work>:ro -v <runner-user-work>:<runner-user-work>:ro \
+        python:3.11-slim sleep infinity
+      docker exec <new-serve-container> <ci-venv>/bin/python \
+        -c "import pynvml; pynvml.nvmlInit(); print('nvml-ok')"   # ← 실패하면 여기서 멈춘다
+      docker exec -d \
+        -e CV_STORE_PATH=<store> -e CV_OUT_DIR=<out> -e CV_RUNNER_IMAGE=<runner-image> \
+        -e CV_MAX_CONCURRENT=<k> -e CV_VRAM_PER_INSTANCE_MB=<mb> \
+        -e CV_ISAAC_CACHE_ROOT=<cache> -e CV_ISAAC_CACHE_SCRATCH_ROOT=<scratch> \
+        -e CV_BIND_HOST=0.0.0.0 -e CV_BIND_PORT=8000 \
+        -e ACCEPT_EULA=<consent> -e PRIVACY_CONSENT=<consent> \
+        <new-serve-container> sh -c '<ci-venv>/bin/python -m cv_infra.orchestrator.serve \
+          >> <ci-root>/logs/<serve-log> 2>&1'
+      ```
+
+      **NVML 스모크(3번째 명령)를 건너뛰지 마라** — 이게 "부팅이 loud 실패할지"를
+      *serve를 띄우기 전에* 가르는 유일한 지점이다.
+
+      실집행 관측(2026-08-03, `cv-p5c6-ci` → `cv-p5c8-ci`): `nvml-ok` → serve-config에
+      `store_path` 동일·`consent_env_present=["ACCEPT_EULA","PRIVACY_CONSENT"]`(값 미로깅)·
+      **`outer_wallclock_s=13726.2`**(= 새 코드로 떴다는 증거)·`job_timeout_s=1800.0`
+      (strict `outer > inner` coherence 통과)·`k=8`·reconciliation 전부 0 →
+      `/monitor.json`에서 **`gpu_reachable` false→true 회복**(G-36 해소)·
+      `vram_total_mib=97887`·`requests[]`에 2026-07-22 봉투 잔존(**store 연속성 실증**).
+      ★ **재기동 후 netns 감사 하네스는 반드시 재무장**한다(`netns_audit.sh arm <새 컨테이너>`)
+      — 컨테이너가 바뀌면 이전 무장은 무효고, 빠뜨리면 그 사이클은 감사되지 않은 런이 된다.
 4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh` → **exit 0**(IN SYNC)이어야
    한다. exit 3이면 3단계 미완 → 라이브 leg 착수 금지.
 5. **그때서야 라이브 leg 착수.**
