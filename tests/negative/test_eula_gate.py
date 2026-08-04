@@ -21,22 +21,29 @@ NFR-DEPLOY-004; 게이트 DoD-P5-06; 결정 2026-07-03-p1-eula-runtime-consent).
 
 **★ CPU 등가로 대체한 항 (정직 표기 — 숨기지 않는다).**
 
-* 1항의 ``docker compose up``은 **이 기기(CPU)에서 실행 불가**하고, 애초에
-  **저장소에 compose 파일이 아직 없다**(``docker/compose/``는 빈 디렉토리 — M5 산출물
-  미도래). 그래서 여기서는 compose가 결국 띄우는 **바로 그 프로세스**를 직접 띄운다:
-  ``python -m cv_infra.runner.main`` = 러너 이미지의 ENTRYPOINT
-  (``docker/runner/Dockerfile``). 등가 주장이 말뿐이 되지 않도록
-  ``test_cpu_substitute_runs_the_image_entrypoint``이 Dockerfile의 ENTRYPOINT와
+* 1항의 ``docker compose up``은 **이 기기(CPU)에서 실행 불가**다(GPU 예약 + 러너
+  이미지). compose 파일 자체는 **p5c10-T4에 착지했다** — 정본 경로는
+  ``docker/compose.yaml``이고 빈 스캐폴드 ``docker/compose/``는 삭제됐다. 다만 그
+  compose가 직접 띄우는 것은 **제어 평면(orchestrator)** 이고, Isaac을 부팅하며 이
+  게이트가 겨냥하는 **러너**는 M3가 sibling으로 스폰한다. 그래서 여기서는 그 체인의
+  끝에 있는 **바로 그 프로세스**를 직접 띄운다: ``python -m cv_infra.runner.main`` =
+  러너 이미지의 ENTRYPOINT (``docker/runner/Dockerfile``). 등가 주장이 말뿐이 되지
+  않도록 ``test_cpu_substitute_runs_the_image_entrypoint``이 Dockerfile의 ENTRYPOINT와
   아래 subprocess가 실행하는 모듈이 **같음을 기계적으로 단정**한다 — ENTRYPOINT가
   바뀌면 이 등가 주장이 red로 무너진다.
   **커버 못 하는 것**: docker 데몬/compose 파싱/이미지·GPU 계층. 컨테이너 경계에서의
   exit-3 전파는 GPU 사이클 실측 몫이다(본 파일은 프로세스 exit 코드까지).
-* 3항의 "동의(identity+timestamp) **기록**"은 **아직 제품에 없다**. 결정
-  2026-07-03-p1-eula-runtime-consent가 명시하듯 정식 동의 게이트(identity+timestamp
-  영속 기록, ``scripts/consent/*``)는 **Phase 5 / M5 산출물이며 미구현**이고, 현재
-  구현된 것은 **런타임 운영자 입력(per-run env)** 브리지뿐이다. 따라서 여기서 검증
-  가능한 것은 "동의 입력 부재 -> 차단 / 동의 입력 존재 -> 해제"까지이며, 레코드의
-  identity·timestamp 필드 자체는 **미검증**(그런 레코드가 존재하지 않는다).
+  (``docker/compose.yaml``·``docker/.env.example``·``docker/orchestrator/Dockerfile``은
+  전부 아래 ``_GATE_DIRS`` 스캔 범위 안이다 — 리터럴을 심으면 red, 실측 확인.)
+* 3항의 "동의(identity+timestamp) **기록**"은 **p5c10-T4에 제품으로 생겼다**
+  (``scripts/consent/{accept_eula,check_consent}.sh`` — ``eula_accepted`` +
+  ``eula_operator_identity`` + ``eula_consented_at``를 0600 JSON으로 기록하고, 부재·
+  무효 시 게이트가 exit 3). **그러나 그 레코드를 검증하는 것은 셸 게이트이지 이 파일이
+  아니다.** 이 파일이 겨냥하는 층은 여전히 러너 부트 게이트 = **env 판정**이고(결정
+  2026-07-03-p1-eula-runtime-consent의 "게이트 SoT = env, 레코드 = 감사" 분리),
+  따라서 여기서 증명되는 것은 "동의 입력 부재 -> 차단 / 동의 입력 존재 -> 해제"까지다.
+  레코드 필드별 검증(스키마·ISO-8601·비긍정값)과 레코드->env 라운드트립은 **이 파일의
+  단정이 아니다**.
 
 **G-35 무장 실증.** "부트가 안 됐다"는 negative는 *다른 이유로 죽어도* 참이다. 그래서
 차단 단정마다 **반대편(해제)** 을 같은 형태로 함께 돌려, 차단이 EULA 게이트 때문임을
@@ -284,9 +291,10 @@ def test_boot_guard_blocks_when_no_consent_is_recorded():
 def test_boot_guard_releases_once_consent_is_recorded():
     """동의 기록 후 -> 기동 해제 (G-35 반대편: 게이트가 상시 거부하는 게 아님).
 
-    한계(정직): 현재 "기록"은 **런타임 운영자 입력(env)** 이다 — identity+timestamp
-    영속 레코드는 M5/P5 산출물로 아직 없다(모듈 docstring 참조). 따라서 이 단정은
-    "동의 입력이 있으면 게이트가 해제된다"까지만 증명한다.
+    범위(정직): 이 부트 게이트가 판정하는 "기록"은 **런타임 운영자 입력(env)** 이다.
+    identity+timestamp 영속 레코드는 p5c10-T4에 ``scripts/consent/*``로 생겼지만
+    **게이트의 판정 근거가 아니다**(SoT = env, 레코드 = 감사 — 모듈 docstring 참조).
+    따라서 이 단정은 "동의 입력이 있으면 게이트가 해제된다"까지만 증명한다.
     """
     assert eula_boot_guard({_CONSENT_KEY: _OPAQUE_CONSENT}) is None
 
