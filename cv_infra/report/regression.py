@@ -7,8 +7,9 @@ Two thin pieces on top of M3's rollup + M4's baseline:
   runs that differ ONLY in SUT map to the SAME key ("same request, only SUT
   differs"). M1 owns the key's *model field* (``Result.request_identity_key``);
   M4 owns the key *derivation* (LOCKED §7.13). The normalization SCOPE (which
-  fields identify a request) was deferred at requirements time — pinned here, see
-  ``_IDENTITY_EXCLUDE`` and the report's surfaced-assumption section.
+  fields identify a request, and the "absent == explicit null" rule) was deferred
+  at requirements time — pinned in the ``_IDENTITY_EXCLUDE*`` header block below
+  and in the report's surfaced-assumption section.
 
 * ``judge_regression`` (REQ-REPORT-003/004): compares the current rolled-up
   verdict against the matched baseline. ``pass->fail`` = regression (the SUT got
@@ -34,12 +35,14 @@ from typing import Any
 # --- request_identity_key normalization scope (M4-owned, surfaced assumption) --
 #
 # The key = sha256 of the request's *identity projection* = the FULL Verification
-# Request wire dump MINUS these keys. A deny-list (not an allow-list) is chosen so
-# the key AUTO-TRACKS contract growth: any field M1 adds to a request flows into
-# the key by default, and the only way two requests collide is if they are
-# identical modulo the excluded axes. That fails SAFE toward "keys differ -> no
-# baseline match -> regression skip" (NFR-REPORT-002), never toward a false match.
+# Request wire dump MINUS the excluded axes below, with NULL-VALUED KEYS PRUNED
+# (``_without_nulls``). A deny-list (not an allow-list) is chosen so the key
+# AUTO-TRACKS contract growth: any field M1 adds to a request flows into the key
+# by default, and the only way two requests collide is if they are identical
+# modulo the excluded axes. That fails SAFE toward "keys differ -> no baseline
+# match -> regression skip" (NFR-REPORT-002), never toward a false match.
 #
+# EXCLUDED AXES
 #   * ``sut`` / ``apiVersion`` / ``api_version`` — the SUT is THE variable axis
 #     (the whole point, REQ-REPORT-002); ``apiVersion`` is schema-version metadata
 #     (a re-run of identical content under a newer contract version is the SAME
@@ -49,11 +52,38 @@ from typing import Any
 #     flakiness, not WHAT is verified. The rolled-up verdict already collapses N
 #     repeats to one verdict, so bumping repeats must NOT invalidate a baseline.
 #
+# ABSENT == EXPLICIT NULL (null pruning, CEO decision D-5 @ p5c10)
+#   Null-valued keys are dropped recursively — nested mappings and mappings inside
+#   list elements included — and a mapping left EMPTY by that drop (or by the
+#   ``repeats`` exclusion above: ``{"repeats": 1, "fixed_dt": null}`` prunes to
+#   ``{}``) is dropped as well. So "field omitted", "field explicitly null" and
+#   "optional field defaulted to null" are ONE key. Two consequences:
+#     * the ``repeats`` invariant above now holds for EVERY mapping, not only for
+#       a full ``model_dump()`` (a caller dumping with ``exclude_none=True`` — the
+#       ``orchestrator/api.py`` idiom — no longer forks the key);
+#     * adding an optional field that DEFAULTS TO NULL is baseline-safe: it dumps
+#       as ``null`` on every existing request, prunes away, existing keys stand.
+#       (A new field with a NON-null default still moves every key — it lands in
+#       the dump as a value. Pruning equates absence with null, not with defaults.)
+#   SURFACED ASSUMPTION: this promotes "null == unspecified" to a CONTRACT
+#   CONVENTION. A future field where ``null`` itself MEANS something distinct from
+#   "absent" would have that meaning erased here — M1 must not introduce one.
+#   Mechanically guarded in tests/test_report_regression.py (the guard walks a real
+#   wire dump, so it grows with the contract instead of listing today's fields).
+#   ONE-OFF RESET (expected, not a defect): pruning changed every pre-existing key
+#   once — measured on the canonical fixture (tests/fixtures/
+#   nova_carter_warehouse_goal.yaml): sha256:4234cf09… -> sha256:3ed4011c….
+#   Baseline rows written before p5c10 therefore miss ONCE — ``status:
+#   no-baseline``, which is NORMAL (NFR-REPORT-002) — and the advance-on-pass in
+#   ``baseline.update_baseline`` re-establishes them on the next passing run. No
+#   store migration (D-5).
+#
 # Everything else IS in the key: scenario (scene/robot/goal/seed/timeout_s/
 # debug_obstacle — determinism + world + mission), interface (sim<->SUT wiring),
 # acceptance_criteria (the judgement, ORDER-SENSITIVE — order is not normalized;
-# a reordered criteria list is conservatively a different request, skip-safe), and
-# execution_settings.fixed_dt (determinism dt affects sim behavior).
+# a reordered criteria list is conservatively a different request, skip-safe; list
+# LENGTH/positions are never pruned either, only mapping keys are), and
+# execution_settings.fixed_dt when set (determinism dt affects sim behavior).
 _IDENTITY_EXCLUDE_TOP: frozenset[str] = frozenset({"sut", "apiVersion", "api_version"})
 _IDENTITY_EXCLUDE_SETTINGS: frozenset[str] = frozenset({"repeats"})
 
@@ -81,19 +111,38 @@ class RegressionVerdict:
     detail: str | None = None
 
 
+def _without_nulls(value: Any) -> Any:
+    """Recursively drop null-valued keys + mappings left empty by that drop.
+
+    Mappings shrink; LISTS DO NOT — their length/order/element positions are
+    identity-bearing (acceptance_criteria is ORDER-SENSITIVE) and an empty list
+    is kept as an empty list. Returns fresh containers, never aliasing/mutating
+    the caller's mapping.
+    """
+    if isinstance(value, Mapping):
+        pruned: dict[str, Any] = {}
+        for key, item in value.items():
+            if item is None:
+                continue  # absent == explicit null (header block)
+            cleaned = _without_nulls(item)
+            if isinstance(cleaned, dict) and not cleaned:
+                continue  # a mapping that pruned away == a mapping that was never there
+            pruned[key] = cleaned
+        return pruned
+    if isinstance(value, list):
+        return [_without_nulls(item) for item in value]
+    return copy.deepcopy(value)
+
+
 def _identity_projection(request: Mapping[str, Any]) -> dict[str, Any]:
-    """The identity-bearing subset of a request wire dump (see ``_IDENTITY_EXCLUDE``)."""
-    projection = {
-        key: copy.deepcopy(value)
-        for key, value in request.items()
-        if key not in _IDENTITY_EXCLUDE_TOP
-    }
+    """The identity-bearing subset of a request wire dump (see the header block)."""
+    projection = {key: value for key, value in request.items() if key not in _IDENTITY_EXCLUDE_TOP}
     settings = projection.get("execution_settings")
     if isinstance(settings, Mapping):
         projection["execution_settings"] = {
             key: value for key, value in settings.items() if key not in _IDENTITY_EXCLUDE_SETTINGS
         }
-    return projection
+    return _without_nulls(projection)
 
 
 def identity_key(request: Mapping[str, Any]) -> str:
@@ -102,8 +151,8 @@ def identity_key(request: Mapping[str, Any]) -> str:
     ``request`` is the request's wire dump (``VerificationRequest.model_dump(
     mode="json", by_alias=True)`` — M4 consumes the M1-validated shape as a plain
     mapping so this module stays pydantic-free/portable). Same scenario+criteria+
-    settings modulo SUT/apiVersion/repeats -> byte-identical canonical JSON ->
-    identical ``sha256:`` key.
+    settings modulo SUT/apiVersion/repeats AND modulo absent-vs-null fields ->
+    byte-identical canonical JSON -> identical ``sha256:`` key.
     """
     canonical = json.dumps(
         _identity_projection(request),
