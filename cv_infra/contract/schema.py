@@ -277,7 +277,7 @@ class Metrics(_ForbidExtra):
     defaults (pinned by the golden literals)."""
 
     time_to_goal_s: float | None = None
-    min_clearance_m: float | None = None
+    min_clearance_m: float | None = None  # MVP-descoped: permanently None (CEO 2026-08-04 D-3)
     collision_count: int = 0
     path_len_m: float | None = None
 

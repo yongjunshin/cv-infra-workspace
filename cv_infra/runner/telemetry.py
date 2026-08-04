@@ -136,17 +136,24 @@ def contact_partners(events: list[ContactEvent], chassis_path: str) -> list[str]
 
 
 def min_clearance_m() -> None:
-    """Min distance to obstacles/walls along the GT trajectory (REQ-EXEC-012).
+    """Min distance to obstacles/walls along the GT trajectory — DESCOPED (REQ-EXEC-012).
 
-    The unconditional ``None`` is an INTENTIONAL STUB. The production mechanism is a
-    distance query — a PhysX scene-query / raycast per GT sample (NOT contact-based,
-    see ``implementation-plan/modules/M2-simulation-runner.md`` §"min-clearance 산출
-    메커니즘") — so it is Isaac-only and cannot be produced on this CPU path.
+    The unconditional ``None`` is PERMANENT for the MVP, not an unfinished feature.
+    CEO decision 2026-08-04 §D-3 EXPLICITLY DESCOPED min-clearance: it was struck from
+    the REQ-EXEC-012 ledger text, and the earlier "deferred to Phase 4" carry-over
+    (decision 2026-07-09 §D-3, DoD-P2-01 footnote) is CANCELLED. Function and
+    ``Metrics.min_clearance_m`` are KEPT — removing them would churn the result JSON
+    and the fixed negative tests for nothing.
 
-    CEO decision 2026-07-09 (D-3): formally DEFERRED to Phase 4. DoD-P2-01 closes on
-    3/4 metrics with ``min_clearance`` footnoted (needs a new PhysX scene-query +
-    obstacle-prim set; adding it in the last P2 cycle would be over-engineering). See
-    ``agent-comms/decisions/2026-07-09-p2-close-decisions.md`` §D-3.
+    Why it is not simply implemented: the honest mechanism is a PhysX scene-query
+    (surface-to-surface distance) per GT sample — NOT contact-based, see
+    ``implementation-plan/modules/M2-simulation-runner.md`` §"min-clearance 산출
+    메커니즘" — and REPORTING AN APPROXIMATION AS A SAFETY METRIC IS WORSE THAN
+    REPORTING NOTHING. A per-step scene query would also tax every job at runtime.
+
+    Reserved for post-MVP. Pre-registered re-open trigger: a consumer actually asks for
+    a clearance-based acceptance criterion. See
+    ``agent-comms/decisions/2026-08-04-p5c10-scope-and-req-exec-rulings.md`` §D-3.
     """
     return None
 
