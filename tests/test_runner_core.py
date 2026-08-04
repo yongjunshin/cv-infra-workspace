@@ -145,6 +145,8 @@ def test_first_reach_index_and_time_to_goal():
 
 
 def test_min_clearance_is_none_in_p2():
+    # Name says "in_p2" but the None is PERMANENT: MVP-descoped by CEO 2026-08-04 D-3
+    # (rationale in telemetry.min_clearance_m). Not a pending implementation.
     assert telemetry.min_clearance_m() is None
 
 
