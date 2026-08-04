@@ -183,10 +183,92 @@ def _staging_relpath(entry: dict[str, Any], src: Path) -> Path:
     return Path(request) / f"repeat-{entry.get('repeat_index')}" / f"{kind}{src.suffix}"
 
 
+#: Absolute paths a staging dir may never resolve TO — emptying any of them would
+#: destroy the host. Ancestors of ``$HOME`` and the filesystem root are additionally
+#: rejected by the depth/containment checks in ``_prepare_staging_dir``.
+_FORBIDDEN_STAGING_DIRS = frozenset(
+    Path(p)
+    for p in (
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/var",
+    )
+)
+
+
+def _prepare_staging_dir(staging_dir: Path) -> Path:
+    """Resolve, safety-check and EMPTY the staging dir; return the resolved path.
+
+    WHY empty it (p5c9 T1 — 사용자 산물 오염 수리): the self-hosted runner does NOT
+    clean its workspace between jobs (we reuse ``actions/runner`` as-is, LOCKED §11),
+    so a staging tree left by a PREVIOUS run survives and ``actions/upload-artifact``
+    re-uploads it verbatim. p5c8 live: ``staged=6`` yet 17→23 files were uploaded and
+    92.9% of a GREEN PR's zip were off-policy bytes — mostly the previous push's
+    FAILURE recordings. The manifest (결정 #1/#2/#3) is the only thing allowed into the
+    artifact, so the target must START empty; this function is that guarantee.
+
+    SAFETY (a path mistake here is unrecoverable — every guard is explicit and there
+    is no shell ``rm -rf``): the target ① is resolved to an absolute path (the Action
+    passes the relative ``artifacts``), ② must not be a system root, ``$HOME`` or an
+    ancestor of it, nor a shallow (<2 component) path, ③ must not be a repository
+    checkout (a ``.git`` entry — this is what catches a stray ``.``), ④ must not be a
+    symlink (its contents live outside the named location). Only the target's ENTRIES
+    are removed — never the target itself, never its parent — and removal never
+    follows a symlink out (a symlinked entry is unlinked, its referent untouched).
+    A non-existent target is merely created (nothing to clear).
+
+    HONESTY: one stderr line always reports what was cleared. This defect lived 12
+    days because staging was silent; the line is also the runtime-plane deployment
+    marker (G-43 — the ``@v1`` tag does not move the runner's installed code).
+    """
+    raw = Path(staging_dir).expanduser()
+    if raw.is_symlink():
+        raise ValueError(f"stage-artifacts: refusing a symlinked staging dir: {raw}")
+    target = raw.resolve()
+    home = Path.home()
+    if len(target.parts) < 3 or target in _FORBIDDEN_STAGING_DIRS:
+        raise ValueError(f"stage-artifacts: refusing an unsafe staging dir: {target}")
+    if target == home or target in home.parents:
+        raise ValueError(f"stage-artifacts: refusing a home/ancestor staging dir: {target}")
+    if (target / ".git").exists():
+        raise ValueError(f"stage-artifacts: refusing a repo checkout as staging dir: {target}")
+
+    cleared = 0
+    if target.is_dir():
+        for entry in sorted(target.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            cleared += 1
+    target.mkdir(parents=True, exist_ok=True)
+    plural = "y" if cleared == 1 else "ies"
+    print(f"stage-artifacts: cleared {cleared} stale entr{plural} from {target}", file=sys.stderr)
+    return target
+
+
 def stage_uploads(uploads: list[dict[str, Any]], staging_dir: Path) -> dict[str, int]:
     """Copy each ``uploads[]`` entry's ``path`` into ``staging_dir`` under a stable
     layout. ONLY the curated ``uploads`` are staged — ``missing``/``excluded`` never
-    reach here (결정 #1/#2 curation was already applied when the manifest was built).
+    reach here (결정 #1/#2 curation was already applied when the manifest was built),
+    and the target is EMPTIED first (``_prepare_staging_dir``) so a previous run's
+    tree can never ride along.
 
     Defensive (T2 is aligning the producer to host-resolvable absolute paths): an
     entry whose ``path`` is absent/empty, or does not resolve to an existing file
@@ -194,7 +276,7 @@ def stage_uploads(uploads: list[dict[str, Any]], staging_dir: Path) -> dict[str,
     is SKIPPED with a stderr warning — a missing byte never fails the upload/job.
     Returns ``{"staged", "skipped"}``.
     """
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    target = _prepare_staging_dir(staging_dir)
     staged = 0
     skipped = 0
     for entry in uploads:
@@ -208,7 +290,7 @@ def stage_uploads(uploads: list[dict[str, Any]], staging_dir: Path) -> dict[str,
             print(f"stage-artifacts: skip (unresolved path) {path}", file=sys.stderr)
             skipped += 1
             continue
-        dest = staging_dir / _staging_relpath(entry, src)
+        dest = target / _staging_relpath(entry, src)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         staged += 1

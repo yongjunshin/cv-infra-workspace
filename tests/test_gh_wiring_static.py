@@ -298,6 +298,157 @@ def test_stage_artifacts_empty_report_is_empty_dir(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# (B3) stage-artifacts PRE-CLEAN (p5c9 T1) — a previous run's tree must not ride
+# --------------------------------------------------------------------------- #
+# The self-hosted runner does not clean its workspace between jobs, so the staging
+# dir survives from push to push. Before p5c9 the stager only mkdir(exist_ok=True)'d
+# it, so ``upload-artifact`` re-uploaded whatever was left: p5c8 live measured
+# staged=6 but 17->23 files uploaded, 92.9% of a GREEN PR's zip being off-policy
+# bytes — mostly the PREVIOUS push's failure recordings.
+#
+# These tests therefore run against a PRE-POPULATED staging dir. A test that only
+# stages into an empty tmp dir cannot see this defect at all (G-35) — every
+# assertion below is paired with a planted byte that must disappear.
+
+
+def _plant_previous_run_tree(staging: Path) -> dict[str, Path]:
+    """Plant a PREVIOUS run's staging tree (the p5c8 live shape) + a stray file.
+
+    Three top-level entries: an envelope dir the current run does NOT write, an
+    envelope dir the current run DOES write into (so overwriting files is not
+    enough — the extra repeat must go too), and a loose file.
+    """
+    planted = {
+        "other_envelope": staging / "req-previous/repeat-0/rosbag_mcap.mcap",
+        "same_envelope": staging / "req-a/repeat-9/recording_mp4.mp4",
+        "loose_file": staging / "leftover-report.json",
+    }
+    for path in planted.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    planted["other_envelope"].write_bytes(b"\x00previous push failure recording")
+    planted["same_envelope"].write_bytes(b"\x00previous push failure video")
+    planted["loose_file"].write_text('{"from": "previous run"}', encoding="utf-8")
+    return planted
+
+
+def test_stage_artifacts_clears_a_previous_runs_tree(tmp_path):
+    report = _report_with_artifacts(tmp_path)
+    staging = tmp_path / "artifacts"
+    planted = _plant_previous_run_tree(staging)
+    summary = publish_glue.stage_artifacts(report, staging)
+    # (a) every planted stale byte is GONE — including the one under an envelope the
+    # current run also writes into.
+    for label, path in planted.items():
+        assert not path.exists(), label
+    assert not (staging / "req-previous").exists()
+    # (b) the resulting tree is EXACTLY the manifest's uploads, nothing else.
+    assert _staged_relpaths(staging) == {
+        "req-a/repeat-0/result_json.json",
+        "req-a/repeat-0/rosbag_mcap.mcap",
+        "req-a/repeat-2/result_json.json",
+    }
+    assert summary == {"staged": 3, "skipped": 0}
+    # (c) the curation contract still holds through the pre-clean (결정 #1/#2):
+    # missing (mp4) / excluded (size-capped mcap) never appear.
+    assert not any("recording_mp4" in p for p in _staged_relpaths(staging))
+    assert "req-a/repeat-2/rosbag_mcap.mcap" not in _staged_relpaths(staging)
+
+
+def test_staged_tree_equals_manifest_uploads_after_a_previous_run(tmp_path):
+    # The upload-plane invariant, stated against the manifest rather than a literal:
+    # what upload-artifact sees == what the manifest declares (QA-recommended form).
+    report = _report_with_artifacts(tmp_path)
+    staging = tmp_path / "artifacts"
+    _plant_previous_run_tree(staging)
+    publish_glue.stage_artifacts(report, staging)
+    uploads = github.render_artifact_manifest(report)["uploads"]
+    expected_envelopes = {publish_glue._fs_safe(u["request_id"]) for u in uploads}
+    assert {p.name for p in staging.iterdir()} == expected_envelopes == {"req-a"}
+    assert len(_staged_relpaths(staging)) == len(uploads) == 3
+
+
+def test_relative_staging_dir_is_cleared_like_the_action_invokes_it(tmp_path, monkeypatch):
+    # The Action runs ``publish_glue stage-artifacts report.json artifacts`` in the
+    # step CWD, i.e. the target arrives RELATIVE — it must still resolve+clear.
+    monkeypatch.chdir(tmp_path)
+    stale = Path("artifacts/req-previous/repeat-0/rosbag_mcap.mcap")
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"\x00previous")
+    assert publish_glue.stage_uploads([], Path("artifacts")) == {"staged": 0, "skipped": 0}
+    assert not stale.exists()
+    assert (tmp_path / "artifacts").is_dir()
+
+
+def test_pre_clean_says_on_stderr_what_it_removed(tmp_path, capsys):
+    # Honesty: this defect survived 12 days because staging was silent. The line is
+    # also the runtime-plane deployment marker (G-43).
+    staging = tmp_path / "artifacts"
+    _plant_previous_run_tree(staging)
+    publish_glue.stage_artifacts({}, staging)
+    assert f"cleared 3 stale entries from {staging.resolve()}" in capsys.readouterr().err
+
+
+# --- safety guards: the pre-clean must refuse dangerous targets, and refuse them
+# --- BEFORE removing anything (each case plants a canary that must survive).
+@pytest.mark.parametrize("unsafe", ["/", "/tmp", "/usr", "/home"])
+def test_pre_clean_refuses_system_paths(unsafe):
+    with pytest.raises(ValueError):
+        publish_glue._prepare_staging_dir(Path(unsafe))
+
+
+def test_pre_clean_refuses_home_and_its_ancestor(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home/etri"
+    fake_home.mkdir(parents=True)
+    canary = fake_home / "do-not-delete.txt"
+    canary.write_text("survives", encoding="utf-8")
+    monkeypatch.setattr(publish_glue.Path, "home", classmethod(lambda cls: fake_home))
+    for unsafe in (fake_home, fake_home.parent):
+        with pytest.raises(ValueError):
+            publish_glue._prepare_staging_dir(unsafe)
+    assert canary.read_text(encoding="utf-8") == "survives"
+
+
+def test_pre_clean_refuses_a_repository_checkout(tmp_path):
+    # This is what catches a stray ``.`` — on the runner the step CWD IS the checkout.
+    checkout = tmp_path / "cv-infra-user"
+    (checkout / ".git").mkdir(parents=True)
+    canary = checkout / "verify.yml"
+    canary.write_text("name: verify\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        publish_glue._prepare_staging_dir(checkout)
+    assert canary.read_text(encoding="utf-8") == "name: verify\n"
+
+
+def test_pre_clean_refuses_a_symlinked_target(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    canary = outside / "keep.mcap"
+    canary.write_bytes(b"outside bytes")
+    link = tmp_path / "artifacts"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError):
+        publish_glue._prepare_staging_dir(link)
+    assert canary.read_bytes() == b"outside bytes"
+
+
+def test_pre_clean_unlinks_symlinked_entries_without_following_them(tmp_path):
+    # A symlink INSIDE the staging dir is removed as a link; its referent (outside
+    # the staging dir) is never touched.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.mcap"
+    keep.write_bytes(b"outside bytes")
+    staging = tmp_path / "artifacts"
+    staging.mkdir()
+    (staging / "link-to-dir").symlink_to(outside, target_is_directory=True)
+    (staging / "link-to-file").symlink_to(keep)
+    assert publish_glue.stage_uploads([], staging) == {"staged": 0, "skipped": 0}
+    assert list(staging.iterdir()) == []
+    assert not (staging / "link-to-dir").is_symlink()
+    assert outside.is_dir() and keep.read_bytes() == b"outside bytes"
+
+
+# --------------------------------------------------------------------------- #
 # (C) M1 error object -> ::error file,line,col:: annotation (D-L 1:1)
 # --------------------------------------------------------------------------- #
 def _sample_error() -> ContractError:
