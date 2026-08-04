@@ -13,6 +13,7 @@ NFR-DEPLOY-004; 게이트 DoD-P5-06; 결정 2026-07-03-p1-eula-runtime-consent).
    -> ``test_no_acceptance_value_injection_in_any_syntax``  (G-21 전 구문형)
    -> ``test_gate_scan_reads_real_non_empty_directories``   (스캔 무장 실증)
    -> ``test_scan_patterns_are_not_vacuous``                (패턴 비공허 + 오탐 대조)
+   -> ``test_ci_plane_bakes_no_automatic_consent``          (계약의 CI 절, p5c10)
 3. "동의 레코드 없음 -> 기동 차단 단정; 동의(identity+timestamp) 기록 후 -> 기동 해제 단정"
    -> ``test_boot_guard_blocks_when_no_consent_is_recorded``
    -> ``test_boot_guard_releases_once_consent_is_recorded``
@@ -47,6 +48,21 @@ p5c8이 실측한 함정(문면의 ``profiles/`` 부재로 grep이 exit 2를 내
 **동의 값 리터럴 0.** 이 파일은 ``ACCEPT_EULA=Y`` 같은 **수락 값 리터럴을 텍스트로
 담지 않는다**(G-21) — 양성 대조 샘플은 키 상수에서 **런타임 조립**한다. 덕분에
 저장소 전역 grep이 이 테스트 자신에 걸리지 않는다.
+
+**★ p5c10 공허화 보강 2건**(p5c9 Step 5 자기 발견 -> 본 사이클 재현·특정). 두 벡터
+모두 **실측으로** 확인했다 — 각각을 심으면 이 파일(그리고 전 스위트 790개)이 그대로
+green이었다:
+
+* **(a) 호출/콤마 구문 값 주입**: ``environment.setdefault("ACCEPT_EULA", "Y")`` 를
+  ``supervisor.run_job``의 러너 컨테이너 env 조립부에 심으면 **오케스트레이터가 모든
+  잡의 EULA를 대신 수락**하는데, 등호·콜론만 겨냥한 패턴은 이를 못 본다(G-21의
+  세 번째 구문형). -> 값 주입 패턴의 구분자에 ``,`` 를 추가.
+* **(b) CI 평면 미스캔**: ``.github/workflows/ci.yml``에 수락 리터럴을 넣어도 게이트
+  문면의 스캔 대상 4개 디렉토리에 ``.github/`` 가 없어 무사통과한다(``M8``의
+  ``test_gh_wiring_static.py``는 ``verify.yml``+composite action **2개 파일만** 본다).
+  NEG-2 계약은 *"CI도 동의 자동 우회 금지"* 를 명시하므로 그 절을 아래
+  ``test_ci_plane_bakes_no_automatic_consent``가 집행한다(게이트 문면의 4개 디렉토리
+  스캔은 그대로 — 축소 아님, 계약 절의 추가 집행).
 
 Stdlib + pytest (+ 기존 픽스처 YAML). 신규 의존 0.
 """
@@ -97,11 +113,14 @@ _GATE_DIRS = ("docker", "cv_infra", "scripts", "docs")
 #: 게이트 문면의 리터럴 그대로. 조립해 만든다 — 이 파일에 수락 값이 박히지 않도록.
 _GATE_LITERAL = f"{_CONSENT_KEY}=Y"
 
-#: G-21: 값 주입은 등호형 하나가 아니다. 콜론/JSON/subscript 대입까지 겨냥한 상위집합
-#: (기존 ``tests/test_gh_wiring_static.py``의 관용구를 넓힌 형태 — 그 패턴은 dict
-#: 콜론형 ``{"ACCEPT_EULA": "Y"}``를 놓친다, 본 사이클 실측).
+#: G-21: 값 주입은 등호형 하나가 아니다. 콜론/JSON/subscript 대입 **+ 호출 인자
+#: (콤마)** 까지 겨냥한 상위집합 (기존 ``tests/test_gh_wiring_static.py``의 관용구를
+#: 넓힌 형태 — 그 패턴은 dict 콜론형 ``{"ACCEPT_EULA": "Y"}``를 놓친다[p5c9 실측] 그리고
+#: 호출형 ``setdefault("ACCEPT_EULA", "Y")``도 놓친다[p5c10 실측, 모듈 docstring (a)]).
+#: 콤마 구분자가 저장소의 합법적인 **키 튜플 나열**(``("ACCEPT_EULA", "PRIVACY_CONSENT")``)
+#: 을 잡지 않는 이유는 값 자리가 truthy 리터럴로 한정되기 때문 — 아래 오탐 대조가 단정.
 _ANY_SYNTAX = re.compile(
-    rf"({_CONSENT_KEY}|{_PRIVACY_KEY})[\"']?\s*\]?\s*[:=]\s*[\"']?\s*(Y|y|yes|Yes|true|True|1)\b"
+    rf"({_CONSENT_KEY}|{_PRIVACY_KEY})[\"']?\s*\]?\s*[:=,]\s*[\"']?\s*(Y|y|yes|Yes|true|True|1)\b"
 )
 
 #: 실제 주입이 이렇게 생겼다면 잡혀야 한다(패턴 비공허 — 런타임 조립).
@@ -112,6 +131,10 @@ _INJECTION_SAMPLES = (
     f"      {_PRIVACY_KEY}: yes",
     f'os.environ["{_CONSENT_KEY}"] = "1"',
     f"- {_CONSENT_KEY}=true",
+    # p5c10 (a): 호출 인자형 — 실제로 심어 본 벡터 그대로.
+    f'environment.setdefault("{_CONSENT_KEY}", "Y")',
+    f'os.environ.setdefault("{_PRIVACY_KEY}", "yes")',
+    f'os.putenv("{_CONSENT_KEY}", "1")',
 )
 
 #: 스캔이 각 게이트 디렉토리를 **실제로 읽고 있음**을 보이는 실재 문자열(무장 실증).
@@ -134,24 +157,34 @@ _LEGITIMATE_SAMPLES = (
 )
 
 
-def _scan_files() -> list[Path]:
-    """Every regular file under the gate's directories (``grep -r`` 등가).
+#: NEG-2 계약의 **CI 절**("CI도 동의 자동 우회 금지, self-test 선행")이 걸리는 평면.
+#: 게이트 문면의 스캔 4개 디렉토리 밖이라 p5c10 이전에는 이 파일이 한 줄도 안 읽었다
+#: (모듈 docstring (b) — 실측: ``ci.yml``에 수락 리터럴을 심어도 790/790 green).
+_CI_DIRS = (".github",)
+
+#: CI 평면 스캔이 **실재 파일을 읽고 있음**을 보이는 앵커(이름이 바뀌면 red — 부재가
+#: 조용한 통과로 둔갑하던 p5c8 함정의 CI판).
+_CI_SENTINEL_FILES = (".github/workflows/ci.yml", ".github/workflows/verify.yml")
+
+
+def _scan_files(dirs: tuple[str, ...] = _GATE_DIRS) -> list[Path]:
+    """Every regular file under ``dirs`` (``grep -r`` 등가).
 
     ``__pycache__`` only holds compiled copies of sources already scanned, so it is
     skipped to keep the scan deterministic; nothing else is filtered.
     """
     files: list[Path] = []
-    for name in _GATE_DIRS:
+    for name in dirs:
         for path in sorted((_REPO_ROOT / name).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts:
                 files.append(path)
     return files
 
 
-def _hits(predicate) -> list[str]:
+def _hits(predicate, dirs: tuple[str, ...] = _GATE_DIRS) -> list[str]:
     return [
         f"{path.relative_to(_REPO_ROOT)}:{number}: {line.strip()}"
-        for path in _scan_files()
+        for path in _scan_files(dirs)
         for number, line in enumerate(
             path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
         )
@@ -165,7 +198,11 @@ def test_no_acceptance_literal_is_baked_into_the_gate_dirs():
 
 
 def test_no_acceptance_value_injection_in_any_syntax():
-    """G-21 상위집합: 등호/콜론/JSON/subscript 어떤 구문으로도 수락 값 주입 0."""
+    """G-21 상위집합: 등호/콜론/JSON/subscript/**호출 인자** 어떤 구문으로도 수락 값 주입 0.
+
+    호출 인자형은 p5c10 보강분 (a) — ``environment.setdefault("<key>", "Y")`` 를
+    ``run_job``의 러너 env 조립부에 심어 실측했다: 보강 전에는 전 스위트 790/790 green.
+    """
     assert _hits(lambda line: bool(_ANY_SYNTAX.search(line))) == []
 
 
@@ -191,6 +228,29 @@ def test_gate_scan_reads_real_non_empty_directories():
             if path.is_relative_to(root)
         )
         assert found, f"{directory}/ 스캔이 실재하는 {needle!r}조차 못 읽었다 — 공허하다"
+
+
+def test_ci_plane_bakes_no_automatic_consent():
+    """계약 문면의 CI 절 집행: CI 워크플로가 동의를 자동 수락하지 않는다.
+
+    NEG-2 계약은 *"CI도 동의 자동 우회 금지(self-test 선행)"* 를 명시하는데, 검증 명령의
+    grep 대상 4개 디렉토리에는 ``.github/``가 없다 — 즉 **계약의 한 절이 스캔 밖**이었다
+    (p5c10 실측: ``ci.yml``에 수락 리터럴 1줄을 심어도 이 파일 10/10·전 스위트 790/790
+    green). M8의 ``test_gh_wiring_static.py``가 CI를 보긴 하지만 ``verify.yml`` +
+    composite action **2개 파일만**이고 패턴도 등호/콜론형뿐이다.
+
+    무장 실증을 함께 건다(부재가 통과로 둔갑하지 못하게): 스캔이 실재 워크플로 파일을
+    읽고 있음을 앵커로 단정한다.
+    """
+    scanned = _scan_files(_CI_DIRS)
+    names = {path.relative_to(_REPO_ROOT).as_posix() for path in scanned}
+    assert set(_CI_SENTINEL_FILES) <= names, f"CI 평면 스캔이 워크플로를 못 읽었다: {sorted(names)}"
+    assert any(
+        "runs-on" in path.read_text(encoding="utf-8", errors="ignore") for path in scanned
+    ), "CI 평면 스캔이 잡 정의조차 못 봤다 — 공허하다"
+
+    assert _hits(lambda line: _GATE_LITERAL in line, _CI_DIRS) == []
+    assert _hits(lambda line: bool(_ANY_SYNTAX.search(line)), _CI_DIRS) == []
 
 
 def test_scan_patterns_are_not_vacuous():
