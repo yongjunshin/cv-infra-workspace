@@ -1,0 +1,156 @@
+# docker/compose.yaml — cv-infra CONTROL PLANE (M5 §3.2; REQ-DEPLOY-001/002).
+#
+# ─── What this file starts, and what it deliberately does NOT ────────────────
+# Two-tier topology (LOCKED §3, M5 §3.2). Compose owns the LONG-LIVED control
+# plane only:
+#
+#   orchestrator = M3 REST submit/scheduler + M6 operational read model
+#                  (one FastAPI app: cv_infra.orchestrator.serve)
+#
+# The DATA plane (Isaac runner + SUT, one pair per job) is **not a compose
+# service and must never become one**: M3 spawns runners PROGRAMMATICALLY on the
+# host docker daemon (sibling-container via /var/run/docker.sock), each on its
+# own per-job bridge network with its own ROS_DOMAIN_ID, at a concurrency k that
+# is derived from the live resource budget. A static `replicas:` cannot express a
+# resource-aware k — that mismatch is exactly why the split exists. Adding a
+# `runner:` service here would silently break REQ-ORCH-004/005 and NFR-ORCH-003.
+#
+# Host networking is FORBIDDEN project-wide (LOCKED §5, R8): DDS multicast on the
+# host network makes parallel jobs hear each other. The control plane therefore
+# uses the compose default bridge; per-job networks are created at runtime by M3.
+#
+# ─── The deployment flow this file is step ③ of (C-2, REQ-DEPLOY-001) ────────
+#   ① scripts/workstation_setup/provision.sh   (host prereqs: driver + toolkit)
+#   ② scripts/consent/accept_eula.sh           (NVIDIA EULA — explicit, once)
+#   ③ docker compose -f docker/compose.yaml up -d --build      ← THIS FILE
+#   ④ cv-infra selftest                        (M7 — not implemented yet, p5c11+)
+# "One command + one documented consent step" is the honest form of the
+# one-command promise (M5 §7); step ② can never be auto-accepted (LOCKED §8).
+#
+# ─── EULA (LOCKED §8 / NEG-2) ────────────────────────────────────────────────
+# No acceptance value is baked into this file, the images, or any committed file.
+# The two consent keys below use compose's `:?` form, so `docker compose up|config`
+# REFUSES LOUDLY when the operator never consented. The values reach compose from
+# docker/.env, which scripts/consent/accept_eula.sh writes AFTER recording the
+# consent (identity + timestamp). docker/.env is git-ignored and never committed.
+# Last line of defence: the runner's own boot guard refuses Isaac without the env
+# (cv_infra/runner/sim_runtime.py -> exit 3), so a hand-edited .env still cannot
+# make a runner boot silently without a consent decision having been made.
+#
+# ─── Config source ───────────────────────────────────────────────────────────
+# Compose reads docker/.env (the project directory = this file's directory).
+# Start from docker/.env.example — every knob is documented there.
+
+name: ${CV_COMPOSE_PROJECT:-cv-infra}
+
+services:
+  orchestrator:
+    # Locally built from docker/orchestrator/Dockerfile (digest-pinned base +
+    # uv.lock closure = the reproducibility anchors, CLAUDE §2-7). For a release
+    # deployment, set CV_ORCHESTRATOR_IMAGE to a registry ref pinned by @sha256.
+    image: ${CV_ORCHESTRATOR_IMAGE:-cv-infra-orchestrator:local}
+    build:
+      # Context = repo root: the builder stage needs pyproject.toml + uv.lock +
+      # cv_infra/ (the root .dockerignore keeps the rest out).
+      context: ..
+      dockerfile: docker/orchestrator/Dockerfile
+    container_name: ${CV_COMPOSE_PROJECT:-cv-infra}-orchestrator
+    restart: unless-stopped
+    # The store is SQLite/WAL; give the process time to finish an in-flight write
+    # and tear down spawned runners before SIGKILL.
+    stop_grace_period: 30s
+
+    # Loopback-only by default: the submit API has no authn (single-host MVP,
+    # M8 §8 cicd-g5). Publishing it on 0.0.0.0 exposes job submission to the LAN.
+    ports:
+      - "${CV_PUBLISH_ADDR:-127.0.0.1}:${CV_PUBLISH_PORT:-8000}:8000"
+
+    environment:
+      # --- bind INSIDE the container (the host-side exposure is `ports:` above) ---
+      CV_BIND_HOST: "0.0.0.0"
+      CV_BIND_PORT: "8000"
+
+      # --- required boot contract (cv_infra/orchestrator/serve.py docstring) ---
+      # Every path below is a HOST ABSOLUTE path that is bind-mounted at the SAME
+      # path inside the container (see `volumes:`). That identity is load-bearing,
+      # not cosmetic: this process asks the HOST daemon to bind-mount paths into
+      # runner containers, so a path that means something different inside the
+      # control plane would silently mount the wrong host directory (R-mount,
+      # M5 §3.2 D-O) and result.json would never come back.
+      CV_STORE_PATH: "${CV_STATE_DIR:?set CV_STATE_DIR in docker/.env — see docker/.env.example}/cv-infra.sqlite3"
+      CV_OUT_DIR: "${CV_OUT_DIR:?set CV_OUT_DIR in docker/.env — see docker/.env.example}"
+      # No default by policy (FU-10 image-as-artifact): the runner image is an
+      # explicitly recorded artifact pin, never a floating guess.
+      CV_RUNNER_IMAGE: "${CV_RUNNER_IMAGE:?set CV_RUNNER_IMAGE in docker/.env — the recorded runner image pin}"
+      # Operator's authoritative concurrency cap (LOCKED §7.4); the scheduler takes
+      # min(this, VRAM-derived k, ...) — it never raises it.
+      CV_MAX_CONCURRENT: "${CV_MAX_CONCURRENT:?set CV_MAX_CONCURRENT in docker/.env — the operator concurrency cap}"
+      # Warm shared cache = COPY SOURCE only; per-job writable copies are seeded
+      # under the scratch root (D-B, DoD-P4-15).
+      CV_ISAAC_CACHE_ROOT: "${CV_ISAAC_CACHE_ROOT:?set CV_ISAAC_CACHE_ROOT in docker/.env — the warm Isaac cache base}"
+      CV_ISAAC_CACHE_SCRATCH_ROOT: "${CV_ISAAC_CACHE_SCRATCH_ROOT:?set CV_ISAAC_CACHE_SCRATCH_ROOT in docker/.env — per-job cache scratch root}"
+
+      # --- optional knobs: pass-through form ---------------------------------
+      # An UNSET variable stays unset in the container (compose renders null), which
+      # is what serve.py's "unset optional = documented default" contract expects.
+      # Do NOT write an empty assignment in .env: set-but-empty is a LOUD boot
+      # error by contract (G-26 변종). Leave the line commented out instead.
+      CV_VRAM_PER_INSTANCE_MB:
+      CV_OUTER_WALLCLOCK_S:
+
+      # --- NVML for the M6 sampler / VRAM guard ------------------------------
+      # utility only: the control plane never renders (that is the runner's job).
+      NVIDIA_DRIVER_CAPABILITIES: utility
+
+      # --- operator consent (NEG-2, LOCKED §8) -------------------------------
+      # Written to docker/.env by scripts/consent/accept_eula.sh, never by hand,
+      # never committed, never defaulted. serve.py forwards these VERBATIM into the
+      # runner env; absent -> the runner boot guard refuses Isaac (exit 3).
+      ACCEPT_EULA: "${ACCEPT_EULA:?no operator consent on this host — run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)}"
+      PRIVACY_CONSENT: "${PRIVACY_CONSENT:?no operator consent on this host — run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)}"
+
+    volumes:
+      # Sibling-container spawn (LOCKED §3, R11): the control plane drives the HOST
+      # daemon instead of running docker-in-docker (DinD breaks GPU passthrough and
+      # costs a second storage layer). Accepted risk: socket access ≈ host root, and
+      # this is a single-tenant deployment (deployment-group assumption).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Identical host:container paths — see the CV_* env comment above (R-mount).
+      # These host directories MUST EXIST before `up`: dockerd creates missing bind
+      # sources as root:root, which later breaks the uid-1234 runner (G-15).
+      - "${CV_STATE_DIR}:${CV_STATE_DIR}"
+      - "${CV_OUT_DIR}:${CV_OUT_DIR}"
+      # `:ro` is correct HERE and would be WRONG on a runner: the control plane only
+      # READS this tree to seed per-job copies. A `:ro` cache bind inside a runner
+      # does not make the cache read-only, it DISABLES it (G-34, measured p4c5).
+      - "${CV_ISAAC_CACHE_ROOT}:${CV_ISAAC_CACHE_ROOT}:ro"
+      - "${CV_ISAAC_CACHE_SCRATCH_ROOT}:${CV_ISAAC_CACHE_SCRATCH_ROOT}"
+      # If submitted requests reference host paths outside the roots above (e.g. an
+      # oracle plugin dir, or a CI runner workspace holding scenario YAML), add the
+      # same identical-path read-only bind for that root, e.g.:
+      #   - "/home/<operator>/actions-runner/_work:/home/<operator>/actions-runner/_work:ro"
+
+    # The control plane needs NVML only (no render). On a host without the NVIDIA
+    # container runtime this reservation makes `up` fail loudly — intended: this
+    # deployment targets a GPU host (NFR-DEPLOY-005).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Resident service on a disk-pressured GPU host (R18): cap the json-file log.
+    logging:
+      driver: json-file
+      options:
+        max-size: "${CV_LOG_MAX_SIZE:-50m}"
+        max-file: "${CV_LOG_MAX_FILE:-5}"
+
+# NOTE (deliberate absence): no `runner:` service, no `networks:` block for job
+# networks, no `user:` override. Runners + their networks are created/destroyed
+# per job by M3; the control plane runs as root because seeding the per-job cache
+# with `cp -a` must preserve the runner's uid-1234 ownership — a non-privileged
+# copier silently produces a cache the runner cannot write, i.e. a disabled cache
+# (cv_infra/orchestrator/supervisor.py::_assert_runner_writable, G-34/G-15).

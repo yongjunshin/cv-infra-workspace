@@ -164,3 +164,25 @@ readonly CV_SMOKE_TIMEOUT_S="${CV_SMOKE_TIMEOUT_S:-2400}"    # smoke wall guard 
 readonly CV_HANDSHAKE_BOOT_TIMEOUT_S="${CV_HANDSHAKE_BOOT_TIMEOUT_S:-1200}"
 readonly CV_HANDSHAKE_WAIT_S="${CV_HANDSHAKE_WAIT_S:-240}"   # in-sim wall wait for reverse /cmd_vel
 readonly CV_HANDSHAKE_ECHO_TIMEOUT_S="${CV_HANDSHAKE_ECHO_TIMEOUT_S:-60}"
+
+# ---------------------------------------------------------------------------
+# --- P5 EULA consent gate (M5 §3.7) ---
+# ---------------------------------------------------------------------------
+# Sourced by scripts/consent/{accept_eula.sh,check_consent.sh}. Same rule as above:
+# the paths/URLs live HERE only, so the writer and the gate can never drift apart.
+#
+# The consent RECORD (identity + timestamp, REQ-DEPLOY-010) is the host-side audit
+# + gate artifact, deliberately SEPARATE from the runtime .env: the record answers
+# "did an operator consent, who, when", while the runtime boot gate's single source
+# of truth stays the env the runner receives (M5 §3.7 D-O/F7). It lives under $HOME
+# (no sudo, survives re-deploys of the repo checkout).
+readonly CV_CONSENT_RECORD="${CV_CONSENT_RECORD:-$HOME/.cv-infra/eula-consent.json}"
+readonly CV_CONSENT_RECORD_SCHEMA="cv-infra/eula-consent/v1"
+
+# What the operator is asked to accept. The license URL is the one the P1 smoke
+# wrapper already shows (single wording across the deployment).
+readonly CV_EULA_URL="https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/"
+# NVIDIA privacy policy (stable official URL). The Omniverse/Kit data-collection
+# notice itself is presented by the Isaac Sim container at boot; the deployment's
+# job is to make the operator's decision explicit and recorded, not to restate it.
+readonly CV_PRIVACY_URL="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/"
