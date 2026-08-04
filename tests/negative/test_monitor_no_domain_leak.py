@@ -9,6 +9,7 @@ NFR-MONITOR-002; 게이트 DoD-P4-13). 게이트 문면 2항 ↔ 테스트 매�
    -> ``test_operational_and_domain_detail_field_sets_are_disjoint``
    -> ``test_shared_handles_are_not_domain_detail``              (제외 목록 정직성)
    -> ``test_live_operational_response_leaks_no_domain_field_or_value``
+   -> ``test_failure_path_breadcrumbs_leak_no_domain_value``  (★ p5c10 보강)
 2. "운영 projection이 M3 store의 부분 투영임을 구조 확인(도메인 상세 컬럼 미포함)"
    -> ``test_projection_row_is_a_strict_subset_of_the_store_columns``
    -> ``test_projection_sql_never_reads_a_domain_column``        (★ SQL 무장 실증)
@@ -28,6 +29,18 @@ Artifacts=녹화 · Scenario/SutRef/오라클 params=요청 명세). 파생이�
 이 제외가 손쉬운 도피구가 되지 않도록 ``test_shared_handles_are_not_domain_detail``이
 **제외 목록의 어떤 이름도 도메인 상세 생산자 모델의 필드가 아님**을 단정한다 — 즉
 누수를 제외 목록에 숨기는 순간 red가 된다.
+
+**★ p5c10 공허화 보강 1건**(p5c9 Step 5 자기 발견 -> 본 사이클 재현·특정). 살아 있는
+누수 단정이 쓰는 러너는 ``_PassRunner`` **하나뿐**이라 응답의 **실패 채널**
+(``infra_error``·``error_category``·``runner_exit_code``)이 전부 ``null``인 창에서만
+"값 누수 0"을 재 왔다. 그런데 자유 텍스트인 ``infra_error``가 바로 도메인 상세가 탈 수
+있는 유일한 통로다 — supervisor 자신이 *"NOT a channel for runner stderr dumps,
+consent/secret values or SUT domain detail"* 라고 선언해 놓고 **그 선언을 집행하는
+테스트가 없었다**. 실측: 크래시 경계의 breadcrumb에 ``job.job_spec``을 붙이면
+(``supervisor.ParallelSupervisor._run_one``) 운영뷰가 scene/robot/SUT image ref를 그대로
+싣는데 이 파일 8/8·전 스위트 790/790이 green이었다. ->
+``test_failure_path_breadcrumbs_leak_no_domain_value``가 **실패 경로를 실제로 태워**
+(크래시 + 비정상 종료) 같은 단정을 건다.
 
 **출처 분리 = 구조 강제.** 2항은 표시 필터가 아니라 **SELECT 목록**의 문제다. 그래서
 ① 물리 테이블 컬럼(외부 sqlite3 커넥션의 ``PRAGMA table_info``)과 ② projection이
@@ -214,6 +227,41 @@ class _PassRunner:
         return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
 
 
+class _BrokenRunner:
+    """Fake seam that actually TAKES the failure path (p5c10 보강).
+
+    r0 raises (supervisor crash boundary), r1 returns a non-zero termination —
+    the two ways ``infra_error`` / ``error_category`` / ``runner_exit_code`` get
+    populated. Both messages are OPERATIONAL text only (도메인 값 0), so any domain
+    value found on the operational surface was put there by the PRODUCT.
+    """
+
+    CRASH_MESSAGE = "scripted seam crash (no domain detail)"
+    EXIT_MESSAGE = "runner exited nonzero (fake seam)"
+
+    def run(self, job: Job) -> JobResult:
+        if job.request_id.endswith("r0"):
+            raise RuntimeError(self.CRASH_MESSAGE)
+        return JobResult(
+            job=job,
+            state=JobState.FAILED,
+            verdict=None,
+            runner_exit_code=1,
+            infra_error=self.EXIT_MESSAGE,
+        )
+
+
+def _domain_values(document: dict) -> tuple[str, ...]:
+    """도메인 값 표본 — 운영 표면 어디에도 타면 안 되는 문자열들(시나리오 실물에서)."""
+    return (
+        document["scenario"]["scene"],
+        document["scenario"]["robot"],
+        document["sut"]["image_ref"],
+        document["acceptance_criteria"][0]["oracle"],
+        document["acceptance_criteria"][1]["params"]["chassis_path"],
+    )
+
+
 def _wait_completed(client: TestClient, envelope_id: str, timeout_s: float = 10.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -246,13 +294,7 @@ def test_live_operational_response_leaks_no_domain_field_or_value(tmp_path):
         specs = [job.job_spec for job in store.load_jobs()]
         assert specs and all(spec is not None for spec in specs)
         spec_text = json.dumps(specs)
-        domain_values = (
-            document["scenario"]["scene"],
-            document["scenario"]["robot"],
-            document["sut"]["image_ref"],
-            document["acceptance_criteria"][0]["oracle"],
-            document["acceptance_criteria"][1]["params"]["chassis_path"],
-        )
+        domain_values = _domain_values(document)
         for value in domain_values:
             assert value in spec_text, f"양성 대조 실패 — store에 {value!r}가 없다"
 
@@ -268,6 +310,58 @@ def test_live_operational_response_leaks_no_domain_field_or_value(tmp_path):
     for value in domain_values:
         assert value not in raw_json, f"도메인 값 누수(/monitor.json): {value!r}"
         assert value not in raw_html, f"도메인 값 누수(/monitor): {value!r}"
+
+
+def test_failure_path_breadcrumbs_leak_no_domain_value(tmp_path):
+    """★ p5c10 보강: **실패 경로**를 실제로 태운 창에서도 도메인 값 누수 0.
+
+    위 테스트는 ``_PassRunner`` 하나만 쓰므로 응답의 ``infra_error`` /
+    ``error_category`` / ``runner_exit_code``가 **전부 null**인 창에서 "값 누수 0"을
+    재고 있었다 — 그런데 자유 텍스트 ``infra_error``가 도메인 상세가 탈 수 있는 유일한
+    통로다(supervisor의 실패-이유 위생 주석: *"NOT a channel for ... SUT domain
+    detail"*, 그 선언을 집행하는 테스트는 없었다). 실측 공허화: 크래시 경계 breadcrumb에
+    ``job.job_spec``을 붙이면 운영뷰가 scene/robot/SUT ref를 그대로 싣는데도 이 파일
+    8/8·전 스위트 790/790이 green이었다.
+
+    무장(G-35): "누수 0"을 재기 전에 **실패 채널이 실제로 채워졌음**을 먼저 단정한다 —
+    두 실패 종류(크래시 / 비정상 종료)가 각각의 category로 표면화하고 breadcrumb 문구가
+    실제로 응답에 실린다. 그 위에서 도메인 값/필드 누수 0을 본다.
+    """
+    document = yaml.safe_load(_FIXTURE.read_text(encoding="utf-8"))
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, _BrokenRunner(), k=2)
+        with TestClient(app) as client:
+            response = client.post("/envelopes", json={"requests": [document, document]})
+            assert response.status_code == 202, response.text
+            _wait_completed(client, response.json()["envelope_id"])
+            raw_json = client.get("/monitor.json").text
+            raw_html = client.get("/monitor").text
+
+        # 양성 대조: 실패한 그 잡들의 도메인 상세는 store에 분명히 들어 있다.
+        spec_text = json.dumps([job.job_spec for job in store.load_jobs()])
+        domain_values = _domain_values(document)
+        for value in domain_values:
+            assert value in spec_text, f"양성 대조 실패 — store에 {value!r}가 없다"
+
+    body = json.loads(raw_json)
+    jobs = [job for request in body["requests"] for job in request["jobs"]]
+    assert len(jobs) == 2
+
+    # ★ 무장: 실패 채널이 정말로 채워졌다 (null 창에서 재는 함정 회피).
+    assert {job["error_category"] for job in jobs} == {"runner-crash", "infra"}
+    assert all(job["infra_error"] for job in jobs), jobs
+    assert any(job["runner_exit_code"] == 1 for job in jobs), jobs
+    breadcrumbs = " ".join(job["infra_error"] for job in jobs)
+    assert _BrokenRunner.CRASH_MESSAGE in breadcrumbs  # breadcrumb가 실물이다
+    assert _BrokenRunner.EXIT_MESSAGE in breadcrumbs
+
+    # 게이트 1항 — 실패 경로에서도 필드/값 누수 0 (두 운영 표면 모두).
+    leaked_fields = _json_keys(body) & _DOMAIN_DETAIL_FIELDS
+    assert leaked_fields == set(), f"운영 응답에 도메인 필드: {sorted(leaked_fields)}"
+    assert _json_keys(body) <= _OPERATIONAL_FIELDS
+    for value in domain_values:
+        assert value not in raw_json, f"실패 경로 도메인 값 누수(/monitor.json): {value!r}"
+        assert value not in raw_html, f"실패 경로 도메인 값 누수(/monitor): {value!r}"
 
 
 # --------------------------------------------------------------------------- #
