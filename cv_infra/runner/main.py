@@ -39,7 +39,7 @@ from cv_infra.runner.evaluate import (
     build_result_dict,
     read_field,
 )
-from cv_infra.runner.sim_runtime import EulaNotAcceptedError
+from cv_infra.runner.sim_runtime import EulaNotAcceptedError, SimConfig
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -196,6 +196,36 @@ def criteria_view(request: VerificationRequest) -> dict:
     return view
 
 
+def sim_config_for(request: VerificationRequest) -> SimConfig:
+    """Typed request -> the runner's sim settings (REQ-EXEC-002 consumption, D-8).
+
+    Both "declared, or the default stands" branches live HERE, off the GPU path,
+    so they are unit-testable:
+
+    * ``scenario.initial_pose`` omitted -> ``SimConfig.initial_pose`` stays None
+      and the runner applies NO pose (CEO D-2's binding constraint: the scene
+      asset's own placement stands — what every pre-p5c11 scenario got). The
+      block is handed over as a plain dict, exactly like ``debug_obstacle``.
+    * ``execution_settings.fixed_dt`` absent/None -> the 1/60 ``SimConfig``
+      defaults stand (M3's wire contract: an undeclared knob leaves behaviour
+      unchanged); declared -> it drives physics AND rendering dt. This is an
+      HONESTY fix — the knob was riding ``identity_key`` while nothing read it
+      — NOT a determinism improvement (D-8: the step was already fixed at 1/60).
+    """
+    pose = request.scenario.initial_pose
+    config = SimConfig(
+        scene_ref=request.scenario.scene,
+        robot_usd_ref=request.scenario.robot,
+        initial_pose=None if pose is None else pose.model_dump(),
+        seed=request.scenario.seed,
+    )
+    fixed_dt = request.execution_settings.fixed_dt
+    if fixed_dt is not None:
+        config.physics_dt = fixed_dt
+        config.rendering_dt = fixed_dt
+    return config
+
+
 # --------------------------------------------------------------------------- #
 # Evaluation-engine composition (D-1 (4), 2026-07-11) — CPU-testable.
 # --------------------------------------------------------------------------- #
@@ -312,7 +342,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         honored_env,
         reexec_for_bridge_lib,
     )
-    from cv_infra.runner.sim_runtime import SimConfig, SimRuntime
+    from cv_infra.runner.sim_runtime import SimRuntime
     from cv_infra.runner.telemetry import (
         PhysicsTelemetrySampler,
         contact_partners,
@@ -345,14 +375,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # tracer is handed to SimRuntime so the scene-load / robot-spawn / first-frame
     # boundaries only it can see are timed on the same clock as main's phases.
     trace = BootTrace()
-    sim = SimRuntime(
-        SimConfig(
-            scene_ref=request.scenario.scene,
-            robot_usd_ref=request.scenario.robot,
-            seed=request.scenario.seed,
-        ),
-        trace=trace,
-    )
+    sim = SimRuntime(sim_config_for(request), trace=trace)
     # The adapter's readiness/mission loops must keep the sim stepping (the sim IS
     # the /clock source — G-19), so it gets the step function as a dependency.
     adapter = Ros2Adapter(adapter_config, stepper=sim.step)
@@ -397,7 +420,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         sensor_topics = [s.topic for s in adapter_config.sensors]
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
-        sim.load_scene()  # step 3: scene/spawn/dt/seed (+ telemetry pre-bind)
+        sim.load_scene()  # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind)
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)

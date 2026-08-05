@@ -1,8 +1,11 @@
 """Headless SimulationApp lifecycle (M2, REQ-EXEC-001/002/003/015, NFR-EXEC-001).
 
 Boots ``SimulationApp({"headless": True})`` FIRST (before any ``omni.*`` / ``isaacsim.*``
-import — LOCKED §7.7), opens the scene, spawns the robot at a fixed pose, pins
-``physics_dt`` / ``rendering_dt`` / seed for determinism, runs the step loop, and
+import — LOCKED §7.7), opens the scene, moves the robot the scene asset already
+placed to the DECLARED ``scenario.initial_pose`` when the scenario carries one
+(REQ-EXEC-002 — nothing is ever *spawned*: the sample scene ships the robot, and
+an undeclared pose leaves the asset's own placement alone), pins ``physics_dt`` /
+``rendering_dt`` / seed for determinism, runs the step loop, and
 closes cleanly to return VRAM/slots. Boot also pins the R4 texture-streaming
 budget cap (see ``simulation_app_launch_config`` — the k>=2 OOM-trap guard).
 All Isaac imports are deferred into ``boot()`` so this module imports on a CPU
@@ -17,6 +20,7 @@ are the seams filled in cycles 2-4.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -49,11 +53,25 @@ def eula_boot_guard(env: dict | None = None) -> None:
 
 @dataclass
 class SimConfig:
-    """Deterministic sim settings (REQ-EXEC-002/003). P2: from JOB_SPEC; P3: Scenario."""
+    """Deterministic sim settings (REQ-EXEC-002/003), built by ``main.sim_config_for``.
+
+    ``initial_pose`` is the M1 ``Scenario.initial_pose`` block as a plain dict
+    (``{"x", "y", "yaw"}`` — planar 3-DoF, metres / radians, scene world frame;
+    the same hand-off shape ``debug_obstacle`` uses, so the sim layer stays free
+    of contract models). **None means the runner applies NO pose at all** and the
+    scene asset's own robot placement stands — that is what every pre-p5c11
+    scenario gets, and it is why there is no ``(0, 0, 0)`` default here: a
+    default would silently teleport those robots to the world origin. (This
+    replaces the never-consumed ``initial_pose_xyz`` placeholder; the contract
+    carries no ``z`` on purpose — floor contact owns it, see ``InitialPose``.)
+
+    ``physics_dt`` / ``rendering_dt`` default to 1/60 and are overridden only by
+    a DECLARED ``execution_settings.fixed_dt``.
+    """
 
     scene_ref: str
     robot_usd_ref: str
-    initial_pose_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    initial_pose: dict | None = None
     physics_dt: float = 1.0 / 60.0
     rendering_dt: float = 1.0 / 60.0
     seed: int = 0
@@ -260,6 +278,50 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
     return sorted(set(enabled)), sorted(wanted[k] for k in set(wanted) - matched)
 
 
+# --------------------------------------------------------------------------- #
+# REQ-EXEC-002: the DECLARED spawn pose (scenario.initial_pose) — CPU-testable.
+# --------------------------------------------------------------------------- #
+def resolve_initial_pose_target(pose: dict | None, robot_prim_path: str | None) -> str | None:
+    """Which prim the declared spawn pose applies to — or None for "do nothing".
+
+    This is the branch that carries the regression risk, so it lives OFF the GPU
+    path and is unit-tested: ``pose is None`` (every pre-p5c11 scenario) MUST be
+    a no-op, because the scene asset has already placed the robot and moving it
+    would change behaviour nobody asked to change (CEO D-2).
+
+    A pose declared for a scene whose robot prim never resolved (a direct
+    ``.usd`` ref carries no ``robot_prim_candidates``) is LOUD, never silently
+    dropped — a field the runner accepts and ignores is the ``goal_tolerance_m``
+    silent-ignore pattern (G-25).
+    """
+    if pose is None:
+        return None
+    if not robot_prim_path:
+        raise RuntimeError(
+            "scenario.initial_pose was declared but this run has no known robot prim, "
+            "so the runner cannot honour it: mapped scenes resolve the robot via "
+            "SCENE_ASSETS[...].robot_prim_candidates, a direct .usd/.usda/.usdz ref "
+            "carries none. Drop initial_pose or use a mapped scene."
+        )
+    return robot_prim_path
+
+
+def initial_pose_world_transform(
+    pose: dict, current_position
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """``{"x", "y", "yaw"}`` + the asset's own height -> (position, ``(w,x,y,z)``).
+
+    The contract is planar 3-DoF (M1 ``InitialPose``): ``z`` is deliberately NOT
+    a consumer input — floor contact owns it — so the robot keeps the height the
+    scene asset placed it at, and the orientation is a pure right-handed +Z
+    rotation (roll/pitch dropped for the same reason). Stdlib-only (no numpy) so
+    the math is unit-tested on CPU; the GPU caller only moves the numbers.
+    """
+    half_yaw = float(pose["yaw"]) / 2.0
+    position = (float(pose["x"]), float(pose["y"]), float(current_position[2]))
+    return position, (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+
+
 class SimRuntime:
     """Wraps the SimulationApp / World lifecycle. Isaac bodies are deferred-import."""
 
@@ -321,7 +383,10 @@ class SimRuntime:
 
         REUSE (do-not-reinvent): the sample scene ships the Nova Carter robot with
         its ROS2 action graphs pre-wired — no robot spawn/graph authoring here for
-        mapped scenes; we only locate the robot prim (candidates -> loud error).
+        mapped scenes; we only locate the robot prim (candidates -> loud error) and,
+        when the scenario DECLARED ``initial_pose``, move that already-placed robot
+        to it before reset (REQ-EXEC-002). No declaration = the asset's placement
+        stands untouched.
         """
         if self.simulation_app is None:
             raise RuntimeError("boot() must run before load_scene() (M2 §3.2 order)")
@@ -360,9 +425,10 @@ class SimRuntime:
         )
 
         # robot_spawn (p4c5 T1) = World ctor + seed pins + robot-prim resolve +
-        # pre_reset hooks + world.reset() — i.e. everything that materializes the
-        # robot/physics scene. A block INSIDE reset() (pipeline/PhysX warm-up) lands
-        # here; a block in the first stepped frame lands in first_render_frame.
+        # declared initial pose + pre_reset hooks + world.reset() — i.e. everything
+        # that materializes the robot/physics scene. A block INSIDE reset()
+        # (pipeline/PhysX warm-up) lands here; a block in the first stepped frame
+        # lands in first_render_frame.
         self._phase_begin(PHASE_ROBOT_SPAWN)
         # Determinism pins (REQ-EXEC-003, LOCKED §6): seed before physics init;
         # fixed dt on the World. numpy is legal here (post-SimulationApp, D-C).
@@ -390,10 +456,53 @@ class SimRuntime:
                     "(sample asset naming changed? update SCENE_ASSETS)"
                 )
 
+        # REQ-EXEC-002: honour a DECLARED spawn pose before anything binds to the
+        # robot (the telemetry tensor view is a pre_reset hook) — and before
+        # reset(), while the robot is still a plain USD xform.
+        target = resolve_initial_pose_target(self.config.initial_pose, self.robot_prim_path)
+        if target is not None:
+            self.apply_initial_pose(target)
+
         for hook in self.pre_reset:
             hook(self.world)
         self.world.reset()
         self._phase_end(PHASE_ROBOT_SPAWN, robot_prim=self.robot_prim_path)
+
+    def apply_initial_pose(self, prim_path: str) -> None:  # pragma: no cover - GPU path
+        """Move the asset-placed robot to the declared spawn pose (REQ-EXEC-002).
+
+        Called only when ``config.initial_pose`` is declared — the branch itself
+        is ``resolve_initial_pose_target`` (CPU-tested) — and only BEFORE
+        ``world.reset()``: at that point the robot is still a plain USD xform, so
+        a stage-level world-pose write is what sticks (after play it would have
+        to go through the articulation view). do-not-reinvent: ``SingleXFormPrim``
+        is Isaac's own world-pose wrapper, the singular sibling of telemetry's
+        ``SingleRigidPrim``; we author no transform ops ourselves. The declared
+        pose is planar, so the asset's own z is read back and kept.
+
+        API anchor (NOT yet GPU-confirmed by us — p5c11 was a CPU cycle):
+        ``docs/research/nova-carter-nav2-verification.md`` records
+        ``isaacsim.core.prims.SingleXFormPrim.get_world_pose() -> (pos(3),
+        quat(4) wxyz)`` from the 5.0.0 API docs, which is where the ``wxyz``
+        ordering and the "z lives at index 2" assumption below come from. First
+        live run must confirm the pose actually MOVES the robot (a wrong wrapper
+        here fails loudly at import/attr, not silently).
+        """
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+
+        prim = SingleXFormPrim(prim_path)
+        current_position, _ = prim.get_world_pose()
+        position, orientation = initial_pose_world_transform(
+            self.config.initial_pose, current_position
+        )
+        prim.set_world_pose(position=np.array(position), orientation=np.array(orientation))
+        print(
+            f"[cv-runner] initial pose applied: {prim_path} -> "
+            f"declared={self.config.initial_pose} position={position} "
+            f"(z kept from the scene asset) orientation_wxyz={orientation}",
+            flush=True,
+        )
 
     def enable_declared_sensors(self, topics) -> list[str]:  # pragma: no cover - GPU path
         """FU-17 GPU wrapper: pre_reset hook body over the LIVE stage.
