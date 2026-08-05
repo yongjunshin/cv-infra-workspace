@@ -1,0 +1,39 @@
+# profiles/a100.yaml — adaptive GPU profile (M5 §3.4; REQ-DEPLOY-003, NFR-DEPLOY-001).
+#
+# REQ-DEPLOY-003 names the supported set as "RTX Pro 6000 / A100", so the second
+# member gets a profile. Read profiles/rtx_pro_6000.yaml first — it carries the
+# grammar rules and the reason this directory exists.
+#
+# ★ THIS PROFILE CARRIES NO MEASURED NUMBERS — WE HAVE NEVER HAD AN A100.
+# Nothing in this repository has ever run on one (every 실측 in
+# implementation-plan/nfr-measurement-notes.md is RTX PRO 6000 Blackwell / etri6000).
+# Inventing a per-instance VRAM figure here would be a CLAUDE §2-4 violation AND an
+# operational hazard: too low silently over-launches into OOM, too high wastes the
+# card. So the field stays EMPTY = TBD (unmeasured / 미실측).
+#
+# What an empty value MEANS at deploy time (scripts/detect_gpu.sh honours it):
+#   * selection still succeeds — this host IS supported and deployable;
+#   * the CV_VRAM_PER_INSTANCE_MB line is emitted COMMENTED OUT, so the NVML 2nd
+#     guard stays OFF and k = min(CV_MAX_CONCURRENT, render_cap) — the operator cap
+#     alone, which is the documented default contract (docker/.env.example);
+#   * the script says so LOUDLY on stderr instead of guessing (no silent fallback).
+#
+# To fill it in: run one job, sample per-PID VRAM
+#   nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+# cross-checked against the full (G+C) process table minus idle baseline
+# (DoD-P2-09 / DoD-P4-10 recipe), then write the number here TOGETHER with a
+# vram_per_instance_source line naming the evidence path (G-24).
+#
+# Also unverified on this SKU (do not assume; observe on first deployment): A100 is
+# a datacenter part with no display engine, and Isaac Sim's RTX renderer path
+# (off-screen render product, D-A) has never been exercised on it here. MIG is out of
+# scope for MVP (LOCKED §18).
+
+id: a100
+
+# `nvidia-smi --query-gpu=name` on this family reports strings of the shape
+# "NVIDIA A100-SXM4-40GB" / "NVIDIA A100 80GB PCIe"; the token matches all of them.
+match_name_pattern: A100
+
+vram_per_instance_mb:
+vram_per_instance_source:

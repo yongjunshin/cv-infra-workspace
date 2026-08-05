@@ -1,0 +1,37 @@
+# profiles/rtx_pro_6000.yaml — adaptive GPU profile (M5 §3.4; REQ-DEPLOY-003, NFR-DEPLOY-001).
+#
+# WHY THIS FILE EXISTS: `profiles/**` is the ONLY sanctioned home for GPU model
+# knowledge (M5 D9 / implementation-plan/_meta/revision-decisions.md:103 — scan
+# target = cv_infra/**·docker/**·scripts/**·CI, allowlist = profiles/**). Supporting
+# a new GPU means ADDING A FILE HERE, never editing code or compose. That is the
+# whole content of "적응형 설치 / no single-machine hardcoding".
+#
+# GRAMMAR (load-bearing, keep it): flat `key: value`, one per line, no nesting, no
+# inline comments after a value, no `: ` inside a value. TWO parsers read this file —
+# scripts/detect_gpu.sh (sed/awk, because a freshly provisioned host may have no
+# python) and the tests (pyyaml). tests/test_deploy_gpu_profiles.py asserts the two
+# agree on every field; nesting would silently break the shell side only.
+#
+# NUMBERS ARE MEASURED, NEVER GUESSED (CLAUDE §2-4). Every quantitative field has a
+# `*_source` sibling naming the evidence that reproduces it (G-24). No measurement
+# -> leave the value EMPTY (see profiles/a100.yaml); an invented number here would
+# silently mis-size the concurrency guard on someone else's host.
+
+id: rtx_pro_6000
+
+# Matched case-insensitively (ERE) against `nvidia-smi --query-gpu=name`.
+# Deliberately TOKEN-based, not a full product string: this repository has never
+# captured an nvidia-smi name line for this SKU. What is recorded is the
+# identification "RTX PRO 6000 Blackwell" (agent-comms/decisions/
+# 2026-07-07-workstation-access-ssh-first-alpacon-fallback.md:26 —
+# "hostname etri6000 · IP 10.254.170.62 · RTX PRO 6000 Blackwell";
+# implementation-plan/nfr-measurement-notes.md, every measurement block's 조건 line).
+# A token pattern therefore matches every spelling of the SKU family (Workstation
+# Edition / Server Edition / Max-Q) without pretending to know which one is present.
+match_name_pattern: RTX[ _-]?PRO[ _-]?6000
+
+# Per-instance VRAM in MiB -> emitted as CV_VRAM_PER_INSTANCE_MB, i.e. the NVML 2nd
+# guard input of k = min(max_concurrent, floor(availVRAM / this), render_cap)
+# (cv_infra/orchestrator/scheduler.py::compute_k, LOCKED §7.4).
+vram_per_instance_mb: 6000
+vram_per_instance_source: implementation-plan/nfr-measurement-notes.md P4c5 (2026-07-15, QA passed) per-PID steady peak ~6.0 GiB, mean 5947-6043 MiB, flat over k=1..8; raw evidence on the workstation at ~/cv-infra-p2-out/p4c5/{T6,T6-resume}/; the same 6000 ran live as the NVML guard in the p5c10 k=8 leg
