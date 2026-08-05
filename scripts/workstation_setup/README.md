@@ -306,7 +306,7 @@ above, so a plain no-env run is unchanged):
 | Env | Workspace default | `cv-infra-user` runner |
 |---|---|---|
 | `CV_GH_RUNNER_REPO_URL` | `https://github.com/yongjunshin/cv-infra-workspace` | `https://github.com/yongjunshin/cv-infra-user` |
-| `CV_GH_RUNNER_NAME` | `etri6000-cv-infra` | `etri6000-cv-infra-user` |
+| `CV_GH_RUNNER_NAME` | `$(hostname -s)-cv-infra` (derived at run time) | `$(hostname -s)-cv-infra-user` |
 | `CV_GH_RUNNER_HOME` | `~/cv-infra-gh-runner` | `~/cv-infra-gh-runner-user` |
 | `CV_GH_RUNNER_SERVICE` | `cv-infra-gh-runner` | `cv-infra-gh-runner-user` |
 
@@ -315,11 +315,19 @@ above, so a plain no-env run is unchanged):
 gh api -X POST repos/yongjunshin/cv-infra-user/actions/runners/registration-token --jq .token \
   | ssh cv-infra-ws 'IFS= read -r RUNNER_REG_TOKEN; export RUNNER_REG_TOKEN
                      CV_GH_RUNNER_REPO_URL=https://github.com/yongjunshin/cv-infra-user \
-                     CV_GH_RUNNER_NAME=etri6000-cv-infra-user \
+                     CV_GH_RUNNER_NAME=$(hostname -s)-cv-infra-user \
                      CV_GH_RUNNER_HOME=$HOME/cv-infra-gh-runner-user \
                      CV_GH_RUNNER_SERVICE=cv-infra-gh-runner-user \
                      bash /tmp/cv-runner-setup/register_gh_runner.sh'
 ```
+
+`$(hostname -s)` expands on the **remote** host (same single-quoted string as the
+`$HOME` above), so the two runners are named after the machine that runs them
+instead of after ours — DoD-P5-09, no machine hardcoded into the deployment. On the
+original workstation it resolves to the names the live runners already carry
+(`etri6000-cv-infra` / `etri6000-cv-infra-user`; that host's `hostname` is measured
+as `etri6000` — decision `2026-07-07-workstation-access-ssh-first-alpacon-fallback`),
+so a re-run there is a no-op either way (`.runner` marker short-circuits it).
 
 CI jobs find the host-plane `cv-infra` CLI via the runner's `.path` file. The
 loading mechanism is the unit's `ExecStart=<home>/bin/runsvc.sh`, which exports

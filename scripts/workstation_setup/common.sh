@@ -122,7 +122,14 @@ readonly CV_GH_RUNNER_TARBALL_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf0382
 # binary with the same `cv-infra-gpu` label (decision 2026-07-03 §2/§3 hardening
 # applies identically to each registration).
 readonly CV_GH_RUNNER_REPO_URL="${CV_GH_RUNNER_REPO_URL:-https://github.com/yongjunshin/cv-infra-workspace}"  # repo-level target (decision §1)
-readonly CV_GH_RUNNER_NAME="${CV_GH_RUNNER_NAME:-etri6000-cv-infra}"
+# Runner name = LIVE HOST identity + role, derived at run time (DoD-P5-09: no machine
+# hardcoded into the deployment). Provisioning a second host used to silently propose
+# the first host's runner name; GitHub runner names are per-repo unique, so that is a
+# portability defect, not cosmetics. On the original workstation this is byte-identical
+# to the previous literal (`hostname` there is measured as `etri6000` — decision
+# 2026-07-07-workstation-access-ssh-first-alpacon-fallback §"동일 호스트 실측 확증"),
+# and register_gh_runner.sh skips an already-configured runner anyway (.runner marker).
+readonly CV_GH_RUNNER_NAME="${CV_GH_RUNNER_NAME:-$(hostname -s)-cv-infra}"
 readonly CV_GH_RUNNER_LABELS="cv-infra-gpu"   # effective label set: [self-hosted, Linux, X64, cv-infra-gpu]
 readonly CV_GH_RUNNER_HOME="${CV_GH_RUNNER_HOME:-$HOME/cv-infra-gh-runner}"
 readonly CV_GH_RUNNER_SERVICE="${CV_GH_RUNNER_SERVICE:-cv-infra-gh-runner}"
