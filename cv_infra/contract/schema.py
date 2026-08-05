@@ -104,8 +104,10 @@ class InitialPose(_ForbidExtra):
 
     * ``z`` — floor contact determines it; a consumer-supplied height that
       disagrees with the scene either drops or embeds the robot. The runner's
-      never-consumed ``SimConfig.initial_pose_xyz`` is the dead Phase-2
-      placeholder this requirement was open on, not evidence of demand.
+      former never-consumed ``SimConfig.initial_pose_xyz`` (replaced by
+      ``SimConfig.initial_pose`` in p5c11 T4) was the dead Phase-2 placeholder
+      this requirement was open on, not evidence of demand — the runner now
+      READS the asset's own z and keeps it.
       Adding ``z: float | None = None`` later stays baseline-safe (D-5).
     * ``frame`` — unlike ``Goal`` (which is PUBLISHED to the SUT's nav stack,
       where the frame is part of the message), this pose is applied by the
