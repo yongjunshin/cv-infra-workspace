@@ -32,6 +32,7 @@ from cv_infra.cli import batch, publish_glue
 from cv_infra.cli.main import _build_parser
 from cv_infra.contract.errors import ContractError
 from cv_infra.report import github
+from tests.negative.test_eula_gate import baked_consent_bindings
 
 _ROOT = Path(__file__).resolve().parents[1]
 _VERIFY_WORKFLOW = _ROOT / ".github/workflows/verify.yml"
@@ -641,7 +642,11 @@ def test_stage_step_gated_on_have_report(path):
 
 @pytest.mark.parametrize("path", [_VERIFY_WORKFLOW, _VERIFY_ACTION])
 def test_no_consent_or_secret_value_injection(path):
-    # G-21 (전 구문형): consent/secret VALUES are never injected as literals — only
-    # env-key names are forwarded. No `ACCEPT_EULA=Y` / `{"ACCEPT_EULA": "Y"}` etc.
+    # NEG-2: consent VALUES are never baked here — only env-key names are forwarded.
+    # The predicate is IMPORTED from the NEG-2 suite, never re-stated (p5c11 F-1 /
+    # G-56): this file used to carry its own value enumeration
+    # (`Y|yes|true|1`), which was narrower than the boot guard's pure truthiness —
+    # `ACCEPT_EULA=accepted-by-operator` sailed through both. Two copies of a
+    # negative pattern drift, and the difference between them is the hole.
     text = path.read_text(encoding="utf-8")
-    assert not re.search(r"(ACCEPT_EULA|PRIVACY_CONSENT)\s*[:=]\s*['\"]?(Y|yes|true|1)\b", text)
+    assert baked_consent_bindings(text) == []
