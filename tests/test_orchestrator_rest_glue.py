@@ -98,7 +98,14 @@ def plugin_import_state():
 def test_job_spec_builder_matches_the_m8_producer(plugin_import_state):
     """``api._job_spec_for`` == ``cli/main._job_spec_from_request`` on the same
     admitted models — the mechanical guard the builder's SOURCE OF TRUTH anchor
-    names (drift in either copy fails here loudly)."""
+    names (drift in either copy fails here loudly).
+
+    The input set must EXERCISE every optional branch, else the guard is blind to
+    a drift inside it: measured 2026-08-05 (p5c11), un-wiring the REST twin's
+    ``execution_settings`` branch left this guard GREEN while the twins had
+    actually diverged — the canonical fixture declares no ``execution_settings``,
+    so both copies returned the same dict anyway. ``settings`` covers it.
+    """
     plain = _admit(_request_doc()).request
     custom_doc = _request_doc()
     custom_doc["acceptance_criteria"].append(
@@ -108,7 +115,10 @@ def test_job_spec_builder_matches_the_m8_producer(plugin_import_state):
         }
     )
     custom = _admit(custom_doc, plugin_dir=_PLUGIN_DIR).request
-    for request in (plain, custom):
+    settings_doc = _request_doc()
+    settings_doc["execution_settings"] = {"repeats": 3, "fixed_dt": 0.02}  # D-8 branch
+    settings = _admit(settings_doc).request
+    for request in (plain, custom, settings):
         assert _job_spec_for(request, "jid-1") == m8_job_spec_from_request(request, "jid-1")
     # Positive control (비공허 실증): the frozen P2 seam shape actually came out.
     spec = _job_spec_for(custom, "jid-1")
@@ -116,6 +126,36 @@ def test_job_spec_builder_matches_the_m8_producer(plugin_import_state):
     assert spec["job_id"] == "jid-1"
     assert spec["sut_image_ref"] == _CANONICAL_DOC["sut"]["image_ref"]  # sut.image_ref flattened
     assert spec["acceptance_criteria"][-1]["params"]["explicit_null"] is None  # user null survives
+
+
+def test_execution_settings_rides_the_wire_only_as_runner_actionable_knobs():
+    """D-8 배선: 러너가 작동시킬 수 있는 노브만 JOB_SPEC에 싣는다 — 양쪽 쌍둥이 동일.
+
+    쌍(G-35): **부재 케이스**(선언 안 하면 frozen 키 집합 그대로 — 이것만으로는
+    "배선이 꺼져 있어도 참")과 **착지 케이스**(선언하면 실제로 실리고, 러너의
+    ``parse_request``가 그 값을 그대로 복원)를 함께 건다. ``repeats``는 M3 fan-out의
+    축이라 실리지 않는다(잡 1개 = 반복 1회 — 러너에게 거짓을 말하지 않는다).
+    """
+    plain = _admit(_request_doc()).request
+    dt_doc = _request_doc()
+    dt_doc["execution_settings"] = {"repeats": 3, "fixed_dt": 0.02}
+    with_dt = _admit(dt_doc).request
+
+    # 부재: 캐노니컬 요청은 execution_settings를 선언하지 않는다 -> 키 집합 불변.
+    assert "execution_settings" not in _job_spec_for(plain, "jid-1")
+    assert "execution_settings" not in m8_job_spec_from_request(plain, "jid-1")
+
+    # 착지: 선언된 러너 노브만 실린다 (repeats 제외) — 두 생산자 동일.
+    for spec in (_job_spec_for(with_dt, "jid-1"), m8_job_spec_from_request(with_dt, "jid-1")):
+        assert spec["execution_settings"] == {"fixed_dt": 0.02}
+    assert with_dt.execution_settings.repeats == 3  # 모델에는 남아 있다 (fan-out이 읽는다)
+
+    # 착지의 반대편 끝: 러너 seam이 이 wire를 실제로 복원한다 (M2 소비는 T4 몫).
+    # 함수-로컬 import — 이 파일은 제어 평면 테스트이고 러너 평면을 상시 끌지 않는다.
+    from cv_infra.runner.main import parse_request
+
+    restored, _adapter = parse_request(_job_spec_for(with_dt, "jid-1"))
+    assert restored.execution_settings.fixed_dt == 0.02
 
 
 def test_admitted_spec_rides_fanned_out_jobs_and_persists(tmp_path):

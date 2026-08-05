@@ -317,12 +317,26 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict (p4c4 glue).
 
     The wire shape is the frozen Phase-2 M3->M2 seam (supervisor JOB_SPEC file
-    -> runner ``resolve_job_spec_dict``): exact top-level key set ``{job_id,
-    scenario, sut_image_ref, interface, acceptance_criteria}`` with
-    ``sut.image_ref`` flattened (REQ-INTAKE-006). ``exclude_none=True`` keeps
-    "None = downstream default applies" fields ABSENT (a present-but-null
-    known-key param would defeat the oracle ``read_field`` fallback); free-form
+    -> runner ``resolve_job_spec_dict``): top-level key set ``{job_id, scenario,
+    sut_image_ref, interface, acceptance_criteria}`` with ``sut.image_ref``
+    flattened (REQ-INTAKE-006), plus ``execution_settings`` when it carries a
+    runner-actionable knob (below). ``exclude_none=True`` keeps "None =
+    downstream default applies" fields ABSENT (a present-but-null known-key
+    param would defeat the oracle ``read_field`` fallback); free-form
     custom-criterion params are not filtered, so explicit user nulls survive.
+
+    ``execution_settings`` (decision 2026-08-04 D-8): the knobs the RUNNER can
+    act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
+    each fanned-out job IS one repeat, so shipping it would tell the runner
+    something false about the job it holds (one home per field). The subtree is
+    dumped mechanically (``exclude={"repeats"}`` + ``exclude_none``) so a future
+    M1 knob rides without an allowlist to drift (G-25), and it is OMITTED when
+    nothing survives that filter — an undeclared ``fixed_dt`` leaves the frozen
+    key set byte-identical. Nesting (not flattening like ``sut_image_ref``) is
+    what the seam actually admits: the runner re-validates the spec as a whole
+    ``VerificationRequest`` (``runner/main.py::parse_request``, ``extra=forbid``)
+    — measured 2026-08-05, a top-level ``fixed_dt`` is rejected with exit 2.
+    Consuming the value is M2's (T4); this producer only stops swallowing it.
 
     SOURCE OF TRUTH anchor (G-25): the envelope-less producer of this exact
     shape is ``cv_infra/cli/main.py::_job_spec_from_request`` (M8, ``cv-infra
@@ -330,7 +344,7 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
     guard ``tests/test_orchestrator_rest_glue.py`` — production M3 deliberately
     does NOT import the M8 CLI plane (layer direction: M8 wraps M3).
     """
-    return {
+    spec = {
         "job_id": job_id,
         "scenario": request.scenario.model_dump(exclude_none=True),
         "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
@@ -339,6 +353,10 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
             criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
         ],
     }
+    runner_knobs = request.execution_settings.model_dump(exclude_none=True, exclude={"repeats"})
+    if runner_knobs:
+        spec["execution_settings"] = runner_knobs
+    return spec
 
 
 def _result_wire(result: JobResult) -> dict[str, Any]:
