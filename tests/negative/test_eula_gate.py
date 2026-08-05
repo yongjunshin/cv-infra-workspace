@@ -11,6 +11,7 @@ NFR-DEPLOY-004; 게이트 DoD-P5-06; 결정 2026-07-03-p1-eula-runtime-consent).
 2. "``grep -rn "ACCEPT_EULA=Y" docker/ cv_infra/ scripts/ docs/`` -> 하드코딩 박힘 0"
    -> ``test_no_acceptance_literal_is_baked_into_the_gate_dirs``
    -> ``test_no_acceptance_value_injection_in_any_syntax``  (G-21 전 구문형)
+   -> ``test_scan_covers_every_value_the_boot_guard_accepts`` (G-56 불변식)
    -> ``test_gate_scan_reads_real_non_empty_directories``   (스캔 무장 실증)
    -> ``test_scan_patterns_are_not_vacuous``                (패턴 비공허 + 오탐 대조)
    -> ``test_ci_plane_bakes_no_automatic_consent``          (계약의 CI 절, p5c10)
@@ -71,6 +72,46 @@ green이었다:
   ``test_ci_plane_bakes_no_automatic_consent``가 집행한다(게이트 문면의 4개 디렉토리
   스캔은 그대로 — 축소 아님, 계약 절의 추가 집행).
 
+**★ p5c11 공허화 수리 — 스캔이 값을 열거하는 한 가드보다 좁다 (G-56, F-1).** 위 (a)/(b)
+보강 뒤에도 스캔은 여전히 **truthy 값을 열거**했다(``Y|y|yes|Yes|true|True|1``). 그런데
+부트 가드 ``eula_boot_guard``는 ``if not environ.get("ACCEPT_EULA")`` = **순수
+truthiness** — 빈 문자열이 아닌 **아무 값이나** 동의를 해제한다. 차집합이 통째로 구멍이라
+``ENV ACCEPT_EULA=accepted-by-operator`` 를 심으면 p5c10 시점 809/809 green이었다.
+``=YES``가 잡히던 것은 리터럴 부분문자열의 **우연**이다.
+
+수리 방향 = **G-56 ①(키 대입 자체를 겨냥)**. 값 열거를 버리고 ``baked_consent_bindings``가
+*"동의 키에 **상수 값**을 묶는 자리"* 를 찾는다 — 허용되는 것은 **런타임에 운영자가
+공급해야만 값이 생기는 형태**뿐이다(``${VAR}``·``$(cmd)``·docs 자리표시자 ``<consent>``·
+빈 값). 대안 ②(가드의 수용 값을 제한)를 택하지 않은 이유는 두 가지다: 가드는 M2 소유라
+이 태스크의 수정 범위 밖이고, 무엇보다 **금지의 실체가 값이 아니라 "동의를 이미지에
+굽는 행위"** 라서 수용 값을 좁혀도 좁혀진 리터럴을 굽는 것을 막지 못한다.
+
+**불변식 = 스캔 집합 ⊇ 가드 수용 집합.** ``test_scan_covers_every_value_the_boot_guard_
+accepts``가 이것을 **가드에서 유도**해 고정한다: 후보 값마다 실제
+``eula_boot_guard``를 호출해 수용 여부를 물어보고, 수용되면 6종 대입 구문 전부에서
+스캔이 발화함을 단정한다(거부되는 유일한 값 = 빈 문자열은 발화하지 않아야 한다).
+가드가 나중에 값을 제한하면 이 테스트가 **자동으로 따라간다** — 값 목록은 스캔이
+아니라 가드가 정한다.
+
+**못 잡는 것(정직 표기 — 잡을 수 있는 척하지 않는다)**:
+
+* **줄 단위 스캔**이다(게이트 문면이 ``grep -rn``이라 그 의미론을 따른다). 키와 값이
+  서로 다른 줄에 있는 대입은 보지 못한다.
+* **다른 상수에서 조립되는 값**: ``scripts/measure/common.sh``는 ``CV_EULA_CONSENT``에서
+  ``ACCEPT_EULA`` 값을 파생시킨다. 누가 ``CV_EULA_CONSENT=yes``를 커밋하면 동의가
+  전이적으로 구워지는데, 이 스캔은 **동의 키 자신의 대입 자리만** 본다. 그렇다고 아래
+  키 목록에 ``CV_EULA_CONSENT``를 그냥 넣지 마라 — 실측하면 게이트 디렉토리에서 **24행이
+  발화**한다(사용법 문서·에러 메시지의 ``CV_EULA_CONSENT=yes <cmd>``). ``ACCEPT_EULA``와
+  달리 이 키는 **운영자 입력 변수**라 *문서화된 호출 형태 자체가 truthy 대입*이고,
+  "명령 접두로 주는 런타임 입력"과 "파일이 굽는 값"을 줄 단위로 가를 수 없다. 넓히려면
+  다른 규칙이 필요하다(p5c11 T5 관측).
+* **키 이름 나열의 carve-out**: ``("ACCEPT_EULA", "PRIVACY_CONSENT")`` 형태(콤마 + 호출
+  아님 + 값이 다른 동의 키 이름)는 합법 관용구로 통과시킨다. 같은 모양의 *bare* 시퀀스
+  리터럴을 값으로 악용하는 경우는 줄 단위로 구분 불가다(호출형
+  ``setdefault("ACCEPT_EULA", "PRIVACY_CONSENT")`` 쪽은 잡는다 — 아래 오탐 대조 참조).
+* 스캔 **범위 밖**: 운영자의 미추적 ``.env``, 베이스 이미지 레이어, CI 시크릿. 게이트가
+  디렉토리 목록을 고정한다.
+
 Stdlib + pytest (+ 기존 픽스처 YAML). 신규 의존 0.
 """
 
@@ -120,15 +161,74 @@ _GATE_DIRS = ("docker", "cv_infra", "scripts", "docs")
 #: 게이트 문면의 리터럴 그대로. 조립해 만든다 — 이 파일에 수락 값이 박히지 않도록.
 _GATE_LITERAL = f"{_CONSENT_KEY}=Y"
 
-#: G-21: 값 주입은 등호형 하나가 아니다. 콜론/JSON/subscript 대입 **+ 호출 인자
-#: (콤마)** 까지 겨냥한 상위집합 (기존 ``tests/test_gh_wiring_static.py``의 관용구를
-#: 넓힌 형태 — 그 패턴은 dict 콜론형 ``{"ACCEPT_EULA": "Y"}``를 놓친다[p5c9 실측] 그리고
-#: 호출형 ``setdefault("ACCEPT_EULA", "Y")``도 놓친다[p5c10 실측, 모듈 docstring (a)]).
-#: 콤마 구분자가 저장소의 합법적인 **키 튜플 나열**(``("ACCEPT_EULA", "PRIVACY_CONSENT")``)
-#: 을 잡지 않는 이유는 값 자리가 truthy 리터럴로 한정되기 때문 — 아래 오탐 대조가 단정.
-_ANY_SYNTAX = re.compile(
-    rf"({_CONSENT_KEY}|{_PRIVACY_KEY})[\"']?\s*\]?\s*[:=,]\s*[\"']?\s*(Y|y|yes|Yes|true|True|1)\b"
+#: 동의 키에 값을 묶는 **자리**를 찾는다 — 값이 무엇인지는 여기서 판단하지 않는다(G-56).
+#: 겨냥하는 구문(G-21 전 구문형): ``KEY=v`` (Dockerfile ENV/compose short/CLI ``-e``) ·
+#: ``KEY: v`` (YAML/dict) · ``d["KEY"] = v`` (subscript) · ``f("KEY", v)`` (호출 인자).
+#: ``callee`` 그룹은 **호출/첨자 위치**를 구분하려고 잡는다(합법적인 키 이름 시퀀스
+#: ``("ACCEPT_EULA", "PRIVACY_CONSENT")``\ 와 ``setdefault("ACCEPT_EULA", "PRIVACY_CONSENT")``\
+#: 를 가르는 유일한 줄 단위 신호). ``${KEY...}``\ 는 **읽기**이지 대입이 아니라 lookbehind로
+#: 배제한다(``docker/compose.yaml``의 ``${ACCEPT_EULA:?...}`` 필수-변수 관용구).
+_CONSENT_BINDING = re.compile(
+    rf"""
+    (?:(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*[(\[]\s*)?  # f( / d[  -> 인자·첨자 위치
+    ["']?                                               # 키를 감싼 따옴표(선택)
+    (?<!\$\{{)                                          # ${{KEY...}} = 읽기, 대입 아님
+    (?P<key>{_CONSENT_KEY}|{_PRIVACY_KEY})
+    ["']?\s*\]?\s*                                      # 닫는 따옴표 / 첨자 괄호
+    (?P<sep>[:=,])                                      # = | : | ,
+    \s*
+    (?P<value>"[^"]*"|'[^']*'|[^\s,)\]}}]*)             # 묶인 값 토큰
+    """,
+    re.VERBOSE,
 )
+
+#: 값이 **런타임에만 존재**하게 만드는 형태. ``$'...'``(ANSI-C 인용 리터럴)는 확장이
+#: 아니므로 일부러 제외한다 — ``$`` 다음이 ``{``/``(``/식별자일 때만 확장으로 친다.
+_EXPANSION = re.compile(r"\$[{(A-Za-z_]")
+
+#: 확장이지만 **폴백 값을 굽는** 형태: ``${VAR:-Y}``/``${VAR=Y}``/``${VAR:+Y}`` 는 VAR가
+#: 없거나(있거나) 할 때 리터럴을 그대로 내놓는다 = 구워진 동의. 확장이라고 봐주지 않는다.
+#: (부분문자열 확장 ``${_c:0:1}`` 은 여기 걸리지 않는다 — ``:`` 다음이 숫자.)
+_FALLBACK_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=+]")
+
+#: 문서의 자리표시자 (``-e ACCEPT_EULA=<consent>``) — 값 전체가 꺾쇠일 때만.
+_PLACEHOLDER = re.compile(r"^<[^>]*>$")
+
+#: 합법적인 **키 이름 나열**(``_CONSENT_ENV_KEYS`` 튜플·로그 필드 목록)의 값 자리.
+_KEY_NAMES = frozenset({_CONSENT_KEY, _PRIVACY_KEY})
+
+
+def _is_operator_supplied(value: str) -> bool:
+    """이 값이 **런타임 운영자 입력으로만** 생길 수 있는가(= 굽힌 동의가 아닌가)."""
+    token = value.strip("\"'")
+    if not token:
+        return True  # 빈 값 -> 가드는 여전히 거부한다
+    if _FALLBACK_EXPANSION.search(token):
+        return False  # ${VAR:-Y} = 확장의 탈을 쓴 리터럴
+    if _EXPANSION.search(token):
+        return True
+    return bool(_PLACEHOLDER.match(token))
+
+
+def baked_consent_bindings(text: str) -> list[str]:
+    """``text``\\ 가 동의 키에 **상수 값**을 묶는 자리 전부(없으면 빈 리스트).
+
+    NEG-2 스캔의 **단일 출처** — ``tests/test_gh_wiring_static.py``\\ 의 CI 평면 가드도
+    이것을 임포트한다. 두 곳이 각자 패턴을 들고 있으면 갈라지고, 갈라지면 차집합이
+    구멍이 된다(G-56이 정확히 그 사고였다).
+    """
+    bindings: list[str] = []
+    for match in _CONSENT_BINDING.finditer(text):
+        is_key_name_list = (
+            match.group("sep") == ","
+            and match.group("callee") is None
+            and match.group("value").strip("\"'") in _KEY_NAMES
+        )
+        if is_key_name_list or _is_operator_supplied(match.group("value")):
+            continue
+        bindings.append(match.group(0))
+    return bindings
+
 
 #: 실제 주입이 이렇게 생겼다면 잡혀야 한다(패턴 비공허 — 런타임 조립).
 _INJECTION_SAMPLES = (
@@ -142,6 +242,13 @@ _INJECTION_SAMPLES = (
     f'environment.setdefault("{_CONSENT_KEY}", "Y")',
     f'os.environ.setdefault("{_PRIVACY_KEY}", "yes")',
     f'os.putenv("{_CONSENT_KEY}", "1")',
+    # p5c11 (F-1/G-56): 계약 예시 값이 **아닌** 값 — 값 열거 스캔이 통과시키던 벡터들.
+    f"ENV {_CONSENT_KEY}=accepted-by-operator",
+    f"ENV {_CONSENT_KEY}=no",  # 문자열 "no"도 truthy = 동의 해제
+    f'ENV {_CONSENT_KEY}=" "',  # 공백 한 칸도 truthy
+    f"ENV {_CONSENT_KEY}=${{UNSET_VAR:-Y}}",  # 확장의 탈을 쓴 폴백 리터럴
+    f'environ.get("{_CONSENT_KEY}", "{_OPAQUE_CONSENT}")',  # 가드 자신에 심는 기본값
+    f'setdefault("{_CONSENT_KEY}", "{_PRIVACY_KEY}")',  # 키 이름을 값으로 쓰는 우회
 )
 
 #: 스캔이 각 게이트 디렉토리를 **실제로 읽고 있음**을 보이는 실재 문자열(무장 실증).
@@ -155,12 +262,65 @@ _SCAN_SENTINELS = (
 )
 
 #: 저장소에 **실재하는 합법 형태**(런타임 주입·키 이름 참조) — 여기 걸리면 오탐이다.
+#: 키 대입 자체를 겨냥하는 스캔(G-56 ①)의 실제 난이도는 여기에 있다: 저장소는 동의 키
+#: **이름**을 정당하게 다루는 코드로 가득하다. 아래는 ``grep -rn`` 으로 실측한 전 출현
+#: 형태의 대표 verbatim이다 — 파일이 사라져도 이 대조군은 남는다(G-35: negative는
+#: 반대편 단정과 쌍으로). 새 합법 관용구가 생기면 **여기 먼저 추가**하고 스캔을 고쳐라.
 _LEGITIMATE_SAMPLES = (
+    # docker/compose.yaml — 운영자 env 필수 요구(값이 없으면 compose가 기동을 거부)
+    '      ACCEPT_EULA: "${ACCEPT_EULA:?no operator consent on this host'
+    ' — run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)}"',
+    # scripts/isaac_smoke/run_smoke.sh · scripts/measure/common.sh — 첫 글자 합성 주입
     'CV_EULA_DOCKER_ARGS=(-e "ACCEPT_EULA=${_consent_upper:0:1}")',
+    'CV_EULA_DOCKER_ARGS=(-e "ACCEPT_EULA=${_c:0:1}" -e "PRIVACY_CONSENT=${_c:0:1}")',
+    # cv_infra/cli/main.py · cv_infra/orchestrator/serve.py — 키 이름 튜플(값 아님)
+    '_CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")',
     'CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")',
+    # 가드 자신 + P1 스모크 — 읽기
     'if not environ.get("ACCEPT_EULA"):',
+    'os.environ.get("ACCEPT_EULA", "")',  # 빈 기본값은 동의가 아니다
+    # scripts/consent/accept_eula.sh — 키 이름 순회
+    "for key in ACCEPT_EULA PRIVACY_CONSENT; do",
+    # docs/deploy/plane-sync.md — 자리표시자 + 로그 필드 목록
     "-e ACCEPT_EULA=<consent> -e PRIVACY_CONSENT=<consent>",
     'consent_env_present=["ACCEPT_EULA","PRIVACY_CONSENT"]',
+    # 산문 안의 키 이름 언급(주석·docstring·README)
+    "Operator consent (``ACCEPT_EULA``/``PRIVACY_CONSENT``) is forwarded from",
+    "# EULA (NEG-2): per-run operator consent required (exit 3); no ACCEPT_EULA literal baked.",
+    "* Entrypoint is `runheadless.sh` -> `license.sh` (checks `$ACCEPT_EULA`) -> streaming.",
+)
+
+#: 가드 유도 불변식(G-56 ②)의 후보 값. **스캔이 아니라 가드가** 무엇이 동의인지 정한다 —
+#: 아래 테스트는 각 값을 실제 ``eula_boot_guard``\ 에 물어보고 그 답에 스캔을 맞춘다.
+#: 공백만 있는 값은 6종 구문 중 인용부호 없는 것들에서 "빈 값"과 구분되지 않으므로
+#: 여기 대신 ``_INJECTION_SAMPLES``\ 의 ``="` `"`` 항이 인용된 형태로 덮는다.
+_CANDIDATE_VALUES = (
+    "Y",  # 계약 문면의 예시 값
+    "y",
+    "yes",
+    "true",
+    "1",
+    "accepted-by-operator",  # p5c10 실측 벡터 — 값 열거 스캔이 809 green으로 통과시켰다
+    _OPAQUE_CONSENT,
+    "no",  # 부정으로 읽히지만 truthy = 동의 해제
+    "false",
+    "0",
+    "0.0",
+    "네",  # 비-ASCII
+    "-",
+    "#",
+    _PRIVACY_KEY,  # 키 이름을 값으로 (carve-out 경계)
+    "",  # 가드가 거부하는 **유일한** 값 -> 스캔도 발화하면 안 된다
+)
+
+#: 커밋된 파일이 동의 키에 값을 묶을 수 있는 구문 6종(위 ``_CONSENT_BINDING``\ 이 겨냥).
+_BINDING_SYNTAXES = (
+    "ENV {key}={value}",
+    '      {key}: "{value}"',
+    'environment = {{"{key}": "{value}"}}',
+    'os.environ["{key}"] = "{value}"',
+    'environment.setdefault("{key}", "{value}")',
+    "- {key}={value}",
 )
 
 
@@ -205,12 +365,39 @@ def test_no_acceptance_literal_is_baked_into_the_gate_dirs():
 
 
 def test_no_acceptance_value_injection_in_any_syntax():
-    """G-21 상위집합: 등호/콜론/JSON/subscript/**호출 인자** 어떤 구문으로도 수락 값 주입 0.
+    """동의 키에 **상수 값을 묶는 자리 0** — 값이 무엇이든(G-56 ①, p5c11 F-1 수리).
 
-    호출 인자형은 p5c10 보강분 (a) — ``environment.setdefault("<key>", "Y")`` 를
-    ``run_job``의 러너 env 조립부에 심어 실측했다: 보강 전에는 전 스위트 790/790 green.
+    이전 판은 truthy 값을 열거해서(``Y|y|yes|Yes|true|True|1``) 가드
+    (``if not environ.get("ACCEPT_EULA")`` = 순수 truthiness)보다 좁았다. 실측:
+    ``docker/orchestrator/Dockerfile``에 ``ENV ACCEPT_EULA=accepted-by-operator``를
+    심으면 p5c10 시점 전 스위트 809/809 green. 이제는 값을 보지 않고 **대입 자체**를
+    본다 — 통과하는 것은 런타임 운영자 입력 형태뿐이다(위 ``_is_operator_supplied``).
     """
-    assert _hits(lambda line: bool(_ANY_SYNTAX.search(line))) == []
+    assert _hits(lambda line: bool(baked_consent_bindings(line))) == []
+
+
+def test_scan_covers_every_value_the_boot_guard_accepts():
+    """**불변식: 스캔 집합 ⊇ 가드 수용 집합** (G-56 ②). 값 목록은 가드가 정한다.
+
+    스캔이 자기 값 목록을 들고 있으면 가드와 갈리고, 그 차집합이 통째로 구멍이다
+    (F-1이 정확히 그 사고). 그래서 여기서는 후보 값마다 **실제 부트 가드를 호출해**
+    수용 여부를 묻고, 수용되면 6종 대입 구문 전부에서 스캔이 발화함을 단정한다.
+    가드가 언젠가 수용 값을 제한하면 이 테스트가 자동으로 따라간다.
+    """
+    for value in _CANDIDATE_VALUES:
+        try:
+            eula_boot_guard({_CONSENT_KEY: value})
+            guard_accepts = True
+        except EulaNotAcceptedError:
+            guard_accepts = False
+
+        for syntax in _BINDING_SYNTAXES:
+            line = syntax.format(key=_CONSENT_KEY, value=value)
+            flagged = bool(baked_consent_bindings(line))
+            assert flagged == guard_accepts, (
+                f"가드 수용={guard_accepts} 인데 스캔 발화={flagged}: {line!r}"
+                " — 스캔이 가드보다 좁으면 그 차집합이 구멍이다 (G-56)"
+            )
 
 
 def test_gate_scan_reads_real_non_empty_directories():
@@ -257,16 +444,21 @@ def test_ci_plane_bakes_no_automatic_consent():
     ), "CI 평면 스캔이 잡 정의조차 못 봤다 — 공허하다"
 
     assert _hits(lambda line: _GATE_LITERAL in line, _CI_DIRS) == []
-    assert _hits(lambda line: bool(_ANY_SYNTAX.search(line)), _CI_DIRS) == []
+    assert _hits(lambda line: bool(baked_consent_bindings(line)), _CI_DIRS) == []
 
 
 def test_scan_patterns_are_not_vacuous():
-    """패턴이 실제 주입 형태에 발화하고, 합법 형태에는 발화하지 않는다."""
+    """스캔이 실제 주입에 발화하고(비공허), 합법 관용구에는 발화하지 않는다(오탐 대조).
+
+    두 방향이 **쌍으로** 있어야 의미가 있다: 발화만 보면 "전부 금지"로 약화 없이
+    통과하고(저장소가 red가 되지만 그건 다음 사람이 스캔을 무디게 만드는 압력이다),
+    오탐만 보면 아무것도 안 잡는 스캔이 통과한다(G-35).
+    """
     for sample in _INJECTION_SAMPLES:
-        assert _ANY_SYNTAX.search(sample), f"실제 값 주입을 놓쳤다: {sample}"
+        assert baked_consent_bindings(sample), f"실제 값 주입을 놓쳤다: {sample}"
     assert _GATE_LITERAL in _INJECTION_SAMPLES[0]  # 게이트 리터럴도 살아 있다
     for sample in _LEGITIMATE_SAMPLES:
-        assert not _ANY_SYNTAX.search(sample), f"합법 런타임 주입에 오탐: {sample}"
+        assert not baked_consent_bindings(sample), f"합법 런타임 주입에 오탐: {sample}"
 
 
 # --------------------------------------------------------------------------- #

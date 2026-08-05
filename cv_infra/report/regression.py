@@ -54,10 +54,18 @@ from typing import Any
 #
 # ABSENT == EXPLICIT NULL (null pruning, CEO decision D-5 @ p5c10)
 #   Null-valued keys are dropped recursively — nested mappings and mappings inside
-#   list elements included — and a mapping left EMPTY by that drop (or by the
-#   ``repeats`` exclusion above: ``{"repeats": 1, "fixed_dt": null}`` prunes to
-#   ``{}``) is dropped as well. So "field omitted", "field explicitly null" and
-#   "optional field defaulted to null" are ONE key. Two consequences:
+#   list elements included — and a mapping that is EMPTY AFTER PRUNING is dropped
+#   from its parent as well. "Empty after pruning" has THREE origins, not only the
+#   derived ones (p5c11 F-3 — the previous wording said "left empty BY THAT DROP"
+#   and was narrower than the code): a mapping the caller wrote as ``{}`` to begin
+#   with, one emptied by the null drop, and one emptied by the ``repeats``
+#   exclusion above (``{"repeats": 1, "fixed_dt": null}`` prunes to ``{}``). So
+#   ``{"a": 1, "b": {}}`` and ``{"a": 1}`` are ONE key, exactly as "field omitted",
+#   "field explicitly null" and "optional field defaulted to null" are — a consumer
+#   who hands us an explicitly empty block gets the same key as one who omits it.
+#   BOUNDARY: a mapping that prunes to ``{}`` while it is a LIST ELEMENT stays in
+#   the list as ``{}`` — lists never shrink (``_without_nulls``).
+#   Two consequences:
 #     * the ``repeats`` invariant above now holds for EVERY mapping, not only for
 #       a full ``model_dump()`` (a caller dumping with ``exclude_none=True`` — the
 #       ``orchestrator/api.py`` idiom — no longer forks the key);
@@ -67,16 +75,44 @@ from typing import Any
 #       the dump as a value. Pruning equates absence with null, not with defaults.)
 #   SURFACED ASSUMPTION: this promotes "null == unspecified" to a CONTRACT
 #   CONVENTION. A future field where ``null`` itself MEANS something distinct from
-#   "absent" would have that meaning erased here — M1 must not introduce one.
-#   Mechanically guarded in tests/test_report_regression.py (the guard walks a real
-#   wire dump, so it grows with the contract instead of listing today's fields).
+#   "absent" would have that meaning erased here — M1 must not introduce one (the
+#   convention is written into cv_infra/contract/schema.py's module docstring).
+#   WHAT IS AND IS NOT MECHANICALLY GUARDED (p5c11 F-3 — the previous wording said
+#   "mechanically guarded" flat out, which overclaimed):
+#     * GUARDED — that the PRUNING holds: tests/test_report_regression.py walks a
+#       real wire dump and asserts "explicitly null == absent" at every key path,
+#       so it grows with the contract instead of listing today's fields. Turn the
+#       pruning off and it goes red.
+#     * NOT GUARDED — that no field VIOLATES the convention. That guard can only
+#       assert absent == null, which pruning makes true BY CONSTRUCTION; no test
+#       can see that some field's null was MEANT to be a third state. A violating
+#       field lands green. This is a review-time rule and M1 says so in the same
+#       words (schema.py, "LIMIT (honest)"). Nothing here catches it for you.
 #   ONE-OFF RESET (expected, not a defect): pruning changed every pre-existing key
 #   once — measured on the canonical fixture (tests/fixtures/
 #   nova_carter_warehouse_goal.yaml): sha256:4234cf09… -> sha256:3ed4011c….
 #   Baseline rows written before p5c10 therefore miss ONCE — ``status:
-#   no-baseline``, which is NORMAL (NFR-REPORT-002) — and the advance-on-pass in
-#   ``baseline.update_baseline`` re-establishes them on the next passing run. No
-#   store migration (D-5).
+#   no-baseline``, which is NORMAL (NFR-REPORT-002) — and the NEXT run under the
+#   new key establishes a fresh baseline. No store migration (D-5).
+#   ⚠ THAT ESTABLISH IS NOT "advance-on-pass" (p5c11 F-2 — the previous wording,
+#   "re-establishes them on the next PASSING run", is FALSE):
+#   ``baseline.update_baseline`` declines to write only when ``existing is not
+#   None and verdict != pass``. With NO existing row — exactly the post-reset
+#   state — a ``fail`` is written as the baseline too. That is deliberate for a
+#   genuinely new request (baseline.py: "a first-run fail can be a baseline so a
+#   later fix reads as improved"); the reset is what makes EVERY OLD request look
+#   new. Live evidence: p5c10's isolated store holds a ``verdict: 'fail'`` row.
+#   ★ RESET × FLAKINESS SILENTLY DISABLES REGRESSION DETECTION. NFR-EXEC-001 is
+#   currently measured at ~0.2 flakiness (p5c10 T1: N=10 -> 8 pass / 2 fail; gate
+#   DoD-P2-06 re-opened), so the first post-reset run freezes a ``fail`` baseline
+#   with ~20% probability — after which a passing SUT reads ``improved`` and a REAL
+#   pass->fail regression reads ``unchanged``, the one status a reader treats as
+#   "nothing happened". BINDING on the next live cycle that lifts the runtime plane
+#   past the normalization (p5c11 D-3 defers it — no plane re-sync this cycle, so
+#   the reset has not fired on the live plane yet): either establish the canonical
+#   baseline from a run CONFIRMED to pass, or read the established row back and
+#   drop it when its verdict is ``fail``. Root-causing the flakiness (p5c10 D-7)
+#   dissolves this.
 #
 # Everything else IS in the key: scenario (scene/robot/goal/seed/timeout_s/
 # debug_obstacle — determinism + world + mission), interface (sim<->SUT wiring),
@@ -112,11 +148,14 @@ class RegressionVerdict:
 
 
 def _without_nulls(value: Any) -> Any:
-    """Recursively drop null-valued keys + mappings left empty by that drop.
+    """Recursively drop null-valued keys + mappings that END UP empty.
 
-    Mappings shrink; LISTS DO NOT — their length/order/element positions are
-    identity-bearing (acceptance_criteria is ORDER-SENSITIVE) and an empty list
-    is kept as an empty list. Returns fresh containers, never aliasing/mutating
+    "Ends up empty" is not only the derived case: a mapping written as ``{}`` in
+    the first place is dropped from its parent too (``{"a": 1, "b": {}}`` ->
+    ``{"a": 1}``). Mappings shrink; LISTS DO NOT — their length/order/element
+    positions are identity-bearing (acceptance_criteria is ORDER-SENSITIVE), an
+    empty list is kept as an empty list, and a list ELEMENT that prunes to ``{}``
+    stays in place as ``{}``. Returns fresh containers, never aliasing/mutating
     the caller's mapping.
     """
     if isinstance(value, Mapping):
@@ -126,7 +165,7 @@ def _without_nulls(value: Any) -> Any:
                 continue  # absent == explicit null (header block)
             cleaned = _without_nulls(item)
             if isinstance(cleaned, dict) and not cleaned:
-                continue  # a mapping that pruned away == a mapping that was never there
+                continue  # empty after pruning — or empty to begin with — == never there
             pruned[key] = cleaned
         return pruned
     if isinstance(value, list):
