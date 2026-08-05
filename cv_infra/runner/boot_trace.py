@@ -69,7 +69,7 @@ LOG_PREFIX = "[cv-runner]"
 PHASE_SIMULATION_APP_INIT = "simulation_app_init"  # SimulationApp({...}) ctor + R4 cap
 PHASE_ROS_BRIDGE_READY = "ros_bridge_ready"  # enable_extension(isaacsim.ros2.bridge)
 PHASE_SCENE_LOAD = "scene_load"  # open_stage + first app pump
-PHASE_ROBOT_SPAWN = "robot_spawn"  # World ctor + robot prim resolve + pre_reset + reset
+PHASE_ROBOT_SPAWN = "robot_spawn"  # World ctor + prim resolve + initial pose + pre_reset + reset
 PHASE_ADAPTER_WIRE = "adapter_wire"  # rclpy init/node/clock sub/goal client (no SUT spawn)
 PHASE_SUT_READINESS_WAIT = "sut_readiness_wait"  # the barrier (p4c4 발견 ①'s grave)
 PHASE_FIRST_RENDER_FRAME = "first_render_frame"  # first world.step(render=True) COMPLETED

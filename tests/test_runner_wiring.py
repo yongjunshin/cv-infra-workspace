@@ -8,6 +8,12 @@ pre-sim (no Isaac touched, no result.json emitted), that ``debug_obstacle`` is
 consumed from its D-2' home (``scenario.debug_obstacle``, criteria ride-along
 loud-rejected), and that the ros2 adapter's goal interface comes from the M1
 adapter_schema (module DEFAULT_* constants removed).
+
+Section (5) (p5c11) covers the two knobs whose consumers landed this cycle —
+``scenario.initial_pose`` (REQ-EXEC-002 / CEO D-2) and
+``execution_settings.fixed_dt`` (D-8) — including the mechanical
+producer/consumer binds that keep the field names from drifting (G-17) and the
+undeclared-path no-op that protects every pre-p5c11 scenario.
 """
 
 import json
@@ -15,8 +21,9 @@ import json
 import pytest
 
 from cv_infra.contract.adapter_schema import GoalInterface, Ros2AdapterConfig
-from cv_infra.contract.schema import Goal, VerificationRequest
-from cv_infra.runner import main
+from cv_infra.contract.schema import Goal, InitialPose, Scenario, VerificationRequest
+from cv_infra.oracles.reached_goal import angle_diff, yaw_from_quat_wxyz
+from cv_infra.runner import main, sim_runtime
 from cv_infra.runner.adapter import ros2
 
 
@@ -221,3 +228,144 @@ def test_goal_interface_defaults_come_from_schema_not_module_constants():
     assert (got.kind, got.name, got.type) == (default.kind, default.name, default.type)
     assert not hasattr(ros2, "DEFAULT_GOAL_ACTION")
     assert not hasattr(ros2, "DEFAULT_GOAL_ACTION_TYPE")
+
+
+# --------------------------------------------------------------------------- #
+# (5) scenario.initial_pose + execution_settings.fixed_dt -> SimConfig
+#     (p5c11 T4: REQ-EXEC-002 consumption / CEO D-2, and D-8's fixed_dt).
+# --------------------------------------------------------------------------- #
+DECLARED_POSE = {"x": -6.0, "y": -1.0, "yaw": 3.1416}
+
+
+def _request(initial_pose: dict | None = None, fixed_dt: float | None = None):
+    """The canonical spec as the ADMITTED ``VerificationRequest`` (producer side)."""
+    spec = _valid_spec()
+    doc = {
+        "scenario": dict(spec["scenario"]),
+        "sut": {"image_ref": spec["sut_image_ref"]},
+        "interface": spec["interface"],
+        "acceptance_criteria": spec["acceptance_criteria"],
+    }
+    if initial_pose is not None:
+        doc["scenario"]["initial_pose"] = initial_pose
+    if fixed_dt is not None:
+        doc["execution_settings"] = {"fixed_dt": fixed_dt}
+    return VerificationRequest.model_validate(doc)
+
+
+def test_undeclared_initial_pose_is_a_no_op_all_the_way_to_the_prim():
+    # ★ The biggest regression risk of the whole wiring (CEO D-2): a scenario
+    # that says nothing about the spawn pose must leave the scene asset's own
+    # robot placement ALONE. A (0, 0, 0) default would teleport every pre-p5c11
+    # robot to the world origin. Proven at each hop, not just at the config.
+    request, _ = main.parse_request(_valid_spec())
+    assert request.scenario.initial_pose is None  # contract hop
+    config = main.sim_config_for(request)  # runner-config hop
+    assert config.initial_pose is None
+    # apply hop: with no pose there is no target prim, so apply_initial_pose is
+    # never called even though the robot prim resolved fine.
+    assert (
+        sim_runtime.resolve_initial_pose_target(config.initial_pose, "/World/Nova_Carter_ROS")
+        is None
+    )
+
+
+def test_declared_initial_pose_reaches_sim_config_verbatim():
+    request, _ = main.parse_request(
+        {**_valid_spec(), "scenario": {**_valid_spec()["scenario"], "initial_pose": DECLARED_POSE}}
+    )
+    config = main.sim_config_for(request)
+    assert config.initial_pose == DECLARED_POSE  # x/y/yaw, names unchanged
+    assert sim_runtime.resolve_initial_pose_target(config.initial_pose, "/World/X") == "/World/X"
+
+
+def test_declared_initial_pose_without_a_resolved_robot_prim_is_loud():
+    # A pose the runner cannot honour must NOT be silently dropped (G-25's
+    # goal_tolerance_m pattern): direct .usd scene refs carry no robot prim.
+    with pytest.raises(RuntimeError, match="initial_pose"):
+        sim_runtime.resolve_initial_pose_target(DECLARED_POSE, None)
+
+
+def test_initial_pose_transform_keeps_the_assets_height_and_yaws_about_z():
+    position, orientation = sim_runtime.initial_pose_world_transform(
+        DECLARED_POSE, current_position=(1.0, 2.0, 0.37)
+    )
+    assert position == (-6.0, -1.0, 0.37)  # z comes from the asset, never the consumer
+    # Round-trip through the oracle's OWN quaternion->yaw reader, compared wrapped:
+    # the contract's example 3.1416 sits a hair PAST pi, so atan2 returns the
+    # equivalent negative angle. Same rotation, and angle_diff is how the rest of
+    # the runner already compares headings.
+    assert angle_diff(yaw_from_quat_wxyz(orientation), DECLARED_POSE["yaw"]) == pytest.approx(
+        0.0, abs=1e-9
+    )
+    w, x, y, z = orientation
+    assert (x, y) == (0.0, 0.0)  # pure +Z rotation: no roll/pitch smuggled in
+    assert w**2 + z**2 == pytest.approx(1.0)
+
+
+def test_undeclared_fixed_dt_leaves_the_step_at_one_sixtieth():
+    # T3's wire contract: an undeclared knob leaves behaviour unchanged. NOT a
+    # determinism claim (D-8) — 1/60 was already the fixed step.
+    config = main.sim_config_for(main.parse_request(_valid_spec())[0])
+    assert config.physics_dt == pytest.approx(1.0 / 60.0)
+    assert config.rendering_dt == pytest.approx(1.0 / 60.0)
+
+
+def test_declared_fixed_dt_drives_both_physics_and_rendering_dt():
+    spec = {**_valid_spec(), "execution_settings": {"fixed_dt": 0.02}}
+    config = main.sim_config_for(main.parse_request(spec)[0])
+    assert (config.physics_dt, config.rendering_dt) == (0.02, 0.02)
+
+
+def test_the_declared_knobs_reach_sim_config_through_the_real_job_spec_wire():
+    # Full round-trip over the PRODUCTION producer (M3 REST twin, G-25-anchored
+    # to the M8 CLI twin) -> runner parse -> SimConfig: the value has to survive
+    # every hop under its contract name (G-17 is exactly this seam).
+    from cv_infra.orchestrator.api import _job_spec_for
+
+    spec = _job_spec_for(_request(initial_pose=DECLARED_POSE, fixed_dt=0.02), "job-0001")
+    assert spec["scenario"]["initial_pose"] == DECLARED_POSE
+    assert spec["execution_settings"] == {"fixed_dt": 0.02}  # repeats stays M3's axis
+    config = main.sim_config_for(main.parse_request(spec)[0])
+    assert config.initial_pose == DECLARED_POSE
+    assert (config.physics_dt, config.rendering_dt) == (0.02, 0.02)
+
+
+def test_the_undeclared_knobs_keep_the_wire_and_sim_config_at_pre_p5c11_behaviour():
+    from cv_infra.orchestrator.api import _job_spec_for
+
+    spec = _job_spec_for(_request(), "job-0001")
+    assert "initial_pose" not in spec["scenario"]  # exclude_none: off the wire
+    assert "execution_settings" not in spec  # nothing survived the knob filter
+    config = main.sim_config_for(main.parse_request(spec)[0])
+    assert config.initial_pose is None
+    assert (config.physics_dt, config.rendering_dt) == (1.0 / 60.0, 1.0 / 60.0)
+
+
+def test_initial_pose_keys_match_the_runner_read_set():
+    # ★ G-17 guard, same mechanical form as
+    # test_debug_obstacle_keys_match_the_runner_read_set: the contract's known
+    # keys ARE the keys the runner actually reads (``pose["k"]`` call sites),
+    # never a hand-kept list. M1 could not write this in T2 — until this cycle
+    # there was no consumer, so the read-set was empty and the test vacuous.
+    import inspect
+    import re
+
+    src = inspect.getsource(sim_runtime.initial_pose_world_transform)
+    reads = set(re.findall(r"""pose(?:\.get\(|\[)\s*["'](\w+)["']""", src))
+    assert reads, "read-set extraction went empty (positive control, G-07)"
+    assert set(InitialPose.model_fields) == reads
+
+
+def test_runner_reads_the_spawn_pose_under_its_contract_field_name():
+    # The other half of the G-17 bind: the read-set above pins the SUB-keys, this
+    # pins the FIELD name. Renaming Scenario.initial_pose (or deleting the
+    # runner's read) breaks one of the two assertions. Note for the next editor:
+    # a ``request.scenario.<method>()`` call would also be captured here — if one
+    # is ever added, exclude it explicitly rather than weakening the field check.
+    import inspect
+    import re
+
+    reads = set(re.findall(r"request\.scenario\.(\w+)", inspect.getsource(main)))
+    assert "initial_pose" in reads, "the runner stopped reading scenario.initial_pose"
+    assert reads <= set(Scenario.model_fields), f"runner reads non-contract fields: {reads}"
