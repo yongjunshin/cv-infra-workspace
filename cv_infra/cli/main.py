@@ -256,11 +256,11 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
     The wire shape is the frozen Phase-2 seam (supervisor JOB_SPEC file ->
-    runner parse): exact top-level key set ``{job_id, scenario, sut_image_ref,
+    runner parse): top-level key set ``{job_id, scenario, sut_image_ref,
     interface, acceptance_criteria}`` with ``sut.image_ref`` flattened
-    (REQ-INTAKE-006). Contract-side fields (``apiVersion`` /
-    ``execution_settings`` / ``sut.image_id``) stay OFF the wire — consuming
-    them is a later-cycle supervisor/runner surface.
+    (REQ-INTAKE-006), plus ``execution_settings`` when it carries a
+    runner-actionable knob (below). ``apiVersion`` (resolved at admit) and
+    ``sut.image_id`` stay OFF the wire — no execution-plane consumer exists.
 
     ``exclude_none=True`` keeps "None = downstream default applies" fields
     ABSENT exactly as the raw-YAML pass-through did: a present-but-``null``
@@ -269,8 +269,20 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
     criterion params) are NOT filtered by pydantic's ``exclude_none`` —
     explicit nulls a user wrote survive verbatim (measured 2026-07-10).
     ``scenario.debug_obstacle`` (D-2') rides the wire only when declared.
+
+    ``execution_settings`` (decision 2026-08-04 D-8): the knobs the RUNNER can
+    act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
+    each fanned-out job IS one repeat (this CLI path runs exactly one), so
+    shipping it would tell the runner something false about the job it holds.
+    The subtree is dumped mechanically (``exclude={"repeats"}`` +
+    ``exclude_none``) so a future M1 knob rides without an allowlist to drift,
+    and it is OMITTED when nothing survives that filter — an undeclared
+    ``fixed_dt`` leaves the frozen key set byte-identical. It nests (rather than
+    flattening like ``sut_image_ref``) because the runner re-validates the spec
+    as a whole ``VerificationRequest`` (``extra=forbid``): a top-level
+    ``fixed_dt`` is rejected with exit 2 (measured 2026-08-05).
     """
-    return {
+    spec = {
         "job_id": job_id,
         "scenario": request.scenario.model_dump(exclude_none=True),
         "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
@@ -279,6 +291,10 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
             criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
         ],
     }
+    runner_knobs = request.execution_settings.model_dump(exclude_none=True, exclude={"repeats"})
+    if runner_knobs:
+        spec["execution_settings"] = runner_knobs
+    return spec
 
 
 def _render_contract_errors(err: Any) -> None:
