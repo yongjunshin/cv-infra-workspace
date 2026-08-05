@@ -20,6 +20,18 @@ Wire grounding (karpathy — only fields with a real basis exist):
   emission-binding tests in tests/test_contract_schema_p3.py (guard +
   positive control, G-25/G-17).
 
+CONTRACT CONVENTION — ``null`` means "unspecified", NEVER a distinct value:
+do not add a field whose ``null`` carries its own meaning (a third state
+separate from "absent"). The M4 identity normalization prunes null-valued keys
+recursively (CEO decision D-5 @ p5c10, header block of
+``cv_infra/report/regression.py``), so such a meaning would be erased from
+``request_identity_key`` — two materially different requests would collide on
+one key. Encode a third state as a distinct VALUE or a distinct field instead.
+LIMIT (honest): this is a REVIEW-TIME rule with no mechanical enforcement. The
+guard in tests/test_report_regression.py can only assert that absent == null,
+which pruning makes true BY CONSTRUCTION; no test can see that a difference was
+intended. Nothing here will catch a violation for you.
+
 This pydantic canon is the ONLY definition since D-4' (2026-07-10): the
 Phase-2 stdlib dataclasses (contract/models.py) are retired, all consumers
 validate through here. This module is imported lazily from
@@ -76,6 +88,40 @@ class Goal(_ForbidExtra):
     frame: str = "map"
 
 
+class InitialPose(_ForbidExtra):
+    """Pose the robot is spawned at before the mission starts (REQ-EXEC-002).
+
+    Planar 3-DoF on the SAME axes as ``Goal`` (x/y in metres, ``yaw`` in
+    radians, scene world frame): the MVP SUT is a ground robot on a warehouse
+    floor, so what a consumer can meaningfully choose is where on the plane it
+    starts and which way it faces. Example values = the SUT's AMCL start pose
+    as RECORDED IN the consumer scenario's own comment (cv-infra-user
+    scenarios/nova_carter_warehouse_goal.yaml) — the contract does not couple
+    the two: a spawn pose that disagrees with the SUT's localization init is
+    the consumer's to reconcile (SUT config is black-box, REQ-EXEC-005).
+
+    Deliberately ABSENT (no field without a basis AND a consumer):
+
+    * ``z`` — floor contact determines it; a consumer-supplied height that
+      disagrees with the scene either drops or embeds the robot. The runner's
+      never-consumed ``SimConfig.initial_pose_xyz`` is the dead Phase-2
+      placeholder this requirement was open on, not evidence of demand.
+      Adding ``z: float | None = None`` later stays baseline-safe (D-5).
+    * ``frame`` — unlike ``Goal`` (which is PUBLISHED to the SUT's nav stack,
+      where the frame is part of the message), this pose is applied by the
+      runner to a stage prim. A frame field the runner cannot honour would be
+      the ``goal_tolerance_m`` silent-ignore pattern (G-25).
+
+    All three components are REQUIRED inside the block: "spawn here, facing
+    this way" then has exactly one meaning, and required->optional stays
+    backwards compatible if partial overrides ever earn their demand.
+    """
+
+    x: float = Field(examples=[-6.0])
+    y: float = Field(examples=[-1.0])
+    yaw: float = Field(examples=[3.1416])
+
+
 class DebugObstacle(_ForbidExtra):
     """FAIL-injection cuboid dropped into the stage pre-reset (D-2' 2026-07-10).
 
@@ -112,6 +158,15 @@ class Scenario(_ForbidExtra):
     seed: int = Field(examples=[42])
     timeout_s: float = Field(gt=0, examples=[120])
     debug_obstacle: DebugObstacle | None = None
+    initial_pose: InitialPose | None = Field(
+        default=None,
+        description=(
+            "Robot spawn pose (REQ-EXEC-002). Omitted (or null — same thing, see "
+            "the module convention) = the scene asset's own placement stands, "
+            "which is the behaviour every pre-p5c11 scenario got."
+        ),
+        examples=[{"x": -6.0, "y": -1.0, "yaw": 3.1416}],
+    )
 
 
 class SutRef(_ForbidExtra):

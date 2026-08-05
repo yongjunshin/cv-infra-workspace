@@ -208,19 +208,47 @@ def test_omitted_block_and_explicit_defaults_are_one_key():
 
 
 def test_a_new_optional_null_field_does_not_move_the_key():
-    """Why D-2 (p5c11 ``scenario.initial_pose``) is baseline-safe.
+    """Why D-2 (``scenario.initial_pose``) was baseline-safe — now with the REAL field.
 
     An optional field added to the contract dumps as ``null`` on every existing
     request; pruning drops it, so pre-existing identity keys — and the baseline
-    rows behind them — stand. Simulated at the wire level because the field does
-    not exist yet (it cannot be validated through today's model).
+    rows behind them — stand. Since p5c11 the D-2 field EXISTS, so the first half
+    is no longer simulated: deleting it from a genuine model dump reproduces the
+    pre-growth wire exactly. The synthetic half keeps covering growth shapes the
+    contract does not have yet (a nested knob, a whole new top-level block).
     """
-    base = identity_key(_dump())
-    grown = _dump()
-    grown["scenario"]["initial_pose"] = None  # D-2's exact field
+    grown = _dump()  # real dump — carries scenario.initial_pose: null since p5c11
+    assert grown["scenario"]["initial_pose"] is None, "D-2's field must be in the dump"
+    pre_growth = copy.deepcopy(grown)
+    del pre_growth["scenario"]["initial_pose"]  # byte-for-byte the pre-p5c11 wire
+    assert identity_key(grown) == identity_key(pre_growth)
+
     grown["execution_settings"]["some_future_knob"] = None  # a nested one
     grown["future_top_level_block"] = None  # and a whole new block
-    assert identity_key(grown) == base
+    assert identity_key(grown) == identity_key(pre_growth)
+
+
+# The canonical consumer request's key AFTER the p5c10 D-5 one-off reset. Measured
+# (p5c11 T2) on both sides of the ``scenario.initial_pose`` addition — identical —
+# and equal to the value the ``regression.py`` header records.
+CANONICAL_FIXTURE_KEY = "sha256:3ed4011ca34c5a1c4f1a32ded31a93812ec2a9d8664fb42a8d4cccd8da8db487"
+
+
+def test_canonical_fixture_key_is_pinned_to_the_live_baseline_value():
+    """The key live baseline rows for the canonical request carry — it must stand.
+
+    Derived exactly as production does (``orchestrator/api.py``: full
+    ``model_dump(mode="json", by_alias=True)`` of the ADMITTED request). A red here
+    means every baseline row for this request just became ``no-baseline``: legitimate
+    ONLY as a conscious contract/fixture change (re-pin, and expect one no-baseline
+    run), never as a side effect of adding an optional field.
+    """
+    from cv_infra.contract.loader import load_request
+
+    fixture = pathlib.Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
+    dump = load_request(fixture).request.model_dump(mode="json", by_alias=True)
+    assert dump["scenario"]["initial_pose"] is None  # optional, omitted by the consumer
+    assert identity_key(dump) == CANONICAL_FIXTURE_KEY
 
 
 def test_empty_list_is_kept_not_treated_as_absent():

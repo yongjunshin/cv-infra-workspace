@@ -31,6 +31,7 @@ from cv_infra.contract.schema import (
     DebugObstacle,
     ExecutionSettings,
     Goal,
+    InitialPose,
     NoCollisionCriterion,
     ReachedGoalCriterion,
     RequestEnvelope,
@@ -199,6 +200,38 @@ def test_debug_obstacle_keys_match_the_runner_read_set():
     assert set(DebugObstacle.model_fields) == reads
 
 
+# --- scenario.initial_pose (REQ-EXEC-002; CEO D-2 2026-08-04: OPTIONAL) ------ #
+def test_scenario_initial_pose_is_optional_and_absent_by_default():
+    # D-2's binding constraint: omitted => the scene asset's own placement stands
+    # (pre-p5c11 behaviour, 4 consumer scenarios unaffected) and the field does not
+    # ride the exclude_none JOB_SPEC wire at all.
+    scenario = Scenario.model_validate(VALID_DOC["scenario"])
+    assert scenario.initial_pose is None
+    assert "initial_pose" not in scenario.model_dump(exclude_none=True)
+
+
+def test_scenario_initial_pose_rides_the_wire_when_declared():
+    pose = {"x": -6.0, "y": -1.0, "yaw": 3.1416}
+    scenario = Scenario.model_validate({**VALID_DOC["scenario"], "initial_pose": pose})
+    assert scenario.initial_pose.model_dump() == pose  # planar 3-DoF, Goal's axes
+    assert scenario.model_dump(exclude_none=True)["initial_pose"] == pose
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"x": 0.0, "y": 0.0},  # a pose is all three or nothing (no partial override)
+        {"x": 0.0, "yaw": 0.0},
+        {"y": 0.0, "yaw": 0.0},
+        {"x": 0.0, "y": 0.0, "yaw": 0.0, "z": 0.3},  # planar-only (InitialPose docstring)
+        {"x": 0.0, "y": 0.0, "yaw": 0.0, "frame": "map"},  # a frame the runner can't honour
+    ],
+)
+def test_scenario_initial_pose_is_known_key_and_complete(bad):
+    with pytest.raises(ValidationError):
+        Scenario.model_validate({**VALID_DOC["scenario"], "initial_pose": bad})
+
+
 def test_execution_settings_bounds():
     assert ExecutionSettings().repeats == 1 and ExecutionSettings().fixed_dt is None
     assert ExecutionSettings(repeats=3, fixed_dt=1 / 60).repeats == 3
@@ -241,8 +274,15 @@ def test_resource_budget_shape_and_bounds():
     ("model", "expected"),
     [
         (Goal, {"x", "y", "yaw", "frame"}),
-        # debug_obstacle = the D-2' addition (2026-07-10) on the Phase-2 set.
-        (Scenario, {"scene", "robot", "goal", "seed", "timeout_s", "debug_obstacle"}),
+        # initial_pose = planar spawn pose, deliberately NOT Goal's field set
+        # (no frame — the runner applies it to a stage prim, REQ-EXEC-002).
+        (InitialPose, {"x", "y", "yaw"}),
+        # debug_obstacle = the D-2' addition (2026-07-10) on the Phase-2 set;
+        # initial_pose = the D-2 addition (CEO 2026-08-04, landed p5c11).
+        (
+            Scenario,
+            {"scene", "robot", "goal", "seed", "timeout_s", "debug_obstacle", "initial_pose"},
+        ),
     ],
 )
 def test_field_sets_pin_the_wire_shape(model, expected):
