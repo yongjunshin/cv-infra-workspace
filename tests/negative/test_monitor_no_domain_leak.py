@@ -7,6 +7,7 @@ NFR-MONITOR-002; 게이트 DoD-P4-13). 게이트 문면 2항 ↔ 테스트 매�
    telemetry·녹화 등) = ∅ 단정"
    -> ``test_domain_detail_field_set_is_derived_and_not_empty``  (★ 비공허 실증)
    -> ``test_operational_and_domain_detail_field_sets_are_disjoint``
+   -> ``test_resource_budget_k_is_operational_not_domain``       (★ p5c12 스키마 diff)
    -> ``test_shared_handles_are_not_domain_detail``              (제외 목록 정직성)
    -> ``test_live_operational_response_leaks_no_domain_field_or_value``
    -> ``test_failure_path_breadcrumbs_leak_no_domain_value``  (★ p5c10 보강)
@@ -41,6 +42,13 @@ consent/secret values or SUT domain detail"* 라고 선언해 놓고 **그 선�
 싣는데 이 파일 8/8·전 스위트 790/790이 green이었다. ->
 ``test_failure_path_breadcrumbs_leak_no_domain_value``가 **실패 경로를 실제로 태워**
 (크래시 + 비정상 종료) 같은 단정을 건다.
+
+**★ p5c12 스키마 성장 1건**(결정 2026-08-05 D-7 (C)). 운영 표면에
+``resources.concurrency_budget_k``(동시성 예산)가 추가됐다 — 도메인 결과가 아니라 **자원
+예산값**이라 게이트 1항을 위반하지 않는다는 판정을 위 ★ 테스트가 집합 수준에서 고정한다.
+선택적 필드가 늘었으므로 이 파일의 입력도 **두 분기를 모두 밟는다**(G-59): 살아 있는
+누수 단정들은 ``create_app(..., k=2)``로 예산이 실린 응답을, ``test_projection_sql_...``은
+store-only(``build_operational_record(store)`` = 예산 None) 경로를 탄다.
 
 **출처 분리 = 구조 강제.** 2항은 표시 필터가 아니라 **SELECT 목록**의 문제다. 그래서
 ① 물리 테이블 컬럼(외부 sqlite3 커넥션의 ``PRAGMA table_info``)과 ② projection이
@@ -202,6 +210,23 @@ def test_operational_and_domain_detail_field_sets_are_disjoint():
     """게이트 1항 본문: 운영 read model 필드 ∩ 도메인 상세 필드 = ∅."""
     leaked = _OPERATIONAL_FIELDS & _DOMAIN_DETAIL_FIELDS
     assert leaked == set(), f"운영뷰가 도메인 상세 필드를 실었다: {sorted(leaked)}"
+
+
+def test_resource_budget_k_is_operational_not_domain():
+    """★ p5c12 (결정 2026-08-05 D-7 (C)) 스키마 diff 판정: 새로 실린 예산 ``k``가
+    NEG-3 위반이 아님을 **집합 수준에서** 확정한다.
+
+    D-7의 집행 조건이 *"필드 추가는 스키마 동등성 게이트를 건드리므로 스키마 diff를
+    보고 확정한다"* 였다. diff = ``MonitorResources``에 ``concurrency_budget_k`` 1개.
+    그 이름이 ① 운영 필드 집합에 실재하고 ② 도메인 상세 집합에 없고 ③ **제외 목록
+    (``_SHARED_HANDLES``)에 숨겨서 통과한 것이 아님**을 단정한다 — 제외 목록에 넣어
+    피해가는 도피구를 미리 막는다(위 정직성 테스트와 같은 논리).
+    """
+    assert "concurrency_budget_k" in _OPERATIONAL_FIELDS
+    assert "concurrency_budget_k" not in _DOMAIN_DETAIL_FIELDS
+    assert "concurrency_budget_k" not in _SHARED_HANDLES  # 제외로 통과한 게 아니다
+    for model in _DOMAIN_DETAIL_MODELS:  # 도메인 생산자 어디에도 같은 이름이 없다
+        assert "concurrency_budget_k" not in _model_field_names(model), model.__name__
 
 
 def test_shared_handles_are_not_domain_detail():

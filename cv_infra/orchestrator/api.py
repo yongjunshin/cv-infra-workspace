@@ -650,8 +650,9 @@ def create_app(
 
     # M6 operational view (DoD-P4-12/13): read-only projection surfaces on the
     # SAME app (no separate server). Routes only — the resident sampler is wired
-    # in production (serve.build_app), never on the TestClient path.
-    register_monitor(app, store)
+    # in production (serve.build_app), never on the TestClient path. The admission
+    # budget k rides along so the operator reads it next to running_k (D-7 (C)).
+    register_monitor(app, store, concurrency_budget_k=k)
     return app
 
 

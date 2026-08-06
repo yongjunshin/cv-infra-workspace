@@ -28,6 +28,12 @@ P4 구조상 ``SlotAccountant``는 봉투마다 임시 객체라 그 필드는 *
 나온다. 채널 자체가 살아 있음(0이 하드코딩이 아님)만
 ``test_monitor_over_launch_field_is_a_live_channel_not_a_hardcoded_zero``가 단정한다.
 
+**p5c12 (결정 2026-08-05 D-7 (C)): 죽은 카운터 대신 예산 `k`를 노출한다.** 운영 표면이
+``resources.concurrency_budget_k``를 실어 운영자가 ``running_k > k``를 **직접** 판정한다
+— 카운터를 살아 보이게 만드는 대신(허위 활성화 금지) 판정 재료를 준다.
+``test_surfaced_budget_k_is_the_measured_budget_the_admission_uses``가 그 값이 admission이
+실제로 쓰는 예산과 같은 수임을 단정한다.
+
 **CPU 층 한정 (정직 표기 — G-35).** 여기서 세는 "기동"은 **admission + 실행 seam 진입**
 이다(fake 러너 = 실행자 스레드). 실제 **러너 컨테이너 수**를 ``docker ps``로 주기
 샘플하는 절반은 GPU/라이브 평면 몫이며 p4c5 배치 실측(k=4·k=8, 초과 0)이 그 증거다 —
@@ -307,6 +313,10 @@ def test_operational_view_samples_running_at_most_k_while_the_rest_wait(tmp_path
                 assert time.monotonic() < deadline, f"RUNNING 창을 못 봤다: {samples}"
                 resources = client.get("/monitor.json").json()["resources"]
                 assert resources["running_k"] <= k, resources  # 상시 <= k
+                # p5c12 D-7 (C): 예산이 같은 응답에 실려 있으므로 초과 판정이 표면
+                # 내부에서 성립한다 (운영자가 외부 지식 없이 running_k > k를 읽는다).
+                assert resources["concurrency_budget_k"] == k, resources
+                assert resources["running_k"] <= resources["concurrency_budget_k"], resources
                 if resources["running_k"] == k:
                     samples.append(resources)
                 time.sleep(0.02)
@@ -346,6 +356,31 @@ def test_monitor_over_launch_field_is_a_live_channel_not_a_hardcoded_zero(tmp_pa
             nvml_snapshot_fn=lambda _index: None,  # CPU 호스트: NVML 부재 경로 고정
         ).sample_once()
         assert build_operational_record(store).resources.over_launch_count == sentinel
+
+
+def test_surfaced_budget_k_is_the_measured_budget_the_admission_uses(tmp_path):
+    """★ p5c12 (D-7 (C)): 운영 표면의 ``concurrency_budget_k`` = admission이 쓰는 예산.
+
+    죽은 카운터를 대신하는 판정 재료이므로 **그 수가 진짜 예산과 같아야** 의미가 있다.
+    여기서는 ``compute_k``가 VRAM 항으로 깎은 예산(2)을 그대로 앱에 주입하고, 표면이
+    그 수를 싣는지 본다.
+
+    비공허(G-35/G-59): ① 예산이 운영자 상한(8)과 **다른 수**라 "상한을 그냥 베꼈다"와
+    구분되고 ② 다른 예산(1)로 앱을 하나 더 세워 표면 값이 **따라 움직임**을 보이므로
+    상수 하드코딩과 구분되며 ③ 앱 없는 store-only projection은 ``None``(선택적 분기)을
+    낸다 — 없는 예산을 0으로 날조하지 않는다.
+    """
+    k = compute_k(8, vram_gauge=_FakeGauge(5000.0), vram_per_instance_mb=2000.0)
+    assert k == 2 < 8  # 예산 항이 운영자 상한보다 작다 — 대조가 성립한다
+
+    with Store(tmp_path / "cv.sqlite3") as store:
+        assert build_operational_record(store).resources.concurrency_budget_k is None
+
+        with TestClient(create_app(store, _GatedRunner(), k=k)) as client:
+            assert client.get("/monitor.json").json()["resources"]["concurrency_budget_k"] == k
+        with TestClient(create_app(store, _GatedRunner(), k=1)) as client:
+            other = client.get("/monitor.json").json()["resources"]["concurrency_budget_k"]
+    assert other == 1 != k  # 값이 앱의 예산을 따라간다 (상수가 아니다)
 
 
 # --------------------------------------------------------------------------- #

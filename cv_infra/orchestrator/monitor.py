@@ -117,10 +117,25 @@ class MonitorHealth(BaseModel):
 
 
 class MonitorResources(BaseModel):
-    """Queue/slot + NVML resource header (values null when never sampled/degraded)."""
+    """Queue/slot + NVML resource header (values null when never sampled/degraded).
+
+    ``concurrency_budget_k`` is the computed concurrency budget the app admits
+    against (``scheduler.compute_k`` output — LOCKED §7.4), surfaced READ-ONLY so
+    the operator can judge ``running_k > concurrency_budget_k`` directly (decision
+    2026-08-05 D-7 (C)). It is a RESOURCE BUDGET value, not a domain result — the
+    NEG-3 disjointness gate covers it. None = the projection was built without an
+    app-level budget (a bare ``build_operational_record(store)`` call: store-only
+    read, no k to report — never a fabricated 0).
+
+    ``over_launch_count`` stays exactly as it was: the sampler-provided counter
+    whose 0 is a BY-CONSTRUCTION constant, not a measurement (the increment branch
+    is unreachable while the admission gate holds — ``tests/test_scheduler_budget.py``
+    ★ test). Exposing k is an ADDITION next to it, never a false activation of it.
+    """
 
     queue_depth: int
     running_k: int
+    concurrency_budget_k: int | None
     over_launch_count: int
     vram_used_mib: int | None
     vram_total_mib: int | None
@@ -220,7 +235,9 @@ def _monitor_request(
     )
 
 
-def build_operational_record(store: Store) -> OperationalRecord:
+def build_operational_record(
+    store: Store, *, concurrency_budget_k: int | None = None
+) -> OperationalRecord:
     """Project the store into the ``OperationalRecord`` — READ-ONLY (DoD-P4-13).
 
     Only read methods are touched: ``load_recent_envelopes`` /
@@ -229,6 +246,10 @@ def build_operational_record(store: Store) -> OperationalRecord:
     ``load_resource_sample``. queue_depth / running_k are LIVE store counts (the
     resource-sample copies lag by a poll interval); vram/util/over_launch come
     from the latest sampler snapshot (defaults when never sampled).
+
+    ``concurrency_budget_k`` is the app's admission budget, passed in by the
+    caller that owns it (``register`` <- ``api.create_app``'s computed k); the
+    store holds no k, so a store-only call reports None rather than inventing one.
     """
     jobs_by_request: dict[str, list[OperationalJobRow]] = {}
     for row in store.load_operational_jobs():
@@ -260,6 +281,7 @@ def build_operational_record(store: Store) -> OperationalRecord:
         resources=MonitorResources(
             queue_depth=counts.get(JobState.QUEUED.value, 0),  # live store count
             running_k=counts.get(JobState.RUNNING.value, 0),  # live store count
+            concurrency_budget_k=concurrency_budget_k,  # admission budget (None = not supplied)
             over_launch_count=sample.over_launch_count if sample is not None else 0,
             vram_used_mib=sample.vram_used_mib if sample is not None else None,
             vram_total_mib=sample.vram_total_mib if sample is not None else None,
@@ -313,6 +335,7 @@ def render_dashboard_html(record: OperationalRecord) -> str:
         f"<p class='health'>orchestrator_up={_cell(h.orchestrator_up)} · "
         f"gpu_reachable={_cell(h.gpu_reachable)} · last_sample_at={_cell(h.last_sample_at)}</p>"
         f"<p class='resources'>queue_depth={r.queue_depth} · running_k={r.running_k} · "
+        f"concurrency_budget_k={_cell(r.concurrency_budget_k)} · "
         f"over_launch_count={r.over_launch_count} · "
         f"vram={_cell(r.vram_used_mib)}/{_cell(r.vram_total_mib)} MiB · "
         f"gpu_util={_cell(r.gpu_util_pct)}%</p>"
@@ -481,16 +504,24 @@ class ResourceHealthSampler:
 # --------------------------------------------------------------------------- #
 
 
-def register(app: FastAPI, store: Store) -> None:
-    """Register the two operational routes on the M3 app (routes only, no writes)."""
+def register(app: FastAPI, store: Store, *, concurrency_budget_k: int | None = None) -> None:
+    """Register the two operational routes on the M3 app (routes only, no writes).
+
+    ``concurrency_budget_k`` is the app's admission budget (``api.create_app``'s
+    computed k) — both surfaces report the SAME value from the one projection.
+    """
 
     @app.get("/monitor.json")
     async def monitor_json() -> dict:
-        return build_operational_record(store).model_dump()
+        return build_operational_record(
+            store, concurrency_budget_k=concurrency_budget_k
+        ).model_dump()
 
     @app.get("/monitor", response_class=HTMLResponse)
     async def monitor_dashboard() -> str:
-        return render_dashboard_html(build_operational_record(store))
+        return render_dashboard_html(
+            build_operational_record(store, concurrency_budget_k=concurrency_budget_k)
+        )
 
 
 def attach_sampler(app: FastAPI, sampler: ResourceHealthSampler) -> None:

@@ -57,6 +57,10 @@ _PIN_HEALTH = {"orchestrator_up", "gpu_reachable", "last_sample_at"}
 _PIN_RESOURCES = {
     "queue_depth",
     "running_k",
+    # p5c12 (D-7 (C)): the admission budget k, exposed read-only next to running_k
+    # so the operator can judge running_k > k himself. Adding it here IS the NEG-3
+    # review gate being exercised — the equality assert below reddens without it.
+    "concurrency_budget_k",
     "over_launch_count",
     "vram_used_mib",
     "vram_total_mib",
@@ -292,7 +296,7 @@ def test_batch8_surfaces_running_then_terminal_counts(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def _sample_record() -> OperationalRecord:
+def _sample_record(concurrency_budget_k: int | None = 2) -> OperationalRecord:
     """A minimal hand-built record so the assertions target the TEMPLATE, not data."""
     return OperationalRecord(
         generated_at="2026-07-16T00:00:00+00:00",
@@ -300,6 +304,7 @@ def _sample_record() -> OperationalRecord:
         resources=MonitorResources(
             queue_depth=0,
             running_k=0,
+            concurrency_budget_k=concurrency_budget_k,
             over_launch_count=0,
             vram_used_mib=None,
             vram_total_mib=None,
@@ -336,6 +341,43 @@ def test_dashboard_html_auto_refreshes_and_is_fully_self_contained():
     assert "http://" not in page and "https://" not in page
     assert "<script" not in page.lower()
     assert "src=" not in page and "href=" not in page
+
+
+# --------------------------------------------------------------------------- #
+# (2c) p5c12 (D-7 (C)): the admission budget k on the operational surfaces.
+# Both optional branches are exercised (G-59): an app-wired budget AND the
+# store-only None — a guard whose input never takes the None path would pass
+# even if the field were hardcoded.
+# --------------------------------------------------------------------------- #
+
+
+def test_monitor_surfaces_the_apps_admission_budget_k(tmp_path):
+    """``/monitor.json`` reports the SAME k the app admits against — so a reader
+    of ``running_k`` has the budget next to it (죽은 카운터 대신 판정 가능한 값)."""
+    k = 3
+    with Store(tmp_path / "cv.sqlite3") as store:
+        # Store-only projection: no app, so no budget to report — None, never a
+        # fabricated 0 (the optional branch, G-59).
+        assert build_operational_record(store).resources.concurrency_budget_k is None
+
+        app = create_app(store, GatedScriptedRunner(), k=k)
+        with TestClient(app) as client:
+            envelope_id = _submit(client, [_request_doc(repeats=2)])
+            _wait_status(client, envelope_id, "completed")
+            resources = client.get("/monitor.json").json()["resources"]
+            page = client.get("/monitor").text
+
+    assert resources["concurrency_budget_k"] == k  # the app's computed cap, verbatim
+    assert resources["running_k"] <= resources["concurrency_budget_k"]
+    assert f"concurrency_budget_k={k}" in page  # same value on the HTML surface
+
+
+@pytest.mark.parametrize(("budget", "rendered"), [(4, "4"), (None, "-")])
+def test_dashboard_renders_the_budget_including_the_absent_branch(budget, rendered):
+    """The one-glance header carries the budget; an absent one degrades to the
+    page's ``-`` null idiom instead of reading as a real budget of 0."""
+    page = render_dashboard_html(_sample_record(concurrency_budget_k=budget))
+    assert f"concurrency_budget_k={rendered}" in page
 
 
 # --------------------------------------------------------------------------- #
