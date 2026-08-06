@@ -38,6 +38,11 @@ from cv_infra.contract.adapter_schema import Ros2AdapterConfig
 BAG_DIR_NAME = "bag"
 VIDEO_NAME = "recording.mp4"
 
+# Opt-in sensor capture (see ``bag_sensors_requested``). Runner-side env, not an
+# adapter_config field: what an operator records for a diagnostic run is not
+# scenario wiring (same reasoning as the mp4 camera below).
+BAG_SENSORS_ENV = "CV_BAG_SENSOR_TOPICS"
+
 # mp4 capture defaults (module policy, not consumer contract — the camera an
 # operator reviews is not scenario wiring; revisit at the P3 recording
 # formalization if consumers need to pick a camera).
@@ -67,12 +72,34 @@ def plan_artifacts(out_dir: str | Path) -> ArtifactPaths:
 # --------------------------------------------------------------------------- #
 # Pure planning helpers — CPU unit-test surface.
 # --------------------------------------------------------------------------- #
-def bag_topics(config: Ros2AdapterConfig) -> list[str]:
+def bag_topics(config: Ros2AdapterConfig, include_sensors: bool = False) -> list[str]:
     """Topics the MCAP bag records: /clock (always — sim-time keying) + the nav
-    streams (odom fan-out + cmd_vel). Sensor topics (PointCloud2 etc.) are
-    deliberately excluded in Phase 2 (artifact size; R12)."""
+    streams (odom fan-out + cmd_vel), and — opt-in only — the DECLARED sensor
+    streams.
+
+    The default is unchanged: sensor topics stay out (artifact size; R12). With
+    ``include_sensors`` the topics come from ``adapter_config.sensors`` — the
+    scenario's own declaration, so a scenario that names a different lidar gets
+    that one and no topic literal lives here (R7).
+    """
     topics = [config.clock_topic, *config.odom_topics, config.cmd_vel.topic]
+    if include_sensors:
+        topics += [sensor.topic for sensor in config.sensors]
     return list(dict.fromkeys(topics))  # dedupe, order-preserving
+
+
+def bag_sensors_requested(env: dict | None = None) -> bool:
+    """Whether this run also records the declared sensor streams (opt-in).
+
+    A measurement/diagnostic knob, NOT consumer contract (same stance as
+    ``READINESS_TIMEOUT_S``): the determinism investigation needs the
+    sim-published sensor stream IN the bag, because the RTX render sits inside
+    the closed loop (sensor -> SUT localization -> cmd_vel -> physics -> GT) and
+    the bag currently carries no way to test that channel. Keeping it opt-in
+    leaves every production artifact byte-identical to Phase 2.
+    """
+    environ = os.environ if env is None else env
+    return bool(environ.get(BAG_SENSORS_ENV))
 
 
 def bag_record_cmd(bag_dir: Path, topics: list[str]) -> list[str]:
@@ -128,9 +155,18 @@ class RosbagRecorder:
     degradation (mcap=None in the Result).
     """
 
-    def __init__(self, paths: ArtifactPaths, config: Ros2AdapterConfig | None = None) -> None:
+    def __init__(
+        self,
+        paths: ArtifactPaths,
+        config: Ros2AdapterConfig | None = None,
+        include_sensors: bool | None = None,
+    ) -> None:
         self.paths = paths
         self.config = config if config is not None else Ros2AdapterConfig()
+        # None = read the opt-in env (production default: nav streams only).
+        self.include_sensors = (
+            bag_sensors_requested() if include_sensors is None else include_sensors
+        )
         self._proc: subprocess.Popen | None = None
         self._log_file = None
 
@@ -143,12 +179,16 @@ class RosbagRecorder:
                 "rosbag2-storage-mcap; report deployment-2026-07-08-p2c5-rosbag2-layer)"
             )
         self.paths.bag_dir.parent.mkdir(parents=True, exist_ok=True)
+        topics = bag_topics(self.config, self.include_sensors)
+        # G-26 feature-on gate: the opt-in must be observable, or a knob that
+        # silently did not engage reads as "the channel is empty".
+        print(f"[cv-runner] bag topics ({len(topics)}): {topics}", flush=True)
         # G-18 evidence culture: keep the recorder's own output as a file.
         self._log_file = open(  # noqa: SIM115 (lifetime spans the recording)
             self.paths.bag_dir.parent / "rosbag2.log", "w", encoding="utf-8"
         )
         self._proc = subprocess.Popen(  # pragma: no cover - needs the backend
-            bag_record_shell_cmd(self.paths.bag_dir, bag_topics(self.config), setup),
+            bag_record_shell_cmd(self.paths.bag_dir, topics, setup),
             stdout=self._log_file,
             stderr=subprocess.STDOUT,
             env=recorder_subprocess_env(),
