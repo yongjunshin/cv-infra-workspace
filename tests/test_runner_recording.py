@@ -43,6 +43,74 @@ def test_bag_topics_dedupes_preserving_order():
     assert recording.bag_topics(cfg) == ["/clock", "/odom", "/cmd_vel"]
 
 
+# --------------------------------------------------------------------------- #
+# Opt-in sensor capture (p5c12: the determinism probe needs the sensor stream in
+# the bag — history 2026-08-05 follow-up ① 선결). Default stays Phase-2 exact.
+# --------------------------------------------------------------------------- #
+def _cfg_with_sensors(topic: str = "/front_3d_lidar/lidar_points") -> Ros2AdapterConfig:
+    return Ros2AdapterConfig.model_validate(
+        {
+            "odom_topics": ["/odom", "/chassis/odom"],
+            "sensors": [{"topic": topic, "type": "sensor_msgs/msg/PointCloud2"}],
+        }
+    )
+
+
+def test_declared_sensors_are_excluded_by_default():
+    # G-59: the input DECLARES a sensor, so the default-off branch is armed —
+    # a config without sensors would pass whatever the code did.
+    assert recording.bag_topics(_cfg_with_sensors()) == [
+        "/clock",
+        "/odom",
+        "/chassis/odom",
+        "/cmd_vel",
+    ]
+
+
+def test_opt_in_appends_the_declared_sensor_topics():
+    cfg = _cfg_with_sensors("/some_other_lidar/points")  # NOT a house literal
+    topics = recording.bag_topics(cfg, include_sensors=True)
+    assert topics[0] == "/clock"  # sim-time keying still first
+    assert topics[-1] == "/some_other_lidar/points"  # derived from adapter_config
+    assert recording.bag_topics(cfg) == topics[:-1]  # opt-in is the ONLY difference
+
+
+def test_opt_in_dedupes_a_sensor_that_is_already_a_nav_stream():
+    cfg = Ros2AdapterConfig.model_validate(
+        {
+            "odom_topics": ["/odom"],
+            "sensors": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry"}],
+        }
+    )
+    assert recording.bag_topics(cfg, include_sensors=True) == ["/clock", "/odom", "/cmd_vel"]
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, False),  # production default: nav streams only
+        ({recording.BAG_SENSORS_ENV: ""}, False),  # set-but-empty = unset (G-26)
+        ({recording.BAG_SENSORS_ENV: "1"}, True),
+        ({recording.BAG_SENSORS_ENV: "yes"}, True),
+    ],
+)
+def test_bag_sensors_requested_reads_the_opt_in_env(env, expected):
+    assert recording.bag_sensors_requested(env) is expected
+
+
+def test_recorder_resolves_the_opt_in_env_at_construction(tmp_path, monkeypatch):
+    paths = recording.plan_artifacts(tmp_path)
+    monkeypatch.delenv(recording.BAG_SENSORS_ENV, raising=False)
+    assert recording.RosbagRecorder(paths, _cfg_with_sensors()).include_sensors is False
+    monkeypatch.setenv(recording.BAG_SENSORS_ENV, "1")
+    assert recording.RosbagRecorder(paths, _cfg_with_sensors()).include_sensors is True
+    # An explicit argument still wins over the env (measurement harnesses).
+    assert (
+        recording.RosbagRecorder(paths, _cfg_with_sensors(), include_sensors=False).include_sensors
+        is False
+    )
+
+
 def test_bag_record_cmd_is_mcap_storage():
     cmd = recording.bag_record_cmd(Path("/out/bag"), ["/clock", "/odom"])
     assert cmd[:3] == ["ros2", "bag", "record"]
