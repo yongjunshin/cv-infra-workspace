@@ -69,6 +69,8 @@ def test_monitor_renders_the_pinned_projection_as_operator_table(monkeypatch, ca
     assert "generated_at=2026-07-16T02:26:53.560521+00:00" in out
     assert "orchestrator_up=true" in out and "gpu_reachable=false" in out
     assert "queue_depth=0" in out and "running_k=0" in out and "over_launch_count=0" in out
+    # The pin predates the budget field (p4c6 bbad1e4) -> absent scalar degrades (G-17).
+    assert "concurrency_budget_k=n/a" in out
     assert "vram=n/a/n/a MiB" in out and "gpu_util=n/a%" in out
 
     lines = out.splitlines()
@@ -125,6 +127,7 @@ def test_monitor_empty_projection_renders_without_rows(monkeypatch, capsys):
         "resources": {
             "queue_depth": 0,
             "running_k": 0,
+            "concurrency_budget_k": 2,
             "over_launch_count": 0,
             "vram_used_mib": None,
             "vram_total_mib": None,
@@ -137,6 +140,30 @@ def test_monitor_empty_projection_renders_without_rows(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "requests: none" in out
     assert "last_sample_at=n/a" in out  # null last_sample_at -> n/a
+    assert "concurrency_budget_k=2" in out  # budget renders on an idle orchestrator too
+
+
+@pytest.mark.parametrize(
+    "budget, shown",
+    [(3, "3"), (0, "0"), (None, "n/a")],
+)
+def test_monitor_shows_the_servers_concurrency_budget_k_verbatim(
+    monkeypatch, capsys, budget, shown
+):
+    """The CLI axis of the M6 operational view carries the SAME
+    ``resources.concurrency_budget_k`` the JSON/HTML surfaces do (decision
+    2026-08-06 p5c12-cli-k-axis-dx): the value is copied, never derived from
+    ``running_k``, and a null budget degrades to the CLI's ``n/a`` idiom (a
+    store-only projection reports no k — never a fabricated 0)."""
+    payload = json.loads(_MONITOR_SAMPLE_JSON)
+    payload["resources"]["running_k"] = 5  # differs from the budget: no cross-read
+    payload["resources"]["concurrency_budget_k"] = budget
+
+    _wire_ok(monkeypatch, payload)
+    assert main(["monitor"]) == EXIT_PASS
+    out = capsys.readouterr().out
+    assert f"concurrency_budget_k={shown}" in out
+    assert "running_k=5" in out
 
 
 # --------------------------------------------------------------------------- #

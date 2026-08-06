@@ -82,6 +82,8 @@ def render_monitor(record: dict[str, Any]) -> str:
     flakiness) plus the broken (error-categorised) jobs with their state /
     category / runner exit code / infra_error. Counts are surfaced verbatim — the
     server already aggregated them (M6 §3.3), this only lays them out.
+    ``concurrency_budget_k`` sits next to ``running_k`` (same order as the HTML
+    dashboard) so the operator can judge ``running_k > k`` inside one surface.
     """
     health = record.get("health") or {}
     resources = record.get("resources") or {}
@@ -99,6 +101,7 @@ def render_monitor(record: dict[str, Any]) -> str:
             "resources: "
             f"queue_depth={_fmt(resources.get('queue_depth'))}  "
             f"running_k={_fmt(resources.get('running_k'))}  "
+            f"concurrency_budget_k={_fmt(resources.get('concurrency_budget_k'))}  "
             f"over_launch_count={_fmt(resources.get('over_launch_count'))}  "
             f"vram={_fmt(resources.get('vram_used_mib'))}/"
             f"{_fmt(resources.get('vram_total_mib'))} MiB  "
