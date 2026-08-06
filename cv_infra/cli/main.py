@@ -447,8 +447,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # Consent pass-through (decision 2026-07-03): forward the operator-provided
     # consent env keys verbatim, only when present. When absent, ``runner_env``
     # is NOT passed — the runner boot guard refuses to start Isaac (FU-8 is P5).
-    consent_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
-    kwargs: dict[str, Any] = {"runner_env": consent_env} if consent_env else {}
+    # Bag sensor opt-in (p5c12): same seam; key name from recording.BAG_SENSORS_ENV
+    # via lazy import (G-25; keep --help free of runner imports).
+    from cv_infra.runner.recording import BAG_SENSORS_ENV
+
+    runner_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
+    if BAG_SENSORS_ENV in os.environ:
+        runner_env[BAG_SENSORS_ENV] = os.environ[BAG_SENSORS_ENV]
+    kwargs: dict[str, Any] = {"runner_env": runner_env} if runner_env else {}
     # D-1 wiring contract #2 (decision 2026-07-11): an admitted CustomCriterion
     # means consumer oracle plugin .py files live next to the scenario YAML —
     # hand that directory (resolved absolute) to the supervisor, which ro-mounts

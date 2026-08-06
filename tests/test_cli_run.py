@@ -559,6 +559,43 @@ def test_consent_env_partial_forwards_only_present_key(
     assert stub.kwargs_calls == [{"runner_env": {present: "opaque-token-partial-05d8"}}]
 
 
+def test_bag_sensors_env_pass_through_uses_recording_canonical_key(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent
+):
+    """p5c12: CV_BAG_SENSOR_TOPICS reaches runner_env; key name = recording.BAG_SENSORS_ENV."""
+    from cv_infra.runner.recording import BAG_SENSORS_ENV
+
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    monkeypatch.setenv(BAG_SENSORS_ENV, "1")
+    monkeypatch.setenv("ACCEPT_EULA", "opaque-token-eula-bag")
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    assert stub.kwargs_calls == [
+        {
+            "runner_env": {
+                "ACCEPT_EULA": "opaque-token-eula-bag",
+                BAG_SENSORS_ENV: "1",
+            }
+        }
+    ]
+
+
+def test_bag_sensors_env_absent_does_not_inject_key(
+    monkeypatch, scenario_file, tmp_path, no_ambient_consent
+):
+    from cv_infra.runner.recording import BAG_SENSORS_ENV
+
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    monkeypatch.setenv("ACCEPT_EULA", "opaque-token-eula-only")
+    monkeypatch.delenv(BAG_SENSORS_ENV, raising=False)
+
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
+    assert stub.kwargs_calls == [{"runner_env": {"ACCEPT_EULA": "opaque-token-eula-only"}}]
+    assert BAG_SENSORS_ENV not in stub.kwargs_calls[0]["runner_env"]
+
+
 # --- (7) oracle_plugin_dir pass-through (D-1 wiring contract #2, 2026-07-11) --
 # An admitted CustomCriterion -> the CLI hands the scenario's parent directory
 # (resolved absolute) to the supervisor as kw-only ``oracle_plugin_dir`` so it

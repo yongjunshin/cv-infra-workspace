@@ -130,7 +130,8 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ros-jazzy-ros2bag ros-jazzy-rosbag2-storage-mcap \
-        ros-jazzy-nav-msgs ros-jazzy-geometry-msgs; \
+        ros-jazzy-nav-msgs ros-jazzy-geometry-msgs \
+        ros-jazzy-sensor-msgs; \
     dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.after; \
     echo '=== rosbag2 apt layer manifest (every package this layer installed) ==='; \
     comm -13 /tmp/pkgs.before /tmp/pkgs.after; \
