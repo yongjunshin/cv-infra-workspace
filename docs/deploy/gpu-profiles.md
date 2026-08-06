@@ -102,10 +102,25 @@ python이 없을 수 있다)와 테스트(pyyaml). `tests/test_deploy_gpu_profil
 
 ## 6. 이 문서가 **주장하지 않는** 것 (정직 표기)
 
-- **라이브 GPU에서의 적응 선택은 아직 관찰되지 않았다.** `detect_gpu.sh`는 CPU에서
-  stub `nvidia-smi`로만 실증됐다(`tests/test_deploy_gpu_profiles.py`). 실제 카드에서
-  `nvidia-smi --query-gpu=name`이 내놓는 **정확한 문자열**은 이 저장소가 캡처한 적이
-  없다 — 그래서 패턴을 토큰 기반으로 느슨하게 두었다. 첫 GPU 사이클에서
-  `./scripts/detect_gpu.sh` 1회 실행 + 출력 보존이 이 갭을 닫는다.
+- ~~**라이브 GPU에서의 적응 선택은 아직 관찰되지 않았다.**~~ **해소(2026-08-06, p5c12 —
+  SSH 단일 채널·워크스테이션 실 카드 1회).** 그 전까지 `detect_gpu.sh`는 CPU에서 stub
+  `nvidia-smi`로만 실증됐고(`tests/test_deploy_gpu_profiles.py`), 실제 카드가 내놓는
+  **정확한 문자열**을 이 저장소가 캡처한 적이 없어 패턴을 토큰 기반으로 느슨하게 두었다.
+  이제 캡처됐다:
+
+  | 항목 | 실측값 |
+  |---|---|
+  | `nvidia-smi --query-gpu=name` (1 디바이스) | `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` |
+  | 드라이버 / `memory.total` | `580.159.03` / `97887 MiB` |
+  | 선택된 프로파일 | `rtx_pro_6000` (매치 1건 — 모호성 0, `a100.yaml`은 비발화) |
+  | 방출 조각 | `CV_VRAM_PER_INSTANCE_MB=6000` + `# measured` 앵커 주석 · exit **0** |
+
+  즉 느슨한 토큰 패턴 `RTX[ _-]?PRO[ _-]?6000`이 **접두 `NVIDIA `와 접미 `Blackwell
+  Workstation Edition`을 모두 통과**했다 — 정확한 제품 문자열을 몰라도 SKU 표기 변형을
+  받는다는 설계 의도가 실 카드에서 확인된 것이다. 방출된 `6000`은 상주 serve가 NVML
+  가드로 이미 쓰고 있는 값과 같다(`serve-config`의 `vram_per_instance_mb: 6000.0`) —
+  적응 경로가 라이브에서 검증된 구성과 **같은 숫자**로 수렴한다.
+  증적: 워크스테이션 `~/cv-infra-p2-out/p5c12/detect-gpu/`(`01-nvidia-smi.txt` ·
+  `02-fragment.env` · `03-stderr.log` · `04-exit.txt`).
 - **A100은 우리가 가진 적이 없다.** `profiles/a100.yaml`은 구조만 있고 숫자는
   `TBD(미실측)`이다. 렌더 경로(D-A)·MIG(LOCKED §18 미사용)도 그 카드에서 미검증이다.

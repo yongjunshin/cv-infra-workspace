@@ -46,6 +46,19 @@ stale**하다. 이 "우연한 일치"가 아래 **stale-local-tag 함정**의 �
 첫 줄이 이 게이트의 **가장 중요한 실전 교훈**이다: 기본 호출은 "런타임 == 태그"만
 보증하며, **태그 자신이 릴리즈 대상보다 뒤면 조용히 통과한다**(아래 트러블슈팅 ★★).
 
+**두 번째 실집행(2026-08-06, p5c12, SSH 단일 채널)** — `a6fe344` → `ae3b477`(21 커밋).
+1회차와 다른 것만 적는다:
+
+| 관측 | 결과 |
+|---|---|
+| 재동기화 **전** 게이트 | **두 형태 모두 exit 3** — 기본(`--tag v1`)은 `0 behind / 16 ahead`, 명시(`--tag ae3b477`)는 `21 behind / 0 ahead`. 1회차의 거짓 통과가 재현되지 **않은** 이유는 이번엔 런타임이 태그보다 **앞서** 있었기 때문이다(우연) — 함정이 사라진 게 아니다. |
+| 재설치 필요 판정 | `git diff --name-only a6fe344 ae3b477 -- pyproject.toml uv.lock` **공집합** → 재설치 0회. 두 venv 모두 `git checkout`만으로 새 심볼 전파(`contract.schema.InitialPose`·`report.regression._without_nulls` import 성공, `cv-infra --help` exit 0). |
+| serve 재기동(3-3) | **운영자에게 이월** — consent env는 운영자 소유 값이라 자동화가 채울 수 없다(NEG-2). 체크아웃 평면은 동기, **상주 serve 프로세스는 여전히 옛 코드**라는 상태를 명시적으로 남긴다(G-43 보강의 "세 번째 평면"). |
+| 태그 이동 | **하지 않음.** 아래 ★★ 예외 레시피대로 내용 동일성을 증거로 남겼다: `git diff --stat v1 ae3b477 -- .github/workflows/verify.yml actions/` **공집합** → 소비자가 `@v1`로 실행하는 YAML 평면은 릴리즈 대상과 바이트 동일. |
+| 재동기화 **후** 게이트 | `--tag ae3b477` **exit 0**. 기본 `--tag v1`은 exit 3(`37 ahead`) — 태그 미이동의 정상 귀결. |
+
+증적: 워크스테이션 `~/cv-infra-p2-out/p5c12/plane/01~05*.log`.
+
 ## 불변식 + 게이트를 언제 돌리나
 
 **불변식**: *어떤 라이브 leg를 시작하기 전에도* 런타임 평면(②)은 라이브 leg가
@@ -154,7 +167,79 @@ peel을 대조하고, 어긋나면 loud fail(exit 3, fail-closed). **읽기 대�
       — 컨테이너가 바뀌면 이전 무장은 무효고, 빠뜨리면 그 사이클은 감사되지 않은 런이 된다.
 4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh` → **exit 0**(IN SYNC)이어야
    한다. exit 3이면 3단계 미완 → 라이브 leg 착수 금지.
-5. **그때서야 라이브 leg 착수.**
+5. **회귀 기준선 통제** — 아래 [fail-baseline 통제](#재동기화-이후-첫-라이브-leg--fail-baseline-통제)
+   절. 코드가 앞으로 가면 **기준선이 조용히 리셋될 수 있고**, 리셋 직후 첫 런의 verdict가
+   무엇이든 그대로 기준선이 된다.
+6. **그때서야 라이브 leg 착수.**
+
+## 재동기화 이후 첫 라이브 leg — fail-baseline 통제
+
+**언제 이 절이 발동하나**: 재동기화가 `request_identity_key`의 **정규화 범위**를 바꾸는
+커밋을 넘어갈 때. 넘어갔는지는 추측하지 말고 **재계산해서** 판정한다(아래 ①).
+
+**왜 위험한가** — 두 사실의 곱이다.
+
+1. **리셋**: 정규화가 바뀌면 기존 `request_baselines` 행의 키는 **한 번 빗나간다**
+   (`cv_infra/report/regression.py` 헤더 `ONE-OFF RESET`). 리셋된 요청은 기준선 **부재**
+   상태가 된다.
+2. **부재 시엔 `fail`도 기준선이 된다**: `cv_infra/report/baseline.py::update_baseline`은
+   `existing is not None and verdict != PASS`일 때만 no-op이다 → **기준선이 없으면 첫
+   definite verdict가 pass든 fail이든 그대로 수립**된다. 그리고 그 수립은 게시 CLI가
+   아니라 **오케스트레이터 완료 경로**(`orchestrator/api.py::_persist_terminal` ③)에서
+   자동으로 일어난다 — "리포트 명령을 안 부르면 안전"은 **거짓**이다(G-53).
+
+여기에 flakiness가 곱해진다. `fail` 기준선이 굳으면 판정이 뒤집힌다(2026-08-06 실측,
+격리 store):
+
+| 기준선 | 이후 런 | `judge_regression` | 읽히는 의미 |
+|---|---|---|---|
+| `fail`(오염) | `pass` | `improved` | 원래 정상인 것이 "고쳐졌다"로 |
+| `fail`(오염) | `fail` | **`unchanged`** | **진짜 회귀가 보이지 않는다** |
+| `pass`(정상) | `fail` | `regressed` | 정상 |
+
+### 절차 (GPU 호스트, 운영자)
+
+**① 리셋 여부를 재계산으로 판정한다** — 새 코드로 캐노니컬 요청의 키를 뽑아 store의
+기준선 키 집합에 있는지 본다. 프로덕션 store는 **사본으로만 읽는다**(G-53 ④ — 원본
+열기·체크포인트 0):
+
+```bash
+cp -p <store>.sqlite3 <store>.sqlite3-wal <evidence>/   # -shm은 복사 후 지운다
+<venv>/bin/python - <<'PY'
+import sqlite3, sys
+from cv_infra.contract.loader import load_request
+from cv_infra.report.regression import identity_key
+req = load_request("<src>/tests/fixtures/nova_carter_warehouse_goal.yaml").request
+key = identity_key(req.model_dump(mode="json", by_alias=True))   # api.py:563과 같은 dump
+db = sqlite3.connect("<evidence>/<store>.sqlite3")
+stored = {r[0] for r in db.execute("SELECT request_identity_key FROM request_baselines")}
+print(key, "MATCHES" if key in stored else "ABSENT -> 리셋. 아래 ②/③ 적용")
+PY
+```
+
+**② 통제 A(권장) — 기준선을 pass 확인 런에서만 수립한다.** 리셋 이후 **첫 런의 verdict가
+곧 기준선**이므로, 첫 런은 *기준선을 세우는 런*으로 취급한다. 리포트가 `pass`로 끝나면
+그대로 두고, `fail`이면 아래 ③로 되돌린다. (플랫폼이 자동으로 세우므로 "안 세우기"라는
+선택지는 없다 — 세워진 것을 **검사**하는 것이 통제다.)
+
+**③ 통제 B — 이미 fail 행이 수립됐으면 제거 후 재수립.** 그 키의 non-pass 행만 지우고,
+같은 요청을 pass로 한 번 더 돌려 기준선을 다시 세운다:
+
+```bash
+sqlite3 <store>.sqlite3 \
+  "DELETE FROM request_baselines WHERE request_identity_key='<key>' AND verdict!='pass';"
+```
+
+지운 뒤 다시 `find_baseline` → `None`이 되고, 다음 pass 런이 정상 기준선을 세운다.
+
+**④ 증거는 행 덤프로 남긴다.** WAL 모드 db의 **파일 sha256은 논리적 불변성의 척도가
+아니다**(M6 헬스 샘플러가 5초마다 `-wal`/`-shm`을 움직인다, G-53 ③). 오염 0의 증명은
+`request_baselines` **전 행 덤프 대조**다.
+
+**⑤ 측정·실험은 격리에서.** 위 표를 다시 얻고 싶거나 통제를 리허설하려면 프로덕션 store가
+아니라 **사본**에서 하라. 2026-08-06 실집행이 그 형태다
+(`~/cv-infra-p2-out/p5c12/baseline/{fail_baseline_lab.py,04-fail-baseline-lab.log}` —
+사본 3개 위에서 위험·통제 A·통제 B를 전부 실증하고 프로덕션 2행은 불변 확인).
 
 ## 게이트 사용법 — `scripts/check_plane_skew.sh`
 
