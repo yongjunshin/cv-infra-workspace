@@ -15,6 +15,7 @@
 |---|---|---|
 | **① YAML 평면** | reusable workflow / composite action (`.github/workflows/verify.yml` · `actions/verify`) | 릴리즈 태그 `@vN` 이동으로 **자동** 갱신(소비자 `uses: …@vN` 핀) |
 | **② 런타임 평면** | GPU 잡이 **실제 실행하는 코드** = 러너 venv의 editable install + **사전 설치된 serve/CLI 컨테이너** | **체크아웃 + 재설치 + 컨테이너 재기동으로만** 갱신 |
+| **③ 러너 이미지 평면** | 잡 컨테이너 **안에서** 실행되는 wheel(`cv-infra-runner:<tag>`에 박힘) | **이미지 리빌드로만** 갱신 — ①②를 아무리 옮겨도 움직이지 않는다([아래 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)) |
 
 GPU 잡은 설계상(R10) `actions/checkout`을 **하지 않는다** → 소비자가 실행하는 코드는
 러너에 **사전 설치된 패키지**이지 태그가 가리키는 코드가 아니다. 따라서 `@vN`을 새
@@ -58,6 +59,53 @@ stale**하다. 이 "우연한 일치"가 아래 **stale-local-tag 함정**의 �
 | 재동기화 **후** 게이트 | `--tag ae3b477` **exit 0**. 기본 `--tag v1`은 exit 3(`37 ahead`) — 태그 미이동의 정상 귀결. |
 
 증적: 워크스테이션 `~/cv-infra-p2-out/p5c12/plane/01~05*.log`.
+
+## ③ 러너 이미지 평면 — 잡 컨테이너 안의 wheel
+
+①②는 **호스트에서 실행되는 코드**만 옮긴다. 잡은 `cv-infra-runner:<tag>` 안에서 돌고,
+그 안의 `cv_infra`는 **빌드 시점에 박힌 wheel**이다 — 체크아웃·재설치·serve 재기동
+어느 것도 이 평면을 건드리지 않는다. 실측된 비용(2026-08-06, p5c12): 러너 이미지가
+`p4c5`에 머물러 있어 `scenario.initial_pose`(p5c11 T4 랜딩)를 선언한 잡이 표준 경로에서
+`Extra inputs are not permitted`로 **거절**됐다 — 제어 평면은 신선했는데 잡이 죽었다.
+즉 **러너 코드 변경은 리빌드 전까지 라이브로 검증 불가**다.
+
+**리빌드는 명시적 결정이 있을 때만** 한다(FU-10 image-as-artifact,
+`decisions/2026-07-07-fu10-image-as-artifact.md`). 결정되면 GPU 호스트에서:
+
+```bash
+# ① 빌드 컨텍스트를 대상 커밋 X 그대로 내보낸다(런타임 평면 체크아웃과 무관 — 경합 0).
+#    아직 push되지 않은 커밋도 이 경로로 빌드할 수 있다.
+git archive --format=tar X | ssh <gpu-host> 'mkdir -p <build>/src && tar -x -C <build>/src'
+
+# ② 빌드(태그는 사이클 슬러그. latest 금지 — LOCKED §2)
+ssh <gpu-host> 'cd <build>/src && docker build --progress=plain \
+  -f docker/runner/Dockerfile -t cv-infra-runner:<tag> . > <build>/build.log 2>&1'
+
+# ③ 핀 기록(로컬 태그는 RepoDigest가 없다 → Image Id가 핀이다)
+docker image inspect cv-infra-runner:<tag> --format 'Id={{.Id}} Created={{.Created}}'
+```
+
+**이전 태그는 지우지 않는다** — 과거 게이트/앵커가 그 Id를 인용하고 있다(FU-10 핀 대장).
+
+**provenance 확인(이미지 ↔ 커밋 결속)**: wheel에는 커밋 스탬프가 없다(`__version__`은
+`0.0.0` 고정). 그래서 결속은 **바이트 대조**로 만든다 — 이미지 안 site-packages의
+`cv_infra/**.py` 매니페스트가 소스 트리의 그것과 같아야 한다:
+
+```bash
+docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
+  'cd /isaac-sim/kit/python/lib/python3.11/site-packages && find cv_infra -name "*.py" | sort | xargs sha256sum'
+# vs.  (cd <build>/src && find cv_infra -name "*.py" | sort | xargs sha256sum)   → diff 공집합
+```
+
+**리빌드 기록**:
+
+| 태그 | Image Id | 소스 커밋 | 확인 |
+|---|---|---|---|
+| `cv-infra-runner:p5c12` | `sha256:d3e945d9546ec9ce8e06512920cd5cea82478c66cd04c54055d3fc781e0dcb8b` | `d4ac0a0` (workspace main, 미push 상태에서 `git archive`로 빌드) | wheel 49파일 ↔ 소스 diff 공집합 · D-4' pydantic 2.11.7 가드 통과 · `scenario.initial_pose` 수용(p4c5는 거절) · `recording.bag_topics(include_sensors=True)`가 선언 센서 3토픽 append |
+
+**아직 열린 갭**: `scripts/check_plane_skew.sh`는 ①②만 본다 — 이 평면의 stale은
+**게이트가 잡지 않는다**. 라이브 leg 전에는 위 provenance 대조를 수기로 돌리거나,
+게이트를 이미지 wheel까지 보도록 확장해야 한다(follow-up).
 
 ## 불변식 + 게이트를 언제 돌리나
 
