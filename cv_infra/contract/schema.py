@@ -203,6 +203,41 @@ class ExecutionSettings(_ForbidExtra):
 
 
 # --- acceptance criteria ("criteria are also input", REQ-INTAKE-007) -------- #
+class GoalToleranceBudget(_ForbidExtra):
+    """SUT-declared error budget the goal tolerance is DERIVED from (CEO D-6,
+    decision 2026-08-05 §D-6 — determinism repair (B), "structural verdict").
+
+    Why it exists: the pass/fail threshold was a constant a consumer typed into
+    the scenario (``position_tolerance_m: 0.75``), so the verdict rode the
+    margin between that constant and the observed GT residual — a margin
+    measured SMALLER than the residual's own spread (p5c10/p5c11: spread
+    0.341–0.736 m vs margin +0.193). A gate whose bool depends on that margin
+    reports "not blown up yet", not determinism (G-55). The repair is to take
+    the threshold from what the SUT itself claims plus the localization error
+    budget the consumer declares, instead of raising the constant (raising it
+    is explicitly NOT (B) — it only pushes the tail out).
+
+    Since SUT configuration is BLACK-BOX (REQ-EXEC-005), the platform cannot
+    read the planner's ``xy_goal_tolerance`` out of the SUT image; the scenario
+    contract is the only declaration path. Hence this block.
+
+    Derivation (documented intent, VERBATIM from the p5c13 cross-team pin)::
+
+        derived_tolerance_m = sut_xy_goal_tolerance_m + localization_budget_m
+
+    M1 owns the SHAPE only — applying the formula (and its default when the
+    block is absent) is the reached_goal oracle's, i.e. M2's (same split as
+    ``ReachedGoalParams``: values oracle-owned, shape contract-owned).
+
+    Both keys are REQUIRED once the block is declared: half a budget is not a
+    budget — a lone ``sut_xy_goal_tolerance_m`` would silently mean "zero
+    localization error", which is the assumption the observed residuals refute.
+    """
+
+    sut_xy_goal_tolerance_m: float = Field(gt=0, examples=[0.25])
+    localization_budget_m: float = Field(gt=0, examples=[0.30])
+
+
 class ReachedGoalParams(_ForbidExtra):
     """Known-key params for the ``reached_goal`` oracle.
 
@@ -210,12 +245,28 @@ class ReachedGoalParams(_ForbidExtra):
     cv_infra/oracles/reached_goal.py; fixture-real: ``position_tolerance_m`` /
     ``yaw_tolerance_rad``). ``None`` means "oracle default applies" — the
     default VALUES stay oracle-owned (M2), the shape is M1's.
+
+    Two mutually exclusive ways to fix the position threshold (D-6): the
+    constant ``position_tolerance_m`` (kept for backwards compatibility — every
+    pre-p5c13 scenario declares it) or the derived ``goal_tolerance_budget``.
+    Declaring BOTH is a loud contract violation: a silent precedence rule would
+    let a consumer edit the key that is being ignored and never learn (the
+    ``goal_tolerance_m`` lesson, G-25). One home per threshold.
     """
 
     position_tolerance_m: float | None = Field(default=None, gt=0, examples=[0.75])
     yaw_tolerance_rad: float | None = Field(default=None, gt=0, examples=[0.26])
     goal_orientation_wxyz: list[float] | None = Field(
         default=None, min_length=4, max_length=4, examples=[[1.0, 0.0, 0.0, 0.0]]
+    )
+    goal_tolerance_budget: GoalToleranceBudget | None = Field(
+        default=None,
+        description=(
+            "Derive the position threshold from the SUT's declared goal tolerance "
+            "plus the consumer's localization budget (D-6) instead of a typed "
+            "constant. Mutually exclusive with position_tolerance_m."
+        ),
+        examples=[{"sut_xy_goal_tolerance_m": 0.25, "localization_budget_m": 0.30}],
     )
 
     @model_validator(mode="before")
@@ -230,6 +281,28 @@ class ReachedGoalParams(_ForbidExtra):
                 "'position_tolerance_m' (example: position_tolerance_m: 0.75)"
             )
         return data
+
+    @model_validator(mode="after")
+    def _one_home_for_the_position_threshold(self) -> ReachedGoalParams:
+        """Constant XOR derived budget (D-6) — never a silent precedence.
+
+        Checked on VALUES, not on key presence, so an explicit ``null`` keeps
+        meaning "unspecified" (module-header contract convention; the M4
+        identity normalization prunes nulls, so any other reading would be
+        erased from ``request_identity_key`` anyway).
+        """
+        budget = self.goal_tolerance_budget
+        if self.position_tolerance_m is not None and budget is not None:
+            derived = budget.sut_xy_goal_tolerance_m + budget.localization_budget_m
+            raise ValueError(
+                "'position_tolerance_m' and 'goal_tolerance_budget' both declare the "
+                "position threshold — declare exactly one. Either delete "
+                f"'position_tolerance_m: {self.position_tolerance_m}' (the threshold is "
+                f"then derived: {budget.sut_xy_goal_tolerance_m} + "
+                f"{budget.localization_budget_m} = {derived} m), or delete the whole "
+                "'goal_tolerance_budget:' block to keep the constant"
+            )
+        return self
 
 
 class NoCollisionParams(_ForbidExtra):
