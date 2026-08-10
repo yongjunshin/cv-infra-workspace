@@ -106,6 +106,7 @@ docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
 | 태그 | Image Id | 소스 커밋 | 확인 |
 |---|---|---|---|
 | `cv-infra-runner:p5c12` | `sha256:d3e945d9546ec9ce8e06512920cd5cea82478c66cd04c54055d3fc781e0dcb8b` | `d4ac0a0` (workspace main, 미push 상태에서 `git archive`로 빌드) | wheel 49파일 ↔ 소스 diff 공집합 · D-4' pydantic 2.11.7 가드 통과 · `scenario.initial_pose` 수용(p4c5는 거절) · `recording.bag_topics(include_sensors=True)`가 선언 센서 3토픽 append |
+| **`cv-infra-runner:p5c14`** (**첫 스탬프 이미지**) | `sha256:39482af4c6f67090e51c0cc21c9de243291e0df2647c34b7415aca1f7c4e0308` | `1207dd40ab03a4a4626f81dfc4f4d64e4abf15c0` (`git archive` 컨텍스트 + `--build-arg CV_SOURCE_REVISION`) | wheel 49파일 ↔ 소스 diff 공집합 · D-4' pydantic 2.11.7 가드 통과 · `revision` 라벨 == 소스 커밋 → **게이트 exit 0(③ 최초)** · exit 계약 0/1/2/3 실측 · `ros-jazzy-sensor-msgs=5.3.8-1noble.20260615.112429`(p5c13과 동일 — apt 레이어 캐시 히트, RootFS 19/23 레이어 공유) · 증적 `~/cv-infra-p2-out/p5c13/rebuild/` |
 
 ### 게이트가 ③을 본다 (p5c13, Q1-B) — 그리고 **옛 이미지는 전부 미스탬프**다
 
@@ -119,6 +120,22 @@ docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
 베이스 상속 `ref.name/version` 2개뿐). 그래서 스탬프가 들어간 이미지로 **리빌드하기
 전까지 게이트는 exit 3(UNSTAMPED)로 fail-closed**한다 — 이것이 정상 동작이며,
 "이 평면은 아직 검증 불가"를 조용히 통과시키지 않겠다는 뜻이다.
+
+**마이그레이션 완료(2026-08-10, 같은 날 리빌드)**: `cv-infra-runner:p5c14`가 **첫
+스탬프 이미지**다(`org.opencontainers.image.revision=1207dd4…`). 실 러너 이미지를
+상대로 한 게이트 **exit 0의 최초 실측**:
+
+```
+[cv-infra][plane-skew] runtime plane : …/cv-infra-workspace @ 1207dd4… -> 1207dd40ab03…
+[cv-infra][plane-skew] release tag   : …/cv-infra-workspace @ 1207dd4… -> 1207dd40ab03…
+[cv-infra][plane-skew] runner image  : cv-infra-runner:p5c14 @ org.opencontainers.image.revision -> 1207dd40ab03…
+[cv-infra][plane-skew] IN SYNC — runtime plane AND runner image both match the release ref.
+GATE exit=0
+```
+
+옛 핀들은 **여전히 미스탬프이고 삭제하지 않는다**(FU-10) — 그 태그로 게이트를 부르면
+계속 exit 3이 나오는 것이 정상이다. 라이브 leg는 **스탬프된 이미지**를 써야 한다.
+증적: `~/cv-infra-p2-out/p5c13/rebuild/03-verify-p5c14.log`.
 
 ### 리빌드 후 검증 — exit 계약 4값 (p5c13 Q2 수리의 발효 확인)
 
@@ -150,8 +167,10 @@ docker run --rm -v <spec>:/tmp/jobspec.json:ro \
 | 수리 전(`cv-infra-runner:p5c13`, Id `sha256:7d4ac8f3…`) | `-c sys.exit(N)` → 0/1/**1**/**1** · 실 ENTRYPOINT `no JOB_SPEC` → **1** · EULA 거부 → **1** |
 | 수리 후(같은 이미지, throwaway 컨테이너 writable layer에 sed만 적용) | 0/1/**2**/**3** · `no JOB_SPEC` → **2** · EULA 거부 → **3** |
 | 이미지 불변 확인 | 프로브 전후 Image Id 동일(`sha256:7d4ac8f3…`) — 기존 핀 무손상 |
+| **발효 확인(리빌드 후 `cv-infra-runner:p5c14`, Id `sha256:39482af4…`)** | `-c sys.exit(N)` → **0/1/2/3** · 실 ENTRYPOINT `no JOB_SPEC` → **2**(`[cv-runner] bad job spec: RESULT_OUT is required`) · 유효 spec + consent 없음 → **3**(`… EULA not accepted for this run — boot refused (NEG-2)`). **수리가 이미지에 들어갔다** |
 
-증적: 워크스테이션 `~/cv-infra-p2-out/p5c13/exit/01~03*.log`(+ 프로브 스크립트 동봉).
+증적: 워크스테이션 `~/cv-infra-p2-out/p5c13/exit/01~03*.log`(수리 전/후 비교) ·
+`~/cv-infra-p2-out/p5c13/rebuild/03-verify-p5c14.log`(리빌드 이미지 발효 확인).
 
 ## 불변식 + 게이트를 언제 돌리나
 
