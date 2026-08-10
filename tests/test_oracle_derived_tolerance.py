@@ -49,6 +49,12 @@ MISSION_LEN_M = 6.0
 TIMEOUT_S = 120.0
 
 # The task's verbatim contract example: 0.25 + 0.30 -> 0.55 m derived.
+# G-28 provenance for the SUT-side term (measured 2026-08-10, read-only container
+# on the workstation, no GPU): carter-sut:p5c5-slim declares
+# ``general_goal_checker.xy_goal_tolerance: 0.25`` (and DWB's own 0.25) in
+# /opt/carter_ws/install/share/carter_navigation/params/carter_navigation_params.yaml
+# -- so 0.25 is what this SUT actually declares, not a placeholder. The
+# localization term is a CONSUMER declaration and is NOT measured anywhere yet.
 SUT_XY_TOL_M = 0.25
 LOC_BUDGET_M = 0.30
 DERIVED_TOL_M = SUT_XY_TOL_M + LOC_BUDGET_M
@@ -188,10 +194,15 @@ def test_p5c11_observed_k1_max_residual_is_outside_the_derived_tolerance():
     """Honesty tripwire, not a celebration: p5c11 arm A (k=1, N=20) observed a GT
     closest approach up to 0.557 m, which is 7 mm ABOVE the 0.550 derived from the
     contract's example budget. So this change does NOT put the observed residual
-    distribution safely inside the threshold -- it relocates the threshold, and the
-    live verdict may flip (Wave B measures it). If a later edit inflates the
-    derivation until this run passes, that edit is the forbidden threshold raise
-    (G-55 (4)) and this test goes red on purpose."""
+    distribution safely inside the threshold -- it relocates the threshold (tighter,
+    not looser), and the live verdict may flip (Wave B measures it).
+
+    Counterfactual re-judgment of p5c11's raw residuals (~/cv-infra-p2-out/p5c11/
+    rows-k{1,8}.json, N=40) at 0.550 vs the 0.750 constant: k=1 1/20 vs 0/20 fail,
+    k=8 9/20 vs 1/20 fail. DoD-P2-06 is NOT closed by this change.
+
+    If a later edit inflates the derivation until this run passes, that edit is the
+    forbidden threshold raise (G-55 (4)) and this test goes red on purpose."""
     out = ReachedGoalOracle().evaluate(_record(0.557), _budget_criteria())
     assert out.passed is False
 
@@ -204,7 +215,11 @@ def test_crippled_sut_still_fails_under_the_derived_tolerance():
     the robot crawls ~2.4 m of the 6 m lane inside the 120 s sim budget and never
     arrives. It MUST still fail once the tolerance is derived -- a derived tolerance
     that swallows a 3.6 m miss would have destroyed the product's regression
-    detection (cycle plan p5c13 §2, honesty constraint)."""
+    detection (cycle plan p5c13 §2, honesty constraint).
+
+    G-28 provenance: the 0.02 m/s is the REAL crippled artifact's value --
+    ``carter-sut:p5c8-fail`` carries ``max_vel_x: 0.02`` (measured 2026-08-10,
+    read-only container on the workstation, no GPU)."""
     crawl = _record(MISSION_LEN_M - 0.02 * TIMEOUT_S, speed_mps=0.02)
     out = ReachedGoalOracle().evaluate(crawl, _budget_criteria())
     assert out.passed is False
