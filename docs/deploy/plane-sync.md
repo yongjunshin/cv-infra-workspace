@@ -6,20 +6,20 @@
 > 후속 사이클에서 확장). 요구사항 원문은 재서술하지 않고 ID로만 참조한다
 > (REQ-DEPLOY-001·003, NFR-DEPLOY-001~003; 정본 = deployment 그룹 명세).
 
-## 왜 (두 평면)
+## 왜 (세 평면)
 
-플랫폼은 릴리즈 태그가 **함께 옮기지 못하는 두 배포 평면**으로 배송된다
-(GOTCHAS **G-43**):
+플랫폼은 릴리즈 태그가 **함께 옮기지 못하는 세 배포 평면**으로 배송된다
+(GOTCHAS **G-43** + p5c8·p5c12 보강):
 
 | 평면 | 무엇 | 무엇으로 갱신되나 |
 |---|---|---|
 | **① YAML 평면** | reusable workflow / composite action (`.github/workflows/verify.yml` · `actions/verify`) | 릴리즈 태그 `@vN` 이동으로 **자동** 갱신(소비자 `uses: …@vN` 핀) |
 | **② 런타임 평면** | GPU 잡이 **실제 실행하는 코드** = 러너 venv의 editable install + **사전 설치된 serve/CLI 컨테이너** | **체크아웃 + 재설치 + 컨테이너 재기동으로만** 갱신 |
-| **③ 러너 이미지 평면** | 잡 컨테이너 **안에서** 실행되는 wheel(`cv-infra-runner:<tag>`에 박힘) | **이미지 리빌드로만** 갱신 — ①②를 아무리 옮겨도 움직이지 않는다([아래 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)) |
+| **③ 러너 이미지 평면** | 잡 컨테이너 **안에서** 실행되는 wheel(`cv-infra-runner:<tag>`에 박힘) | **이미지 리빌드로만** 갱신 — ①②를 아무리 옮겨도 움직이지 않는다([아래 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)). **p5c13부터 스큐 게이트가 이 평면도 본다**(`--image` 필수) |
 
 GPU 잡은 설계상(R10) `actions/checkout`을 **하지 않는다** → 소비자가 실행하는 코드는
 러너에 **사전 설치된 패키지**이지 태그가 가리키는 코드가 아니다. 따라서 `@vN`을 새
-커밋으로 **재태그하면 ①만 움직이고 ②는 옛 코드에 머문다** → 두 평면이 **조용히 스큐**
+커밋으로 **재태그하면 ①만 움직이고 ②③은 옛 코드에 머문다** → 평면들이 **조용히 스큐**
 되고, 라이브 leg가 stale 코드를 실행한다. G-43은 이 갭이 **이미 재발했음**을 실측했다.
 
 **측정 앵커(2026-07-24, SSH 읽기전용 단일 채널)**:
@@ -78,11 +78,15 @@ stale**하다. 이 "우연한 일치"가 아래 **stale-local-tag 함정**의 �
 git archive --format=tar X | ssh <gpu-host> 'mkdir -p <build>/src && tar -x -C <build>/src'
 
 # ② 빌드(태그는 사이클 슬러그. latest 금지 — LOCKED §2)
+#    CV_SOURCE_REVISION = X의 **full sha**. git archive 컨텍스트에는 .git이 없으므로
+#    이미지가 자기 커밋을 알 수 있는 유일한 경로다(없으면 빌드가 loud 실패한다).
 ssh <gpu-host> 'cd <build>/src && docker build --progress=plain \
+  --build-arg CV_SOURCE_REVISION=<X-full-sha> \
   -f docker/runner/Dockerfile -t cv-infra-runner:<tag> . > <build>/build.log 2>&1'
 
-# ③ 핀 기록(로컬 태그는 RepoDigest가 없다 → Image Id가 핀이다)
-docker image inspect cv-infra-runner:<tag> --format 'Id={{.Id}} Created={{.Created}}'
+# ③ 핀 기록(로컬 태그는 RepoDigest가 없다 → Image Id가 핀이다) + 평면 ③ 스탬프 확인
+docker image inspect cv-infra-runner:<tag> \
+  --format 'Id={{.Id}} Created={{.Created}} rev={{index .Config.Labels "org.opencontainers.image.revision"}}'
 ```
 
 **이전 태그는 지우지 않는다** — 과거 게이트/앵커가 그 Id를 인용하고 있다(FU-10 핀 대장).
@@ -103,19 +107,62 @@ docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
 |---|---|---|---|
 | `cv-infra-runner:p5c12` | `sha256:d3e945d9546ec9ce8e06512920cd5cea82478c66cd04c54055d3fc781e0dcb8b` | `d4ac0a0` (workspace main, 미push 상태에서 `git archive`로 빌드) | wheel 49파일 ↔ 소스 diff 공집합 · D-4' pydantic 2.11.7 가드 통과 · `scenario.initial_pose` 수용(p4c5는 거절) · `recording.bag_topics(include_sensors=True)`가 선언 센서 3토픽 append |
 
-**아직 열린 갭**: `scripts/check_plane_skew.sh`는 ①②만 본다 — 이 평면의 stale은
-**게이트가 잡지 않는다**. 라이브 leg 전에는 위 provenance 대조를 수기로 돌리거나,
-게이트를 이미지 wheel까지 보도록 확장해야 한다(follow-up).
+### 게이트가 ③을 본다 (p5c13, Q1-B) — 그리고 **옛 이미지는 전부 미스탬프**다
+
+`scripts/check_plane_skew.sh`는 이제 `--image <ref>`를 **필수**로 받아 이미지의
+`org.opencontainers.image.revision` 라벨을 릴리즈 ref와 대조한다(위 provenance
+바이트 대조는 여전히 유효한 정밀 수단이고, 게이트는 그 값싼 상시판이다).
+라벨은 `docker/runner/Dockerfile`이 `--build-arg CV_SOURCE_REVISION`으로 박는다.
+
+**마이그레이션 상태(2026-08-10 실측)**: 기존 핀 `p4c5`·`p5c12`·`p5c13`은 전부
+**라벨이 없다**(`docker image inspect --format '{{json .Config.Labels}}'` →
+베이스 상속 `ref.name/version` 2개뿐). 그래서 스탬프가 들어간 이미지로 **리빌드하기
+전까지 게이트는 exit 3(UNSTAMPED)로 fail-closed**한다 — 이것이 정상 동작이며,
+"이 평면은 아직 검증 불가"를 조용히 통과시키지 않겠다는 뜻이다.
+
+### 리빌드 후 검증 — exit 계약 4값 (p5c13 Q2 수리의 발효 확인)
+
+같은 리빌드에서 러너 이미지의 **exit 계약 붕괴 수리**도 발효된다(베이스 `python.sh`의
+`|| error_exit`가 러너의 2/3을 1로 뭉개던 결함 — 아래 [실측](#실측-근거-2026-08-10)).
+리빌드 직후 GPU 없이 돌릴 수 있는 확인:
+
+```bash
+# (a) 래퍼가 4값을 전부 통과시키는가
+for n in 0 1 2 3; do
+  docker run --rm --entrypoint ./python.sh cv-infra-runner:<tag> -c "import sys; sys.exit($n)"
+  echo "N=$n -> $?"      # 기대: 0 1 2 3   (수리 전: 0 1 1 1)
+done
+# (b) 실제 ENTRYPOINT로 계약 2 (JOB_SPEC 부재 = BadJobSpec)
+docker run --rm cv-infra-runner:<tag>; echo "no-JOB_SPEC -> $?"        # 기대 2 (수리 전 1)
+# (c) 실제 ENTRYPOINT로 계약 3 (EULA 부트 가드 — consent 값을 주지 않는 것이 요점)
+docker run --rm -v <spec>:/tmp/jobspec.json:ro \
+  -e JOB_SPEC=/tmp/jobspec.json -e RESULT_OUT=/tmp/out cv-infra-runner:<tag>; echo "$?"  # 기대 3
+```
+
+`0`/`1`은 잡이 실제로 pass/fail해야 나오므로 (a)의 래퍼 수준에서만 CPU로 확인된다
+— 실 잡 수준 0/1은 다음 GPU 라이브 leg에서 자연히 관측된다.
+
+#### 실측 근거 (2026-08-10)
+
+| 관측 | 값 |
+|---|---|
+| 베이스 `python.sh` 기전 | `$python_exe "${filtered_args[@]}" $args \|\| error_exit` + `error_exit(){ … exit 1; }` → **모든 비-0을 1로 붕괴** |
+| 수리 전(`cv-infra-runner:p5c13`, Id `sha256:7d4ac8f3…`) | `-c sys.exit(N)` → 0/1/**1**/**1** · 실 ENTRYPOINT `no JOB_SPEC` → **1** · EULA 거부 → **1** |
+| 수리 후(같은 이미지, throwaway 컨테이너 writable layer에 sed만 적용) | 0/1/**2**/**3** · `no JOB_SPEC` → **2** · EULA 거부 → **3** |
+| 이미지 불변 확인 | 프로브 전후 Image Id 동일(`sha256:7d4ac8f3…`) — 기존 핀 무손상 |
+
+증적: 워크스테이션 `~/cv-infra-p2-out/p5c13/exit/01~03*.log`(+ 프로브 스크립트 동봉).
 
 ## 불변식 + 게이트를 언제 돌리나
 
-**불변식**: *어떤 라이브 leg를 시작하기 전에도* 런타임 평면(②)은 라이브 leg가
-실행할 릴리즈 커밋과 **바이트 동일**해야 한다.
+**불변식**: *어떤 라이브 leg를 시작하기 전에도* 런타임 평면(②)**과 러너 이미지
+평면(③)** 은 라이브 leg가 실행할 릴리즈 커밋과 **바이트 동일**해야 한다.
 
-**게이트**: `scripts/check_plane_skew.sh` — 런타임 평면 체크아웃 커밋 vs 릴리즈 태그
-peel을 대조하고, 어긋나면 loud fail(exit 3, fail-closed). **읽기 대조만** 하며
-워크스테이션·체크아웃·git ref를 **일절 변경하지 않는다**. 라이브 leg 착수의 **선행
-게이트**로 돌린다.
+**게이트**: `scripts/check_plane_skew.sh` — 런타임 평면 체크아웃 커밋 **및 러너
+이미지의 revision 스탬프**를 릴리즈 태그 peel과 대조하고, 어긋나면 loud fail(exit 3,
+fail-closed). **읽기 대조만** 하며 워크스테이션·체크아웃·git ref·이미지를 **일절
+변경하지 않는다**(`docker image inspect`도 읽기다). 라이브 leg 착수의 **선행 게이트**로
+돌린다.
 
 ## 릴리즈(재태그) 절차 — 런타임 평면 동기화는 **필수 단계**
 
@@ -213,8 +260,12 @@ peel을 대조하고, 어긋나면 loud fail(exit 3, fail-closed). **읽기 대�
       `vram_total_mib=97887`·`requests[]`에 2026-07-22 봉투 잔존(**store 연속성 실증**).
       ★ **재기동 후 netns 감사 하네스는 반드시 재무장**한다(`netns_audit.sh arm <새 컨테이너>`)
       — 컨테이너가 바뀌면 이전 무장은 무효고, 빠뜨리면 그 사이클은 감사되지 않은 런이 된다.
-4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh` → **exit 0**(IN SYNC)이어야
-   한다. exit 3이면 3단계 미완 → 라이브 leg 착수 금지.
+3-bis. **러너 이미지 평면 동기화(③)** — 러너가 실행하는 wheel이 X와 다르면 잡이
+   컨테이너 안에서 죽는다(p5c12 실측). X가 `cv_infra/**`를 건드렸다면
+   [위 ③ 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)의 리빌드가 **선행 조건**이다
+   (`--build-arg CV_SOURCE_REVISION=<X-full-sha>` 필수).
+4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh --tag X --image cv-infra-runner:<tag>`
+   → **exit 0**(IN SYNC)이어야 한다. exit 3이면 3/3-bis 단계 미완 → 라이브 leg 착수 금지.
 5. **회귀 기준선 통제** — 아래 [fail-baseline 통제](#재동기화-이후-첫-라이브-leg--fail-baseline-통제)
    절. 코드가 앞으로 가면 **기준선이 조용히 리셋될 수 있고**, 리셋 직후 첫 런의 verdict가
    무엇이든 그대로 기준선이 된다.
@@ -299,20 +350,43 @@ sqlite3 <store>.sqlite3 \
 | `--src-rev REV` | `CV_PLANE_SRC_REV` | 런타임 평면 커밋으로 읽을 rev | `HEAD` (라이브 체크아웃) |
 | `--tag REF` | `CV_PLANE_TAG` | YAML 평면의 릴리즈 태그/ref (`REF^{commit}`로 peel) | `v1` |
 | `--tag-repo PATH` | `CV_PLANE_TAG_REPO` | 태그를 peel할 저장소 | `= --src` |
+| `--image REF` | `CV_PLANE_IMAGE` | **러너 이미지 평면 ③** — 라이브 leg가 스폰할 이미지(= 그 leg의 `CV_RUNNER_IMAGE`) | **없음 — 필수** |
 
-**exit 코드**: `0` = IN SYNC(라이브 leg 안전) · `2` = 사용법 오류 · `3` = 스큐 탐지
-**또는** rev/저장소 해석 실패(fail-closed, 인프라/구성 오류류 — consent 게이트·D-2
-pull-timeout `infra_error`와 동급).
+`--image`에 기본값을 두지 않는 이유는 둘이다: ① 평면을 안 보는 게이트는 거짓 초록을
+낸다(G-43) ② 여기에 기본 이미지 ref를 박으면 호스트측 리터럴이 스크립트에 들어온다
+(`DoD-P5-09`). 빠뜨리면 **exit 2**로 즉시 멈춘다.
+
+**exit 코드**: `0` = 세 평면 모두 IN SYNC(라이브 leg 안전) · `2` = 사용법 오류(**필수
+`--image` 누락 포함**) · `3` = 어느 평면이든 스큐 탐지, **또는** rev/저장소/이미지 해석
+실패, **또는** 이미지에 revision 스탬프 부재(fail-closed, 인프라/구성 오류류 — consent
+게이트·D-2 pull-timeout `infra_error`와 동급).
 
 예:
 ```
-# 프로덕션(워크스테이션) — 라이브 leg 직전. 기본값만으로:
-scripts/check_plane_skew.sh
-# = CV_PLANE_SRC=~/cv-infra-p2-src/cv-infra-workspace, HEAD vs v1 peel
-
-# 릴리즈 대상을 명시(태그 대신 커밋 SHA로):
-scripts/check_plane_skew.sh --tag 75123e5
+# 프로덕션(워크스테이션) — 라이브 leg 직전. 릴리즈 대상 SHA + 그 leg의 러너 이미지:
+scripts/check_plane_skew.sh --tag <release-sha> --image cv-infra-runner:<tag>
+# = CV_PLANE_SRC=~/cv-infra-p2-src/cv-infra-workspace, HEAD/이미지 라벨 vs 릴리즈 SHA
 ```
+
+### 게이트 자체의 비공허 실증 (positive control — G-35)
+
+게이트를 고칠 때마다 **양방향**으로 다시 증명한다. 라벨만 든 1줄 이미지면 충분하다
+(`FROM scratch`라 바이트 ~0, GPU·베이스 pull 불요):
+
+```bash
+T=$(git rev-parse <release-sha>); O=$(git rev-parse <older-commit>)
+printf 'FROM scratch\nLABEL org.opencontainers.image.revision=%s\n' "$T" | docker build -q -t cv-plane-selftest:insync -
+printf 'FROM scratch\nLABEL org.opencontainers.image.revision=%s\n' "$O" | docker build -q -t cv-plane-selftest:stale  -
+printf 'FROM scratch\nENV X=1\n'                                         | docker build -q -t cv-plane-selftest:unstamped -
+
+scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:insync     # 기대 exit 0
+scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:stale      # 기대 exit 3 (③ N behind)
+scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:unstamped  # 기대 exit 3 (UNSTAMPED)
+scripts/check_plane_skew.sh --src <src> --tag "$T"                                      # 기대 exit 2 (필수 인자)
+```
+
+착지(0)와 탐지(3)를 **쌍으로** 확인하지 않으면, 라벨을 아예 안 읽어도 초록이 나오는
+상태와 구분되지 않는다.
 
 ## 트러블슈팅
 
@@ -360,8 +434,11 @@ scripts/check_plane_skew.sh --tag 75123e5
   ```
   git -C <src> fetch origin --tags                       # refs만 갱신(워킹트리 불변)
   git -C <src> show <target>:scripts/check_plane_skew.sh > <evidence>/gate.sh
-  bash <evidence>/gate.sh --src <src> --tag <target>     # 재동기화 전 positive control
+  bash <evidence>/gate.sh --src <src> --tag <target> \
+       --image cv-infra-runner:<tag>                     # 재동기화 전 positive control
   ```
+  아직 머지되지 않은 게이트(브랜치/worktree)를 돌릴 때도 같은 형태다 — 그 브랜치의
+  스크립트를 증적 디렉토리로 복사해 실행한다(런타임 평면은 건드리지 않는다).
 
 - **`not a git repo` / `cannot resolve … rev` (exit 3)** — 경로/rev 오타는 조용히
   통과시키지 않고 **fail-closed**로 막는다(G-26). `--src`/`--tag`를 확인한다.

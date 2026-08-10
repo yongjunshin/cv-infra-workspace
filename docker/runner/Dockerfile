@@ -168,6 +168,51 @@ assert pydantic.VERSION == pins[0], \
 print('[guard] bundled pydantic %s == pyproject pin (D-4 aligned)' % pydantic.VERSION)" \
  && rm -rf /tmp/cv-infra-wheel
 
+# Exit-code fidelity at the container boundary (Q2 = decision
+# 2026-08-06-p5c12-runner-image-plane-rulings; exit contract 0/1/2/3 = DoD-P2-07 /
+# DoD-P5-13). MEASURED DEFECT: the pinned base's ./python.sh ends every interpreter
+# invocation with `$python_exe … || error_exit`, and its error_exit() does a flat
+# `exit 1` — so the runner's 2 (bad JOB_SPEC) and 3 (EULA boot guard / platform) are
+# COLLAPSED TO 1 before `docker wait` can see them (2026-08-06 on p4c5 and 2026-08-10
+# on p5c13: N=2 -> 1, N=3 -> 1; the real ENTRYPOINT's BadJobSpec 2 -> 1 too).
+# REPAIR: drop that one `|| error_exit` guard (2 call sites — the normal and the
+# --lldb-debug branch). The vendor script already runs under `set -e`, so it then
+# exits with the interpreter's own status; the loud line error_exit printed ("There
+# was an error running python") was misleading anyway — a runner exit of 2/3 is a
+# CONTRACT signal, not an error. Verified in a throwaway container on this very image
+# before landing (evidence: ~/cv-infra-p2-out/p5c13/exit/02,03*.log): 0/1/2/3 all
+# propagate and the EULA refusal reaches `docker run` as 3.
+# The call-site count is asserted BEFORE and AFTER, so a base upgrade that rewrites
+# those lines fails the build LOUDLY instead of silently un-patching us (G-25/G-27
+# pattern, same as the pydantic pin assert above). Patching a vendor file is the
+# minimal repair available: python.sh sources the base's own setup_python_env.sh, and
+# re-implementing that env glue in our layer would be reinventing (CLAUDE §5).
+RUN set -eu; \
+    before="$(grep -c ' || error_exit$' ./python.sh || true)"; \
+    test "$before" = "2" \
+    || { echo "ERROR: ./python.sh no longer has the 2 expected '|| error_exit' call sites" \
+              "(found $before) — the pinned Isaac base changed its launcher: re-measure" \
+              "python.sh and re-derive this exit-code patch (M5 §3.1, Q2 exit contract)"; exit 1; }; \
+    sed -i 's/ || error_exit$//' ./python.sh; \
+    after="$(grep -c ' || error_exit$' ./python.sh || true)"; \
+    test "$after" = "0" \
+    || { echo "ERROR: exit-collapse patch did not apply ($after call site(s) left)"; exit 1; }; \
+    echo "[guard] python.sh exit-code collapse patched — runner 0/1/2/3 reach docker wait"
+
+# Runner-image plane stamp (plane ③, G-43 third-plane clause): the commit this image's
+# wheel was built from, as the OCI-standard label `scripts/check_plane_skew.sh --image`
+# reads. Needed because the wheel carries no commit (`__version__` is pinned 0.0.0) and
+# the rebuild recipe exports the build context with `git archive` (no .git in context),
+# so the value can only come in as a build arg. Asserted non-empty: an unstamped image
+# would be caught by the gate anyway (fail-closed), but failing at BUILD time is louder
+# and cheaper. Placed last so re-stamping never invalidates the apt/wheel layers.
+#   docker build --build-arg CV_SOURCE_REVISION="$(git rev-parse <X>)" …
+ARG CV_SOURCE_REVISION
+RUN test -n "${CV_SOURCE_REVISION}" \
+    || { echo "ERROR: --build-arg CV_SOURCE_REVISION=<source commit sha> is required" \
+              "(runner-image plane stamp; recipe: docs/deploy/plane-sync.md ③)"; exit 1; }
+LABEL org.opencontainers.image.revision=$CV_SOURCE_REVISION
+
 # Stateless runner (LOCKED §15, NFR-EXEC-002): no job state/scenario/result baked in.
 # JOB_SPEC / RESULT_OUT / caches arrive as env + HOST-ABSOLUTE bind mounts (R-mount);
 # one job -> exactly one result.json -> exit (M2 owns the entrypoint's content).
