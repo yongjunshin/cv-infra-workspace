@@ -33,6 +33,11 @@ from cv_infra.contract.adapter_schema import Ros2AdapterConfig
 from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.schema import VerificationRequest
 from cv_infra.oracles.base import ENTRY_POINT_GROUP, load_oracle
+
+# NOT oracle composition (that stays loader-mediated, D-1 (4)): this is the single
+# home of the position-tolerance decision, which the ``time_to_goal_s`` metric must
+# share with the reached_goal verdict (G-25 — two read sites drifted before).
+from cv_infra.oracles.reached_goal import resolve_position_tolerance
 from cv_infra.runner.evaluate import (
     VERDICT_ERROR,
     EvaluationEngine,
@@ -475,10 +480,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
                 flush=True,
             )
         goal = read_field(criteria, "goal_position")
-        pos_tol = float(read_field(criteria, "position_tolerance_m", 0.25))
+        # ONE home for the tolerance (G-25): the metric below and the oracle verdict
+        # must be taken with the SAME number, so both call the oracle's resolver
+        # instead of re-reading the criteria (this site used to re-read the key AND
+        # re-type the 0.25 default). Printed so the applied value is auditable from
+        # the runner log as well as from result.json's criterion detail.
+        tolerance = resolve_position_tolerance(criteria)
+        print(f"[cv-runner] reached_goal {tolerance.audit}", flush=True)
         goal_xyz = (float(goal[0]), float(goal[1]), float(goal[2]))
         metrics = {
-            "time_to_goal_s": time_to_goal_s(record.gt_pose_samples, goal_xyz, pos_tol),
+            "time_to_goal_s": time_to_goal_s(record.gt_pose_samples, goal_xyz, tolerance.value_m),
             "min_clearance_m": min_clearance_m(),
             "collision_count": count_real_collisions(
                 record.contact_events, chassis_path, excluded_paths
