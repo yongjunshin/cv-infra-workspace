@@ -109,6 +109,17 @@ REQUIRED 6개(전부 **호스트 절대경로**):
    만들어 버리고, 비루트로 도는 러너가 나중에 조용히 깨진다.
 3. **`KNOB=` (빈 값)은 "미설정"이 아니다.** 옵션 노브는 set-but-empty 이면 부팅이
    loud 하게 실패한다. 안 쓸 노브는 **줄을 주석 처리**하라.
+4. **시나리오 YAML 이 사는 디렉토리도 제어 평면 컨테이너에서 보여야 한다.**
+   `cv-infra submit` 은 시나리오 파일의 **부모 디렉토리를 stage-5 오라클 앵커로 항상
+   함께 보낸다** — 그 시나리오가 커스텀 오라클을 **안 쓰더라도**. 제어 평면은 그 경로를
+   *자기 파일시스템에서* 검증하므로(G-26), 컨테이너 안에 없으면 잡이 시작 전에 죽는다:
+   ```
+   infra_error: runner seam crashed: ValueError: oracle_plugin_dir <dir> does not exist
+                or is not a directory (expected the scenario directory holding the custom oracle .py, D-1)
+   ```
+   ⇒ 시나리오를 **위 4개 루트 중 하나 아래**(가장 쉬운 것은 `CV_OUT_DIR`)에 두거나,
+   그 디렉토리를 `compose.yaml` 의 주석이 보여주는 **동일-절대경로 `:ro` 바인드**로
+   추가하라(CI 러너 워크스페이스가 그런 경우다). 실측 = §9.
 
 > ### ⚠ 이미 동의(②)를 마친 호스트에서 설정을 고칠 때
 >
@@ -174,7 +185,16 @@ docker compose -f docker/compose.yaml up -d --build
   docker ps -a --filter label=cv-infra.job_id -q | wc -l      # 0 이어야 함
   docker ps --filter publish=8000 --format '{{.Names}}'        # 포트 점유자
   ss -ltn | grep ':8000'
+  # 포트/이름으로는 안 보이는 평면까지 쓸어보는 유일한 방법 —
+  # 실측(2026-08-14): 이 호스트에 포트를 공개하지 않은 serve 가 23일째 살아 있었고
+  # 위 두 명령 어디에도 나타나지 않았다.
+  for c in $(docker ps --format '{{.Names}}'); do
+    docker top "$c" -eo pid,cmd 2>/dev/null | grep -q orchestrator.serve && echo "control plane: $c"
+  done
   ```
+  발견하면 **`docker stop` 만** 한다(`rm` 금지 — 증적·앵커가 딸려 나간다). 그리고 그
+  평면과 **같은 `CV_STATE_DIR` 을 쓸 거라면 반드시 stop 이 끝난 뒤에 `up`** 하라:
+  같은 SQLite 에 writer 가 둘이 되는 것은 순서로만 막힌다.
 
 ### ④ self-test — **미구현**
 
@@ -190,6 +210,17 @@ cv-infra selftest        # → exit 3, "not implemented yet"
 
 ## 4. 기동 직후 확인 (selftest 가 생기기 전까지의 정직한 대체)
 
+> **`cv-infra` CLI 는 어디서 오나**: 이 배포는 호스트에 아무것도 설치하지 않는다
+> (§0). CLI 는 **제어 평면 이미지 자신**이다 — 같은 이미지를 일회용으로 띄워 쓴다.
+> 그러면 CLI 는 컴포즈 네트워크 위의 형제 컨테이너가 되므로 **API 주소가
+> `127.0.0.1` 이 아니라 서비스 이름 `orchestrator`** 다.
+>
+> ```bash
+> alias cvi='docker compose -f docker/compose.yaml run --rm --no-deps orchestrator cv-infra'
+> cvi --help                       # 핀된 CLI 표면
+> ```
+> (호스트에 별도로 설치한 CLI 가 있으면 그때는 `--api http://127.0.0.1:8000` 이다.)
+
 ```bash
 # 1) 컨테이너가 살아있나
 docker compose -f docker/compose.yaml ps
@@ -204,7 +235,7 @@ docker logs cv-infra-orchestrator 2>&1 | grep -m1 serve-config
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/openapi.json   # 200
 
 # 4) 운영 뷰
-cv-infra monitor --api http://127.0.0.1:8000
+cvi monitor --api http://orchestrator:8000
 
 # 5) 외부 egress 감사를 무장한다 (제어 평면을 새로 띄웠으면 반드시 다시)
 bash scripts/netns_audit.sh arm cv-infra-orchestrator
@@ -215,8 +246,22 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 > 배포는 겉보기에 정상으로 돌면서 측정을 전부 콜드로 만든다. 이 줄이 그것을 눈에
 > 보이게 하려고 존재한다.
 
-라운드트립을 실제로 태우려면 지금은 **외부 SUT 가 필요하다**(`cv-infra submit`).
-그 외부 의존을 없애는 것이 바로 `④` 의 존재 이유이며, 아직 없다.
+라운드트립을 실제로 태우려면 지금은 **외부 SUT 가 필요하다**(`④` 가 없애려는 바로 그
+의존이며, 아직 없다). 외부 SUT 가 있다면 전체 관통은 이렇게 확인한다:
+
+```bash
+# 시나리오는 제어 평면이 볼 수 있는 경로에 둔다 (§3-②' 함정 4)
+mkdir -p "$CV_OUT_DIR/_smoke" && cp <scenario>.yaml "$CV_OUT_DIR/_smoke/"
+cvi submit "$CV_OUT_DIR/_smoke/<scenario>.yaml" --api http://orchestrator:8000 --wait
+# 도는 동안 다른 셸에서: 잡 컨테이너 2개(runner + sut)가 잡 전용 네트워크에 뜬다
+docker ps --filter label=cv-infra.job_id \
+  --format '{{.Names}}\t{{.Image}}\t{{.Networks}}'
+# 끝나면: 산출물은 호스트의 CV_OUT_DIR 아래 잡 디렉토리로 돌아온다
+ls "$CV_OUT_DIR"/cvj-*/result/result.json
+```
+
+`submit --wait` 의 종료 코드가 곧 계약이다 — 0 PASS / 1 FAIL(SUT 판정) /
+3 INFRA. **3 이면 SUT 가 아니라 배포를 의심하라**(§8).
 
 ---
 
@@ -231,6 +276,15 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 | 설정 변경 반영 | `.env` 를 **upsert 로** 고친 뒤(§3-②' 경고) `up -d` 재실행 |
 | 제어 평면 코드 갱신 | 체크아웃 갱신 → `up -d --build` |
 | **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --tag <release-sha> --image <ref>` |
+| CLI 한 번 쓰기 | `docker compose -f docker/compose.yaml run --rm --no-deps orchestrator cv-infra <cmd> --api http://orchestrator:8000` (§4) |
+
+> ⚠ **`up -d --build` 로 만든 제어 평면 이미지에는 리비전 라벨이 없다.** `compose build`
+> 는 `--label` 을 걸어주지 않으므로 그 이미지에는 compose 자신의 라벨만 남는다
+> (실측 2026-08-14). 제어 평면까지 스큐 추적을 하려면 별도로 태깅해 두어라:
+> `docker build -f docker/orchestrator/Dockerfile -t cv-infra-orchestrator:<tag> \`
+> `  --label org.opencontainers.image.revision=$(git rev-parse HEAD) .`
+> `CV_ORCHESTRATOR_IMAGE` 로 그 태그를 가리키면 `up` 은 빌드 없이 그 이미지를 쓴다.
+> (`check_plane_skew.sh` 가 보는 세 평면에 제어 평면 이미지는 **포함되지 않는다**.)
 
 **동의를 남긴 채 스택을 내려라.** compose 파일이 동의 키를 요구하므로 `down`·`ps` 같은
 서브커맨드도 키가 있어야 돈다. 호스트에서 동의를 지우기 **전에** 스택을 먼저 내려라.
@@ -278,7 +332,9 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 | `config`/`up` 이 `required variable ACCEPT_EULA/PRIVACY_CONSENT is missing` | 동의 미기록(또는 `.env` 를 덮어써서 소멸) | `②` 실행. 이건 버그가 아니라 게이트다 |
 | `up` 이 `port is already allocated` | 다른 프로세스/컨테이너가 그 포트를 점유 | `docker ps --filter publish=8000` 로 범인 확인 → 내리거나 `CV_PUBLISH_PORT` 변경 |
 | `up` 이 `could not select device driver "nvidia"` | 컨테이너 툴킷 미설치/미등록 | `①` 재실행. 이 배포는 GPU 호스트를 전제한다(`NFR-DEPLOY-005`) |
-| 잡이 시작되자마자 exit **3** | 인프라/플랫폼 문제 — 동의 env 부재, 오케스트레이터 다운 등. **SUT FAIL(1)과 구분되는 코드다** | `docker logs cv-infra-orchestrator` + 러너 로그 |
+| 잡이 시작되자마자 exit **3** | 인프라/플랫폼 문제 — 동의 env 부재, 오케스트레이터 다운 등. **SUT FAIL(1)과 구분되는 코드다** | `docker logs cv-infra-orchestrator` + `curl .../envelopes/<id>` 의 `infra_error` |
+| `infra_error: … oracle_plugin_dir <dir> does not exist …` (잡 컨테이너가 아예 안 뜬다) | 시나리오 디렉토리가 **제어 평면 컨테이너 안에 없다**. `submit` 은 커스텀 오라클을 안 써도 그 경로를 함께 보내고, 검사는 컨테이너 안에서 돈다(G-26) | 시나리오를 `CV_OUT_DIR` 등 이미 마운트된 루트 아래로 옮기거나 동일-절대경로 `:ro` 바인드 추가 — §3-②' 함정 4 |
+| NEG-2 점검("수락 리터럴이 박혀 있지 않다"는 `grep`)이 **배포 루트에서 매치를 낸다** | 배포된 호스트에서는 당연하다 — 동의 값이 사는 곳이 바로 `docker/.env`(git-ignored)다. 그 점검은 **커밋된 파일**에 대한 것이고, 그대로 돌리면 운영자의 동의 값이 터미널·로그에 찍힌다 | **`git grep`** 으로 돌려라(추적 파일만 본다). 굳이 `grep -r` 을 쓸 거면 `--exclude=.env`. 저장소 안의 정본 점검은 `tests/negative/test_eula_gate.py` 이며 그 테스트가 **문서에도 리터럴을 못 쓰게** 막는다(이 표에 리터럴이 없는 이유) |
 | 컨테이너 안 앱이 캐시/디렉토리에 못 쓴다 | 마운트 부모를 dockerd 가 `root:root` 로 생성 | 해당 호스트 디렉토리를 **미리** 만들고 러너 uid 소유로 맞춘 뒤 재기동 |
 | 캐시가 웜인데 잡마다 느리다 | 캐시를 **`:ro` 로 러너에 물리면 캐시가 꺼진다**(읽기 폴백이 아니라 비활성화) | 러너에는 **쓰기 가능한 잡별 사본**을 준다. 공유 트리는 복사 *원본*으로만 |
 | 옵션 노브를 넣었는데 부팅이 죽는다 | `KNOB=` 빈 값 | 줄을 **주석 처리**(미설정 = 문서화된 기본값) |
@@ -291,13 +347,30 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 > 아래는 **증거이지 설정값이 아니다**. 이 문서의 어떤 절차도 특정 호스트·특정 카드에
 > 분기하지 않는다(`DoD-P5-09`). 값은 전부 위 명령들의 실행 결과다.
 
-- 채널 = SSH. 증적 = 워크스테이션 `~/cv-infra-p2-out/p5c14/t2/*.log`.
+- 채널 = SSH. 증적 = 워크스테이션 `~/cv-infra-p2-out/p5c14/{t2,t4}/*.log`.
 - `①` 은 이미 충족된 호스트에서 확인만 함(드라이버 R580 브랜치·Docker 28.3.3·
   Compose v2.39.2·`nvidia` 런타임 등록·`--gpus all` 스모크 exit 0).
 - `②` = 운영자가 직접 실행(2026-08-14). 게이트 exit 0, 기록에 identity + timestamp 존재.
 - `②'` = REQUIRED 6 + `detect_gpu.sh` append. `detect_gpu` 가 살아있는 카드를 질의해
   프로파일을 선택하고 **측정 출처 주석과 함께** VRAM 노브를 써 넣는 것을 관측.
-- `③` 은 **`config` 까지만** 실행됨(exit 0, 렌더 결과에 4개 바인드가 전부 동일
-  호스트 절대경로로 나타남). 실제 `up` 은 이 문서 작성 시점 이후.
 - 동의 키만 제거한 동일 구성에서 `config` 는 **exit 1 로 loud 실패**(§3-② 인용문).
-- 제어 평면 이미지 빌드: **160,840,981 B / 8.3 s**, 빌드 중 임포트 가드 통과.
+- 제어 평면 이미지 빌드: **160,840,981 B / 8.3 s**(ad-hoc `docker build`),
+  **7.5 s**(`compose up --build`, 캐시 웜) — 둘 다 빌드 중 임포트 가드 통과.
+
+**`③`·§4 는 2026-08-14 에 실제로 실행됐다**(이 프로젝트 최초의 `docker compose up`,
+증적 `~/cv-infra-p2-out/p5c14/t4/`):
+
+- `up -d --build` **exit 0 / wall 7.5 s** — 네트워크 `cv-infra_default` 생성,
+  컨테이너 `cv-infra-orchestrator` 기동, `127.0.0.1:8000` 공개.
+- `serve-config` 실측: `k=2` `max_concurrent=2` `runner_image=cv-infra-runner:p5c15`
+  `vram_per_instance_mb=6000` `consent_env_present=[ACCEPT_EULA, PRIVACY_CONSENT]`
+  (**이름만**, 값 아님) `reconciliation` 전 카운트 **0**. 5개 바인드 전부 host==container
+  동일 절대경로.
+- **관통 1건**: `submit --wait` → 잡 전용 네트워크 위에 **runner + SUT 두 컨테이너**
+  스폰(라벨 `cv-infra.job_id`·`cv-infra.ros_domain_id=1`) → `result.json` + MCAP + mp4 가
+  호스트 `CV_OUT_DIR` 아래로 회수 → `report_outcome=pass`, **exit 0**. 제출~종료 **60 s**
+  (웜 캐시 시딩 1.84 GB / **0.31 s**).
+- 이 관통에서 **제어 평면·클라이언트 어느 쪽도 호스트 venv 가 아니었다** — 둘 다
+  `cv-infra-orchestrator:local` 컨테이너다.
+- 첫 시도는 **실패했고 그 실패가 §3-②' 함정 4·§8 두 줄을 낳았다**: 컨테이너 밖 경로에
+  둔 시나리오는 `oracle_plugin_dir … does not exist` 로 잡이 뜨기도 전에 죽는다.
