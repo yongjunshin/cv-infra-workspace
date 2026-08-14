@@ -39,7 +39,7 @@ readonly EXIT_USAGE=2
 
 log()  { printf '[cv-infra][stub-probe] %s\n' "$*"; }
 err()  { printf '[cv-infra][stub-probe][ERROR] %s\n' "$*" >&2; }
-die()  { err "$*"; exit "${2:-$EXIT_USAGE}"; }
+die()  { err "$1"; exit "${2:-$EXIT_USAGE}"; }   # $2 = exit code, never part of the message
 
 # --- configuration ----------------------------------------------------------
 # The image ref is REQUIRED and never guessed (image-as-artifact, FU-10 — the same
