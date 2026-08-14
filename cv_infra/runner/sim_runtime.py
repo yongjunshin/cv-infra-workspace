@@ -5,7 +5,8 @@ import — LOCKED §7.7), opens the scene, moves the robot the scene asset alrea
 placed to the DECLARED ``scenario.initial_pose`` when the scenario carries one
 (REQ-EXEC-002 — nothing is ever *spawned*: the sample scene ships the robot, and
 an undeclared pose leaves the asset's own placement alone), pins ``physics_dt`` /
-``rendering_dt`` / seed for determinism, runs the step loop, and
+``rendering_dt`` / seed for determinism AND reports what it applied
+(``emit_sim_config`` — DoD-P2-06 ①), runs the step loop, and
 closes cleanly to return VRAM/slots. Boot also pins the R4 texture-streaming
 budget cap (see ``simulation_app_launch_config`` — the k>=2 OOM-trap guard).
 All Isaac imports are deferred into ``boot()`` so this module imports on a CPU
@@ -133,6 +134,40 @@ def texture_budget_log_line(at_boot: object, readback: object) -> str:
     return (
         f"[cv-runner] {TEXTURE_BUDGET_LOG_MARKER}{TEXTURE_BUDGET_FRACTION} "
         f"at_boot={fmt(at_boot)} readback={fmt(readback)} key={TEXTURE_BUDGET_SETTING}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DoD-P2-06 ①: the settings this run ACTUALLY applied, emitted once — CPU-testable.
+# --------------------------------------------------------------------------- #
+# The gate was re-aimed on 2026-08-14 (CEO D-5) from "the results repeat" to "the
+# PROCESSING repeats + the spread is not hidden". Its ① clause needs the applied
+# execution settings to be OBSERVABLE per run; before this line they were applied
+# and never reported, so N runs could not be compared at all.
+#
+# CROSS-TEAM WIRE (PM verbatim pin, cycle p5c15 — QA greps it): the prefix and the
+# four field names are the contract; every VALUE is measured at run time (G-64 —
+# a pinned shape never pins a number).
+SIM_CONFIG_LOG_PREFIX = "[cv-runner] sim_config"
+
+
+def sim_config_log_line(physics_dt, rendering_dt, seed, identity_key) -> str:
+    """Format the one applied-settings line (see ``SimRuntime.emit_sim_config``).
+
+    Floats are rendered at FULL round-trip precision (``repr``): a dt that differs
+    in the 15th digit between two runs is exactly the kind of divergence this line
+    exists to expose, and a ``%.6f`` would round it away. ``seed``/``identity_key``
+    render as the literal string ``none`` when absent — an observation ("this run
+    had no key"), never a fabricated value.
+    """
+
+    def opt(value: object) -> object:
+        return "none" if value is None else value
+
+    return (
+        f"{SIM_CONFIG_LOG_PREFIX} physics_dt={float(physics_dt)!r} "
+        f"rendering_dt={float(rendering_dt)!r} seed={opt(seed)} "
+        f"identity_key={opt(identity_key)}"
     )
 
 
@@ -378,6 +413,51 @@ class SimRuntime:
         readback = settings.get(TEXTURE_BUDGET_SETTING)
         print(texture_budget_log_line(at_boot, readback), flush=True)
 
+    def _applied_dt(self, getter_name: str, requested: float) -> tuple[float, bool]:
+        """Ask the World what dt it is really running with; (value, observed?).
+
+        The read-back accessor is NOT assumed to exist: a vendor API is measured,
+        not trusted (G-62 ④). Missing/raising -> the REQUESTED value with
+        ``observed=False``, which ``emit_sim_config`` says out loud rather than
+        passing an echo of intent off as an observation (G-26).
+        """
+        getter = getattr(self.world, getter_name, None)
+        if getter is None:
+            return requested, False
+        try:
+            return float(getter()), True
+        except Exception:  # a diagnostic read-back must never cost the job
+            return requested, False
+
+    def emit_sim_config(self, identity_key: str | None = None) -> str:
+        """Emit the applied-settings line (DoD-P2-06 ①) + a loud note if it diverges.
+
+        Called by ``load_scene`` the moment the World holds the settings, so a job
+        that dies later has ALREADY left this line in its log.
+
+        ``identity_key`` is a parameter, not something this runner derives: the key
+        is M4's (``report/regression.identity_key`` over the request wire dump) and
+        nothing hands one to the runner today, so the field renders ``none`` here
+        and the observation for ① lives on the report plane. Wiring one in later is
+        this one argument.
+        """
+        physics_dt, physics_ok = self._applied_dt("get_physics_dt", self.config.physics_dt)
+        rendering_dt, rendering_ok = self._applied_dt("get_rendering_dt", self.config.rendering_dt)
+        line = sim_config_log_line(physics_dt, rendering_dt, self.config.seed, identity_key)
+        print(line, flush=True)
+        notes = []
+        for field, requested, applied, observed in (
+            ("physics_dt", self.config.physics_dt, physics_dt, physics_ok),
+            ("rendering_dt", self.config.rendering_dt, rendering_dt, rendering_ok),
+        ):
+            if not observed:
+                notes.append(f"{field} not readable from the World (line carries the REQUEST)")
+            elif applied != requested:
+                notes.append(f"{field} requested={requested!r} applied={applied!r}")
+        if notes:
+            print(f"[cv-runner] WARNING: sim_config {'; '.join(notes)}", flush=True)
+        return line
+
     def load_scene(self) -> None:  # pragma: no cover - GPU path (T3 proves)
         """open_stage(sample scene) + locate pre-wired robot; pin dt/seed; reset.
 
@@ -441,6 +521,11 @@ class SimRuntime:
             rendering_dt=self.config.rendering_dt,
             stage_units_in_meters=1.0,
         )
+        # DoD-P2-06 ①: report what was applied, HERE — the seeds are pinned just
+        # above and the World now holds the dt, and everything after this point
+        # (robot resolve, initial pose, reset) can fail. Emitting later would lose
+        # exactly the runs whose settings a reader most wants to compare.
+        self.emit_sim_config()
 
         if asset.robot_prim_candidates:
             stage = omni.usd.get_context().get_stage()
@@ -582,9 +667,11 @@ class SimRuntime:
         NOT on the runner's terminal path since p5c14: the vendor ``close()`` does
         not return, it ends the process with status 0 and takes the job's exit code
         with it (G-62), so ``main.run``'s ``finally`` hands the shutdown to process
-        death (``main.hard_exit``) instead. Kept as the explicit shutdown seam for a
-        caller that must OUTLIVE the sim (probes/tools), and as the one place to
-        re-enable graceful close if the live probe shows it is survivable.
+        death (``main.hard_exit``) instead. The p5c14 live ``closeprobe`` arm closed
+        the "restore it if the probe says it is survivable" branch: close() raises
+        nothing catchable, the process ends inside it. So this stays a seam for a
+        caller that INTENDS to end here (probes/tools), never a shutdown to return
+        from — and a caller that must OUTLIVE the sim cannot use it at all.
         """
         if self.simulation_app is not None:  # pragma: no cover - GPU path
             self.simulation_app.close()
