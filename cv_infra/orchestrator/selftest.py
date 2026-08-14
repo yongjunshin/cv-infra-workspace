@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,10 +79,11 @@ SUT_IMAGE_ENV = "CV_SELFTEST_SUT_IMAGE"
 #   ``InitialPose`` example. Spawn pose == goal pose is the whole trick of the
 #   trivial criterion: the robot is AT the goal at t=0 by construction, so the
 #   judgement needs no SUT motion and no tuned threshold.
-# * acceptance_criteria: ONE ``reached_goal`` with NO params — the oracle default
+# * acceptance_criteria: ``reached_goal`` with NO params — the oracle default
 #   tolerance applies to a residual that is ~0 by construction. A threshold typed
 #   here would be a fabricated measurement (M7 §8 open item 2); this stub avoids
-#   needing one at all.
+#   needing one at all — plus the ``no_collision`` criterion below (its own
+#   provenance note).
 # * seed: the platform fixture's determinism seed (42), unchanged.
 #
 # ASSUMPTION SURFACED (verified LIVE only by the Wave-C round-trip, not here):
@@ -93,6 +95,37 @@ _STUB_SCENE = "nova_carter_warehouse"
 _STUB_ROBOT = "nova_carter"
 _STUB_POSE = {"x": -6.0, "y": -1.0, "yaw": 3.1416}
 _STUB_SEED = 42
+
+#: ``no_collision`` params of the stub — WHY the criterion is here at all: the runner
+#: builds the physics telemetry sampler and binds it PRE-reset UNCONDITIONALLY
+#: (``runner/main.py`` step 2->3), and ``telemetry.bind()`` raises when it has no
+#: ``chassis_path``. That key lives ONLY on ``NoCollisionParams`` (M1
+#: ``contract/schema.py``; ``ReachedGoalParams`` is ``extra=forbid``), so a stub
+#: declaring reached_goal ALONE dies before the readiness barrier. 판정 기준은 그 자체가
+#: INPUT이므로 (REQ-INTAKE-007) 고치는 것도 입력이다 — 실행 평면 코드는 건드리지 않는다.
+#:
+#: PROVENANCE (values NOT invented here — CLAUDE §2-4): both prim paths are the
+#: workstation measurements carried by the platform fixture, which is their source of
+#: truth: ``tests/fixtures/nova_carter_warehouse_goal.yaml``,
+#: ``acceptance_criteria[no_collision].params`` (today lines 104 / 107-109 — comments
+#: "measured (bringup probe-01)" for the chassis body and "measured contact partners
+#: (bringup run1, D-E reduction)" for the exclusions). They apply verbatim because the
+#: stub resolves to the SAME asset as that fixture: scene ``nova_carter_warehouse`` ->
+#: ``/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd`` with robot prim
+#: ``/World/Nova_Carter_ROS`` (``runner/sim_runtime.SCENE_ASSETS``).
+#:
+#: The exclusions are NOT decoration: the stub robot sits parked ON the ground, and the
+#: measured contact partners of the chassis are exactly its own self-body subtree and
+#: that floor plane — unfiltered, a motionless robot false-FAILs (the reduction
+#: ``oracles/no_collision.py`` documents). With them, "no collision" is trivially true
+#: for a parked robot while still proving the verdict path ran for a SECOND oracle.
+_STUB_COLLISION_PARAMS: dict[str, Any] = {
+    "chassis_path": "/World/Nova_Carter_ROS/chassis_link",
+    "collision_excluded_paths": [
+        "/World/Nova_Carter_ROS",
+        "/World/warehouse_with_forklifts/GroundPlane",
+    ],
+}
 
 #: Sim-time budget of the stub mission (``Scenario.timeout_s``) — an UPPER BOUND,
 #: not a pass threshold: the verdict comes from where the robot IS, and it is at
@@ -145,7 +178,10 @@ def _stub_request_document(sut_image_ref: str) -> dict[str, Any]:
             "timeout_s": _STUB_TIMEOUT_S,
         },
         "sut": {"image_ref": sut_image_ref},
-        "acceptance_criteria": [{"oracle": "reached_goal"}],
+        "acceptance_criteria": [
+            {"oracle": "reached_goal"},
+            {"oracle": "no_collision", "params": deepcopy(_STUB_COLLISION_PARAMS)},
+        ],
     }
 
 
