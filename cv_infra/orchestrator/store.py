@@ -75,8 +75,14 @@ def _now_iso() -> str:
 # completion, keyed by envelope_id; ADDITIVE new table via CREATE IF NOT EXISTS so
 # ``GET /envelopes/{id}/report`` serves the durable report AFTER an orchestrator
 # restart, never re-assembling from results that did not survive — same 영속본
-# 서빙 discipline as the rollups/registry above).
-_SCHEMA_VERSION = 7
+# 서빙 discipline as the rollups/registry above);
+# v8 = p5c15 self-test 출처 (envelopes.is_self_test + envelopes.origin — the two M1
+# ``RequestEnvelope`` provenance markers the submit wire now threads, REQ-SELFTEST-001/002;
+# ADDITIVE guarded ALTERs, legacy rows read back as False/None = "an ordinary submission",
+# which is what they were. Persisted rather than kept in memory because the operational
+# projection (M6, REQ-SELFTEST-004) reads envelopes from the store, so a self-test stays
+# identifiable after a restart).
+_SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -101,7 +107,9 @@ CREATE TABLE IF NOT EXISTS envelopes (
     status         TEXT NOT NULL,
     report_outcome TEXT,
     error          TEXT,
-    submitted_at   TEXT
+    submitted_at   TEXT,
+    is_self_test   INTEGER NOT NULL DEFAULT 0,
+    origin         TEXT
 );
 CREATE TABLE IF NOT EXISTS envelope_requests (
     envelope_id       TEXT    NOT NULL,
@@ -155,6 +163,8 @@ class StoredEnvelope:
     equal-length per-request stage-5 anchor list (None = no anchor).
     ``report_outcome`` / ``error`` stay None until completion / a crash marker.
     ``submitted_at`` (v5) is the ISO8601 submit timestamp (None for legacy rows).
+    ``is_self_test`` / ``origin`` (v8) are the M1 envelope provenance markers the
+    submit wire threads (REQ-SELFTEST-001/002): False/None = an ordinary submission.
     """
 
     envelope_id: str
@@ -164,6 +174,8 @@ class StoredEnvelope:
     report_outcome: str | None = None
     error: str | None = None
     submitted_at: str | None = None
+    is_self_test: bool = False
+    origin: str | None = None
 
 
 @dataclass
@@ -274,11 +286,19 @@ class Store:
             ):
                 if column not in job_columns:
                     self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {column_type}")
-            # v5: envelopes.submitted_at — same additive discipline (the resource
-            # sample table is new, so CREATE IF NOT EXISTS already handles it).
+            # v5: envelopes.submitted_at / v8: envelopes.is_self_test + origin — same
+            # additive discipline (the resource sample table is new, so CREATE IF NOT
+            # EXISTS already handles it). A pre-v8 row upgrades to
+            # is_self_test=0/origin=NULL, i.e. "an ordinary submission" — true by
+            # construction, since self-test envelopes did not exist before v8.
             env_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(envelopes)")}
-            if "submitted_at" not in env_columns:
-                self._conn.execute("ALTER TABLE envelopes ADD COLUMN submitted_at TEXT")
+            for column, column_type in (
+                ("submitted_at", "TEXT"),
+                ("is_self_test", "INTEGER NOT NULL DEFAULT 0"),
+                ("origin", "TEXT"),
+            ):
+                if column not in env_columns:
+                    self._conn.execute(f"ALTER TABLE envelopes ADD COLUMN {column} {column_type}")
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # -- jobs (REQ-ORCH-011: every transition is persisted) -------------------
@@ -398,12 +418,17 @@ class Store:
         envelope_id: str,
         request_ids: list[str],
         oracle_plugin_dirs: list[str | None] | None = None,
+        *,
+        is_self_test: bool = False,
+        origin: str | None = None,
     ) -> None:
         """Persist a submitted envelope's registry row + ordered request refs.
 
         ``oracle_plugin_dirs`` (optional) must be equal-length when given —
         the per-request stage-5 anchors ride the registry so a restart knows
-        them (None entry = no anchor).
+        them (None entry = no anchor). ``is_self_test`` / ``origin`` (v8,
+        kw-only, defaults = an ordinary submission) record the M1 envelope
+        provenance markers (REQ-SELFTEST-001/002).
         """
         anchors: list[str | None] = (
             oracle_plugin_dirs if oracle_plugin_dirs is not None else [None] * len(request_ids)
@@ -414,8 +439,9 @@ class Store:
             )
         with self._write_lock, self._conn:
             self._conn.execute(
-                "INSERT INTO envelopes (envelope_id, status, submitted_at) VALUES (?, ?, ?)",
-                (envelope_id, ENVELOPE_RUNNING, _now_iso()),
+                "INSERT INTO envelopes (envelope_id, status, submitted_at, is_self_test, origin)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (envelope_id, ENVELOPE_RUNNING, _now_iso(), int(is_self_test), origin),
             )
             self._conn.executemany(
                 "INSERT INTO envelope_requests"
@@ -457,13 +483,13 @@ class Store:
     def load_envelope(self, envelope_id: str) -> StoredEnvelope | None:
         """Restore one envelope's registry view (None when unknown)."""
         row = self._conn.execute(
-            "SELECT status, report_outcome, error, submitted_at FROM envelopes"
-            " WHERE envelope_id = ?",
+            "SELECT status, report_outcome, error, submitted_at, is_self_test, origin"
+            " FROM envelopes WHERE envelope_id = ?",
             (envelope_id,),
         ).fetchone()
         if row is None:
             return None
-        status, report_outcome, error, submitted_at = row
+        status, report_outcome, error, submitted_at, is_self_test, origin = row
         refs = self._conn.execute(
             "SELECT request_id, oracle_plugin_dir FROM envelope_requests"
             " WHERE envelope_id = ? ORDER BY position",
@@ -477,6 +503,8 @@ class Store:
             report_outcome=report_outcome,
             error=error,
             submitted_at=submitted_at,
+            is_self_test=bool(is_self_test),  # stored as INTEGER 0/1 (v8)
+            origin=origin,
         )
 
     def load_recent_envelopes(self, limit: int) -> list[StoredEnvelope]:

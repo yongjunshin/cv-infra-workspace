@@ -20,8 +20,10 @@ setting it turns ON the NVML 2nd guard via ``PynvmlVramGauge``; never a
 constant, CLAUDE §2-4), ``CV_BIND_HOST``/``CV_BIND_PORT`` (default
 127.0.0.1:8000 — matches the M8 client default, M8 §8 cicd-g5 same-host MVP),
 ``CV_ISAAC_CACHE_ROOT``/``CV_ISAAC_CACHE_SCRATCH_ROOT`` (existing FU-16 / D-B
-cache contract, resolved once at boot and passed explicitly), plus the operator
-consent keys ``ACCEPT_EULA``/``PRIVACY_CONSENT`` forwarded VERBATIM to
+cache contract, resolved once at boot and passed explicitly), ``CV_RUNNER_SHM_SIZE``
+(runner ``/dev/shm`` size — LOCKED risk R-shm; unset = ``DEFAULT_RUNNER_SHM_SIZE``,
+whose in-repo measured source and open gap are documented on that constant), plus
+the operator consent keys ``ACCEPT_EULA``/``PRIVACY_CONSENT`` forwarded VERBATIM to
 ``runner_env`` only when present (decision 2026-07-03 — values are never
 committed/logged; absent = the runner boot guard honestly refuses, LOCKED §7.8).
 
@@ -62,6 +64,7 @@ from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
     CACHE_SCRATCH_ROOT_ENV,
     DEFAULT_OUTER_WALLCLOCK_S,
+    DEFAULT_RUNNER_SHM_SIZE,
     RestartReconciliation,
     RunJobRunner,
     reconcile_at_restart,
@@ -79,6 +82,12 @@ BIND_PORT_ENV = "CV_BIND_PORT"
 #: image pull (p5c7 T2, D-2). Unset = ``DEFAULT_OUTER_WALLCLOCK_S`` (MEASURED derivation on the
 #: constant); an override must stay strictly > the inner watchdog or the coherence gate refuses.
 OUTER_WALLCLOCK_ENV = "CV_OUTER_WALLCLOCK_S"
+#: Runner ``/dev/shm`` size (LOCKED risk R-shm, p5c15) — a docker size string ("1g",
+#: "512m") or a byte count. Unset = ``DEFAULT_RUNNER_SHM_SIZE`` (its measured in-repo
+#: source, and what that measurement does NOT cover, live on the constant). Kept an
+#: operator knob rather than a hardcode because the value that matters is a LIVE peak
+#: usage nobody has measured on the production spawn yet (CLAUDE §2-4).
+RUNNER_SHM_SIZE_ENV = "CV_RUNNER_SHM_SIZE"
 
 _REQUIRED_ENVS = (STORE_PATH_ENV, OUT_DIR_ENV, RUNNER_IMAGE_ENV, MAX_CONCURRENT_ENV)
 
@@ -107,6 +116,7 @@ class ServeConfig:
     host: str
     port: int
     outer_wallclock_s: float  # outer wall-clock cap over pull(s)+mission (default on unset)
+    runner_shm_size: str | int  # runner /dev/shm size (R-shm; default on unset)
 
 
 def _get(environ: Mapping[str, str], name: str) -> str | None:
@@ -164,6 +174,7 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
         outer_wallclock_s=(
             outer_wallclock_s if outer_wallclock_s is not None else DEFAULT_OUTER_WALLCLOCK_S
         ),
+        runner_shm_size=_get(environ, RUNNER_SHM_SIZE_ENV) or DEFAULT_RUNNER_SHM_SIZE,
     )
 
 
@@ -205,6 +216,7 @@ def build_app(
         runner_env=config.consent_env or None,
         cache_root=config.cache_root,
         cache_scratch_root=config.cache_scratch_root,
+        shm_size=config.runner_shm_size,  # R-shm (p5c15)
         run_job_fn=run_job_fn,
     )
     # p5c7 T2 (D-2): wire the OUTER wall-clock cap — the only bound spanning the image pull.
@@ -251,6 +263,7 @@ def _log_serve_config(
             "consent_env_present": sorted(config.consent_env),
             "job_timeout_s": inner_watchdog_s,  # inner container watchdog (run_job / RunJobRunner)
             "outer_wallclock_s": outer_wallclock_s,  # outer cap over pull(s)+mission (p5c7 T2)
+            "runner_shm_size": config.runner_shm_size,  # runner /dev/shm (R-shm, p5c15)
             "reconciliation": {
                 "containers_removed": recon.containers_removed,
                 "networks_removed": recon.networks_removed,

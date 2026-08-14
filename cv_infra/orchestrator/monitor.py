@@ -94,13 +94,23 @@ class MonitorJob(BaseModel):
 
 
 class MonitorRequest(BaseModel):
-    """One Verification Request's operational rollup COUNT summary + its jobs."""
+    """One Verification Request's operational rollup COUNT summary + its jobs.
+
+    ``is_self_test`` (p5c15, REQ-SELFTEST-004) is the envelope's self-test marker
+    (store v8) — the operator sees the deployment round-trip check next to the real
+    work, which is the whole point of the requirement ("self-test 결과를 운영
+    대시보드에서 확인"). It is a BOOLEAN by deliberate choice: the sibling marker
+    ``origin`` is FREE TEXT a submitter controls, i.e. structurally the same hazard
+    as ``infra_error`` (the p5c10 NEG-3 보강), so it stays in the store (audit) and
+    off the operational surface, while a bool cannot carry a domain value at all.
+    """
 
     envelope_id: str
     request_id: str
     submitted_at: str | None
     envelope_status: str
     report_outcome: str | None
+    is_self_test: bool
     pass_count: int
     fail_count: int
     error_count: int
@@ -227,6 +237,7 @@ def _monitor_request(
         submitted_at=envelope.submitted_at,
         envelope_status=envelope.status,
         report_outcome=envelope.report_outcome,
+        is_self_test=envelope.is_self_test,  # store v8 marker, verbatim (REQ-SELFTEST-004)
         pass_count=sum(1 for v in verdicts if v is Verdict.PASS),
         fail_count=sum(1 for v in verdicts if v is Verdict.FAIL),
         error_count=sum(1 for r in rows if r.state in _ERROR_STATES),
@@ -353,6 +364,7 @@ def render_dashboard_html(record: OperationalRecord) -> str:
             f"<td>{_cell(req.request_id)}</td>"
             f"<td>{_cell(req.envelope_status)}</td>"
             f"<td>{_cell(req.report_outcome)}</td>"
+            f"<td>{_cell(req.is_self_test)}</td>"
             f"<td class='pass'>{req.pass_count}</td>"
             f"<td class='fail'>{req.fail_count}</td>"
             f"<td class='error'>{req.error_count}</td>"
@@ -360,7 +372,7 @@ def render_dashboard_html(record: OperationalRecord) -> str:
             f"<td>{', '.join(broken) if broken else '-'}</td>"
             "</tr>"
         )
-    body = "".join(rows) if rows else "<tr><td colspan='9'>no requests yet</td></tr>"
+    body = "".join(rows) if rows else "<tr><td colspan='10'>no requests yet</td></tr>"
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         f"<meta http-equiv='refresh' content='{DASHBOARD_REFRESH_S}'>"
@@ -371,6 +383,7 @@ def render_dashboard_html(record: OperationalRecord) -> str:
         f"{header}"
         "<table><thead><tr>"
         "<th>envelope</th><th>request</th><th>status</th><th>report_outcome</th>"
+        "<th>self_test</th>"
         "<th>pass</th><th>fail</th><th>error</th><th>flakiness</th><th>broken jobs</th>"
         "</tr></thead><tbody>"
         f"{body}"

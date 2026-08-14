@@ -13,10 +13,13 @@ Wire format (D-1 wire v2, decisions/2026-07-13-p4c2-envelope-contract-timing.md)
 the JSON body ``{"requests": [...], "oracle_plugin_dirs": [...]}`` is an
 INTERNAL representation — the user-facing RequestEnvelope contract (YAML
 schema, apiVersion, friendly file errors) freezes with the M8 batch-CLI submit
-cycle together with M1; this module adapts to it then. One formal envelope key
-IS now threaded (p5c3): an optional top-level ``"trigger_source"`` records human
-vs CI provenance (REQ-INTAKE-003 — ``_parse_envelope``); the remaining wrapper
-keys are still not interpreted this cycle. Each request document IS
+cycle together with M1; this module adapts to it then. Three formal envelope keys
+ARE now threaded: an optional top-level ``"trigger_source"`` records human vs CI
+provenance (p5c3, REQ-INTAKE-003 — ``_parse_envelope``), and the optional
+``"is_self_test"`` / ``"origin"`` pair records self-test provenance (p5c15,
+REQ-SELFTEST-001/002 — the built-in stub envelope ``orchestrator/selftest.py``
+builds rides this SAME path, no self-test branch anywhere below); the remaining
+wrapper keys are still not interpreted this cycle. Each request document IS
 validated NOW: it goes through the full M1 6-stage admit gate
 (``contract.loader.load_request`` — no contract bypass; the JSON document is
 fed to the loader as a canonical indented-JSON stream, which any YAML loader
@@ -84,7 +87,9 @@ is the resident-service cycle's concern (P5 compose).
 
 Persistence (p4c4 — in-memory 유실 해소): job state transitions persist through
 the Store (REQ-ORCH-011) as before; the envelope->request registry is now
-persisted at submit and the per-request ``RequestRollup``s + envelope
+persisted at submit (store v8: WITH its self-test markers, so the provenance
+survives a restart and reaches the M6 operational projection —
+REQ-SELFTEST-004) and the per-request ``RequestRollup``s + envelope
 ``report_outcome`` (or crash ``error``) at completion. A status read for an
 envelope this process never saw (orchestrator restart) is served from the store
 — never recomputed from results, which did not survive. Envelope supervision
@@ -111,6 +116,7 @@ import io
 import json
 import uuid
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, get_args
 
@@ -236,9 +242,51 @@ def _trigger_source_of(body: dict[str, Any]) -> str:
     return trigger_source
 
 
-def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None], str]:
-    """Validate the internal wire wrapper -> (request documents, stage-5 anchors,
-    trigger_source).
+def _self_test_markers_of(body: dict[str, Any]) -> tuple[bool, str | None]:
+    """Parse the optional ``is_self_test`` / ``origin`` envelope markers (p5c15).
+
+    Both are M1 ``RequestEnvelope`` fields (``bool`` / ``str | None``) that the
+    built-in stub envelope sets (``orchestrator/selftest.py`` — REQ-SELFTEST-001/002);
+    absent = the M1 defaults (False / None), i.e. every existing submission is
+    byte-identical. A present value must match the contract's type or it is a 422
+    wrapper violation (same 8-key shape as an admit error) — a self-test marker is
+    provenance, and provenance that silently coerces is worse than none.
+    """
+    is_self_test = body.get("is_self_test")
+    if is_self_test is None:
+        is_self_test = False
+    elif not isinstance(is_self_test, bool):
+        raise _wire_error(
+            "is_self_test",
+            "a boolean (self-test envelope marker, REQ-SELFTEST-002), or absent for false",
+            repr(is_self_test),
+            example='{"requests": [{...}], "is_self_test": true, "origin": "built-in-stub"}',
+        )
+    origin = body.get("origin")
+    if origin is not None and not isinstance(origin, str):
+        raise _wire_error(
+            "origin",
+            "a string recording where the request came from (REQ-SELFTEST-001"
+            ' — the built-in stub uses "built-in-stub"), or absent',
+            repr(origin),
+            example='{"requests": [{...}], "is_self_test": true, "origin": "built-in-stub"}',
+        )
+    return is_self_test, origin
+
+
+@dataclass(frozen=True)
+class _ParsedEnvelope:
+    """The validated wire wrapper (``_parse_envelope`` output) in one value."""
+
+    documents: list[dict[str, Any]]
+    plugin_dirs: list[str | None]
+    trigger_source: str
+    is_self_test: bool
+    origin: str | None
+
+
+def _parse_envelope(body: Any) -> _ParsedEnvelope:
+    """Validate the internal wire wrapper -> ``_ParsedEnvelope``.
 
     Wrapper-only checks (each document's validation is the M1 loader's):
     the body must be a JSON object whose ``"requests"`` is a non-empty list
@@ -246,9 +294,10 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None], 
     present — be an equal-length list of ``null`` (no anchor) or absolute
     directory path strings; absent/null field means no anchors (previous
     behavior, unchanged). ``"trigger_source"`` (p5c3, optional) is parsed by
-    ``_trigger_source_of`` (absent -> ``human-manual``, illegal -> 422). Anchors
-    are same-host trusted paths (module docstring — MVP, M8 §8 g5). Violations
-    raise ``ContractError`` (422).
+    ``_trigger_source_of`` (absent -> ``human-manual``, illegal -> 422);
+    ``"is_self_test"``/``"origin"`` (p5c15, optional) by ``_self_test_markers_of``.
+    Anchors are same-host trusted paths (module docstring — MVP, M8 §8 g5).
+    Violations raise ``ContractError`` (422).
     """
     if not isinstance(body, dict):
         raise _wire_error("(document)", 'a JSON object body {"requests": [...]}', repr(body))
@@ -263,9 +312,17 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None], 
         if not isinstance(doc, dict):
             raise _wire_error(f"requests[{i}]", "a Verification Request object", repr(doc))
     trigger_source = _trigger_source_of(body)
+    is_self_test, origin = _self_test_markers_of(body)
+    parsed = partial(
+        _ParsedEnvelope,
+        documents=requests,
+        trigger_source=trigger_source,
+        is_self_test=is_self_test,
+        origin=origin,
+    )
     plugin_dirs = body.get("oracle_plugin_dirs")
     if plugin_dirs is None:  # field absent (or explicit null): no anchors — unchanged path
-        return requests, [None] * len(requests), trigger_source
+        return parsed(plugin_dirs=[None] * len(requests))
     if not isinstance(plugin_dirs, list) or len(plugin_dirs) != len(requests):
         raise _wire_error(
             "oracle_plugin_dirs",
@@ -281,7 +338,7 @@ def _parse_envelope(body: Any) -> tuple[list[dict[str, Any]], list[str | None], 
                 repr(anchor),
                 example=_ANCHOR_EXAMPLE,
             )
-    return requests, plugin_dirs, trigger_source
+    return parsed(plugin_dirs=plugin_dirs)
 
 
 def _admit_all(
@@ -511,7 +568,8 @@ def create_app(
     async def submit_envelope(request: Request) -> dict[str, str]:
         try:
             body = await request.json()
-            documents, plugin_dirs, trigger_source = _parse_envelope(body)
+            envelope = _parse_envelope(body)
+            documents, plugin_dirs = envelope.documents, envelope.plugin_dirs
         except json.JSONDecodeError as exc:
             err = _wire_error("(document)", "a JSON body", str(exc))
             raise HTTPException(
@@ -540,8 +598,16 @@ def create_app(
             # the production runner seam (RunJobRunner) drives run_job off it.
             job.job_spec = _job_spec_for(admitted_of[job.request_id].request, job_key(job))
         # Durable registry FIRST (p4c4 영속): a restart can then serve status for
-        # this envelope even though the in-memory record below dies with us.
-        store.record_envelope(envelope_id, request_ids, plugin_dirs)
+        # this envelope even though the in-memory record below dies with us. The
+        # self-test markers ride the SAME write (v8) — the operational projection
+        # reads them from the store, so they survive a restart too.
+        store.record_envelope(
+            envelope_id,
+            request_ids,
+            plugin_dirs,
+            is_self_test=envelope.is_self_test,
+            origin=envelope.origin,
+        )
         queue = JobQueue(  # persists every job QUEUED via the store (REQ-ORCH-011)
             jobs, store=store, max_attempts=max_attempts, retry_on_timeout=retry_on_timeout
         )
@@ -563,7 +629,8 @@ def create_app(
                 rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
                 for rid in request_ids
             },
-            trigger_source=trigger_source,  # p5c3: submitted value (or default), recorded verbatim
+            # p5c3: submitted value (or default), recorded verbatim
+            trigger_source=envelope.trigger_source,
         )
         envelopes[envelope_id] = record
         task = asyncio.get_running_loop().create_task(_drive(record, supervisor))
