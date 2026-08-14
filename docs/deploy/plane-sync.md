@@ -15,6 +15,7 @@
 |---|---|---|
 | **① YAML 평면** | reusable workflow / composite action (`.github/workflows/verify.yml` · `actions/verify`) | 릴리즈 태그 `@vN` 이동으로 **자동** 갱신(소비자 `uses: …@vN` 핀) |
 | **② 런타임 평면** | GPU 잡이 **실제 실행하는 코드** = 러너 venv의 editable install + **사전 설치된 serve/CLI 컨테이너** | **체크아웃 + 재설치 + 컨테이너 재기동으로만** 갱신 |
+| **②' 제어 평면 이미지** | p5c14부터 제어 평면은 **컨테이너**다 — 그 안의 `cv_infra`는 `docker/orchestrator/Dockerfile`이 **구운 wheel** | **리빌드로만**(`up -d --build`). **p5c15부터 스큐 게이트가 이 평면도 본다**(`--orchestrator-image` 필수) |
 | **③ 러너 이미지 평면** | 잡 컨테이너 **안에서** 실행되는 wheel(`cv-infra-runner:<tag>`에 박힘) | **이미지 리빌드로만** 갱신 — ①②를 아무리 옮겨도 움직이지 않는다([아래 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)). **p5c13부터 스큐 게이트가 이 평면도 본다**(`--image` 필수) |
 
 GPU 잡은 설계상(R10) `actions/checkout`을 **하지 않는다** → 소비자가 실행하는 코드는
@@ -91,6 +92,18 @@ docker image inspect cv-infra-runner:<tag> \
 
 **이전 태그는 지우지 않는다** — 과거 게이트/앵커가 그 Id를 인용하고 있다(FU-10 핀 대장).
 
+**apt 버전 핀(p5c15, D-6 선행)**: 이 Dockerfile이 호명하는 apt 패키지 8개는 이제
+`=<정확한 버전>`으로 핀돼 있다(값의 출처·전량 핀을 포기한 근거·재핀 절차는 Dockerfile의
+`apt VERSION PINS` 블록). ROS/우분투 저장소는 **대체된 버전을 인덱스에서 내리므로**,
+언젠가 리빌드가 `Version '…' for '…' was not found`로 **loud 실패**한다 — 그것이 의도된
+동작이다(조용한 드리프트보다 낫다). 그때는 **마지막으로 성공한 이미지에서 실측해 재핀**한다:
+```bash
+docker run --rm --entrypoint dpkg-query <last-good-runner-image> -W \
+  -f='${binary:Package}=${Version}\n' <the 8 package names>
+```
+핀되지 않는 것: **transitive 262개**(빌드 로그의 `rosbag2 apt layer manifest`가 전부
+찍는다) · **결과 이미지 다이제스트**(D-6: 핀되는 것은 입력 집합이지 출력이 아니다).
+
 **provenance 확인(이미지 ↔ 커밋 결속)**: wheel에는 커밋 스탬프가 없다(`__version__`은
 `0.0.0` 고정). 그래서 결속은 **바이트 대조**로 만든다 — 이미지 안 site-packages의
 `cv_infra/**.py` 매니페스트가 소스 트리의 그것과 같아야 한다:
@@ -137,6 +150,41 @@ GATE exit=0
 계속 exit 3이 나오는 것이 정상이다. 라이브 leg는 **스탬프된 이미지**를 써야 한다.
 증적: `~/cv-infra-p2-out/p5c13/rebuild/03-verify-p5c14.log`.
 
+### ②' 제어 평면 이미지 — **제품 경로가 임시 명령보다 프로방넌스를 잃고 있었다** (G-66)
+
+러너 이미지는 PM이 `docker build --build-arg CV_SOURCE_REVISION=<sha>`로 만들어 라벨이
+박혔는데, **`docker compose up --build`로 만든 제어 평면 이미지는 `rev=[]`** 였다(실측
+2026-08-14). `docker compose build`는 명령줄의 `--build-arg`/`--label`을 **계승하지
+않는다** — compose 파일이 `build.args`로 명시하지 않으면 아무것도 전달되지 않는다.
+그리고 스큐 게이트는 **러너 이미지만** 봤으므로 이 구멍은 게이트를 깨지 않았다:
+**조용했다**. 이것이 G-43이 이름 붙인 실패 모드 그 자체다 — *게이트가 보지 않는 평면*.
+
+수리(p5c15, 세 조각):
+
+1. `docker/compose.yaml`의 `build.args`가 `CV_SOURCE_REVISION`을 환경에서 받아 넘긴다.
+   compose는 명령을 실행할 수 없으므로 값은 **빌드 명령의 환경**에서 온다:
+   ```bash
+   CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+     docker compose -f docker/compose.yaml up -d --build
+   ```
+   `.git`이 없는 배포(타르볼)면 **기록된 릴리즈 sha**를 그대로 넣는다.
+   **`docker/.env`에 적지 마라** — 이후 모든 빌드가 그 옛 커밋을 주장하게 된다.
+2. `docker/orchestrator/Dockerfile`이 러너와 **같은 규율**로 비어 있음을 거부한다
+   (`ARG` → `test -n` → `LABEL org.opencontainers.image.revision`). 스탬프 없는 이미지는
+   빌드 시점에 죽는다 — 게이트에서 죽는 것보다 크고 싸다.
+3. 게이트가 `--orchestrator-image`를 **필수**로 받아 이 평면도 대조한다. 미스탬프는
+   러너와 똑같이 **exit 3 fail-closed**(마이그레이션 상태를 통과로 읽지 않는다).
+
+**옛 제어 평면 이미지는 전부 미스탬프다**(`cv-infra-orchestrator:local`·`:p5c14` —
+2026-08-14 실측 `rev=[]`). 즉 **첫 리빌드 전까지 게이트는 exit 3**이고, 그것이 정상
+동작이다. 이 수리는 CPU에서 저작·검증됐고(`tests/test_deploy_image_provenance.py`가
+스텁 `docker`로 게이트를 실제로 돌려 fail-closed를 실증), **실 compose 빌드로 스탬프가
+박히는 것은 아직 미실측**이다 — 첫 리빌드에서 확인할 것:
+```bash
+docker image inspect <control-plane-image> \
+  --format 'rev={{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
 ### 리빌드 후 검증 — exit 계약 4값 (p5c13 Q2 수리의 발효 확인)
 
 같은 리빌드에서 러너 이미지의 **exit 계약 붕괴 수리**도 발효된다(베이스 `python.sh`의
@@ -174,11 +222,12 @@ docker run --rm -v <spec>:/tmp/jobspec.json:ro \
 
 ## 불변식 + 게이트를 언제 돌리나
 
-**불변식**: *어떤 라이브 leg를 시작하기 전에도* 런타임 평면(②)**과 러너 이미지
-평면(③)** 은 라이브 leg가 실행할 릴리즈 커밋과 **바이트 동일**해야 한다.
+**불변식**: *어떤 라이브 leg를 시작하기 전에도* 런타임 평면(②)·**제어 평면
+이미지(②')**·**러너 이미지 평면(③)** 은 라이브 leg가 실행할 릴리즈 커밋과 **바이트
+동일**해야 한다.
 
-**게이트**: `scripts/check_plane_skew.sh` — 런타임 평면 체크아웃 커밋 **및 러너
-이미지의 revision 스탬프**를 릴리즈 태그 peel과 대조하고, 어긋나면 loud fail(exit 3,
+**게이트**: `scripts/check_plane_skew.sh` — 런타임 평면 체크아웃 커밋 **및 두 이미지의
+revision 스탬프**를 릴리즈 태그 peel과 대조하고, 어긋나면 loud fail(exit 3,
 fail-closed). **읽기 대조만** 하며 워크스테이션·체크아웃·git ref·이미지를 **일절
 변경하지 않는다**(`docker image inspect`도 읽기다). 라이브 leg 착수의 **선행 게이트**로
 돌린다.
@@ -283,8 +332,13 @@ fail-closed). **읽기 대조만** 하며 워크스테이션·체크아웃·git 
    컨테이너 안에서 죽는다(p5c12 실측). X가 `cv_infra/**`를 건드렸다면
    [위 ③ 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)의 리빌드가 **선행 조건**이다
    (`--build-arg CV_SOURCE_REVISION=<X-full-sha>` 필수).
-4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh --tag X --image cv-infra-runner:<tag>`
-   → **exit 0**(IN SYNC)이어야 한다. exit 3이면 3/3-bis 단계 미완 → 라이브 leg 착수 금지.
+3-ter. **제어 평면 이미지 동기화(②')** — 제어 평면은 컨테이너이므로 체크아웃을 옮겨도
+   **상주 컨테이너 안의 wheel은 그대로다**. X가 `cv_infra/**`를 건드렸다면 리빌드가
+   선행 조건이다: `CV_SOURCE_REVISION="$(git rev-parse X)" docker compose -f
+   docker/compose.yaml up -d --build` (스탬프 없이는 빌드가 거부된다 — G-66).
+4. **스큐 게이트 통과 확인** — `scripts/check_plane_skew.sh --tag X --image cv-infra-runner:<tag>
+   --orchestrator-image <control-plane-image>`
+   → **exit 0**(IN SYNC)이어야 한다. exit 3이면 3/3-bis/3-ter 단계 미완 → 라이브 leg 착수 금지.
 5. **회귀 기준선 통제** — 아래 [fail-baseline 통제](#재동기화-이후-첫-라이브-leg--fail-baseline-통제)
    절. 코드가 앞으로 가면 **기준선이 조용히 리셋될 수 있고**, 리셋 직후 첫 런의 verdict가
    무엇이든 그대로 기준선이 된다.
@@ -370,20 +424,22 @@ sqlite3 <store>.sqlite3 \
 | `--tag REF` | `CV_PLANE_TAG` | YAML 평면의 릴리즈 태그/ref (`REF^{commit}`로 peel) | `v1` |
 | `--tag-repo PATH` | `CV_PLANE_TAG_REPO` | 태그를 peel할 저장소 | `= --src` |
 | `--image REF` | `CV_PLANE_IMAGE` | **러너 이미지 평면 ③** — 라이브 leg가 스폰할 이미지(= 그 leg의 `CV_RUNNER_IMAGE`) | **없음 — 필수** |
+| `--orchestrator-image REF` | `CV_PLANE_ORCH_IMAGE` | **제어 평면 이미지 ②'** — 지금 도는 제어 평면 이미지(= compose의 `CV_ORCHESTRATOR_IMAGE`) | **없음 — 필수** |
 
-`--image`에 기본값을 두지 않는 이유는 둘이다: ① 평면을 안 보는 게이트는 거짓 초록을
-낸다(G-43) ② 여기에 기본 이미지 ref를 박으면 호스트측 리터럴이 스크립트에 들어온다
+두 이미지 인자에 기본값을 두지 않는 이유는 같다: ① 평면을 안 보는 게이트는 거짓 초록을
+낸다(G-43·G-66) ② 여기에 기본 이미지 ref를 박으면 호스트측 리터럴이 스크립트에 들어온다
 (`DoD-P5-09`). 빠뜨리면 **exit 2**로 즉시 멈춘다.
 
-**exit 코드**: `0` = 세 평면 모두 IN SYNC(라이브 leg 안전) · `2` = 사용법 오류(**필수
-`--image` 누락 포함**) · `3` = 어느 평면이든 스큐 탐지, **또는** rev/저장소/이미지 해석
+**exit 코드**: `0` = 전 평면 IN SYNC(라이브 leg 안전) · `2` = 사용법 오류(**필수 이미지
+인자 누락 포함**) · `3` = 어느 평면이든 스큐 탐지, **또는** rev/저장소/이미지 해석
 실패, **또는** 이미지에 revision 스탬프 부재(fail-closed, 인프라/구성 오류류 — consent
 게이트·D-2 pull-timeout `infra_error`와 동급).
 
 예:
 ```
-# 프로덕션(워크스테이션) — 라이브 leg 직전. 릴리즈 대상 SHA + 그 leg의 러너 이미지:
-scripts/check_plane_skew.sh --tag <release-sha> --image cv-infra-runner:<tag>
+# 프로덕션(워크스테이션) — 라이브 leg 직전. 릴리즈 대상 SHA + 그 leg가 쓸 두 이미지:
+scripts/check_plane_skew.sh --tag <release-sha> \
+  --image cv-infra-runner:<tag> --orchestrator-image <control-plane-image>
 # = CV_PLANE_SRC=~/cv-infra-p2-src/cv-infra-workspace, HEAD/이미지 라벨 vs 릴리즈 SHA
 ```
 
@@ -398,11 +454,18 @@ printf 'FROM scratch\nLABEL org.opencontainers.image.revision=%s\n' "$T" | docke
 printf 'FROM scratch\nLABEL org.opencontainers.image.revision=%s\n' "$O" | docker build -q -t cv-plane-selftest:stale  -
 printf 'FROM scratch\nENV X=1\n'                                         | docker build -q -t cv-plane-selftest:unstamped -
 
-scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:insync     # 기대 exit 0
-scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:stale      # 기대 exit 3 (③ N behind)
-scripts/check_plane_skew.sh --src <src> --tag "$T" --image cv-plane-selftest:unstamped  # 기대 exit 3 (UNSTAMPED)
-scripts/check_plane_skew.sh --src <src> --tag "$T"                                      # 기대 exit 2 (필수 인자)
+G=(scripts/check_plane_skew.sh --src <src> --tag "$T")
+"${G[@]}" --image cv-plane-selftest:insync    --orchestrator-image cv-plane-selftest:insync     # exit 0
+"${G[@]}" --image cv-plane-selftest:stale     --orchestrator-image cv-plane-selftest:insync     # exit 3 (③ N behind)
+"${G[@]}" --image cv-plane-selftest:unstamped --orchestrator-image cv-plane-selftest:insync     # exit 3 (③ UNSTAMPED)
+"${G[@]}" --image cv-plane-selftest:insync    --orchestrator-image cv-plane-selftest:stale      # exit 3 (②' N behind)
+"${G[@]}" --image cv-plane-selftest:insync    --orchestrator-image cv-plane-selftest:unstamped  # exit 3 (②' UNSTAMPED)
+"${G[@]}" --image cv-plane-selftest:insync                                                      # exit 2 (필수 인자)
 ```
+
+CPU 등가는 이미 스위트에 있다 — `tests/test_deploy_image_provenance.py`가 **스텁
+`docker`를 PATH에 놓고 같은 6개 형태를 실행**한다(임시 git 저장소 + 라벨만 답하는
+스텁). 위 라이브 형태는 그 등가가 실 docker에서도 성립함을 확인하는 자리다.
 
 착지(0)와 탐지(3)를 **쌍으로** 확인하지 않으면, 라벨을 아예 안 읽어도 초록이 나오는
 상태와 구분되지 않는다.
@@ -454,7 +517,8 @@ scripts/check_plane_skew.sh --src <src> --tag "$T"                              
   git -C <src> fetch origin --tags                       # refs만 갱신(워킹트리 불변)
   git -C <src> show <target>:scripts/check_plane_skew.sh > <evidence>/gate.sh
   bash <evidence>/gate.sh --src <src> --tag <target> \
-       --image cv-infra-runner:<tag>                     # 재동기화 전 positive control
+       --image cv-infra-runner:<tag> \
+       --orchestrator-image <control-plane-image>        # 재동기화 전 positive control
   ```
   아직 머지되지 않은 게이트(브랜치/worktree)를 돌릴 때도 같은 형태다 — 그 브랜치의
   스크립트를 증적 디렉토리로 복사해 실행한다(런타임 평면은 건드리지 않는다).

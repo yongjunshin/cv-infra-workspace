@@ -99,20 +99,55 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 # is written to the fixed keyring path and its fingerprint is asserted against
 # the fixed Open Robotics fingerprint (loud fail on mismatch); `noble` and
 # `amd64` are hardcoded because the digest-pinned base IS ubuntu 24.04/amd64
-# (measured, T2 report §4). Reproducibility (§2-7): the ROS apt repo is rolling
-# — exact-version pins would break future rebuilds — so the layer prints a
-# dpkg-query manifest of every package it installs into the build log
-# (evidence); the artifact reproducibility anchor is the FU-10 image Id pin
-# (decision 2026-07-07-fu10). GNUPGHOME is a throwaway tmpdir so root's gpg
-# call never creates files under the uid-1234 HOME (G-15 hazard).
+# (measured, T2 report §4). GNUPGHOME is a throwaway tmpdir so root's gpg call
+# never creates files under the uid-1234 HOME (G-15 hazard).
 # T3.5 (PM ruling A): + nav-msgs/geometry-msgs typesupport — T3 bringup measured
 # `ros2 bag record` dropping /chassis/odom·/cmd_vel as "unknown type" without
 # them (T3 report §6-1; recommends-off keeps them typesupport-only).
+#
+# ── apt VERSION PINS (CLAUDE §2-7; binding precondition of decision D-6) ──────
+# Shipping path = (C) REBUILD ON THE NEW HOST (decision 2026-08-14 D-6). Registry
+# push / save+load were not adopted because they redistribute the NVIDIA base. C
+# only holds if "a rebuild makes the same thing", so D-6 also RESTATES what FU-10
+# pins: the INPUT SET (base digest + uv.lock + apt versions + source commit), NOT
+# the output image digest. That retires the previous rationale here ("the ROS repo
+# is rolling, so the FU-10 image Id is the anchor") — with C there is no output
+# anchor left, so the apt versions must be pinned like every other input.
+#
+# WHAT IS PINNED: the 8 packages this layer NAMES. Their transitive closure is NOT
+# pinned (247 more in the ROS install's manifest below + 15 in the keyring install).
+# Pinning the whole closure was rejected: those are mostly ubuntu-archive packages
+# whose superseded versions LEAVE the index on every security update, so a 270-pin
+# build would be permanently broken within weeks — a reproducibility claim that
+# never builds is worse than an honest partial pin. (The closure-wide fix is an
+# archive snapshot service, not more pins; packages.ros.org has none — out of scope.)
+#
+# SOURCE OF THE VALUES (never invented — §2-4 / G-64): read out of the image that
+# is actually in service, cv-infra-runner:p5c15, on the workstation over SSH,
+# read-only, 2026-08-14 — same dpkg-query call the layer itself uses below:
+#   docker run --rm --entrypoint dpkg-query cv-infra-runner:p5c15 -W -f=... <pkgs>
+# Base-provided vs installed here (same day, same method, against the digest-pinned
+# base): ca-certificates 20240203 and curl 8.5.0-2ubuntu10.6 ship IN the base and
+# are UPGRADED by this layer; gnupg is absent from the base and is NEW here.
+#
+# WHEN A PIN DISAPPEARS the build fails loudly (both installs print the re-pin
+# recipe). That is the intended §2-7 trade: a loud break beats silent drift. The
+# re-pin instrument is the dpkg-query manifest this layer still prints — keep it.
+# Re-pinning is: read the manifest/dpkg-query of the last good image, replace the
+# versions below, record the measurement in the report (G-24).
 USER root
 RUN set -eu; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates=20260601~24.04.1 \
+        curl=8.5.0-2ubuntu10.11 \
+        gnupg=2.4.4-2ubuntu17.4 \
+    || { echo "ERROR: a pinned ubuntu-archive version above is no longer in the index" \
+              "(superseded versions leave noble-updates/-security). RE-PIN: read the" \
+              "versions off the last good runner image with 'dpkg-query -W' and update" \
+              "the apt VERSION PINS block in docker/runner/Dockerfile (D-6, CLAUDE §2-7)."; \
+         exit 1; }; \
     curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
          -o /usr/share/keyrings/ros-archive-keyring.gpg; \
     GNUPGHOME="$(mktemp -d)"; export GNUPGHOME; \
@@ -129,9 +164,17 @@ RUN set -eu; \
     dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.before; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ros-jazzy-ros2bag ros-jazzy-rosbag2-storage-mcap \
-        ros-jazzy-nav-msgs ros-jazzy-geometry-msgs \
-        ros-jazzy-sensor-msgs; \
+        ros-jazzy-ros2bag=0.26.11-1noble.20260616.083858 \
+        ros-jazzy-rosbag2-storage-mcap=0.26.11-1noble.20260616.074830 \
+        ros-jazzy-nav-msgs=5.3.8-1noble.20260615.112021 \
+        ros-jazzy-geometry-msgs=5.3.8-1noble.20260615.110340 \
+        ros-jazzy-sensor-msgs=5.3.8-1noble.20260615.112429 \
+    || { echo "ERROR: a pinned ros-jazzy version above is no longer served by" \
+              "packages.ros.org (that repo is rolling and withdraws superseded" \
+              "versions). RE-PIN: read the versions off the last good runner image" \
+              "with 'dpkg-query -W' and update the apt VERSION PINS block in" \
+              "docker/runner/Dockerfile, then re-verify the recorder topics (D-6)."; \
+         exit 1; }; \
     dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > /tmp/pkgs.after; \
     echo '=== rosbag2 apt layer manifest (every package this layer installed) ==='; \
     comm -13 /tmp/pkgs.before /tmp/pkgs.after; \

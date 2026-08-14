@@ -70,6 +70,27 @@ print('[guard] control-plane imports OK')"
 # base would break that seeding silently.
 USER root
 
+# Control-plane image plane stamp (G-66; same wiring as docker/runner/Dockerfile's plane ③).
+# The control plane is a CONTAINER since p5c14, so "the code the control plane runs" is the
+# wheel baked HERE — not the checkout. `scripts/check_plane_skew.sh --orchestrator-image`
+# reads this OCI-standard label. MEASURED GAP it closes: `docker compose build` inherits
+# neither `--build-arg` nor `--label` from an ad-hoc command line, so the DOCUMENTED product
+# path used to emit rev=[] while the ad-hoc `docker build` path stamped correctly — the
+# product path had LESS provenance than the throwaway one (2026-08-14).
+# Asserted non-empty: an unstamped image is fail-closed at the gate anyway, but failing at
+# BUILD time is louder and cheaper. Placed last so re-stamping never invalidates the pip layer.
+#   docker build --build-arg CV_SOURCE_REVISION="$(git rev-parse HEAD)" …
+#   CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose -f docker/compose.yaml build
+ARG CV_SOURCE_REVISION
+RUN test -n "${CV_SOURCE_REVISION}" \
+    || { echo "ERROR: CV_SOURCE_REVISION=<source commit sha> is required (control-plane" \
+              "image stamp, G-66). Building through compose:" \
+              "CV_SOURCE_REVISION=\"\$(git rev-parse HEAD)\" docker compose -f" \
+              "docker/compose.yaml up -d --build   — from a tarball deploy with no .git," \
+              "pass the recorded release sha instead. Recipe: docs/deploy/plane-sync.md"; \
+         exit 1; }
+LABEL org.opencontainers.image.revision=$CV_SOURCE_REVISION
+
 # Stateless (LOCKED §15): no store, artifacts or cache in the image — the store path, out
 # dir and cache roots all arrive as env + host-absolute bind mounts (docker/compose.yaml).
 #

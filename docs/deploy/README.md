@@ -52,7 +52,8 @@
 ① scripts/workstation_setup/provision.sh          호스트 선결(Docker CE + Toolkit + 패스스루 + Isaac 베이스 pull)
 ②' 설정:  docker/.env 작성  +  scripts/detect_gpu.sh >> docker/.env
 ②  scripts/consent/accept_eula.sh                 NVIDIA EULA — 운영자만, 1회
-③  docker compose -f docker/compose.yaml up -d --build     ← 제어 평면 기동
+③  CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+     docker compose -f docker/compose.yaml up -d --build     ← 제어 평면 기동
 ④  cv-infra selftest                              ★ 미구현(p5c15+) — 대신 §4
 ```
 
@@ -172,8 +173,19 @@ run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)
 ```bash
 cd <deploy-root>                    # 저장소 루트에서 (빌드 컨텍스트가 루트다)
 docker compose -f docker/compose.yaml config     # 드라이런: 렌더 결과 확인 (exit 0 이어야 함)
-docker compose -f docker/compose.yaml up -d --build
+CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+  docker compose -f docker/compose.yaml up -d --build
 ```
+
+- **`CV_SOURCE_REVISION` 접두는 빌드할 때만 필요하고, 빠뜨리면 빌드가 loud 실패한다.**
+  이 값이 제어 평면 이미지에 `org.opencontainers.image.revision` 으로 박혀 "이 컨테이너가
+  도는 코드는 어느 커밋인가"에 답한다(G-66). compose 는 명령을 실행할 수 없어 값을
+  스스로 만들 수 없고, `docker compose build` 는 `--build-arg`/`--label` 을 **계승하지
+  않는다** — 그래서 `compose.yaml` 의 `build.args` 가 환경에서 받아 넘긴다.
+  `.git` 이 없는 배포(타르볼)면 **기록된 릴리즈 sha 를 그대로** 넣어라.
+  **`docker/.env` 에는 넣지 마라** — 그 순간부터 모든 빌드가 그 옛 커밋을 주장한다
+  (스큐 게이트가 잡지만, 애초에 적어 두지 않는 것이 싸다).
+- 빌드 없이 재기동(`up -d`·`ps`·`down`)에는 이 접두가 **필요 없다**.
 
 - 올라오는 것은 **제어 평면 하나**(orchestrator = 제출/스케줄러 API + 운영 read model)뿐이다.
 - 러너와 SUT 는 **compose 서비스가 아니다** — 잡마다 오케스트레이터가 호스트 데몬에
@@ -274,24 +286,24 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 중지 | `docker compose -f docker/compose.yaml stop` |
 | 내리기 | `docker compose -f docker/compose.yaml down` (네트워크까지 제거) |
 | 설정 변경 반영 | `.env` 를 **upsert 로** 고친 뒤(§3-②' 경고) `up -d` 재실행 |
-| 제어 평면 코드 갱신 | 체크아웃 갱신 → `up -d --build` |
-| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --tag <release-sha> --image <ref>` |
+| 제어 평면 코드 갱신 | 체크아웃 갱신 → `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose -f docker/compose.yaml up -d --build` |
+| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --tag <release-sha> --image <ref> --orchestrator-image <ref>` |
 | CLI 한 번 쓰기 | `docker compose -f docker/compose.yaml run --rm --no-deps orchestrator cv-infra <cmd> --api http://orchestrator:8000` (§4) |
 
-> ⚠ **`up -d --build` 로 만든 제어 평면 이미지에는 리비전 라벨이 없다.** `compose build`
-> 는 `--label` 을 걸어주지 않으므로 그 이미지에는 compose 자신의 라벨만 남는다
-> (실측 2026-08-14). 제어 평면까지 스큐 추적을 하려면 별도로 태깅해 두어라:
-> `docker build -f docker/orchestrator/Dockerfile -t cv-infra-orchestrator:<tag> \`
-> `  --label org.opencontainers.image.revision=$(git rev-parse HEAD) .`
-> `CV_ORCHESTRATOR_IMAGE` 로 그 태그를 가리키면 `up` 은 빌드 없이 그 이미지를 쓴다.
-> (`check_plane_skew.sh` 가 보는 세 평면에 제어 평면 이미지는 **포함되지 않는다**.)
+> ⚠ **`up -d --build` 를 `CV_SOURCE_REVISION` 없이 돌리면 빌드가 실패한다** — 그것이
+> 의도다. 2026-08-14 까지는 반대였다: compose 가 만든 제어 평면 이미지는 리비전 라벨이
+> **비어 있었고**(`compose build` 는 `--build-arg`/`--label` 을 계승하지 않는다),
+> 그래서 **문서화된 제품 경로가 임시 `docker build` 보다 프로방넌스가 낮았다**(G-66).
+> 지금은 `compose.yaml` 의 `build.args` 가 환경의 값을 넘기고, 비면 Dockerfile 이
+> 빌드를 멈춘다. 이미 태깅된 이미지를 쓰고 싶으면 `CV_ORCHESTRATOR_IMAGE` 로
+> 가리켜라 — 그때 `up` 은 빌드하지 않으므로 접두도 필요 없다.
 
 **동의를 남긴 채 스택을 내려라.** compose 파일이 동의 키를 요구하므로 `down`·`ps` 같은
 서브커맨드도 키가 있어야 돈다. 호스트에서 동의를 지우기 **전에** 스택을 먼저 내려라.
 
-**세 개의 배포 평면**(YAML / 런타임 / 러너 이미지)이 따로 논다는 사실과 그 동기화
-절차는 [`plane-sync.md`](plane-sync.md) 에 있다. 릴리즈 태그를 옮겼다고 러너 이미지
-안의 코드가 따라오지 않는다.
+**배포 평면**(YAML / 런타임 / **제어 평면 이미지** / 러너 이미지)이 따로 논다는 사실과
+그 동기화 절차는 [`plane-sync.md`](plane-sync.md) 에 있다. 릴리즈 태그를 옮겼다고 두
+이미지 안의 코드가 따라오지 않는다 — 이미지는 **리빌드로만** 움직인다.
 
 ---
 
@@ -338,7 +350,8 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 컨테이너 안 앱이 캐시/디렉토리에 못 쓴다 | 마운트 부모를 dockerd 가 `root:root` 로 생성 | 해당 호스트 디렉토리를 **미리** 만들고 러너 uid 소유로 맞춘 뒤 재기동 |
 | 캐시가 웜인데 잡마다 느리다 | 캐시를 **`:ro` 로 러너에 물리면 캐시가 꺼진다**(읽기 폴백이 아니라 비활성화) | 러너에는 **쓰기 가능한 잡별 사본**을 준다. 공유 트리는 복사 *원본*으로만 |
 | 옵션 노브를 넣었는데 부팅이 죽는다 | `KNOB=` 빈 값 | 줄을 **주석 처리**(미설정 = 문서화된 기본값) |
-| 실행 코드가 옛날 것 같다 | 세 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --tag <sha> --image <ref>` |
+| 실행 코드가 옛날 것 같다 | 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --tag <sha> --image <ref> --orchestrator-image <ref>` |
+| `up --build` 이 `CV_SOURCE_REVISION=<source commit sha> is required` 로 죽는다 | 스탬프 없는 이미지를 만들지 않겠다는 게이트(G-66) | 접두를 붙여 다시: `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose … up -d --build`. `.git` 이 없으면 기록된 릴리즈 sha 를 넣어라 |
 
 ---
 

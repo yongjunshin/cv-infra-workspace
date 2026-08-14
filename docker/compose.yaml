@@ -24,7 +24,10 @@
 #   ① scripts/workstation_setup/provision.sh   (host prereqs: driver + toolkit)
 #   ②' docker/.env + scripts/detect_gpu.sh >> docker/.env      (configuration)
 #   ② scripts/consent/accept_eula.sh           (NVIDIA EULA — explicit, once)
-#   ③ docker compose -f docker/compose.yaml up -d --build      ← THIS FILE
+#   ③ CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+#        docker compose -f docker/compose.yaml up -d --build    ← THIS FILE
+#      (the env prefix is required only when BUILDING — it stamps the image with
+#       its source commit, G-66; see the `args:` block below)
 #   ④ cv-infra selftest                        (M7 — reserved, NOT implemented:
 #                                               the CLI verb exits 3 today)
 # "One command + one documented consent step" is the honest form of the
@@ -57,6 +60,24 @@ services:
       # cv_infra/ (the root .dockerignore keeps the rest out).
       context: ..
       dockerfile: docker/orchestrator/Dockerfile
+      args:
+        # Provenance stamp for the control-plane image (G-66). `docker compose
+        # build` inherits NOTHING from an ad-hoc `docker build --build-arg/--label`,
+        # so without this block the DOCUMENTED product path produced images with an
+        # EMPTY org.opencontainers.image.revision while the ad-hoc path stamped them
+        # (measured 2026-08-14). Compose cannot run commands, so the value comes from
+        # the environment of the build command — pass the REAL revision:
+        #   CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+        #     docker compose -f docker/compose.yaml up -d --build
+        # Unset renders empty here and the orchestrator Dockerfile then FAILS THE
+        # BUILD (fail-closed, same discipline as docker/runner/Dockerfile). The `:-`
+        # default is what keeps non-build subcommands (`up` without --build, `ps`,
+        # `down`) working — they must not require a build-time input.
+        # Do NOT put CV_SOURCE_REVISION in docker/.env: it would silently stamp a
+        # stale commit on every later build. A stale stamp is caught by
+        # scripts/check_plane_skew.sh (which now reads THIS image too), but the
+        # cheapest defence is to never write it down.
+        CV_SOURCE_REVISION: "${CV_SOURCE_REVISION:-}"
     container_name: ${CV_COMPOSE_PROJECT:-cv-infra}-orchestrator
     restart: unless-stopped
     # The store is SQLite/WAL; give the process time to finish an in-flight write
