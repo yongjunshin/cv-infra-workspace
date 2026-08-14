@@ -169,6 +169,13 @@ probe_arms() {
 
   # --- arm 3: boot OK, then a runner exception -> 3. THE regression arm (p5c13: 0).
   measure_eula_gate   # per-run operator consent; refuses (exit 3) without it
+  # The boot arms run on the harness's dedicated bridge (R8 — host networking is
+  # forbidden), exactly like isaac_baseline_run.sh, which is the configuration Isaac
+  # is known to boot on here. `--network none` is kept ONLY for the two arms that
+  # never boot, so a Kit startup that reaches for the extension registry cannot turn
+  # this probe into a mystery timeout.
+  docker network inspect "$CV_MEASURE_NET" >/dev/null 2>&1 \
+    || docker network create --driver bridge "$CV_MEASURE_NET" >/dev/null
   # Cache mounts are OPTIONAL here (unlike the VRAM/wall harness, this probe measures
   # a status, not a duration): mounted when CV_ISAAC_CACHE_ROOT is set, so a warm tree
   # shortens the boot; absent, the arm just boots cold. D-1 table, verbatim.
@@ -185,7 +192,7 @@ probe_arms() {
     )
   fi
   code="$(run_arm postboot3 --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
-    --network none --shm-size "$CV_MEASURE_SHM_SIZE" \
+    --network "$CV_MEASURE_NET" --shm-size "$CV_MEASURE_SHM_SIZE" \
     "${CV_EULA_DOCKER_ARGS[@]}" "${cache_mounts[@]+"${cache_mounts[@]}"}" \
     -e JOB_SPEC="$PROBE_JOB_SPEC" -e RESULT_OUT=/cv-out -v "$result_dir":/cv-out "$CV_EXIT_IMAGE")"
   [[ "$code" == "3" ]] || failures=$((failures + 1))
@@ -225,7 +232,7 @@ print("[probe] close() RETURNED", flush=True)
 os._exit(43)
 PY
   code="$(run_arm closeprobe --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
-    --network none --shm-size "$CV_MEASURE_SHM_SIZE" \
+    --network "$CV_MEASURE_NET" --shm-size "$CV_MEASURE_SHM_SIZE" \
     "${CV_EULA_DOCKER_ARGS[@]}" "${cache_mounts[@]+"${cache_mounts[@]}"}" \
     --entrypoint /isaac-sim/python.sh \
     -v "$OUT_DIR/close_probe.py":/cv-probe/close_probe.py:ro "$CV_EXIT_IMAGE" /cv-probe/close_probe.py)"
