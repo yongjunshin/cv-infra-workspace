@@ -162,7 +162,8 @@ def hard_exit(code: int, *, exit_process=os._exit) -> None:
     first — the runner's evidence (boot trace, cache delta, oracle tolerance
     audit) is stdout/stderr in the container log (G-24). What the C++ (carb/Kit)
     side left in libc buffers is not flushable from Python; the live probe
-    asserts the last runner line survives (``scripts/exit_contract_probe.sh``).
+    asserts the last runner line survives
+    (``scripts/measure/exit_contract_probe.sh``, arm ``postboot3``).
 
     ``exit_process`` is injected for the CPU test only — production always uses
     ``os._exit`` (a ``sys.exit`` here would be catchable *and* would resume
@@ -573,8 +574,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         #     START optimization, never a job output, and the runner's own
         #     cache_delta line above is emitted at this same point either way.
         # If the live probe shows close() raising a catchable SystemExit (unknown as
-        # of p5c14 — arm 3 of the probe answers it), graceful close can come back in
-        # front of hard_exit at zero cost to the contract.
+        # of p5c14 — the ``closeprobe`` arm of scripts/measure/exit_contract_probe.sh
+        # answers it), graceful close can come back in front of hard_exit at zero
+        # cost to the contract.
 
 
 def _start_quiet(recorder):  # pragma: no cover - GPU path helper
