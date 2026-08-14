@@ -28,7 +28,11 @@ import pytest
 from cv_infra.cli import batch
 from cv_infra.cli.exit_codes import exit_code_for_report_outcome
 from cv_infra.cli.main import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS, _build_parser, main
+from cv_infra.orchestrator.api import create_app
+from cv_infra.orchestrator.fake_runner import FakeRunner
+from cv_infra.orchestrator.models import JobState, Verdict
 from cv_infra.orchestrator.selftest import SUT_IMAGE_ENV, build_self_test_submission
+from cv_infra.orchestrator.store import Store
 
 STUB_SUT = "cv-infra-selftest-stub:test"
 ENVELOPE_ID = "env-selftest-1"
@@ -237,6 +241,19 @@ def test_selftest_takes_no_positional_input(capsys):
     assert "unrecognized argument(s): scenarios/mine.yaml" in capsys.readouterr().err
 
 
+def test_the_consumer_sut_env_never_leaks_into_the_self_test(monkeypatch, capsys):
+    """``CV_INFRA_SUT_IMAGE`` is the CONSUMER injection env ``submit`` reads (G2).
+    It is set on any CI box that ran a verification, so a self-test that fell
+    back to it would silently acquire the external-SUT dependency
+    NFR-SELFTEST-001 forbids — the self-test reads ONLY its own env and refuses."""
+    contacted: list = []
+    monkeypatch.setenv("CV_INFRA_SUT_IMAGE", "ghcr.io/consumer/carter-sut:p2")
+    _wire(monkeypatch, _orchestrator(calls=contacted))
+    assert main(["selftest"]) == EXIT_INFRA
+    assert contacted == []
+    assert "carter-sut" not in capsys.readouterr().err
+
+
 def test_no_host_path_rides_the_wire(monkeypatch):
     """G-69: the self-test sends no client-side host path (no oracle anchor) —
     so a containerised control plane can serve it with no bind-mount."""
@@ -282,7 +299,65 @@ def test_selftest_always_waits_there_is_no_fire_and_forget(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# (5) G-47 — the surface declaration must not outlive the wiring
+# (5) E2E over the REAL orchestrator app (CPU, no Isaac, no sockets)
+# --------------------------------------------------------------------------- #
+# The built-in stub travels the REAL FastAPI app: the M1 6-stage admit gate,
+# fan-out, queue/scheduler, rollup, report_outcome — with the job execution
+# faked (``FakeRunner``, the same seam the batch E2E tests use). This is the
+# DoD-P5-07 round-trip MINUS the Isaac execution: a LIVE round-trip additionally
+# needs the platform-internal stub SUT image, which does not exist yet
+# (M7 §3.5 A/B open). Nothing here claims a live run.
+
+
+def _wire_asgi(monkeypatch, app) -> None:
+    monkeypatch.setattr(
+        batch,
+        "_make_client",
+        lambda api_base: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://cv-infra.test"
+        ),
+    )
+    monkeypatch.setattr(batch, "_POLL_INTERVAL_S", 0.01)
+
+
+@pytest.mark.parametrize(
+    "runner_kwargs,expected",
+    [({}, EXIT_PASS), ({"verdict": Verdict.FAIL}, EXIT_FAIL)],
+)
+def test_round_trip_through_the_real_orchestrator(
+    monkeypatch, tmp_path, capsys, runner_kwargs, expected
+):
+    """The stub is ADMITTED by the real gate and its terminal verdict becomes
+    the process exit code — the platform proving itself with zero consumer input."""
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, FakeRunner(state=JobState.COMPLETED, **runner_kwargs), k=1)
+        _wire_asgi(monkeypatch, app)
+
+        rc = main(["selftest", "--sut-image", STUB_SUT, "--trigger-source", "ci-cd"])
+
+        out = capsys.readouterr().out
+        assert rc == expected
+        envelope_id = out.splitlines()[1]
+        # the envelope is identifiable as a self-test on the operational plane
+        # (REQ-SELFTEST-004) and its provenance survives in the store
+        stored = store.load_envelope(envelope_id)
+        assert stored.is_self_test is True
+        assert stored.origin == "built-in-stub"
+
+
+def test_the_built_in_stub_is_accepted_by_the_real_admit_gate(monkeypatch, tmp_path, capsys):
+    """Non-vacuity guard for the round-trip above: a 422 would ALSO be a
+    deterministic exit (2), so assert the stub actually passed the M1 gate —
+    the platform's own document satisfies the platform's own contract."""
+    with Store(tmp_path / "cv.sqlite3") as store:
+        _wire_asgi(monkeypatch, create_app(store, FakeRunner(state=JobState.COMPLETED), k=1))
+        assert main(["selftest", "--sut-image", STUB_SUT]) == EXIT_PASS
+        err = capsys.readouterr().err
+        assert err == ""  # no rejection prose, no infra note
+
+
+# --------------------------------------------------------------------------- #
+# (6) G-47 — the surface declaration must not outlive the wiring
 # --------------------------------------------------------------------------- #
 def test_help_no_longer_advertises_a_reserved_placeholder(capsys):
     with pytest.raises(SystemExit) as excinfo:
