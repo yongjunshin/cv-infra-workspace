@@ -362,9 +362,7 @@ class Ros2Adapter(SimAdapter):
         self._is_active_client = None
         if self._odom_relay is not None:
             print(
-                odom_relay_fidelity_line(
-                    self._odom_relayed, self._odom_targets, self._clock_count
-                ),
+                odom_relay_fidelity_line(self._odom_relayed, self._odom_targets, self._clock_count),
                 flush=True,
             )
         self._odom_relay = None
@@ -452,10 +450,7 @@ class Ros2Adapter(SimAdapter):
         self._odom_relay = (subscription, publishers)
         self._odom_targets = len(targets)
         self._odom_fanout_done = True
-        print(
-            f"[cv-runner] odom relay wired: {sources[0]} -> {targets}",
-            flush=True,
-        )
+        print(f"[cv-runner] odom relay wired: {sources[0]} -> {targets}", flush=True)
 
     def _verify_use_sim_time(self) -> bool | None:  # pragma: no cover - ROS path
         """VERIFY the SUT use_sim_time contract (never force — REQ-EXEC-005).
