@@ -85,6 +85,10 @@ def test_monitor_renders_the_pinned_projection_as_operator_table(monkeypatch, ca
         "env-a95d204e4481/r0",
         "completed",
         "errored",
+        # SELFTEST: the pin predates the store-v8 marker (p4c6 bbad1e4), so the
+        # absent key degrades to n/a — the same G-17 lenient rule as
+        # concurrency_budget_k above, NOT a fabricated "false".
+        "n/a",
         "1",
         "1",
         "0",
@@ -98,6 +102,7 @@ def test_monitor_renders_the_pinned_projection_as_operator_table(monkeypatch, ca
         "env-a95d204e4481/r2",
         "completed",
         "errored",
+        "n/a",  # SELFTEST: absent in the pre-v8 pin (see r0 above)
         "0",
         "0",
         "1",
@@ -267,6 +272,26 @@ def test_monitor_rejects_unexpected_positional(monkeypatch, capsys):
     assert "unrecognized argument(s): env-x" in capsys.readouterr().err
 
 
+def test_self_test_rows_are_identifiable_on_the_cli_table():
+    """REQ-SELFTEST-004 on the SSH/headless axis: a store-v8 projection marks
+    which envelope was a ``cv-infra selftest`` run. Positive control for the
+    ``n/a`` cells asserted against the pre-v8 pin above (G-59: a column only
+    tested with an absent key never proves it renders the present one).
+
+    The free-text ``origin`` must NOT appear on this view (T3 §7-3): the
+    operational projection carries the bool only.
+    """
+    payload = json.loads(_MONITOR_SAMPLE_JSON)
+    payload["requests"][0]["is_self_test"] = True
+    payload["requests"][0]["origin"] = "built-in-stub"  # audit field — store only
+    payload["requests"][1]["is_self_test"] = False
+    lines = monitor.render_monitor(payload).splitlines()
+    assert "SELFTEST" in next(line for line in lines if line.startswith("ENVELOPE"))
+    assert next(line for line in lines if "/r0" in line).split()[4] == "true"
+    assert next(line for line in lines if "/r1" in line).split()[4] == "false"
+    assert "built-in-stub" not in "\n".join(lines)
+
+
 def test_render_monitor_is_pure_display_no_reaggregation():
     """``render_monitor`` surfaces the server counts VERBATIM — it must not
     recompute pass/fail from the jobs list (M6 §3.3 재집계 금지). A doctored
@@ -277,4 +302,4 @@ def test_render_monitor_is_pure_display_no_reaggregation():
     # render must echo 1/1/0 (the projection), never recount to 2/0/0.
     row = monitor.render_monitor(doctored).splitlines()
     r0 = next(line for line in row if "env-a95d204e4481/r0" in line)
-    assert r0.split()[4:8] == ["1", "1", "0", "0.5"]  # counts as given, not re-summed
+    assert r0.split()[5:9] == ["1", "1", "0", "0.5"]  # counts as given, not re-summed
