@@ -37,6 +37,7 @@ from tests.negative.test_eula_gate import baked_consent_bindings
 _ROOT = Path(__file__).resolve().parents[1]
 _VERIFY_WORKFLOW = _ROOT / ".github/workflows/verify.yml"
 _VERIFY_ACTION = _ROOT / "actions/verify/action.yml"
+_PLATFORM_CI = _ROOT / ".github/workflows/ci.yml"
 
 #: 40-hex immutable commit SHA pin (the trailing ``# vX.Y.Z`` tag comment is
 #: stripped by the YAML parser, so the parsed ``uses`` value ends at the SHA).
@@ -638,6 +639,50 @@ def test_stage_step_gated_on_have_report(path):
         s for s in _steps(doc) if isinstance(s, dict) and "stage-artifacts" in str(s.get("run", ""))
     )
     assert stage["if"] == "always() && steps.verify.outputs.have_report == 'true'"
+
+
+# --------------------------------------------------------------------------- #
+# (G) platform CI 2-tier — self-test tier, 0 consumer dependency (NFR-SELFTEST-001)
+# --------------------------------------------------------------------------- #
+def test_platform_ci_has_a_self_test_tier_on_the_labelled_gpu_runner():
+    job = _load(_PLATFORM_CI)["jobs"]["selftest"]
+    assert job["runs-on"] == ["self-hosted", "cv-infra-gpu"]  # label, never an IP (LOCKED §16)
+    assert "cv-infra selftest" in _runs(job["steps"])
+    assert "--trigger-source ci-cd" in _runs(job["steps"])  # CI provenance (REQ-INTAKE-003)
+
+
+def test_self_test_tier_reads_no_consumer_repo_or_asset():
+    """NFR-SELFTEST-001 / boundary rule ③: the tier checks out THIS repo only,
+    passes no scenario/envelope/SUT argument, and never pulls a consumer image."""
+    job = _load(_PLATFORM_CI)["jobs"]["selftest"]
+    runs = _runs(job["steps"])
+    for checkout in (s for s in job["steps"] if "checkout" in str(s.get("uses", ""))):
+        assert "repository" not in (checkout.get("with") or {})  # = the current repo
+    # the selftest invocation carries NO positional input at all
+    invocation = next(line for line in runs.splitlines() if "cv-infra selftest" in line)
+    assert not re.search(r"cv-infra selftest\s+[^-]", invocation)
+    assert "carter" not in _PLATFORM_CI.read_text(encoding="utf-8")  # no consumer fixture ref
+
+
+def test_self_test_tier_is_gated_and_bakes_no_image_ref():
+    """It has never run: no stub SUT image exists yet (M7 §3.5 A/B open). The
+    gate must be an operator-set repo VARIABLE and the image ref must arrive
+    from configuration — a literal baked here would be exactly the guess the CLI
+    refuses to make (FU-10 / NFR-SELFTEST-001)."""
+    job = _load(_PLATFORM_CI)["jobs"]["selftest"]
+    assert job["if"] == "${{ vars.CV_SELFTEST_ENABLED == 'true' }}"
+    step = next(s for s in job["steps"] if "cv-infra selftest" in str(s.get("run", "")))
+    assert step["env"]["CV_SELFTEST_SUT_IMAGE"] == "${{ vars.CV_SELFTEST_SUT_IMAGE }}"
+    assert job["timeout-minutes"]  # a wedged GPU job never holds CI open forever
+
+
+def test_platform_ci_actions_are_sha_pinned():
+    doc = _load(_PLATFORM_CI)
+    uses = [u for job in doc["jobs"].values() for u in _uses(job["steps"])]
+    assert uses
+    for ref in uses:
+        assert _SHA_PINNED.match(ref), f"{ref} is not pinned to an immutable 40-hex SHA"
+    assert not _FLOATING.search(_PLATFORM_CI.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("path", [_VERIFY_WORKFLOW, _VERIFY_ACTION])

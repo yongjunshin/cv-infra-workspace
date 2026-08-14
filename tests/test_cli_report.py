@@ -55,28 +55,42 @@ def _request(**overrides) -> dict:
     )
 
 
-def _result(job_id: str, verdict: str, *, mcap=None, mp4=None) -> dict:
-    return Result.model_validate(
+def _result(
+    job_id: str, verdict: str, *, mcap=None, mp4=None, metrics=None, rjson=None, mcap_bytes=None
+) -> dict:
+    dump = Result.model_validate(
         {
             "job_id": job_id,
             "verdict": verdict,
-            "metrics": {},
+            "metrics": metrics or {},
             "artifacts": {"mcap": mcap, "mp4": mp4},
         }
     ).model_dump(mode="json")
+    # Optional persistence-plane hints the report carries per result (§3.4):
+    # the result.json path and the MCAP size the cap policy reads.
+    if rjson is not None:
+        dump["result_json"] = rjson
+    if mcap_bytes is not None:
+        dump["mcap_bytes"] = mcap_bytes
+    return dump
 
 
 def _rollup(request_id, verdict, verdicts) -> RequestRollup:
     return RequestRollup(request_id=request_id, verdicts=verdicts, flakiness=0.0, verdict=verdict)
 
 
-def _make_report(tmp_path, inputs, *, seed_baseline=None) -> dict:
+def _make_report(tmp_path, inputs, *, seed_baseline=None, max_mcap_bytes=None) -> dict:
     """Assemble a real VerificationReport JSON (the shape the CLI consumes)."""
     with Store(tmp_path / "cv.sqlite3") as store:
         if seed_baseline is not None:
             update_baseline(store, **seed_baseline)
         return build_report(
-            inputs, store, envelope_id="env-1", trigger_source="ci-cd", generated_at=_AT
+            inputs,
+            store,
+            envelope_id="env-1",
+            trigger_source="ci-cd",
+            generated_at=_AT,
+            max_mcap_bytes=max_mcap_bytes,
         )
 
 
@@ -330,3 +344,137 @@ def test_missing_envelope_id_is_argparse_usage_error(argv):
     with pytest.raises(SystemExit) as excinfo:
         main(argv)
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------- #
+# (6) DoD-P5-10 review surface: metrics + recordings on the CLI TEXT view
+# --------------------------------------------------------------------------- #
+# CEO 결정 D-2 (2026-08-14): the review gate asks for pass/fail + 지표 + 회귀 판정 +
+# 녹화 검수 on a developer review surface. Measured p5c15: the data was already in
+# the report JSON and on all three GitHub surfaces, and ONLY this renderer dropped
+# 지표/녹화 — so the gap was renderer structure, not data. These tests pin the two
+# added columns and the honesty rules they carry.
+
+_MP4 = "/out/env-1/req-0/repeat-0/run.mp4"
+_MCAP = "/out/env-1/req-0/repeat-0/run.mcap"
+_RESULT_JSON = "/out/env-1/req-0/repeat-0/result.json"
+
+
+def _review_report(tmp_path, *, max_mcap_bytes=None, mcap_bytes=None) -> dict:
+    """A report carrying BOTH review cells: measured metrics + artifact paths.
+
+    req-0 passes with a full recording set; req-1 fails with NO artifact paths
+    (the control-plane absence, which must render honestly rather than as a
+    fabricated path) and a metric map whose only measured value is a 0.
+    """
+    return _make_report(
+        tmp_path,
+        [
+            RequestReportInput(
+                request=_request(),
+                rollup=_rollup("req-0", Verdict.PASS, [Verdict.PASS]),
+                results=[
+                    _result(
+                        "req-0:0",
+                        "pass",
+                        metrics={"time_to_goal_s": 12.5, "path_len_m": 8.75},
+                        mcap=_MCAP,
+                        mp4=_MP4,
+                        rjson=_RESULT_JSON,
+                        mcap_bytes=mcap_bytes,
+                    )
+                ],
+            ),
+            RequestReportInput(
+                request=_request(sut={"image_ref": "carter-sut:x"}),
+                rollup=_rollup("req-1", Verdict.FAIL, [Verdict.FAIL]),
+                results=[_result("req-1:0", "fail")],
+            ),
+        ],
+        max_mcap_bytes=max_mcap_bytes,
+    )
+
+
+def _render(monkeypatch, report: dict, capsys) -> str:
+    _wire(monkeypatch, _serve(report))
+    assert main(["report", "env-1"]) == EXIT_PASS
+    return capsys.readouterr().out
+
+
+def test_text_view_renders_measured_metrics_per_request(monkeypatch, tmp_path, capsys):
+    out = _render(monkeypatch, _review_report(tmp_path), capsys)
+    assert "metrics (representative job per request):" in out
+    # measured values are shown with their metric names, keys sorted (deterministic)
+    assert "req-0: collision_count=0, path_len_m=8.75, time_to_goal_s=12.5" in out
+    # a 0 IS a measurement and stays; never-measured (None) metrics are OMITTED
+    # rather than printed as "None" — the honesty rule the GitHub cell applies.
+    assert "req-1: collision_count=0" in out
+    assert "None" not in out
+    assert "min_clearance_m" not in out  # MVP-descoped -> permanently None -> absent
+
+
+def test_text_view_renders_recording_and_telemetry_references(monkeypatch, tmp_path, capsys):
+    out = _render(monkeypatch, _review_report(tmp_path), capsys)
+    assert "artifacts (recording/telemetry review):" in out
+    # the reviewable set carries the PATHS a developer opens (녹화 검수, REQ-EXEC-014)
+    assert f"recording_mp4: {_MP4}" in out
+    assert f"rosbag_mcap: {_MCAP}" in out
+    assert f"result_json: {_RESULT_JSON}" in out
+    # ...tagged with which repeat/role/verdict they belong to
+    assert "req-0 repeat 0 (representative-pass, verdict=pass)" in out
+    # an absent path is M4's honest note, never a fabricated path
+    assert "[unavailable] req-1 repeat 0 (failure, verdict=fail) recording_mp4: 경로 미제공" in out
+
+
+def test_text_view_shows_the_size_cap_exclusion_with_its_warning(monkeypatch, tmp_path, capsys):
+    """결정 #2: an over-cap MCAP is excluded + warned (never truncated) — the
+    reviewer must be able to tell "excluded" from "the platform had no path"."""
+    report = _review_report(tmp_path, max_mcap_bytes=1024, mcap_bytes=99_999)
+    out = _render(monkeypatch, report, capsys)
+    assert "[excluded] req-0 repeat 0 (representative-pass, verdict=pass) rosbag_mcap:" in out
+    assert "업로드 제외" in out  # M4's warning string, verbatim
+    assert _MCAP not in out  # the capped path is NOT offered for review
+
+
+def test_text_view_artifact_set_is_exactly_the_m4_manifest(monkeypatch, tmp_path, capsys):
+    """No re-selection on the CLI side: what the terminal lists IS what the M4
+    manifest classified (the same set the PR artifact upload uses)."""
+    from cv_infra.report.github import render_artifact_manifest
+
+    report = _review_report(tmp_path)
+    out = _render(monkeypatch, report, capsys)
+    manifest = render_artifact_manifest(report)
+    for bucket, label in (("uploads", "reviewable"), ("missing", "unavailable")):
+        assert out.count(f"[{label}] ") == len(manifest[bucket])
+    assert manifest["policy"] in out  # selection provenance surfaced verbatim
+
+
+def test_review_surface_carries_all_four_cells(monkeypatch, tmp_path, capsys):
+    """The DoD-P5-10 gate stated as one assertion: pass/fail · metrics ·
+    regression judgement · recording — all four on the CLI review surface."""
+    report = _review_report(tmp_path)
+    report["baseline_summary"]["regressed"] = 1  # (regression detail rendered below)
+    report["matrix"][1]["regression"] = {
+        "status": "regressed",
+        "baseline_sut_ref": "carter-sut:old",
+        "baseline_established_at": "2026-07-10T00:00:00+00:00",
+        "detail": "req-1 pass→fail",
+    }
+    out = _render(monkeypatch, report, capsys)
+    assert "req-0" in out and "pass" in out and "fail" in out  # (a) pass/fail
+    assert "time_to_goal_s=12.5" in out  # (b) 지표
+    assert "carter-sut:old" in out and "regressed" in out  # (c) 회귀 판정
+    assert _MP4 in out  # (d) 녹화
+
+
+def test_text_render_is_byte_deterministic(monkeypatch, tmp_path, capsys):
+    report = _review_report(tmp_path)
+    assert _render(monkeypatch, report, capsys) == _render(monkeypatch, report, capsys)
+
+
+def test_empty_matrix_renders_no_metric_or_artifact_noise(monkeypatch, tmp_path, capsys):
+    """An empty report still renders (crash 0) and emits no empty section headers."""
+    out = _render(monkeypatch, _make_report(tmp_path, []), capsys)
+    assert "metrics (" not in out
+    assert "artifacts (" not in out
+    assert "outcome: verdict=pass report_outcome=pass" in out

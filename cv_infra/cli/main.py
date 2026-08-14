@@ -15,8 +15,10 @@ stderr and the run continues (M8-D4/D5). Phase 4 added the batch surface
 ``submit``/``status``/``wait`` (``cv_infra/cli/batch.py``, lazily imported —
 envelope submit to the M3 REST surface + terminal aggregated-verdict exit,
 M8-D11); Phase 5 wires ``report`` (informational review — a thin client over
-the M4 VerificationReport the orchestrator serves, D-O); ``selftest`` and the
-GitHub publish integration land in later Phases (M8 Sec.5).
+the M4 VerificationReport the orchestrator serves, D-O) and ``selftest`` (the
+built-in stub round-trip — the same submit/wait machinery over the M7 stub
+envelope ``orchestrator.selftest`` builds, REQ-SELFTEST-001/002). The full
+sub-command surface is now wired: no placeholder remains.
 
 Exit-code contract (LOCKED Sec.9 — exercised standalone at DoD-P2-07)::
 
@@ -74,13 +76,12 @@ _VERDICT_EXIT: dict[str, int] = {
 _CONSENT_ENV_KEYS = ("ACCEPT_EULA", "PRIVACY_CONSENT")
 
 # --- sub-command surface (REQ-INTAKE-003) ----------------------------------
-# ``run`` is implemented (Phase 2, D-2); ``submit``/``status``/``wait`` are
-# implemented (Phase 4 batch surface — cv_infra/cli/batch.py, lazily imported);
-# ``monitor`` is implemented (Phase 4 operational-view surface —
-# cv_infra/cli/monitor.py, lazily imported); ``report`` is implemented (Phase 5
-# informational review — cv_infra/cli/batch.py, lazily imported); ``selftest``
-# stays a reserved placeholder (P5) so the full contract surface remains visible
-# via ``cv-infra --help``.
+# EVERY sub-command below is implemented — the surface carries no placeholder
+# (G-47: a reserved-placeholder note that outlives the wiring is a stale
+# declaration). ``run`` = Phase 2 (D-2); ``submit``/``status``/``wait`` = Phase 4
+# batch surface; ``monitor`` = Phase 4 operational view; ``report`` = Phase 5
+# informational review; ``selftest`` = Phase 5 built-in stub round-trip. All but
+# ``run`` live in the lazily imported cv_infra/cli/{batch,monitor}.py.
 _SUBCOMMANDS: dict[str, str] = {
     "run": "Run a single scenario end-to-end (supervisor co-spawns SUT + runner; envelope-less).",
     "submit": "Submit a RequestEnvelope YAML or scenario paths/globs to the orchestrator [--wait].",
@@ -88,11 +89,23 @@ _SUBCOMMANDS: dict[str, str] = {
     "wait": "Block until an envelope reaches a terminal aggregated verdict (exit 0/1/3).",
     "monitor": "Show the operational view (queue/resources/health + rollup); informational.",
     "report": "Print the aggregated report for an envelope id (informational; --json for raw).",
-    "selftest": "Run the built-in stub round-trip (no external SUT).",
+    "selftest": "Run the built-in stub round-trip (no external SUT); exits like submit --wait.",
 }
 
 #: Batch sub-commands dispatched to ``cv_infra.cli.batch`` (Phase 4).
 _BATCH_COMMANDS = ("submit", "status", "wait")
+
+#: Every sub-command whose body lives in ``cv_infra.cli.batch`` — the batch trio
+#: plus the Phase-5 ``selftest`` (built-in stub submit+wait: the same machinery,
+#: a different document — REQ-SELFTEST-002). ``report`` keeps its own dispatch
+#: block (its argument schema and unavailable-message differ).
+_BATCH_MODULE_COMMANDS = (*_BATCH_COMMANDS, "selftest")
+
+#: The M1 ``RequestEnvelope.trigger_source`` Literal (contract/schema.py, the
+#: SoT), hardcoded ONCE here because the --help path must stay dependency-free
+#: (no contract import to build the parser). Shared by every command that
+#: records trigger provenance (submit, selftest — REQ-INTAKE-003).
+_TRIGGER_SOURCES = ("human-manual", "ci-cd")
 
 _EXIT_CODE_EPILOG = (
     "exit-code contract (LOCKED Sec.9):\n"
@@ -101,8 +114,8 @@ _EXIT_CODE_EPILOG = (
     "  2  CONTRACT  contract/validation error (bad YAML, unsupported apiVersion)\n"
     "  3  INFRA     infrastructure error (orchestrator down, EULA not accepted)\n"
     "\n"
-    "'run' (P2), 'submit'/'status'/'wait'/'monitor' (P4) and 'report' (P5) are "
-    "implemented; 'selftest' is reserved (P5)."
+    "'run' (P2), 'submit'/'status'/'wait'/'monitor' (P4) and 'report'/'selftest' "
+    "(P5) are implemented — every sub-command listed above is wired."
 )
 
 
@@ -134,6 +147,56 @@ def _add_api_argument(sub: argparse.ArgumentParser) -> None:
         default=None,
         help="orchestrator base URL (default: $CV_INFRA_API, else http://127.0.0.1:8000)",
     )
+
+
+def _add_trigger_source_argument(sub: argparse.ArgumentParser) -> None:
+    """``--trigger-source`` (REQ-INTAKE-003) — shared by ``submit`` and ``selftest``.
+
+    Provenance of the trigger, recorded verbatim on the wire: the GitHub Action
+    (and the platform CI self-test tier) passes ``ci-cd``, humans keep the
+    default ``human-manual``. CI and human runs are otherwise identical (same
+    CLI, same semantics — M8 §3.1). One definition, so a second surface can
+    never drift from the M1 Literal (``_TRIGGER_SOURCES``).
+    """
+    sub.add_argument(
+        "--trigger-source",
+        choices=_TRIGGER_SOURCES,
+        default=_TRIGGER_SOURCES[0],
+        help="who triggered this run (default: human-manual; the Action passes ci-cd). "
+        "Recorded verbatim by the orchestrator (REQ-INTAKE-003).",
+    )
+
+
+def _add_selftest_arguments(sub: argparse.ArgumentParser) -> None:
+    """Argument schema for the Phase-5 ``selftest`` command (cv_infra/cli/batch.py).
+
+    No positional input by construction: the request IS the built-in stub the
+    platform supplies to itself (REQ-SELFTEST-001), so a self-test needs no
+    consumer file, repo or image (NFR-SELFTEST-001). It always waits — the
+    round-trip verdict is the whole point (REQ-SELFTEST-003), so there is no
+    ``--wait`` flag to forget.
+    """
+    sub.add_argument(
+        # The ONE deployment-level knob: which platform-internal image plays the
+        # SUT side of the stub (M7 §3.5). Priority flag > $CV_SELFTEST_SUT_IMAGE,
+        # resolved by orchestrator.selftest — never guessed, never a consumer
+        # image (unset => exit 3, image-as-artifact FU-10).
+        "--sut-image",
+        default=None,
+        metavar="REF",
+        help="platform-internal stub SUT image ref (priority: flag > $CV_SELFTEST_SUT_IMAGE; "
+        "never defaulted or guessed — unresolved is an infrastructure error, exit 3)",
+    )
+    _add_trigger_source_argument(sub)
+    sub.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="S",
+        help="max seconds to wait for the terminal verdict; exceeded => exit 3 "
+        "(default: wait indefinitely)",
+    )
+    _add_api_argument(sub)
 
 
 def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
@@ -177,19 +240,7 @@ def _add_batch_arguments(name: str, sub: argparse.ArgumentParser) -> None:
             action="store_true",
             help="block until the terminal aggregated verdict and exit 0/1/3 (M8-D11)",
         )
-        sub.add_argument(
-            # Provenance of the trigger, recorded verbatim on the wire (REQ-INTAKE-003):
-            # the GitHub Action passes 'ci-cd', humans keep the default 'human-manual'.
-            # CI and human runs are otherwise identical (same CLI, same semantics —
-            # M8 §3.1). The two choices ARE the M1 ``RequestEnvelope.trigger_source``
-            # Literal (contract/schema.py, the SoT); hardcoded here because the --help
-            # path must stay dependency-free (no contract import to build the parser).
-            "--trigger-source",
-            choices=("human-manual", "ci-cd"),
-            default="human-manual",
-            help="who triggered this run (default: human-manual; the Action passes ci-cd). "
-            "Recorded verbatim by the orchestrator (REQ-INTAKE-003).",
-        )
+        _add_trigger_source_argument(sub)
     else:
         sub.add_argument("envelope_id", help="envelope id printed by 'cv-infra submit'")
     if name in ("submit", "wait"):
@@ -236,6 +287,8 @@ def _build_parser() -> argparse.ArgumentParser:
             _add_api_argument(sub)  # operational-view read: only the orchestrator base URL
         elif name == "report":
             _add_report_arguments(sub)
+        elif name == "selftest":
+            _add_selftest_arguments(sub)
     return parser
 
 
@@ -477,11 +530,10 @@ def main(argv: list[str] | None = None) -> int:
     matching EXIT_CONTRACT).
     """
     parser = _build_parser()
-    # The placeholder sub-commands (report/selftest) take no real arguments
-    # yet, so we absorb (and ignore) their trailing tokens with
-    # ``parse_known_args`` — this keeps e.g. ``cv-infra report x`` on the
-    # honest "not implemented (3)" path. Implemented commands parse their real
-    # schema and treat leftovers as usage errors (2).
+    # ``parse_known_args`` + the explicit leftover check below renders a stray
+    # token as the friendly one-liner + exit 2, instead of argparse's own bare
+    # usage dump. Every sub-command parses its real schema now (no placeholder
+    # absorbs trailing tokens any more), so the check is unconditional.
     args, extra = parser.parse_known_args(argv)
 
     if args.command is None:
@@ -490,17 +542,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return EXIT_CONTRACT
 
-    if (
-        args.command == "run"
-        or args.command in _BATCH_COMMANDS
-        or args.command in ("monitor", "report")
-    ):
-        if extra:
-            print(
-                f"cv-infra {args.command}: unrecognized argument(s): {' '.join(extra)}",
-                file=sys.stderr,
-            )
-            return EXIT_CONTRACT
+    if extra:
+        print(
+            f"cv-infra {args.command}: unrecognized argument(s): {' '.join(extra)}",
+            file=sys.stderr,
+        )
+        return EXIT_CONTRACT
 
     if args.command == "run":
         return _cmd_run(args)
@@ -536,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_INFRA
         return batch.cmd_report(args)
 
-    if args.command in _BATCH_COMMANDS:
+    if args.command in _BATCH_MODULE_COMMANDS:
         try:
             # Lazy import (mirrors the supervisor idiom above): the batch
             # surface pulls httpx + the M3 REST module — the --help and run
@@ -550,15 +597,23 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_INFRA
-        dispatch = {"submit": batch.cmd_submit, "status": batch.cmd_status, "wait": batch.cmd_wait}
+        dispatch = {
+            "submit": batch.cmd_submit,
+            "status": batch.cmd_status,
+            "wait": batch.cmd_wait,
+            # selftest is the SAME submit+wait machinery over the built-in stub
+            # envelope (REQ-SELFTEST-002: no self-test-only execution path).
+            "selftest": batch.cmd_selftest,
+        }
         return dispatch[args.command](args)
 
-    # Reserved surface: not wired yet. Report as an infrastructure / not-ready
-    # condition (3), never as a SUT FAIL (1) — see the 1-vs-3 rationale in the
-    # module docstring.
+    # UNREACHABLE by construction: every name in ``_SUBCOMMANDS`` is dispatched
+    # above. Kept as the defensive floor so a future sub-command added to the
+    # parser but not to a dispatch table fails LOUDLY as a platform/not-ready
+    # condition (3) instead of falling off the end and returning a silent 0.
     print(
-        f"cv-infra: '{args.command}' is not implemented yet "
-        "(arrives in a later Phase — see M8 Sec.5).",
+        f"cv-infra: '{args.command}' is declared on the CLI surface but has no dispatch "
+        "— platform build incomplete; this is an infrastructure error, not a SUT verdict",
         file=sys.stderr,
     )
     return EXIT_INFRA

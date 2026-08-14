@@ -1,9 +1,15 @@
-# Platform CI — `ubuntu-latest` boundary-enforcement tier (M8 / DoD-P0-04).
+# Platform CI — 2 tiers (M8 §3.8 / DoD-P0-04, NFR-SELFTEST-001).
 #
-# Phase 0 scope: lint + format + import-lint boundary enforcement. Runs with no
-# GPU and no consumer-repo dependency (NFR-SELFTEST-001 spirit: the platform CI
-# passes standalone). The `[self-hosted, cv-infra-gpu]` self-test tier is added
-# in a later Phase (M8 Sec.3.8); this file is single-tier for now.
+#   1. `lint`     — `ubuntu-latest`, always: lint + format + import-lint boundary
+#                   enforcement. No GPU, no consumer repo.
+#   2. `selftest` — `[self-hosted, cv-infra-gpu]`, OPT-IN: `cv-infra selftest`
+#                   round-trips the BUILT-IN stub through the deployed
+#                   orchestrator. Zero consumer dependency by construction — the
+#                   command takes no input at all (see the job comment for the
+#                   preconditions and for why it is gated OFF today).
+#
+# Both tiers use only this repository: the platform CI never checks out, builds
+# or reads a consumer repo (boundary rule ③ / NFR-SELFTEST-001).
 #
 # Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:`
 # action is version-pinned (no mutable / floating-major tags), the uv binary is
@@ -55,3 +61,61 @@ jobs:
 
       - name: Import-boundary enforcement (import-linter)
         run: uv run lint-imports --config .importlinter
+
+  # --------------------------------------------------------------------------
+  # Tier 2 — platform self-test on the GPU workstation (REQ-SELFTEST-001..004,
+  # NFR-SELFTEST-001). `cv-infra selftest` submits the platform's OWN built-in
+  # stub through the ordinary UC-01 path and folds the terminal verdict into the
+  # exit code (0 pass / 1 fail / 2 the stub envelope was rejected / 3 platform or
+  # configuration problem) — the job status IS that exit code.
+  #
+  # ⚠ GATED OFF, AND IT HAS NEVER RUN. As of p5c15 nothing in this repository
+  # can satisfy its preconditions, so the `if:` below evaluates false unless an
+  # operator sets the repository variable. Enabling requires ALL of:
+  #   (1) a self-hosted runner online with the `cv-infra-gpu` label;
+  #   (2) a resident orchestrator reachable from that runner (`CV_INFRA_API`
+  #       repo variable, or the CLI default 127.0.0.1:8000 on the same host);
+  #   (3) `CV_SELFTEST_SUT_IMAGE` = a PLATFORM-INTERNAL stub SUT image ref. This
+  #       image DOES NOT EXIST YET (M7 §3.5 A/B is open — in-runner driver vs a
+  #       lightweight stub container). Unset/empty => the CLI refuses with exit 3
+  #       and never falls back to a consumer image (NFR-SELFTEST-001) — it is a
+  #       loud, honest failure, not a green run.
+  # Until (3) lands, turning `CV_SELFTEST_ENABLED` on buys an exit-3 job, not a
+  # verdict. The gate is a repo VARIABLE (not a secret): no value is baked here.
+  selftest:
+    name: platform self-test (self-hosted GPU)
+    needs: lint
+    if: ${{ vars.CV_SELFTEST_ENABLED == 'true' }}
+    runs-on: [self-hosted, cv-infra-gpu]
+    # Job cap sits ABOVE the CLI's own --timeout below, so a wedged round-trip is
+    # ended by the CLI (honest exit 3 + message) rather than by a job cancellation.
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.11.13"
+
+      # uv provisions the pinned interpreter itself (no setup-python on the
+      # self-hosted box) and installs from the committed lock — same wheel the
+      # deployment ships.
+      - name: Sync environment (frozen — honor committed uv.lock)
+        run: uv sync --frozen
+
+      # No inputs, no consumer checkout, no scenario file: the request IS the
+      # built-in stub. --trigger-source ci-cd records the provenance verbatim
+      # (REQ-INTAKE-003); the exit code is the job's status (0/1/2/3).
+      #
+      # --timeout 1800 is a PROVISIONAL CI budget, not a measured NFR value
+      # (CLAUDE §2-4): the stub's sim-time budget is 30 s but its wall-clock cost
+      # (Isaac boot + Nav2 bringup on this box) has never been measured, because
+      # this tier has never run. Replace it with the measured cost once a live
+      # round-trip exists, in the same commit that records the measurement.
+      - name: cv-infra selftest (built-in stub round-trip)
+        env:
+          CV_SELFTEST_SUT_IMAGE: ${{ vars.CV_SELFTEST_SUT_IMAGE }}
+          CV_INFRA_API: ${{ vars.CV_INFRA_API }}
+        run: uv run cv-infra selftest --trigger-source ci-cd --timeout 1800

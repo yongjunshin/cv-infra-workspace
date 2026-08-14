@@ -67,6 +67,15 @@ _REQUEST_HEADERS = [
     "REQUEST",
     "STATUS",
     "OUTCOME",
+    # Self-test marker (M7 / REQ-SELFTEST-004): the projection carries the bool
+    # ``is_self_test`` since store v8, and the HTML dashboard shows it — this
+    # column keeps the SSH/headless axis aligned with it, so an operator who ran
+    # ``cv-infra selftest`` can tell that envelope apart from user submissions.
+    # The free-text ``origin`` deliberately stays OFF this view (store/audit
+    # only — T3 report §7-3: a free-text field on the operational view is the
+    # domain-leak shape NEG-3 does not catch). A pre-v8 projection has no such
+    # key -> ``n/a`` by the same G-17 lenient rule as concurrency_budget_k.
+    "SELFTEST",
     "PASS",
     "FAIL",
     "ERROR",
@@ -125,6 +134,7 @@ def render_monitor(record: dict[str, Any]) -> str:
                 _fmt(req.get("request_id")),
                 _fmt(req.get("envelope_status")),
                 _fmt(req.get("report_outcome")),
+                _fmt(req.get("is_self_test")),
                 _fmt(req.get("pass_count")),
                 _fmt(req.get("fail_count")),
                 _fmt(req.get("error_count")),

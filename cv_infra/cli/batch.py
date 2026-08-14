@@ -1,4 +1,4 @@
-"""``cv-infra {submit,status,wait}`` — the batch/orchestrator CLI surface (M8).
+"""``cv-infra {submit,status,wait,report,selftest}`` — the orchestrator CLI surface (M8).
 
 Phase-4 counterpart of ``run`` (REQ-INTAKE-001/003, M8 §3.1): ``submit`` sends
 a RequestEnvelope (scenario file-reference list, decision
@@ -32,9 +32,16 @@ unreachable orchestrator or an unknown/absent outcome folds to ``EXIT_INFRA``
 (3), never to FAIL — same fold rule as ``main._VERDICT_EXIT``.
 
 Per-command exit scope (D-O, M8 §3.2): only verdict-granting commands
-(``submit --wait`` / ``wait``) gate on 0/1; ``status`` returns 0 even for a
-failed batch (a query must never turn a CI job red by itself — only 404 -> 2
-and infra -> 3).
+(``submit --wait`` / ``wait`` / ``selftest``) gate on 0/1; ``status`` returns 0
+even for a failed batch (a query must never turn a CI job red by itself — only
+404 -> 2 and infra -> 3).
+
+``selftest`` (P5, REQ-SELFTEST-001/002/003) reuses that machinery UNCHANGED over
+a different document: ``orchestrator.selftest.build_self_test_submission`` (M3/M7)
+returns the built-in stub's size-1 envelope body, this module POSTs it through the
+same ``_post_envelope`` and blocks on the same ``_poll_until_terminal``. Nothing
+about the execution path is self-test-specific — that is the property
+REQ-SELFTEST-002 buys, and duplicating a submit path here would spend it.
 
 Seams (G-17 — M1 T1 lands ``contract/envelope.py`` in parallel)
 ---------------------------------------------------------------
@@ -119,6 +126,7 @@ from cv_infra.cli.exit_codes import (
 from cv_infra.cli.main import _one_line
 from cv_infra.contract.errors import ANNOTATION_KEYS, ContractError
 from cv_infra.orchestrator.api import REPORT_OUTCOME_ERRORED
+from cv_infra.orchestrator.selftest import SelfTestNotConfigured, build_self_test_submission
 
 #: Default orchestrator base URL (MVP topology: CLI and orchestrator share the
 #: host — M8 §8 cicd-g5). Overridden by ``CV_INFRA_API`` env or ``--api``.
@@ -526,6 +534,41 @@ async def _poll_until_terminal(
         await asyncio.sleep(_POLL_INTERVAL_S)
 
 
+async def _post_envelope(
+    client: httpx.AsyncClient,
+    command: str,
+    api: str,
+    body: dict[str, Any],
+    errors_json: Path | None = None,
+) -> tuple[str | None, int]:
+    """POST one envelope body -> ``(envelope_id, EXIT_PASS)`` or ``(None, exit code)``.
+
+    The ONE place the ``POST /envelopes`` response is folded into the exit-code
+    contract, shared by ``submit`` and ``selftest`` (they differ only in WHICH
+    document is submitted — REQ-SELFTEST-002): 422 = the server re-ran the M1
+    admit gate and rejected (contract error, 2 — friendly M1 prose on stderr,
+    plus the 8-key machine view for the annotate step when enabled); anything
+    but 202, an unreachable orchestrator or a 202 without an id = infra (3).
+    """
+    try:
+        response = await client.post("/envelopes", json=body)
+    except httpx.HTTPError as exc:
+        return None, _infra(command, f"orchestrator unreachable at {api}: {_one_line(exc)}")
+    if response.status_code == 422:
+        # Server-side re-rejection (the server re-runs the M1 admit gate —
+        # authoritative even after client pre-validation passed). G3: the
+        # 8-key entries feed the annotate step too.
+        _emit_errors_json(errors_json, _render_rejection(command, response))
+        return None, EXIT_CONTRACT
+    if response.status_code != 202:
+        return None, _infra(command, f"unexpected orchestrator response {response.status_code}")
+    payload = _body_json(response)
+    envelope_id = payload.get("envelope_id") if isinstance(payload, dict) else None
+    if not isinstance(envelope_id, str) or not envelope_id:
+        return None, _infra(command, "202 response carried no envelope_id")
+    return envelope_id, EXIT_PASS
+
+
 async def _submit_async(
     envelope: Any, args: argparse.Namespace, errors_json: Path | None = None
 ) -> int:
@@ -533,24 +576,11 @@ async def _submit_async(
     wire_trigger = _wire_trigger_source(args.trigger_source)
     sut_image = _resolve_sut_image(args.sut_image)
     async with _make_client(api) as client:
-        try:
-            response = await client.post(
-                "/envelopes", json=_wire_body(envelope, wire_trigger, sut_image)
-            )
-        except httpx.HTTPError as exc:
-            return _infra("submit", f"orchestrator unreachable at {api}: {_one_line(exc)}")
-        if response.status_code == 422:
-            # Server-side re-rejection (the server re-runs the M1 admit gate —
-            # authoritative even after client pre-validation passed). G3: the
-            # 8-key entries feed the annotate step too.
-            _emit_errors_json(errors_json, _render_rejection("submit", response))
-            return EXIT_CONTRACT
-        if response.status_code != 202:
-            return _infra("submit", f"unexpected orchestrator response {response.status_code}")
-        body = _body_json(response)
-        envelope_id = body.get("envelope_id") if isinstance(body, dict) else None
-        if not isinstance(envelope_id, str) or not envelope_id:
-            return _infra("submit", "202 response carried no envelope_id")
+        envelope_id, code = await _post_envelope(
+            client, "submit", api, _wire_body(envelope, wire_trigger, sut_image), errors_json
+        )
+        if envelope_id is None:
+            return code
         print(envelope_id)  # bare id on stdout: ID=$(cv-infra submit ...) stays scriptable
         if not args.wait:
             return EXIT_PASS  # submission accepted; verdict gating needs --wait (D-O)
@@ -584,6 +614,37 @@ async def _status_async(args: argparse.Namespace) -> int:
             return _infra("status", "orchestrator returned a non-JSON status body")
         print(json.dumps(body, indent=2))
         return EXIT_PASS  # informational: the verdict NEVER rides this exit (D-O)
+
+
+async def _selftest_async(args: argparse.Namespace) -> int:
+    api = _resolve_api(args.api)
+    try:
+        # M7/M3 owns WHAT the platform submits to itself; this CLI owns the
+        # HTTP call, the output and the exit code (nothing is rebuilt here).
+        submission = build_self_test_submission(
+            sut_image_ref=args.sut_image,
+            trigger_source=_wire_trigger_source(args.trigger_source),
+        )
+    except SelfTestNotConfigured as exc:
+        # Deployment configuration absent = infra (3), the same class as an
+        # unreachable orchestrator or an un-accepted EULA — never a SUT verdict,
+        # and never a guessed image (the refusal prose is M3's, verbatim).
+        return _infra("selftest", _one_line(exc))
+    # Provenance FIRST (REQ-SELFTEST-001): an operator must see WHICH stub ran
+    # before any verdict — including when the round-trip later fails. ``flush``
+    # because stdout is block-buffered in a pipe (CI logs, ``| tee``): without it
+    # this line would land AFTER the stderr diagnostics it is meant to precede.
+    print(
+        f"cv-infra selftest: built-in stub origin={submission.origin} "
+        f"sut={submission.sut_image_ref} -> {api}",
+        flush=True,
+    )
+    async with _make_client(api) as client:
+        envelope_id, code = await _post_envelope(client, "selftest", api, submission.body)
+        if envelope_id is None:
+            return code
+        print(envelope_id)  # bare id line: `cv-infra report <id>` after the round-trip
+        return await _poll_until_terminal(client, "selftest", envelope_id, args.timeout)
 
 
 # --- entry points (main.py dispatch) -----------------------------------------
@@ -623,6 +684,33 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     """``cv-infra status <envelope_id> [--api URL]`` — informational (exit 0)."""
     return asyncio.run(_status_async(args))
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """``cv-infra selftest [--sut-image REF] [--trigger-source S] [--timeout N] [--api URL]``.
+
+    The built-in stub round-trip (REQ-SELFTEST-001/002/003): submit the size-1
+    self-test envelope ``orchestrator.selftest.build_self_test_submission``
+    builds and block on the terminal aggregated verdict — the SAME wire, admit
+    gate, fan-out, supervision and rollup an ordinary submission takes (a
+    self-test-only execution path would make the evidence worthless). No
+    consumer repo, scenario file or image is read (NFR-SELFTEST-001): this
+    command takes no positional input at all.
+
+    Exit codes — the M8 contract, no new fold invented (LOCKED §9 / D-I)::
+
+        condition                                              exit
+        -----------------------------------------------------  ----
+        no stub SUT handle configured (SelfTestNotConfigured)     3
+        orchestrator unreachable / non-202 / id-less 202          3
+        server 422 (the admit gate rejected the stub envelope)    2
+        report_outcome pass / fail / errored                    0 / 1 / 3
+
+    The last row IS ``exit_code_for_report_outcome`` (the single source shared
+    with the Check-conclusion table, DoD-P5-13) — reached through the same
+    ``_poll_until_terminal`` ``submit --wait`` uses.
+    """
+    return asyncio.run(_selftest_async(args))
 
 
 # --- report: informational review surface (D-O, M8 §3.2 / §3.7) --------------
@@ -699,9 +787,75 @@ def _render_baseline(report: dict[str, Any]) -> None:
         print("baseline: no regressions vs the established baseline.")
 
 
+def _render_metrics(report: dict[str, Any]) -> None:
+    """Per-request declared metrics on the CLI review surface (REQ-REPORT-008/009).
+
+    The values ARE the report's ``matrix[].metrics`` map — the representative
+    job's declared metrics, already selected upstream by M4
+    (``aggregate._metrics``); nothing is re-derived or re-selected here. Honesty
+    rule (the same one the GitHub metrics cell applies, ``report/github.py``): a
+    ``None`` value means that metric was never measured, so it is OMITTED rather
+    than printed as ``None``; an empty/all-``None`` map renders ``n/a``; a ``0``
+    (e.g. ``collision_count=0``) IS a measurement and stays. Keys sorted ->
+    byte-deterministic output.
+    """
+    rows = report.get("matrix") or []
+    if not rows:
+        return
+    print("metrics (representative job per request):")
+    for row in rows:
+        measured = {k: v for k, v in (row.get("metrics") or {}).items() if v is not None}
+        rendered = ", ".join(f"{key}={measured[key]}" for key in sorted(measured)) or "n/a"
+        print(f"  {row.get('request_id')}: {rendered}")
+
+
+def _render_artifacts(report: dict[str, Any]) -> None:
+    """Recording / telemetry review references (REQ-REPORT-009, REQ-EXEC-014).
+
+    INVOKES the M4 renderer ``report.github.render_artifact_manifest`` — the same
+    classification the CI publish plane consumes (M8 invokes M4, LOCKED §7.14), so
+    the CLI and the PR show the SAME artifact set and the selection policy (all
+    failing jobs + one representative pass, 결정 #1) is never re-made here. Each
+    already-selected entry's three kinds land in exactly one bucket: a present
+    path (reviewable), M4's honest "the control plane carried no path" note
+    (unavailable — NOT a size-cap drop), or the size-cap exclusion with M4's
+    warning verbatim (결정 #2). Nothing is fetched, measured or fabricated.
+    """
+    from cv_infra.report.github import render_artifact_manifest
+
+    manifest = render_artifact_manifest(report)
+    groups: tuple[tuple[str, list[dict[str, Any]], Any], ...] = (
+        ("reviewable", manifest["uploads"], lambda e: e.get("path")),
+        ("unavailable", manifest["missing"], lambda e: e.get("note")),
+        ("excluded", manifest["excluded"], lambda e: "; ".join(e.get("warnings") or [])),
+    )
+    if not any(entries for _, entries, _ in groups):
+        return
+    print("artifacts (recording/telemetry review):")
+    policy = manifest.get("policy")
+    if policy:
+        # M4's provenance string verbatim (재도출 금지) — on its own line because it
+        # is a paragraph, and a terminal surface should stay scannable.
+        print(f"  selection policy: {policy}")
+    for label, entries, detail in groups:
+        for entry in entries:
+            print(
+                f"  [{label}] {entry.get('request_id')} repeat {entry.get('repeat_index')} "
+                f"({entry.get('role')}, verdict={entry.get('verdict')}) "
+                f"{entry.get('kind')}: {detail(entry)}"
+            )
+
+
 def _render_report(report: dict[str, Any]) -> None:
-    """Human-readable review render: header + the M4 matrix table + the
-    domain/outcome line + C-1 baseline messaging (D-O informational)."""
+    """Human-readable review render (D-O informational; the DoD-P5-10 surface).
+
+    Sections: header + the M4 matrix table (pass/fail) + per-request metrics +
+    artifact/recording references + the domain/outcome line + C-1 baseline
+    messaging (the regression judgement). Metrics and artifacts were added at
+    p5c15 (CEO 결정 D-2): the data was already in the report JSON and on the
+    three GitHub surfaces — only this renderer omitted them, so a developer
+    reviewing from a terminal saw a verdict without the evidence behind it.
+    """
     from cv_infra.report.matrix import render_text
 
     summary = report.get("summary", {})
@@ -710,6 +864,8 @@ def _render_report(report: dict[str, Any]) -> None:
         f"(trigger={report.get('trigger_source')}, generated {report.get('generated_at')})"
     )
     print(render_text(_matrix_view(report)))
+    _render_metrics(report)
+    _render_artifacts(report)
     print(
         f"outcome: verdict={summary.get('verdict')} "
         f"report_outcome={summary.get('report_outcome')}"
