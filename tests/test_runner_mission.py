@@ -162,6 +162,83 @@ def test_mission_outcome_shape():
 
 
 # --------------------------------------------------------------------------- #
+# Relay fidelity: the step-and-spin budget + its measurement (G-63).
+# --------------------------------------------------------------------------- #
+class _FakeRclpy:
+    """Records spin_once calls — the rclpy seam the adapter holds after wire()."""
+
+    def __init__(self) -> None:
+        self.spins: list[tuple[object, float]] = []
+
+    def spin_once(self, node, timeout_sec=None) -> None:
+        self.spins.append((node, timeout_sec))
+
+
+def _spun(adapter) -> _FakeRclpy:
+    """Put the adapter in the post-wire() state without rclpy (private by design:
+    ``wire`` imports the bundled jazzy rclpy, which does not exist on CPU)."""
+    fake = _FakeRclpy()
+    adapter._rclpy = fake
+    adapter._node = object()
+    return fake
+
+
+def test_step_and_spin_drains_a_bounded_batch_not_a_single_callback():
+    """One spin_once = one callback, so a 1-per-step spin starves subscriptions:
+    measured p5c13, the /odom relay passed 24.9 % of the sim's stream (G-63)."""
+    steps: list[int] = []
+    adapter = ros2.Ros2Adapter(Ros2AdapterConfig(), stepper=lambda: steps.append(1))
+    fake = _spun(adapter)
+
+    adapter._step_and_spin()
+
+    assert len(steps) == 1  # still exactly ONE sim step per call (the /clock source)
+    assert len(fake.spins) == ros2.SPIN_CALLBACK_BUDGET_PER_STEP
+    assert 1 < ros2.SPIN_CALLBACK_BUDGET_PER_STEP <= 64  # drains more than one, stays bounded
+    assert {timeout for _, timeout in fake.spins} == {0.0}  # non-blocking: never eats the step
+
+
+def test_relay_odom_counts_every_message_it_fans_out():
+    """The relay body itself: count first, then publish to EVERY target."""
+
+    class _Pub:
+        def __init__(self) -> None:
+            self.got: list[object] = []
+
+        def publish(self, msg) -> None:
+            self.got.append(msg)
+
+    adapter = ros2.Ros2Adapter()
+    pubs = [_Pub(), _Pub()]
+    first, second = object(), object()
+    adapter._relay_odom(first, pubs)
+    adapter._relay_odom(second, pubs)
+
+    assert adapter._odom_relayed == 2  # what the fidelity line reports
+    assert all(pub.got == [first, second] for pub in pubs)  # dualization: BOTH targets
+
+
+def test_odom_relay_fidelity_line_reports_the_ratio_against_clock():
+    # The p5c13 measurement itself (1800 relayed against 7210 clock messages).
+    line = ros2.odom_relay_fidelity_line(1800, 1, 7210)
+    assert "relayed=1800" in line and "targets=1" in line and "clock_msgs=7210" in line
+    assert "ratio_vs_clock=0.250" in line
+    assert "ratio_vs_clock=n/a" in ros2.odom_relay_fidelity_line(0, 0, 0)  # never a ZeroDivision
+
+
+def test_teardown_reports_relay_fidelity_only_when_a_relay_was_wired(capsys):
+    adapter = ros2.Ros2Adapter()
+    adapter.teardown()
+    assert "odom relay fidelity" not in capsys.readouterr().out  # no relay -> no claim
+
+    relayed = ros2.Ros2Adapter()
+    relayed._odom_relay = ("subscription", ["publisher"])  # post-_ensure_odom_fanout state
+    relayed._odom_relayed, relayed._odom_targets, relayed._clock_count = 150, 1, 600
+    relayed.teardown()
+    assert "ratio_vs_clock=0.250" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
 # Structural invariant: importing the runner NEVER pulls Isaac/ROS on CPU.
 # --------------------------------------------------------------------------- #
 def test_runner_imports_stay_isaac_free():

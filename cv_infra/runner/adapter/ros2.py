@@ -11,8 +11,8 @@ it never forces it (REQ-EXEC-005, M2 §3.2 step4).
 rclpy is the bundled internal Jazzy site (cycle-3 measured: rclpy 7.1.5 +
 nav2_msgs, put on ``sys.path`` by ``ros_bridge.bootstrap_bridge_env``) and is
 imported lazily inside the ROS bodies (R16). The pure sequencing/math surface
-(``readiness_sequence`` / ``quat_z_w_from_yaw`` / ``nav_status_str``) is
-Isaac/rclpy-free and CPU unit-tested.
+(``readiness_sequence`` / ``quat_z_w_from_yaw`` / ``nav_status_str`` /
+``odom_relay_fidelity_line``) is Isaac/rclpy-free and CPU unit-tested.
 
 Wiring stance (do-not-reinvent): the carter sample scene's OmniGraphs already
 publish /clock, TF, odom, sensors and subscribe /cmd_vel — ``wire`` REUSES them
@@ -40,6 +40,20 @@ CLOCK_FLOW_MIN_MSGS = 2
 # the service does NOT respond during activation — every poll MUST carry a
 # timeout or the barrier hangs inside a single call).
 IS_ACTIVE_POLL_TIMEOUT_S = 2.0
+
+# rclpy callbacks drained per sim step (G-63). ONE ``spin_once`` executes ONE ready
+# callback, and this loop shares its budget with the sim step, so at 1 callback/step
+# the adapter's subscriptions round-robin: measured p5c13, the /odom relay published
+# only 24.9±0.1 % of what the sim produced (21/21 jobs) — a silent fidelity loss on
+# an input nav2's controller_server actually consumes.
+# The bound (spin is NOT allowed to be open-ended — this loop also drives the sim,
+# which IS the /clock source, G-19): every sim-side publisher is step-driven, so one
+# step makes at most one message per subscribed topic ready. The adapter subscribes
+# to /clock + the odom source (2) and holds an action client + a service client
+# (their responses/feedback/status are the same order of magnitude), i.e. an O(4)
+# ready set — 16 is ~4x headroom while capping the worst case at 16 non-blocking
+# waits (timeout_sec=0.0 returns immediately when nothing is ready).
+SPIN_CALLBACK_BUDGET_PER_STEP = 16
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +99,25 @@ def nav_status_str(code: int | None) -> str:
     if code is None:
         return "unknown"
     return _NAV_STATUS.get(code, f"status_{code}")
+
+
+def odom_relay_fidelity_line(relayed: int, targets: int, clock_msgs: int) -> str:
+    """One-line relay fidelity report — a relay is verified by HOW MUCH it passed.
+
+    G-63 ①: "did it work?" is the wrong question for a relay; p5c13 measured a
+    working relay that delivered a quarter of its input and nobody saw it. The
+    ratio is taken against the received ``/clock`` count because the sim publishes
+    clock and odom from the SAME step-driven graph — measured p5c13, the source
+    odom topic's bag count equalled /clock's in 21/21 jobs, so clock_msgs is a
+    calibrated proxy for "messages the sim produced" that costs no extra
+    subscription. It is a PROXY: the authoritative cross-check stays the recorded
+    bag (source vs relayed topic counts, scripts/measure/odom_relay_fidelity.sh).
+    """
+    ratio = "n/a" if clock_msgs <= 0 else f"{relayed / clock_msgs:.3f}"
+    return (
+        f"[cv-runner] odom relay fidelity: relayed={relayed} targets={targets} "
+        f"clock_msgs={clock_msgs} ratio_vs_clock={ratio}"
+    )
 
 
 def get_parameters_service_for(is_active_service: str) -> str:
@@ -133,6 +166,8 @@ class Ros2Adapter(SimAdapter):
         self._clock_time_s = 0.0
         self._odom_fanout_done = False
         self._odom_relay = None  # (subscription, publishers) keep-alive
+        self._odom_relayed = 0  # relay callbacks executed (fidelity counter, G-63 ①)
+        self._odom_targets = 0  # publisher-less odom_topics[] the relay feeds
         self._readiness_phase: str | None = None  # last barrier stage (p4c5 T1 trace)
 
     @property
@@ -315,11 +350,21 @@ class Ros2Adapter(SimAdapter):
         return MissionOutcome(nav_status_str(status), status, self._clock_time_s - start_sim)
 
     def teardown(self) -> None:
-        """Destroy the rclpy node / leave the DDS domain (CPU-safe when unwired)."""
+        """Destroy the rclpy node / leave the DDS domain (CPU-safe when unwired).
+
+        Emits the relay fidelity line first: main calls teardown in its ``finally``,
+        so the count lands on EVERY path (a success-only report would be blind to
+        the runs worth diagnosing) and before ``hard_exit`` takes the process.
+        """
         node, self._node = self._node, None
         rclpy, self._rclpy = self._rclpy, None
         self._nav_client = None
         self._is_active_client = None
+        if self._odom_relay is not None:
+            print(
+                odom_relay_fidelity_line(self._odom_relayed, self._odom_targets, self._clock_count),
+                flush=True,
+            )
         self._odom_relay = None
         if node is not None:  # pragma: no cover - ROS path
             try:
@@ -336,11 +381,20 @@ class Ros2Adapter(SimAdapter):
     # ------------------------------------------------------------------ #
     # ROS-body helpers (bundled rclpy; not CPU-reachable).
     # ------------------------------------------------------------------ #
-    def _step_and_spin(self) -> None:  # pragma: no cover - ROS path
-        """One sim step (the /clock source) + one non-blocking rclpy spin."""
+    def _step_and_spin(self) -> None:
+        """One sim step (the /clock source) + a BOUNDED batch of rclpy callbacks.
+
+        ``spin_once`` runs at most one ready callback, so spinning once per step
+        starved every subscription but one (G-63: the /odom relay passed 24.9 % of
+        the sim's stream). The batch drains up to ``SPIN_CALLBACK_BUDGET_PER_STEP``
+        of them; each extra call is a non-blocking wait that returns immediately
+        once the ready set is empty, so an idle step costs a few micro-waits and
+        the sim can never be starved by an open-ended spin.
+        """
         if self._stepper is not None:
             self._stepper()
-        self._rclpy.spin_once(self._node, timeout_sec=0.0)
+        for _ in range(SPIN_CALLBACK_BUDGET_PER_STEP):
+            self._rclpy.spin_once(self._node, timeout_sec=0.0)
 
     def _poll_is_active(self) -> bool:  # pragma: no cover - ROS path
         """One bounded poll of the Nav2 lifecycle Trigger gate (never blocks open-
@@ -361,6 +415,17 @@ class Ros2Adapter(SimAdapter):
         response = future.result()
         return bool(response is not None and response.success)
 
+    def _relay_odom(self, msg: object, publishers: list) -> None:
+        """The relay body: fan ONE received Odometry out to every target publisher.
+
+        A named method, not a closure, so the count-then-publish behaviour is
+        CPU-testable — this is the exact code that silently passed 24.9 % of the
+        stream (G-63), and "did it run" was never the question.
+        """
+        self._odom_relayed += 1
+        for pub in publishers:
+            pub.publish(msg)
+
     def _ensure_odom_fanout(self) -> None:  # pragma: no cover - ROS path
         """Supplement (not replace) the sample graph: relay the ONE sim-published
         Odometry stream to every publisher-less ``odom_topics[]`` entry (measured
@@ -379,14 +444,13 @@ class Ros2Adapter(SimAdapter):
             self._odom_fanout_done = True  # graph already covers every entry
             return
         publishers = [self._node.create_publisher(Odometry, t, 10) for t in targets]
-
-        def relay(msg: Odometry) -> None:
-            for pub in publishers:
-                pub.publish(msg)
-
-        subscription = self._node.create_subscription(Odometry, sources[0], relay, 10)
+        subscription = self._node.create_subscription(
+            Odometry, sources[0], lambda msg: self._relay_odom(msg, publishers), 10
+        )
         self._odom_relay = (subscription, publishers)
+        self._odom_targets = len(targets)
         self._odom_fanout_done = True
+        print(f"[cv-runner] odom relay wired: {sources[0]} -> {targets}", flush=True)
 
     def _verify_use_sim_time(self) -> bool | None:  # pragma: no cover - ROS path
         """VERIFY the SUT use_sim_time contract (never force — REQ-EXEC-005).
