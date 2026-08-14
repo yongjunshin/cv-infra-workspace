@@ -168,6 +168,50 @@ def test_parse_request_unknown_nested_adapter_key_raises_usage():
         main.parse_request(spec)
 
 
+def test_parse_request_unknown_criteria_param_key_raises_usage():
+    """Runner-seam guard for the criteria params (p5c14 defect ③, measured LOUD).
+
+    The contract layer forbids extras on ``ReachedGoalParams``; what matters for
+    the runner is that its OWN path (parse_request -> oracles read a dict via
+    read_field) can never let one through — an unread key would be applied as
+    nothing at all and the run would silently judge with a different tolerance
+    (the ``goal_tolerance_m`` lesson, G-25).
+    """
+    spec = _valid_spec()
+    spec["acceptance_criteria"][0]["params"]["goal_tolerance_budget_m"] = 0.85
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    assert "goal_tolerance_budget_m" in str(excinfo.value)
+
+
+def test_parse_request_unknown_key_inside_goal_tolerance_budget_raises_usage():
+    """Same guard one level deeper — the budget block is where a plausible-looking
+    extra term (an overshoot allowance) would be silently dropped from the sum."""
+    spec = _valid_spec()
+    spec["acceptance_criteria"][0]["params"] = {
+        "goal_tolerance_budget": {
+            "sut_xy_goal_tolerance_m": 0.25,
+            "localization_budget_m": 0.60,
+            "overshoot_m": 0.10,
+        }
+    }
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    assert "goal_tolerance_budget.overshoot_m" in str(excinfo.value)
+
+
+def test_parse_request_accepts_the_same_budget_without_the_extra_key():
+    """Positive control (G-07): the two rejections above are caused by the extra
+    key, not by the budget shape itself."""
+    spec = _valid_spec()
+    spec["acceptance_criteria"][0]["params"] = {
+        "goal_tolerance_budget": {"sut_xy_goal_tolerance_m": 0.25, "localization_budget_m": 0.60}
+    }
+    request, _ = main.parse_request(spec)
+    budget = request.acceptance_criteria[0].params.goal_tolerance_budget
+    assert (budget.sut_xy_goal_tolerance_m, budget.localization_budget_m) == (0.25, 0.60)
+
+
 def test_parse_request_non_ros2_interface_raises_usage():
     spec = _valid_spec()
     spec["interface"]["type"] = "grpc"

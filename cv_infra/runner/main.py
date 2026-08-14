@@ -16,7 +16,12 @@ Exit-code contract (0/1/2/3 — LOCKED §9): 0=pass, 1=fail/timeout (mission not
 the fine-grained verdict is retained in result.json), 2=bad JOB_SPEC/usage (incl.
 oracle-load failure — defence-in-depth, admit rejects first — and an oracle's
 ``validate_params`` rejection, D-1 2026-07-13 pre-boot), 3=platform (EULA missing,
-runner crash, verdict=error).
+runner crash, verdict=error). The code is DELIVERED by ``hard_exit`` — measured
+(p5c13, G-62): Isaac's ``SimulationApp.close()`` never returns, it terminates the
+process with status 0, so every code decided after a successful boot was silently
+overwritten before ``docker wait`` could see it (die codes 16/16 = 0, verdict=fail
+included). See ``hard_exit`` and ``run``'s ``finally`` for the repair + its
+REQ-EXEC-015 trade-off.
 """
 
 from __future__ import annotations
@@ -141,6 +146,31 @@ def write_result(result: dict, result_path: Path) -> Path:
 def exit_code_for_verdict(verdict: str) -> int:
     """Map a result verdict to the 0/1/2/3 exit contract."""
     return _VERDICT_EXIT.get(verdict, EXIT_PLATFORM)
+
+
+def hard_exit(code: int, *, exit_process=os._exit) -> None:
+    """Deliver ``code`` to the process (container) boundary — nothing runs after.
+
+    Measured (p5c13 3-arm GPU probe, G-62): ``SimulationApp.close()`` does NOT
+    return — it terminates the process with status 0. Anything that runs between
+    the decision and the status can therefore erase it, and Kit's shutdown is not
+    the only such thing: interpreter finalization (atexit hooks, ``__del__``,
+    non-daemon Kit threads) can hang or exit on its own. ``os._exit`` is the only
+    delivery that no vendor teardown, GC or thread join can preempt.
+
+    ``os._exit`` skips buffer flushing, so the Python streams are flushed HERE
+    first — the runner's evidence (boot trace, cache delta, oracle tolerance
+    audit) is stdout/stderr in the container log (G-24). What the C++ (carb/Kit)
+    side left in libc buffers is not flushable from Python; the live probe
+    asserts the last runner line survives (``scripts/exit_contract_probe.sh``).
+
+    ``exit_process`` is injected for the CPU test only — production always uses
+    ``os._exit`` (a ``sys.exit`` here would be catchable *and* would resume
+    interpreter shutdown, i.e. exactly the two ways the code got lost).
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    exit_process(code)
 
 
 def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
@@ -526,8 +556,25 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         for recorder in (rosbag, video):  # failure paths: no child proc/writer leak
             if recorder is not None:
                 recorder.abort()
-        adapter.teardown()  # step 11: clean shutdown
-        sim.close()
+        adapter.teardown()  # step 11: clean shutdown (rclpy node + DDS domain leave)
+        # step 12: the sim is deliberately NOT closed here (G-62). Isaac's
+        # SimulationApp.close() does not return — it ends the process with status 0,
+        # which is precisely how every post-boot exit code died at the container
+        # boundary (16/16 die codes = 0, verdict=fail and timeout included). The
+        # code decided above is delivered instead by main -> hard_exit(os._exit).
+        # REQ-EXEC-015 (resource return) trade-off, taken with eyes open:
+        #   kept — this job's OWN outputs are already flushed before we get here:
+        #     result.json (write+os.replace), the rosbag2 child (SIGINT + wait, or
+        #     abort above) and the cv2 mp4 writer (release), plus the rclpy node;
+        #   given up — Kit's graceful shutdown. VRAM/GPU context return then rests
+        #     on process death (driver teardown), which the live probe measures
+        #     (nvidia-smi back to baseline after `docker wait`), and any Kit-internal
+        #     cache flush that only happens inside close() is lost — that is a WARM
+        #     START optimization, never a job output, and the runner's own
+        #     cache_delta line above is emitted at this same point either way.
+        # If the live probe shows close() raising a catchable SystemExit (unknown as
+        # of p5c14 — arm 3 of the probe answers it), graceful close can come back in
+        # front of hard_exit at zero cost to the contract.
 
 
 def _start_quiet(recorder):  # pragma: no cover - GPU path helper
@@ -565,4 +612,4 @@ def main(env: dict | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+    hard_exit(main())  # NOT sys.exit: interpreter shutdown can still eat the code (G-62)

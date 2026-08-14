@@ -577,7 +577,15 @@ class SimRuntime:
             callback()
 
     def close(self) -> None:
-        """Clean shutdown — returns VRAM/slots (REQ-EXEC-015, NFR-EXEC-002/004)."""
+        """Clean shutdown — returns VRAM/slots (REQ-EXEC-015, NFR-EXEC-002/004).
+
+        NOT on the runner's terminal path since p5c14: the vendor ``close()`` does
+        not return, it ends the process with status 0 and takes the job's exit code
+        with it (G-62), so ``main.run``'s ``finally`` hands the shutdown to process
+        death (``main.hard_exit``) instead. Kept as the explicit shutdown seam for a
+        caller that must OUTLIVE the sim (probes/tools), and as the one place to
+        re-enable graceful close if the live probe shows it is survivable.
+        """
         if self.simulation_app is not None:  # pragma: no cover - GPU path
             self.simulation_app.close()
             self.simulation_app = None
