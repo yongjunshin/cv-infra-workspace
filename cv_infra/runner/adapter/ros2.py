@@ -417,6 +417,17 @@ class Ros2Adapter(SimAdapter):
         response = future.result()
         return bool(response is not None and response.success)
 
+    def _relay_odom(self, msg: object, publishers: list) -> None:
+        """The relay body: fan ONE received Odometry out to every target publisher.
+
+        A named method, not a closure, so the count-then-publish behaviour is
+        CPU-testable — this is the exact code that silently passed 24.9 % of the
+        stream (G-63), and "did it run" was never the question.
+        """
+        self._odom_relayed += 1
+        for pub in publishers:
+            pub.publish(msg)
+
     def _ensure_odom_fanout(self) -> None:  # pragma: no cover - ROS path
         """Supplement (not replace) the sample graph: relay the ONE sim-published
         Odometry stream to every publisher-less ``odom_topics[]`` entry (measured
@@ -435,13 +446,9 @@ class Ros2Adapter(SimAdapter):
             self._odom_fanout_done = True  # graph already covers every entry
             return
         publishers = [self._node.create_publisher(Odometry, t, 10) for t in targets]
-
-        def relay(msg: Odometry) -> None:
-            self._odom_relayed += 1  # counted, not assumed (G-63 ①)
-            for pub in publishers:
-                pub.publish(msg)
-
-        subscription = self._node.create_subscription(Odometry, sources[0], relay, 10)
+        subscription = self._node.create_subscription(
+            Odometry, sources[0], lambda msg: self._relay_odom(msg, publishers), 10
+        )
         self._odom_relay = (subscription, publishers)
         self._odom_targets = len(targets)
         self._odom_fanout_done = True

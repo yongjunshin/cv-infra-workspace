@@ -198,6 +198,26 @@ def test_step_and_spin_drains_a_bounded_batch_not_a_single_callback():
     assert {timeout for _, timeout in fake.spins} == {0.0}  # non-blocking: never eats the step
 
 
+def test_relay_odom_counts_every_message_it_fans_out():
+    """The relay body itself: count first, then publish to EVERY target."""
+
+    class _Pub:
+        def __init__(self) -> None:
+            self.got: list[object] = []
+
+        def publish(self, msg) -> None:
+            self.got.append(msg)
+
+    adapter = ros2.Ros2Adapter()
+    pubs = [_Pub(), _Pub()]
+    first, second = object(), object()
+    adapter._relay_odom(first, pubs)
+    adapter._relay_odom(second, pubs)
+
+    assert adapter._odom_relayed == 2  # what the fidelity line reports
+    assert all(pub.got == [first, second] for pub in pubs)  # dualization: BOTH targets
+
+
 def test_odom_relay_fidelity_line_reports_the_ratio_against_clock():
     # The p5c13 measurement itself (1800 relayed against 7210 clock messages).
     line = ros2.odom_relay_fidelity_line(1800, 1, 7210)
