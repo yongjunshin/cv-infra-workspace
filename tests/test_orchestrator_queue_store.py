@@ -320,7 +320,7 @@ def test_v1_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert (job.runner_exit_code, job.infra_error) == (None, None)  # ... v4 (p4c5)
         store.record_envelope("env-1", ["r0"])  # new tables exist and accept writes
         assert store.load_envelope("env-1") is not None
-    assert _stamped_version(db) == 7  # v7 = p5c2 M4 envelope_reports table (additive)
+    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
 
 
 def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
@@ -344,7 +344,7 @@ def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert job.job_spec is None
         job.job_spec = {"job_id": "v2-req:0", "sut_image_ref": "img:1"}
         store.upsert_job(job)  # the new column accepts writes
-    assert _stamped_version(db) == 7  # v7 = p5c2 M4 envelope_reports table (additive)
+    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
 
 
 def test_v3_file_upgrades_in_place_and_keeps_rows(tmp_path):
@@ -375,7 +375,65 @@ def test_v3_file_upgrades_in_place_and_keeps_rows(tmp_path):
     with Store(db) as reopened:
         (job,) = reopened.load_jobs()
         assert (job.runner_exit_code, job.infra_error) == (137, "runner container hard-crashed")
-    assert _stamped_version(db) == 7  # v7 = p5c2 M4 envelope_reports table (additive)
+    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
+
+
+# The EXACT v7 envelopes shape as shipped by p5c2 (store.py @ 2805522) — the shape of
+# the store file the p5c14 compose deployment actually created on the workstation, and
+# the one an in-place v8 upgrade has to handle (same anchoring discipline, G-28).
+_V7_ENVELOPES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS envelopes (
+    envelope_id    TEXT PRIMARY KEY,
+    status         TEXT NOT NULL,
+    report_outcome TEXT,
+    error          TEXT,
+    submitted_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS envelope_requests (
+    envelope_id       TEXT    NOT NULL,
+    position          INTEGER NOT NULL,
+    request_id        TEXT    NOT NULL UNIQUE,
+    oracle_plugin_dir TEXT,
+    PRIMARY KEY (envelope_id, position)
+);
+"""
+
+
+def test_v7_envelope_rows_upgrade_in_place_to_the_self_test_columns(tmp_path):
+    # A p5c2 file (envelopes without the p5c15 provenance columns) opens, gains them
+    # via the guarded ALTER and keeps its rows — CREATE IF NOT EXISTS alone cannot add
+    # a column to an EXISTING table, so this is the branch that a real deployed store
+    # takes. A legacy row reads back as "an ordinary submission", which it was.
+    db = tmp_path / "cv.sqlite3"
+    legacy = sqlite3.connect(str(db))
+    try:
+        legacy.executescript(_V7_ENVELOPES_SCHEMA)
+        legacy.execute(
+            "INSERT INTO envelopes (envelope_id, status, report_outcome, submitted_at)"
+            " VALUES ('env-old', 'completed', 'pass', '2026-08-13T00:00:00+00:00')"
+        )
+        legacy.execute(
+            "INSERT INTO envelope_requests (envelope_id, position, request_id)"
+            " VALUES ('env-old', 0, 'env-old/r0')"
+        )
+        legacy.execute("PRAGMA user_version = 7")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    with Store(db) as store:
+        old = store.load_envelope("env-old")
+        assert old is not None
+        assert (old.report_outcome, old.request_ids) == ("pass", ["env-old/r0"])  # v7 data intact
+        assert (old.is_self_test, old.origin) == (False, None)  # never fabricated
+        store.record_envelope(
+            "env-selftest", ["env-selftest/r0"], is_self_test=True, origin="built-in-stub"
+        )
+
+    with Store(db) as reopened:  # the new columns accept writes and survive a reopen
+        fresh = reopened.load_envelope("env-selftest")
+        assert (fresh.is_self_test, fresh.origin) == (True, "built-in-stub")
+    assert _stamped_version(db) == 8
 
 
 def test_newer_schema_version_refuses_loudly(tmp_path):

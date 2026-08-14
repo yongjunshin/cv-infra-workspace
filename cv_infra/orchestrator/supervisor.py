@@ -147,6 +147,36 @@ _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immed
 # the production ``RunJobRunner`` share this ONE constant (이중 정의 금지).
 DEFAULT_JOB_TIMEOUT_S = 1800.0
 
+# --- runner /dev/shm (LOCKED risk R-shm, M5 §8 / §3.3 D-O) --------------------------------
+#
+# Kit uses /dev/shm; docker's default is 64m. Every Isaac boot the platform runs from a
+# SCRIPT already overrides it — and the production runner spawn (this module) was the ONE
+# Isaac boot path that did not, i.e. the two planes disagreed about the same container knob.
+#
+# SOURCE of the value (in-repo, MEASURED — not invented, CLAUDE §2-4):
+#   * scripts/isaac_smoke/README.md §--shm-size (2026-07-03, DoD-P1-04 smoke): "measured
+#     in-run usage 28K/1.0G (1%) for the smoke scene — 1g is ample ... Kept at 1g for Kit
+#     headroom (docker default 64m)". The measurement harness is run_smoke.sh, which spawns
+#     with ``--shm-size "$CV_SMOKE_SHM_SIZE"`` and captures ``df -h /dev/shm`` per run.
+#   * scripts/workstation_setup/common.sh ``CV_SMOKE_SHM_SIZE=1g`` and
+#     scripts/measure/common.sh ``CV_MEASURE_SHM_SIZE=1g`` ("docker default 64m is too small
+#     for Kit; separate from the DDS SHM transport") — the same value on both GPU harnesses.
+# So this default ADOPTS the platform's own proven Isaac boot recipe; it does not invent a
+# number, and it is a tmpfs CAP (memory is consumed only when used), not an allocation.
+#
+# WHAT IT DOES *NOT* CLAIM (honesty — the gap Wave C must measure):
+#   * No production runner has been observed CRASHING on 64m. This is preemptive plumbing of
+#     a LOCKED risk, not the repair of an observed defect.
+#   * That 28K measurement was taken with the Fast DDS SHM transport DISABLED (the smoke
+#     forces the UDPv4-only profile). The production spawn injects NO
+#     ``FASTRTPS_DEFAULT_PROFILES_FILE`` (see the runner ``environment`` assembly below), so a
+#     live job's /dev/shm ALSO carries whatever Fast DDS data-sharing puts there — a
+#     population the 28K number never covered. Hence a knob, not a hardcode: the live
+#     measurement (peak ``df -B1 /dev/shm`` inside a running job's runner container) belongs
+#     to the GPU-host cycle, and the operator raises ``CV_RUNNER_SHM_SIZE`` (serve.py) if it
+#     lands near the cap.
+DEFAULT_RUNNER_SHM_SIZE = "1g"
+
 # (a)+(b) transport-gap repair (p5c5 T2, history 2026-07-21 놀란점 3): the SUT/runner
 # image pull is UPSTREAM of every existing watchdog. The wall-clock ``job_timeout_s``
 # only starts inside ``_supervise_until_runner_exit`` — AFTER the SUT container is
@@ -673,6 +703,7 @@ def run_job(
     sut_restart_limit: int = 1,
     poll_interval_s: float = 1.0,
     ros_domain_id: int | None = None,
+    shm_size: str | int | None = DEFAULT_RUNNER_SHM_SIZE,
 ) -> JobOutcome:
     """Run ONE verification job end-to-end and return its ``JobOutcome`` (D-2 seam).
 
@@ -736,6 +767,15 @@ def run_job(
     it passes the allocated id here so run_job does NOT re-derive a colliding pure-hash id
     (the p4c5 defect: k>=~6 동시 admission에서 두 잡이 같은 도메인 — cross-talk은 잡별 전용
     브리지+host_net=0으로 구조 차단되나 "잡별 고유 도메인" 하위 불변식이 확률적 파손).
+
+    ``shm_size`` (p5c15, LOCKED risk R-shm) sizes the RUNNER container's ``/dev/shm``
+    (docker default 64m is below what Kit expects — see ``DEFAULT_RUNNER_SHM_SIZE`` for the
+    measured in-repo source and for what that measurement does NOT cover). Runner only: the
+    SUT is a blackbox nav stack, not a Kit process, and gets the docker default exactly as
+    before. ``None`` = pass nothing to docker (the pre-p5c15 behavior, kept reachable so the
+    knob can be turned OFF as cleanly as it can be turned up). The effective value is emitted
+    on the ``runner-mounts`` line (G-26 feature-on gate) — a silent knob is a knob nobody can
+    prove engaged.
 
     Infra failures (docker/spawn/collection) are returned as ``infra_error``, never
     raised; a missing ``job_id`` is a seam-contract violation and raises ValueError
@@ -848,6 +888,10 @@ def run_job(
                 if cfg_key in adapter_config:
                     environment[env_key] = str(adapter_config[cfg_key])
         runner_extra: dict[str, Any] = {}
+        if shm_size is not None:
+            # R-shm: /dev/shm for Kit (runner only — the SUT keeps the docker default).
+            # Omitted entirely when None so the pre-p5c15 call shape stays byte-identical.
+            runner_extra["shm_size"] = shm_size
         if runner_gpus:
             # Runner = Isaac = always GPU on the default path (--gpus all equivalent);
             # NVIDIA_DRIVER_CAPABILITIES=all is baked into the runner image (M5), so
@@ -866,7 +910,7 @@ def run_job(
             str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
             str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
         }
-        _log_runner_mounts(job_id, volumes)
+        _log_runner_mounts(job_id, volumes, shm_size=shm_size)
         runner_ct = client.containers.run(
             runner_image,
             detach=True,
@@ -917,19 +961,23 @@ def run_job(
         _discard_scratch(scratch_dir)  # D-B: per-job scratch dies with the job (stateless)
 
 
-def _log_runner_mounts(job_id: str, volumes: dict[str, dict[str, str]]) -> None:
+def _log_runner_mounts(
+    job_id: str, volumes: dict[str, dict[str, str]], *, shm_size: str | int | None = None
+) -> None:
     """Feature-on gate (G-26): one structured stderr line per runner spawn.
 
     Emits the FULL assembled mount spec (count, ro/rw mode, source/target paths)
     so tests and operators can assert the cache/plugin mounts actually engaged —
     a silent no-mount (all-cold measured as warm) is worse than a loud error.
     Wave-2 GPU evidence additionally uses ``docker inspect`` (G-26 합의).
+    ``shm_size`` (p5c15, R-shm) rides the same line — /dev/shm is a tmpfs mount, and
+    the effective size must be assertable off ONE record (null = docker default).
     """
     spec = [
         {"source": source, "target": bind["bind"], "mode": bind["mode"]}
         for source, bind in volumes.items()
     ]
-    line = json.dumps({"job_id": job_id, "mounts": spec}, sort_keys=True)
+    line = json.dumps({"job_id": job_id, "mounts": spec, "shm_size": shm_size}, sort_keys=True)
     print(f"[cv-supervisor] runner-mounts {line}", file=sys.stderr, flush=True)
 
 
@@ -1263,6 +1311,9 @@ class RunJobRunner:
       declaration the ``ParallelSupervisor`` coherence gate reads (p4c1 후속 ②)
       — and the SAME attribute is what every ``run_job`` call receives (single
       source, 이중 정의 금지; default = ``DEFAULT_JOB_TIMEOUT_S``).
+    * ``shm_size`` (p5c15, R-shm) is the runner ``/dev/shm`` size every spawned job
+      gets; PUBLIC for the same reason (``serve.py`` logs the effective value at
+      boot). Default = ``DEFAULT_RUNNER_SHM_SIZE``; None = docker's default.
     """
 
     def __init__(
@@ -1277,9 +1328,11 @@ class RunJobRunner:
         runner_gpus: bool = True,
         readiness_probe: ReadinessProbe | None = None,
         job_timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
+        shm_size: str | int | None = DEFAULT_RUNNER_SHM_SIZE,
         run_job_fn: Callable[..., JobOutcome] | None = None,
     ) -> None:
         self.job_timeout_s = job_timeout_s  # public: coherence-gate contract (class docstring)
+        self.shm_size = shm_size  # public: the operator-visible R-shm value (serve-config log)
         self._out_dir = Path(out_dir)
         self._runner_image = runner_image
         self._docker_client = docker_client
@@ -1314,6 +1367,7 @@ class RunJobRunner:
             # p4c6 §7-1: hand run_job the admission-allocated id (None when no
             # allocator is attached -> run_job's pure-hash fallback).
             ros_domain_id=job.ros_domain_id,
+            shm_size=self.shm_size,  # p5c15 R-shm (construction-time knob, one source)
         )
         return _job_result_of(job, outcome)
 

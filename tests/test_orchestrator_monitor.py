@@ -72,6 +72,11 @@ _PIN_REQUEST = {
     "submitted_at",
     "envelope_status",
     "report_outcome",
+    # p5c15 (REQ-SELFTEST-004): the envelope's self-test marker. Adding it here IS the
+    # NEG-3 review gate being exercised — a BOOLEAN (structurally incapable of carrying a
+    # domain value), unlike its free-text sibling ``origin``, which stays store-only.
+    # The disjointness verdict lives in tests/negative/test_monitor_no_domain_leak.py.
+    "is_self_test",
     "pass_count",
     "fail_count",
     "error_count",
@@ -317,6 +322,7 @@ def _sample_record(concurrency_budget_k: int | None = 2) -> OperationalRecord:
                 submitted_at=None,
                 envelope_status="completed",
                 report_outcome="passed",
+                is_self_test=False,
                 pass_count=1,
                 fail_count=0,
                 error_count=0,
