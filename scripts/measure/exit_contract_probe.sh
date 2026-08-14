@@ -176,9 +176,17 @@ probe_arms() {
   # this probe into a mystery timeout.
   docker network inspect "$CV_MEASURE_NET" >/dev/null 2>&1 \
     || docker network create --driver bridge "$CV_MEASURE_NET" >/dev/null
-  # Cache mounts are OPTIONAL here (unlike the VRAM/wall harness, this probe measures
-  # a status, not a duration): mounted when CV_ISAAC_CACHE_ROOT is set, so a warm tree
-  # shortens the boot; absent, the arm just boots cold. D-1 table, verbatim.
+  # Cache mounts: this probe measures a STATUS, not a duration, so the tree only makes
+  # the boot faster. They are however ALWAYS mounted in practice, NOT optional — the
+  # SoT sourced above declares CV_ISAAC_CACHE_ROOT readonly with a P1-smoke DEFAULT
+  # (workstation_setup/common.sh:65, $HOME/docker/isaac-sim), so the guard below is
+  # false only if that SoT stops defaulting (re-derived p5c15: `unset
+  # CV_ISAAC_CACHE_ROOT; source common.sh` still yields the default). Consequence to
+  # know: an arm run without an explicit root PROVISIONS/chowns that default tree
+  # (G-15). Deliberate — unlike warm_cache.sh / isaac_baseline_run.sh, whose
+  # measurement IS the tree (they capture the operator's explicit root BEFORE sourcing
+  # and die without one), this probe does not care which tree it warms from.
+  # Mount list = D-1 canonical 6-way, verbatim (mirrors warm_cache.sh's cache_mounts).
   local cache_mounts=()
   if [[ -n "${CV_ISAAC_CACHE_ROOT:-}" ]]; then
     measure_provision_tree "$CV_ISAAC_CACHE_ROOT" "$CV_EXIT_IMAGE"

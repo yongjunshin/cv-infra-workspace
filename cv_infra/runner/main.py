@@ -573,10 +573,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         #     cache flush that only happens inside close() is lost — that is a WARM
         #     START optimization, never a job output, and the runner's own
         #     cache_delta line above is emitted at this same point either way.
-        # If the live probe shows close() raising a catchable SystemExit (unknown as
-        # of p5c14 — the ``closeprobe`` arm of scripts/measure/exit_contract_probe.sh
-        # answers it), graceful close can come back in front of hard_exit at zero
-        # cost to the contract.
+        # The "put graceful close back in front of hard_exit" branch is CLOSED
+        # (p5c14 live ``closeprobe`` arm of scripts/measure/exit_contract_probe.sh):
+        # close() raises nothing catchable — the arm exited 0 with NEITHER of its two
+        # markers printed, i.e. the process ended INSIDE close(). Skipping it was the
+        # only option, not a conservative guess. Re-opening this needs a new probe
+        # run showing 42 (raised) or 43 (returned), never an assumption (G-62 ④).
 
 
 def _start_quiet(recorder):  # pragma: no cover - GPU path helper
