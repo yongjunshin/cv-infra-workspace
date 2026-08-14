@@ -637,11 +637,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 def _matrix_view(report: dict[str, Any]) -> dict[str, Any]:
     """Adapt a VerificationReport JSON into ``report.matrix.render_text``'s
     ``build_matrix`` shape (the report row carries a richer rollup than the P4
-    preview table). The report JSON rollup exposes ``flaky`` (bool), not the
-    ``flakiness`` float the P4 column formats, so that column renders ``-`` here
-    — the full per-row detail stays available via ``--json``. Fields read here
-    are anchored to the canonical fixture
-    (``tests/test_report_verification_report.py``)."""
+    preview table). The ``flakiness`` float lives on the ROW, as a sibling of
+    ``rollup`` (which itself carries the ``flaky`` bool + ``repeats``/``verdicts``),
+    so the P4 flakiness column reads ``row["flakiness"]`` verbatim — a value
+    renders as a value and an absent/None one keeps ``render_text``'s ``-`` null
+    idiom (no verdict-bearing repeat -> no flakiness). Surfacing it is the CLI
+    half of the flaky surface CEO 결정 M-2 pinned; the full per-row detail stays
+    available via ``--json``. Fields read here are anchored to the canonical
+    fixture (``tests/test_report_verification_report.py``)."""
     summary = report.get("summary", {})
     rows: list[dict[str, Any]] = []
     for row in report.get("matrix", []):
@@ -651,7 +654,7 @@ def _matrix_view(report: dict[str, Any]) -> dict[str, Any]:
             {
                 "request_id": row.get("request_id"),
                 "verdict": rollup.get("verdict"),
-                "flakiness": None,
+                "flakiness": row.get("flakiness"),
                 "jobs": rollup.get("repeats", len(verdicts)),
                 "counts": {"pass": verdicts.count("pass"), "fail": verdicts.count("fail")},
             }
