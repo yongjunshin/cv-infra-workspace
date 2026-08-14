@@ -37,7 +37,7 @@ CV_VRAM_PER_INSTANCE_MB=<측정값>            → compose → serve.py → comp
 ②' scripts/detect_gpu.sh >> docker/.env           ← 이 문서
 ②  scripts/consent/accept_eula.sh                 NVIDIA EULA(명시적, 1회)
 ③  docker compose -f docker/compose.yaml up -d --build
-④  cv-infra selftest                              (M7 — 미구현)
+④  cv-infra selftest                              (M7 — 구현됨; CV_SELFTEST_SUT_IMAGE 필요)
 ```
 
 `docker/.env`를 만든 **뒤**, `up` **전**에 돌린다. 출력은 그냥 `.env` 조각이라
