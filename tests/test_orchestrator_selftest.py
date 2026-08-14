@@ -34,9 +34,11 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from cv_infra.contract.loader import load_request
+from cv_infra.contract.schema import VerificationRequest
 from cv_infra.orchestrator import api, selftest, serve
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.monitor import build_operational_record, render_dashboard_html
@@ -48,6 +50,9 @@ from cv_infra.orchestrator.selftest import (
 )
 from cv_infra.orchestrator.store import Store
 from cv_infra.orchestrator.supervisor import DEFAULT_RUNNER_SHM_SIZE, RunJobRunner, run_job
+from cv_infra.runner.evaluate import read_field
+from cv_infra.runner.main import criteria_view
+from cv_infra.runner.telemetry import PhysicsTelemetrySampler
 from tests.test_supervisor_min import RUNNER_IMAGE, SUT_IMAGE, FakeClient, make_spec, put_result
 
 #: A PLATFORM-internal stub SUT handle for the CPU tests (the real one is a deployment
@@ -88,6 +93,18 @@ def _submit(client: TestClient, body: dict) -> str:
     return response.json()["envelope_id"]
 
 
+def _admitted(document: dict) -> VerificationRequest:
+    """A stub document through the REAL M1 admit gate -> the typed request.
+
+    Same 6-stage loader the server runs, so anything asserted downstream of it is
+    asserted on what the execution plane actually receives (no shortcut model build).
+    """
+    return load_request(
+        io.StringIO(json.dumps(document, indent=2, sort_keys=True)),
+        source_path="built-in-stub",
+    ).request
+
+
 def _ordinary_body() -> dict:
     """An ORDINARY submission of the same stub document (the contrast group).
 
@@ -114,7 +131,10 @@ def test_built_in_stub_admits_through_the_real_m1_gate():
         io.StringIO(json.dumps(document, indent=2, sort_keys=True)),
         source_path="built-in-stub",
     )
-    assert admitted.oracles == ("reached_goal",)  # bound by the real stage-5 loader
+    # Both MVP oracles bind through the real stage-5 loader — no_collision is not
+    # decoration: it is the only home of the chassis_path the runner's telemetry bind
+    # demands (see the dedicated test below), and its params survive extra=forbid.
+    assert admitted.oracles == ("reached_goal", "no_collision")
     assert admitted.request.sut.image_ref == STUB_SUT
     # 크기 1 봉투 × 기본 repeats=1 => k=1 single runner (M7 §3.2 footprint).
     assert admitted.request.execution_settings.repeats == 1
@@ -124,6 +144,78 @@ def test_built_in_stub_admits_through_the_real_m1_gate():
     assert scenario.initial_pose is not None
     assert (scenario.initial_pose.x, scenario.initial_pose.y) == (scenario.goal.x, scenario.goal.y)
     assert admitted.request.acceptance_criteria[0].params.position_tolerance_m is None
+
+
+def test_stub_supplies_the_chassis_path_the_telemetry_bind_demands():
+    """★ 라이브 차단 회귀: the runner builds the physics telemetry sampler and binds it
+    PRE-reset for EVERY job — ``runner/main.py`` never asks whether a collision
+    criterion was declared — and ``telemetry.bind()`` raises when it holds no
+    ``chassis_path``. A stub declaring ``reached_goal`` alone therefore dies BEFORE the
+    SUT readiness barrier, i.e. before the round-trip can prove anything.
+
+    Asserted along the runner's OWN read chain (``criteria_view`` -> ``read_field`` with
+    main.py's ``""`` default -> the sampler attribute the raise predicate tests), so the
+    regression reddens WITHOUT a GPU. That is the point: this failure was visible only
+    on the workstation until now.
+    """
+    (document,) = build_self_test_submission(environ=_STUB_ENV).body["requests"]
+    view = criteria_view(_admitted(document))
+    sampler = PhysicsTelemetrySampler(  # main.py's construction, verbatim
+        read_field(view, "chassis_path", ""),
+        read_field(view, "collision_excluded_paths", []) or [],
+    )
+    assert sampler.chassis_path, "stub would raise in telemetry.bind() before readiness"
+
+    # 비공허 대조 (G-35): drop the collision criterion and the empty default — the exact
+    # value the raise predicate rejects — comes back. So the assert above is sensitive
+    # to this one input, not to something that would hold either way.
+    stripped = {
+        **document,
+        "acceptance_criteria": [
+            c for c in document["acceptance_criteria"] if c["oracle"] != "no_collision"
+        ],
+    }
+    assert stripped["acceptance_criteria"] == [{"oracle": "reached_goal"}]
+    assert read_field(criteria_view(_admitted(stripped)), "chassis_path", "") == ""
+
+
+def test_stub_collision_prim_paths_are_the_measured_ones_not_invented():
+    """G-64 / CLAUDE §2-4: prim paths cannot be guessed — a WRONG ``chassis_path`` dies
+    in ``bind()`` ("not found in the stage") exactly as loudly as a missing one, and CPU
+    cannot check a path against a live stage. The one CPU-checkable provenance is that
+    the stub reuses the workstation-MEASURED paths whose source of truth is the platform
+    fixture; the measurement transfers only because the stub names the SAME scene and
+    robot (asserted here), which resolve to the same asset + robot prim.
+
+    Re-syncing the fixture with a new measurement reddens this — the intended coupling:
+    the stub must then be re-checked too.
+    """
+    fixture = yaml.safe_load(_CONSUMER_FIXTURE.read_text(encoding="utf-8"))
+    (document,) = build_self_test_submission(environ=_STUB_ENV).body["requests"]
+    assert fixture["scenario"]["scene"] == document["scenario"]["scene"]
+    assert fixture["scenario"]["robot"] == document["scenario"]["robot"]
+
+    (measured,) = [
+        c["params"] for c in fixture["acceptance_criteria"] if c["oracle"] == "no_collision"
+    ]
+    (stub_params,) = [
+        c["params"] for c in document["acceptance_criteria"] if c["oracle"] == "no_collision"
+    ]
+    assert stub_params["chassis_path"] == measured["chassis_path"]
+    # The exclusions are load-bearing, not decoration: the parked robot rests ON the
+    # floor, so unfiltered chassis contacts (self-body subtree + ground plane — the
+    # measured partners) would false-FAIL a motionless stub.
+    assert stub_params["collision_excluded_paths"] == measured["collision_excluded_paths"]
+    assert stub_params["collision_excluded_paths"]
+
+    # ...and each built document OWNS its params (the module constant is a nested
+    # mutable — a shallow copy would let one submission's edit ride into the next).
+    stub_params["collision_excluded_paths"].append("/mutated")
+    (nxt,) = build_self_test_submission(environ=_STUB_ENV).body["requests"]
+    (next_params,) = [
+        c["params"] for c in nxt["acceptance_criteria"] if c["oracle"] == "no_collision"
+    ]
+    assert "/mutated" not in next_params["collision_excluded_paths"]
 
 
 def test_stub_origin_marker_is_the_requirement_string_verbatim():
@@ -371,7 +463,15 @@ def test_self_test_surfacing_leaks_no_domain_value(tmp_path):
 
         spec_text = json.dumps([job.job_spec for job in store.load_jobs()])
         stub = build_self_test_submission(environ=_STUB_ENV).body["requests"][0]
-        domain_values = (stub["scenario"]["scene"], stub["scenario"]["robot"], STUB_SUT)
+        # The criteria params are domain values too (G-59 ④: the guard's input grows
+        # with the contract) — the chassis prim path joined the stub in p5c15.
+        (collision,) = [c for c in stub["acceptance_criteria"] if c["oracle"] == "no_collision"]
+        domain_values = (
+            stub["scenario"]["scene"],
+            stub["scenario"]["robot"],
+            STUB_SUT,
+            collision["params"]["chassis_path"],
+        )
         for value in domain_values:
             assert value in spec_text, f"양성 대조 실패 — store에 {value!r}가 없다"
 
