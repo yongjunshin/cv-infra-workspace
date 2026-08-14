@@ -218,6 +218,13 @@ cv-infra selftest        # → exit 3, "not implemented yet"
 미구현, p5c15+). 없는 것을 있다고 쓰지 않기 위해 명시한다. 지금 시점에서 "이 호스트에
 배포가 살아있다"를 확인하는 방법은 **§4** 다.
 
+**self-test 의 두 번째 입력 = stub SUT 이미지** (p5c15 신설). self-test 는 **외부 SUT 없이**
+돌아야 하므로(`NFR-SELFTEST-001`) 플랫폼이 자기 SUT 컨테이너를 스스로 공급한다. 그 이미지의
+빌드·배선(`CV_SELFTEST_SUT_IMAGE`)과 **GPU 없이** 계약 만족을 확인하는 프로브는
+[`docker/selftest_stub/README.md`](../../docker/selftest_stub/README.md) 에 있다. 이미지 핸들이
+설정돼 있지 않으면 self-test 는 **추측하지 않고 거부한다**(exit 3) — 소비자 이미지로의 폴백은
+`NFR-SELFTEST-001` 위반이라 코드가 금지한다.
+
 ---
 
 ## 4. 기동 직후 확인 (selftest 가 생기기 전까지의 정직한 대체)
