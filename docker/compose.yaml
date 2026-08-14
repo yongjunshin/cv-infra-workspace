@@ -20,10 +20,13 @@
 # uses the compose default bridge; per-job networks are created at runtime by M3.
 #
 # ─── The deployment flow this file is step ③ of (C-2, REQ-DEPLOY-001) ────────
+# Operator-facing walkthrough of all four steps: docs/deploy/README.md
 #   ① scripts/workstation_setup/provision.sh   (host prereqs: driver + toolkit)
+#   ②' docker/.env + scripts/detect_gpu.sh >> docker/.env      (configuration)
 #   ② scripts/consent/accept_eula.sh           (NVIDIA EULA — explicit, once)
 #   ③ docker compose -f docker/compose.yaml up -d --build      ← THIS FILE
-#   ④ cv-infra selftest                        (M7 — not implemented yet, p5c11+)
+#   ④ cv-infra selftest                        (M7 — reserved, NOT implemented:
+#                                               the CLI verb exits 3 today)
 # "One command + one documented consent step" is the honest form of the
 # one-command promise (M5 §7); step ② can never be auto-accepted (LOCKED §8).
 #
