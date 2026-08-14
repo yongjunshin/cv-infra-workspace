@@ -199,7 +199,10 @@ bash "$SCRIPT_DIR/check_consent.sh"
 cat <<NEXT
 
   Consent is on file. Next:
-    docker compose -f docker/compose.yaml up -d --build
+    CV_SOURCE_REVISION="\$(git rev-parse HEAD)" \\
+      docker compose -f docker/compose.yaml up -d --build
+  (that prefix stamps the built image with its source commit — a build without it is
+   refused; docs/deploy/README.md §3-③. Without --build it is not needed.)
   The gate can be re-checked at any time (exit 0 = recorded, exit 3 = not):
     bash scripts/consent/check_consent.sh
 

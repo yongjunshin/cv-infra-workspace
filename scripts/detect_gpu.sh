@@ -12,7 +12,8 @@
 #   ① scripts/workstation_setup/provision.sh    host prereqs (driver + toolkit)
 #   ②' scripts/detect_gpu.sh >> docker/.env     ← THIS SCRIPT (adaptive parameters)
 #   ② scripts/consent/accept_eula.sh            NVIDIA EULA (explicit, once)
-#   ③ docker compose -f docker/compose.yaml up -d --build
+#   ③ CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+#       docker compose -f docker/compose.yaml up -d --build
 #
 # Reuse (do-not-reinvent): the identification is stock `nvidia-smi --query-gpu=name`
 # — the same NVIDIA tool the provisioning preflight already uses. This is a ONE-SHOT
