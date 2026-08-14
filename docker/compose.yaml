@@ -28,8 +28,10 @@
 #        docker compose -f docker/compose.yaml up -d --build    ← THIS FILE
 #      (the env prefix is required only when BUILDING — it stamps the image with
 #       its source commit, G-66; see the `args:` block below)
-#   ④ cv-infra selftest                        (M7 — reserved, NOT implemented:
-#                                               the CLI verb exits 3 today)
+#   ④ cv-infra selftest                        (M7 — implemented p5c15; needs the
+#                                               built-in stub SUT handle in the
+#                                               CLIENT env: CV_SELFTEST_SUT_IMAGE.
+#                                               Unset = exit 3, never a guess.)
 # "One command + one documented consent step" is the honest form of the
 # one-command promise (M5 §7); step ② can never be auto-accepted (LOCKED §8).
 #

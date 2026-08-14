@@ -24,8 +24,8 @@
 | **약속함** | **한 명령 기동 + 문서화된 동의 한 단계**(`REQ-DEPLOY-001`, M5 §7). "완전 원커맨드"가 아니라 이것이 정직한 형태다 — 동의는 자동화될 수 없기 때문이다(아래 §3-②). |
 | **약속함** | 호스트에 **CUDA·Isaac Sim 을 설치하지 않는다**. 필요한 것은 드라이버 + 컨테이너 런타임뿐(`NFR-DEPLOY-005`). |
 | **약속함** | 배포는 **어느 기계인지 모른다**. GPU 지식은 `profiles/**` 한 곳에만 있다(`REQ-DEPLOY-003`, [gpu-profiles.md](gpu-profiles.md)). |
-| **약속 안 함** | **④ `cv-infra selftest` 는 아직 없다.** 예약된 자리만 있고 실행하면 exit **3**(미구현)이 난다 — §3-④ 참조. 배포가 살아있음을 확인하는 **현재의 정직한 방법은 §4**다. |
-| **약속 안 함** | **러너 이미지(15.5 GB)를 새 호스트로 옮기는 경로가 아직 없다.** 저장소에 레지스트리 push 경로가 0 이다 — §7 에 선택지와 실측 비용만 정리돼 있고, 채택은 미결정이다. |
+| **약속함** | **④ `cv-infra selftest` 가 외부 SUT 0 의존으로 라운드트립을 돈다**(p5c15 실측: 4/4 green, 27–43 s). 단 **빌트인 stub SUT 이미지 핸들**(`CV_SELFTEST_SUT_IMAGE`)을 배포가 공급해야 하고, 없으면 **추측하지 않고 exit 3** 이다 — §3-④. |
+| **약속 안 함** | **러너 이미지(15.5 GB)를 바이트 그대로 새 호스트에 옮기는 경로**. 배송 경로는 **(C) 새 호스트에서 재빌드**로 확정됐고(결정 D-6), 재빌드는 **입력 집합**(베이스 다이제스트 + `uv.lock` + apt 버전 + 소스 커밋)만 핀한다 — **결과 이미지 다이제스트는 재현되지 않는다**. §7. |
 | **약속 안 함** | 인증. 제출 API 는 authn 이 없다(단일 호스트 MVP). 그래서 기본 공개 주소가 `127.0.0.1` 이다. |
 
 ---
@@ -54,7 +54,7 @@
 ②  scripts/consent/accept_eula.sh                 NVIDIA EULA — 운영자만, 1회
 ③  CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
      docker compose -f docker/compose.yaml up -d --build     ← 제어 평면 기동
-④  cv-infra selftest                              ★ 미구현(p5c15+) — 대신 §4
+④  CV_SELFTEST_SUT_IMAGE=<stub 이미지> cv-infra selftest   외부 SUT 0 의존 라운드트립
 ```
 
 **순서가 중요하다.** `②'`(설정)를 `②`(동의) **앞에** 두는 것이 기본 순서다 —
@@ -129,16 +129,26 @@ REQUIRED 6개(전부 **호스트 절대경로**):
 >
 > * `cp docker/.env.example docker/.env` · `> docker/.env` · 에디터의 "새 파일로 저장"
 >   **금지** — 동의 키가 소멸하고, 복구하려면 **운영자를 다시 불러 `②`를 재실행**해야 한다.
+> * **백업도 만들지 마라** — `.bak`·복사본·`docker inspect` 덤프 전부. **동의를 운영자
+>   없이 복원할 수 있는 사본은 그 자체가 자동수락 경로다**(G-68 ④). 복원이 필요하면
+>   `②`를 다시 돌린다 — 그게 NEG-2 의 요지다.
 > * 대신 **멱등 upsert** 로 고쳐라(같은 관용구가 `scripts/consent/accept_eula.sh::env_set`
->   에 있다 — 해당 키 줄만 지우고 다시 append, 그리고 `install -m 600`):
+>   에 있다 — 해당 키 줄만 지우고 다시 append, 그리고 `install -m 600`). 아래는 편집본이
+>   동의 키를 **잃지 않았음을 확인한 뒤에만** 원본을 갈아끼우는 형태다(백업의 안전성을
+>   백업 없이 얻는 방법):
 >
 >   ```bash
->   cp -a docker/.env docker/.env.bak.$(date +%s)      # 먼저 백업
->   tmp=$(mktemp)
+>   tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 >   grep -v -E '^[[:space:]]*(export[[:space:]]+)?CV_MAX_CONCURRENT=' docker/.env > "$tmp"
 >   printf 'CV_MAX_CONCURRENT=%s\n' "<새 값>" >> "$tmp"
->   install -m 600 "$tmp" docker/.env && rm -f "$tmp"
+>   for k in ACCEPT_EULA PRIVACY_CONSENT; do          # 키 이름만 — 값은 보지 않는다
+>     grep -qE "^$k=." "$tmp" || { echo "REFUSE: consent key '$k' lost"; exit 1; }
+>   done
+>   install -m 600 "$tmp" docker/.env
 >   ```
+>   ⚠ 이 관용구는 키를 **파일 끝으로 옮긴다** — 앞에 있던 프로방넌스 주석과 분리된다
+>   (p5c14 실측). 주석이 붙어 있는 키(예: `CV_RUNNER_IMAGE`)는 **제자리 치환**으로 고치고
+>   주석의 Id·revision 도 같이 갱신하라(p5c15 실측 절차 = 이 문서 §9).
 > * 고친 **직후 매번** 게이트를 다시 돌려라:
 >   `bash scripts/consent/check_consent.sh; echo $?` → **0** 이어야 한다.
 > * `scripts/detect_gpu.sh >> docker/.env` 는 순수 append 라 안전하다.
@@ -208,26 +218,42 @@ CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
   평면과 **같은 `CV_STATE_DIR` 을 쓸 거라면 반드시 stop 이 끝난 뒤에 `up`** 하라:
   같은 SQLite 에 writer 가 둘이 되는 것은 순서로만 막힌다.
 
-### ④ self-test — **미구현**
+### ④ self-test
 
 ```bash
-cv-infra selftest        # → exit 3, "not implemented yet"
+# 배포에 stub SUT 이미지가 아직 없다면 먼저 굽는다 (레시피·계약 = docker/selftest_stub/README.md)
+CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker build \
+  -f docker/selftest_stub/Dockerfile --build-arg CV_SOURCE_REVISION="$CV_SOURCE_REVISION" \
+  -t cv-infra-selftest-stub:<tag> docker/selftest_stub
+
+# 라운드트립 (CLI 는 제어 평면 이미지 자신 — §4 의 일회용 컨테이너 관용구)
+docker compose -f docker/compose.yaml run --rm --no-deps \
+  -e CV_SELFTEST_SUT_IMAGE=cv-infra-selftest-stub:<tag> \
+  orchestrator cv-infra selftest --api http://orchestrator:8000
 ```
 
-`cv-infra selftest` 는 CLI 에 **예약된 자리만 있고 아직 배선되지 않았다**(`REQ-SELFTEST-001~004`
-미구현, p5c15+). 없는 것을 있다고 쓰지 않기 위해 명시한다. 지금 시점에서 "이 호스트에
-배포가 살아있다"를 확인하는 방법은 **§4** 다.
-
-**self-test 의 두 번째 입력 = stub SUT 이미지** (p5c15 신설). self-test 는 **외부 SUT 없이**
-돌아야 하므로(`NFR-SELFTEST-001`) 플랫폼이 자기 SUT 컨테이너를 스스로 공급한다. 그 이미지의
-빌드·배선(`CV_SELFTEST_SUT_IMAGE`)과 **GPU 없이** 계약 만족을 확인하는 프로브는
-[`docker/selftest_stub/README.md`](../../docker/selftest_stub/README.md) 에 있다. 이미지 핸들이
-설정돼 있지 않으면 self-test 는 **추측하지 않고 거부한다**(exit 3) — 소비자 이미지로의 폴백은
-`NFR-SELFTEST-001` 위반이라 코드가 금지한다.
+- **종료 코드가 계약이다**: `0` 라운드트립 green · `1` stub 판정 fail · `2` 계약/422 ·
+  `3` 인프라(핸들 미설정·오케스트레이터 부재 등). 판정은 stub 의 대답이 아니라 **Isaac GT**
+  에서 다시 계산되므로 거짓말하는 stub 은 통과가 아니라 실패한다.
+- **`CV_SELFTEST_SUT_IMAGE` 를 어디에 두느냐가 함정**이다. 이 값은 봉투를 만드는
+  **클라이언트 프로세스**가 읽는다(오케스트레이터 서비스가 아니다) — 위처럼 일회용 CLI
+  컨테이너에 `-e` 로 준다. 미설정이면 **추측하지 않고 exit 3**(소비자 이미지로의 폴백은
+  `NFR-SELFTEST-001` 위반이라 코드가 금지한다).
+- **외부 SUT·소비자 저장소 의존 0**: 잡은 러너 + stub 두 컨테이너만 잡 전용 네트워크에
+  띄우고, 러너 마운트는 캐시 스크래치 · `job_spec.json` · 결과 디렉토리뿐이다(§9 실측).
+- self-test 결과는 **운영 대시보드 3면**(`/monitor`·`/monitor.json`·`cv-infra monitor`)에서
+  `self_test=true` 로 식별된다(`REQ-SELFTEST-004`).
+- **자명 시나리오**: 로봇이 목표 지점에 스폰되고 미션이 즉시 성공한다. 재는 것은 **배포가
+  살아있는가**(Isaac 기동·러너 실행·SUT 경계 DDS·결과 회수)이지 항법 품질이 아니다.
+  ⚠ 부작용으로 **미션이 ~0.2 s 라 녹화 경로는 사실상 검증되지 않는다** — MCAP/mp4 는
+  비거나 아예 안 생긴다(§9 실측). 녹화까지 확인하려면 실제 SUT 잡을 돌려라.
 
 ---
 
-## 4. 기동 직후 확인 (selftest 가 생기기 전까지의 정직한 대체)
+## 4. 기동 직후 확인 (④ 가 답하지 않는 것들)
+
+> `④` 는 *"라운드트립이 도는가"* 에 답한다. 아래는 *"어떤 구성으로 도는가"* 에 답한다 —
+> 둘 다 봐라. 특히 `serve-config` 한 줄은 마운트·캐시·k·러너 이미지 핀을 한 번에 보여준다.
 
 > **`cv-infra` CLI 는 어디서 오나**: 이 배포는 호스트에 아무것도 설치하지 않는다
 > (§0). CLI 는 **제어 평면 이미지 자신**이다 — 같은 이미지를 일회용으로 띄워 쓴다.
@@ -265,8 +291,8 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 > 배포는 겉보기에 정상으로 돌면서 측정을 전부 콜드로 만든다. 이 줄이 그것을 눈에
 > 보이게 하려고 존재한다.
 
-라운드트립을 실제로 태우려면 지금은 **외부 SUT 가 필요하다**(`④` 가 없애려는 바로 그
-의존이며, 아직 없다). 외부 SUT 가 있다면 전체 관통은 이렇게 확인한다:
+**실제 SUT 로 관통**(`④` 는 외부 SUT 없이 도는 대신 자명 시나리오다 — 녹화·항법처럼
+미션 길이가 필요한 것은 여기서만 검증된다):
 
 ```bash
 # 시나리오는 제어 평면이 볼 수 있는 경로에 둔다 (§3-②' 함정 4)
@@ -323,24 +349,42 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 
 ---
 
-## 7. 다른 호스트로 옮기기 — **러너 이미지 배송은 미결정**
+## 7. 다른 호스트로 옮기기 — 배송 경로 = **(C) 재빌드** (결정 D-6, 2026-08-14)
 
 제어 평면 이미지는 어디서나 소스에서 재빌드하면 된다(아래 실측: 161 MB / 8.3 s).
-문제는 **러너 이미지**다. 이 저장소에는 **러너 이미지를 레지스트리에 push 하는 경로가
-하나도 없고**, 현재 이미지는 로컬 빌드라 `RepoDigests` 가 비어 있다(= 어떤 레지스트리에도
-존재한 적이 없다). 새 호스트는 그 15.5 GB 를 **어떻게든 받아야** `③` 이 잡을 돌릴 수 있다.
+러너 이미지(15.5 GB)도 **같은 방식으로 옮긴다 — 즉 옮기지 않고 새 호스트에서 다시 굽는다.**
 
-**선택지와 실측 비용** (채택은 아직 안 됐다 — 이 표는 결정의 입력이다):
+**왜 C 인가**: A·B 는 **NVIDIA Isaac Sim 베이스 레이어를 제3자에게 재배포**하는 형태이고
+그것이 EULA 상 허용되는지 **확인된 바 없다**. C 는 각 호스트가 베이스를 `nvcr.io` 에서
+**직접 pull** 하므로 재배포가 **발생하지 않는다**.
+
+> ### ⚠ C 가 핀하는 것 / 핀하지 않는 것 (D-6 문면 그대로)
+> **핀된다 = 입력 집합**: 베이스 다이제스트(`isaac-sim:5.1.0@sha256:…`) + 빌더 베이스
+> 다이제스트 + `uv.lock` + **apt 버전 8개**(`docker/runner/Dockerfile` 의 `apt VERSION PINS`)
+> + 소스 커밋(`org.opencontainers.image.revision`).
+> **핀되지 않는다 = 결과 이미지 다이제스트.** 같은 입력으로 두 번 구우면 Image Id 가 다르다
+> (실측 §9). ⇒ ***"당신이 돌리는 이미지는 우리가 테스트한 바로 그 바이트다" 라고 쓰지 마라 —
+> C 에서 그것은 거짓이다.***
+> 실측된 것은 **동작 동등성**이다(§9: 두 빌드의 apt 매니페스트 252/252 · 전체 dpkg 413/413 ·
+> wheel 50 파일 · 같은 잡의 verdict/지표 동일). **핀되지 않는 것도 있다** — 이 레이어의
+> transitive 262 패키지는 비핀이고, ROS/우분투 아카이브는 대체된 버전을 인덱스에서 내리므로
+> 언젠가 재빌드가 **loud 하게 실패한다**(그때의 재핀 절차 = Dockerfile 의 같은 블록).
+
+**재빌드 레시피**(러너 = [`plane-sync.md`](plane-sync.md) ③ · 제어 평면 = 위 `③` · stub SUT =
+[`docker/selftest_stub/README.md`](../../docker/selftest_stub/README.md) §5). 새 호스트에서는
+`①`→`②'`→`②`→(세 이미지 빌드)→`③`→`④` 순서다.
+
+**미채택 경로와 그 실측 비용** (D-6 이 A 를 영구 폐기하지는 않았다 — 재론 트리거는
+① EULA 재배포 조항이 허용으로 확인되거나 ② 소비자가 재빌드 시간을 수용 불가로 요구할 때):
 
 | 경로 | 전송/시간 | 인증·전제 | 재현성 | 상태 |
 |---|---|---|---|---|
 | **A. 레지스트리 push/pull**(GHCR 등) | 압축 전송량: Isaac 베이스만으로 **7.62 GB**(실측 — 레지스트리 매니페스트의 압축 blob 합, 17 레이어, 최대 단일 레이어 7.50 GB). 우리가 얹는 레이어는 **비압축 661 MB**(실측, `docker history`) → 압축 후 크기 **미실측**. 소요: **미실측**. 참고 앵커 = 이 호스트의 GHCR 콜드 pull 실측 **0.70 MB/s**(p5c9, 다른 이미지) — 두 실측을 산술 투영하면 **≈3 시간**이나 이는 **투영이지 실측이 아니다** | push 권한 필요(write:packages 등). **NVIDIA 베이스 레이어를 제3자 레지스트리에 재배포하는 것이 EULA 상 허용되는지 미확인** — 이 경로를 고르기 전에 반드시 확인할 것 | pull 은 **다이제스트 고정**이라 바이트 동일 보장. 가장 강한 재현성 | 저장소에 push 경로 **0** |
 | **B. `docker save` / `load`** | tar **15,550,096,384 B(15.55 GB)**, `save` 파이프 **30.4 s**(실측, 디스크 미기록). `load` 소요·전달 매체 소요 **미실측** | 없음(파일 복사). 15.5 GB 를 옮길 매체·대역폭 필요 | Image Id 보존 = 바이트 동일 | 즉시 가능. 스크립트 없음 |
-| **C. 새 호스트에서 재빌드** | 베이스 pull **7.62 GB 압축**(실측) + apt/pip 수신(**미실측**) + 빌드 시간(**미실측**) | `nvcr.io` egress. 익명 pull 가능 | **바이트 동일하지 않다** — 같은 소스로 빌드한 이미지들의 Image Id 가 전부 다르다(실측: 동일 리비전 라벨을 갖는 빌드끼리도 Id 상이). 핀된 것은 *입력*(베이스 다이제스트 + `uv.lock` 해시)이지 *출력 다이제스트*가 아니다 | 기존 `docker/runner/Dockerfile` 로 가능 |
+| **C. 새 호스트에서 재빌드** ← **채택(D-6)** | 베이스 pull **7.62 GB 압축**(실측) + apt/pip 수신(**미실측**) + **빌드 2m10s(캐시 웜 베이스, 레이어 캐시 없음) / 1m6s(`--no-cache`)**(실측 §9, 베이스가 이미 로컬인 호스트) | `nvcr.io` egress. 익명 pull 가능 | **바이트 동일하지 않다**(위 ⚠ 블록). 동작 동등성은 실측(§9) | `docker/runner/Dockerfile` 로 가능 — **오늘의 정본 경로** |
 
-> 셋 다 지금은 **문서화된 수동 절차**다. 자동화(릴리즈 파이프라인)는 이 표를 보고
-> 경로를 고른 다음의 일이다. **B 는 오늘 당장 가능하고, A 는 라이선스 확인이 선행**이며,
-> C 는 "같은 이미지"를 약속하지 못한다.
+> 셋 다 **문서화된 수동 절차**다. 자동화(릴리즈 파이프라인)는 D-6 이 정한 C 위에서
+> 만들 일이다.
 
 ---
 
@@ -394,3 +438,33 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
   `cv-infra-orchestrator:local` 컨테이너다.
 - 첫 시도는 **실패했고 그 실패가 §3-②' 함정 4·§8 두 줄을 낳았다**: 컨테이너 밖 경로에
   둔 시나리오는 `oracle_plugin_dir … does not exist` 로 잡이 뜨기도 전에 죽는다.
+
+**`④`·재빌드는 2026-08-15 에 실제로 실행됐다**(증적 `~/cv-infra-p2-out/p5c15/t7/`, 채널 SSH,
+호스트 etri6000, 소스 커밋 `ac442ee`):
+
+- **재빌드 3종**: 러너 `cv-infra-runner:p5c16`(`sha256:1e9750b3…`, **2m10s**) · 같은 입력
+  `--no-cache` 2회차 `:p5c16-rebuild2`(`sha256:ef66de24…`, **1m6s**) · 제어 평면
+  `cv-infra-orchestrator:local`(`sha256:0cbc0b0d…`, `up -d --build` **7.9 s**) · stub SUT
+  `cv-infra-selftest-stub:p5c16`(931 MB). **apt 핀 8개가 실제로 해석됐다**(첫 실빌드).
+- **재빌드 동등성**(D-6 ①): Image Id 는 **다르고**(예고된 대로) 나머지는 같다 —
+  apt 레이어 매니페스트 **252/252 동일** · 이미지 전체 dpkg **413/413 동일**(비핀
+  transitive 포함) · 이미지 안 `cv_infra/**.py` **50 파일 sha256 동일**(그리고 소스 트리와도
+  동일) · `import isaacsim; import cv_infra` + pydantic 2.11.7 / numpy 1.26.0 동일 ·
+  **같은 self-test 잡의 verdict·지표 동일**(`path_len_m` 마지막 자리까지).
+- **3평면 스큐 게이트**: 리빌드 **전 exit 3**(②' 제어 평면 미스탬프 + ③ 러너 17 커밋 뒤짐),
+  리빌드 **후 exit 0**(세 평면 전부 `ac442ee`). 옛 호출형(`--orchestrator-image` 없음)은
+  **exit 2**. G-66 수리가 **제품 경로(`compose up --build`)에서** 확인됐다.
+- **`④` 라운드트립 4/4 green**: `report_outcome=pass exit=0`, **27.7 / 42.7 / 27.7 / 27.7 s**
+  (제출~CLI 종료). 잡마다 컨테이너 **2개**(러너 + stub SUT)가 잡 전용 브리지 네트워크에
+  뜬다. 러너 `/dev/shm` **1 GiB**(`CV_RUNNER_SHM_SIZE`), stub 은 docker 기본 64 m.
+  미설정 배포에서는 **exit 3**(핸들을 추측하지 않는다).
+- **`/dev/shm` 실측**(2 s 폴링, 미션 포함): 러너 피크 **7,405,568 B / 1 GiB = 0.69 %**
+  (SUT 배리어 통과 시점에 49 KB → 7.4 MB 로 점프 = Fast DDS data-sharing 세그먼트),
+  stub 피크 **675,840 B / 64 MiB = 1.0 %**. ⇒ 1 g 는 헤드룸이다(단 이 미션은 0.2 s 로
+  짧다 — 긴 잡의 피크는 미실측).
+- **부트 프로파일**(실측 4회 중 대표): `simulation_app_init` 13.1 s · `scene_load` 7.1–7.8 s ·
+  `robot_spawn` 1.0 s · `sut_readiness_wait` **0.36 s** · `first_render_frame` 0.28 s ·
+  `mission` 0.20 s.
+- **`.env` 취급**: 파일을 다시 만들지도, 백업하지도 않았다(G-68 ④). `CV_RUNNER_IMAGE` 는
+  **제자리 치환 + 프로방넌스 주석(Id/revision) 동시 갱신**, 편집 전후 `check_consent.sh`
+  **exit 0**, 줄 수·모드(600) 불변.
