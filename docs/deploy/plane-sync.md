@@ -419,11 +419,15 @@ sqlite3 <store>.sqlite3 \
 
 ## 게이트 사용법 — `scripts/check_plane_skew.sh`
 
-입력(전부 arg/env; 호스트명·GPU 리터럴 **하드코딩 0** — DoD-P5-09 정신):
+입력(전부 arg/env; 호스트명·GPU 리터럴 **하드코딩 0** — DoD-P5-09 정신).
+⚠ **단 한 곳 예외가 2026-08-15 clean-host 실행에서 드러났다**: `--src` 의 **기본값**은 이
+프로젝트 워크스테이션의 **디렉토리 레이아웃**이다. 호스트 정체성은 아니지만 *한 호스트의
+배치*라서, 체크아웃이 다른 곳에 있는 배포에서는 게이트가 항상 `exit 3` 이다(실측).
+**배포 문맥에서는 `--src <deploy-root>` 를 항상 명시하라.**
 
 | 인자 | env | 의미 | 기본값 |
 |---|---|---|---|
-| `--src PATH` | `CV_PLANE_SRC` | 런타임 평면 체크아웃 디렉토리 | `$HOME/cv-infra-p2-src/cv-infra-workspace` |
+| `--src PATH` | `CV_PLANE_SRC` | 런타임 평면 체크아웃 디렉토리 | `$HOME/cv-infra-p2-src/cv-infra-workspace` ⚠ 위 경고 |
 | `--src-rev REV` | `CV_PLANE_SRC_REV` | 런타임 평면 커밋으로 읽을 rev | `HEAD` (라이브 체크아웃) |
 | `--tag REF` | `CV_PLANE_TAG` | YAML 평면의 릴리즈 태그/ref (`REF^{commit}`로 peel) | `v1` |
 | `--tag-repo PATH` | `CV_PLANE_TAG_REPO` | 태그를 peel할 저장소 | `= --src` |

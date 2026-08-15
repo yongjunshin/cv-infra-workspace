@@ -27,6 +27,7 @@
 | **약속함** | **④ `cv-infra selftest` 가 외부 SUT 0 의존으로 라운드트립을 돈다**(p5c15 실측: 4/4 green, 27–43 s). 단 **빌트인 stub SUT 이미지 핸들**(`CV_SELFTEST_SUT_IMAGE`)을 배포가 공급해야 하고, 없으면 **추측하지 않고 exit 3** 이다 — §3-④. |
 | **약속 안 함** | **러너 이미지(15.5 GB)를 바이트 그대로 새 호스트에 옮기는 경로**. 배송 경로는 **(C) 새 호스트에서 재빌드**로 확정됐고(결정 D-6), 재빌드는 **입력 집합**(베이스 다이제스트 + `uv.lock` + apt 버전 + 소스 커밋)만 핀한다 — **결과 이미지 다이제스트는 재현되지 않는다**. §7. |
 | **약속 안 함** | 인증. 제출 API 는 authn 이 없다(단일 호스트 MVP). 그래서 기본 공개 주소가 `127.0.0.1` 이다. |
+| **약속 안 함** | **캐시가 저절로 데워지는 것.** 잡은 공유 캐시를 읽기 전용 원본으로만 쓰고 자기 사본을 버린다(stateless) — **운영자가 `②''` 를 `warm` 으로 돌리기 전까지 모든 잡이 콜드 비용을 낸다**(실측 141 s vs 28 s, §3-②''·§9). |
 
 ---
 
@@ -38,9 +39,9 @@
 | NVIDIA 드라이버 | **R580 브랜치**(플로어 이상 **AND** major == 580), open kernel module. 프로비저닝은 드라이버를 **절대 설치·업그레이드하지 않는다** — 단언만 한다 | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | Docker CE + Compose v2 | 핀된 버전(`common.sh`) | `docker version --format '{{.Server.Version}}'` · `docker compose version` |
 | NVIDIA Container Toolkit | `nvidia` 런타임 등록 | `docker info --format '{{json .Runtimes}}' \| grep -o '"nvidia"'` |
-| GPU 패스스루 | 호스트에 CUDA 미설치 상태에서 컨테이너가 GPU 를 본다 | `docker run --rm --gpus all <핀된 CUDA 베이스> nvidia-smi -L` |
+| GPU 패스스루 | 컨테이너가 GPU 를 본다 (호스트에 CUDA 툴킷을 **깔 필요가 없다**는 뜻이지, 깔려 있으면 안 된다는 뜻이 아니다) | 핀은 `common.sh` 의 `CV_CUDA_TEST_IMAGE`/`_DIGEST` 다:<br>`docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0…` `nvidia-smi -L` |
 | 디스크 | 러너 이미지 15.5 GB + 잡 산출물(MCAP·mp4)이 자라는 여유 | `df -h /` |
-| 네트워크 | `nvcr.io`(Isaac 베이스) · `download.docker.com` · `nvidia.github.io` · PyPI 로의 egress | — |
+| 네트워크 | `nvcr.io`(Isaac 베이스) · `download.docker.com` · `nvidia.github.io` · PyPI · **`omniverse-content-production.s3-us-west-2.amazonaws.com`**(씬 자산 — 캐시가 콜드면 여기서 받는다) 로의 egress | `for u in https://nvcr.io/v2/ https://download.docker.com/linux/ubuntu/ https://nvidia.github.io/libnvidia-container/ https://pypi.org/simple/ https://omniverse-content-production.s3-us-west-2.amazonaws.com/ ; do curl -s -o /dev/null -m 20 -w "$u %{http_code}\n" "$u"; done`<br>(`nvcr.io` 는 **401 이 정상** — 익명 토큰 교환 전이다) |
 
 `①` 이 이 전부를 멱등하게 충족시킨다(아래).
 
@@ -49,9 +50,12 @@
 ## 2. 4단계 흐름 한눈에
 
 ```
-① scripts/workstation_setup/provision.sh          호스트 선결(Docker CE + Toolkit + 패스스루 + Isaac 베이스 pull)
+⓪  git clone <이 저장소> <deploy-root>            소스 확보 (①~④ 전부가 이 체크아웃 안에서 돈다)
+①  scripts/workstation_setup/provision.sh          호스트 선결(Docker CE + Toolkit + 패스스루 + Isaac 베이스 pull)
 ②' 설정:  docker/.env 작성  +  scripts/detect_gpu.sh >> docker/.env
 ②  scripts/consent/accept_eula.sh                 NVIDIA EULA — 운영자만, 1회
+②'' CV_EULA_CONSENT=<동의어> scripts/measure/warm_cache.sh "$CV_ISAAC_CACHE_ROOT" provision|warm
+                                                   캐시 트리 생성(+chown 1234). 없으면 모든 잡이 거부된다
 ③  CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
      docker compose -f docker/compose.yaml up -d --build     ← 제어 평면 기동
 ④  CV_SELFTEST_SUT_IMAGE=<stub 이미지> cv-infra selftest   외부 SUT 0 의존 라운드트립
@@ -61,9 +65,52 @@
 `docker/.env.example` 의 USE 블록과 같다. 이미 동의를 마친 호스트에서 설정을 나중에
 넣어야 한다면 **§3-②'의 경고**를 반드시 읽어라(파일을 다시 만들면 동의 키가 사라진다).
 
+### 2-1. 어느 단계가 "호스트 1회"이고 어느 단계가 "OS 사용자마다"인가
+
+> 2026-08-15 clean-host 실행(`DoD-P5-08`)이 만든 표다. 그 전까지 이 문서는 단계별 스코프를
+> **구분하지 않았고**, 그래서 두 번째 운영자가 `①`을 실행하려다 막히는 것이 정상인지
+> 고장인지 알 방법이 없었다. **정상이다** — `①`은 애초에 그 사람의 단계가 아니다.
+
+| 단계 | 스코프 | 두 번째 OS 사용자가 다시 해야 하나 | 근거(실측) |
+|---|---|---|---|
+| `⓪` clone | **OS 사용자마다** | **예** — 자기 홈에 자기 체크아웃 | 익명 clone 1.0 s |
+| `①` provision | **호스트 1회 · root 권한** | **아니오 — 실행할 수 없다** | `sudo -n true` → **exit 1**. NOPASSWD 드롭인은 프로비저닝을 한 사용자에게만 부여된다. 이미 충족된 호스트에서는 §1 **확인 명령**만 돌리면 된다 |
+| `②'` `.env` | **OS 사용자마다** | **예** — 경로·포트·프로젝트 이름이 전부 그 사용자 것 | 아래 §2-2 격리 파라미터 |
+| `②` 동의 | **OS 사용자마다** | **예** — 레코드가 `$HOME/.cv-infra/eula-consent.json` 이다 | 새 사용자에서 `check_consent.sh` **exit 3**, `③` 이 **loud 거부**. 이것은 결함이 아니라 NEG-2 가 작동한 것이다 |
+| `②''` 캐시 트리 | **OS 사용자마다** | **예** — `CV_ISAAC_CACHE_ROOT` 가 그 사용자 홈이면 그 트리도 새로 만든다 | 다른 사용자의 웜 캐시는 **읽을 수도 없다**(홈 퍼미션 `drwxr-x---`) |
+| `③` 기동 | **OS 사용자마다** | **예** — 자기 compose 프로젝트·포트 | 아래 §2-2 |
+| `④` self-test | **배포마다** | **예** | — |
+
+**한 호스트에 두 배포를 올릴 때 반드시 분리해야 하는 것**(§2-2):
+
+| 노브 | 왜 |
+|---|---|
+| `CV_COMPOSE_PROJECT` | 컨테이너/네트워크 이름 접두 |
+| `CV_PUBLISH_PORT` | 포트 충돌 |
+| `CV_STATE_DIR` · `CV_OUT_DIR` · `CV_ISAAC_CACHE_ROOT` · `CV_ISAAC_CACHE_SCRATCH_ROOT` | 상태·산출물·캐시 |
+| **`CV_ORCHESTRATOR_IMAGE`** | ⚠ **놓치기 쉽다.** 기본값이 `cv-infra-orchestrator:local` 이라 두 번째 배포의 `up --build` 이 **첫 배포의 이미지 태그를 가져간다**(2026-08-15 실측으로 확인된 충돌). 태그를 분리하라 |
+
+⚠ **그리고 이것은 §3-③ 의 "다른 제어 평면이 떠 있으면 안 된다"와 긴장 관계다.** 두 평면이
+같은 docker 데몬을 보면 **부팅 시 라벨 스윕이 상대의 잡 컨테이너를 지운다.** 두 배포를 정말
+공존시킬 거면 **`up` 직전에 `docker ps -a --filter label=cv-infra.job_id -q | wc -l` 이 0 인지
+확인**하고(= 상대가 잡을 돌리고 있지 않다), 0 이 아니면 **기다려라**. 이 조건은 순서로만 막힌다.
+
 ---
 
 ## 3. 단계별 절차
+
+### ⓪ 소스 확보
+
+```bash
+git clone <이 저장소의 URL> <deploy-root>
+cd <deploy-root>
+git rev-parse HEAD          # 이 값이 이 배포의 릴리즈 ref 다 — 기록해 두어라
+```
+
+- `①`~`④` 의 스크립트·compose 파일·프로파일이 **전부 이 체크아웃 안에 있다.** §1 의 사전요구
+  표가 인용하는 핀(`scripts/workstation_setup/common.sh`)도 마찬가지다 — 즉 **§1 을 제대로
+  확인하려면 먼저 여기를 해야 한다.**
+- 여기서 나온 SHA 가 `③` 의 `CV_SOURCE_REVISION` 이자 평면 스큐 게이트의 릴리즈 ref 다.
 
 ### ① 호스트 프로비저닝
 
@@ -73,6 +120,9 @@ bash scripts/workstation_setup/provision.sh
 ```
 
 - 멱등하다. 이미 충족된 호스트에서 다시 돌려도 안전하다.
+- **이 단계는 호스트 1회 · root 권한이다(§2-1).** 이미 프로비저닝된 호스트에 **새 OS 사용자로**
+  들어온 것이라면 **이 단계를 실행하지 마라 — 실행할 수도 없다**(`sudo -n true` → exit 1).
+  대신 **§1 표의 확인 명령만** 돌려서 호스트가 이미 충족돼 있음을 확인하라. 전부 읽기 전용이다.
 - 사전에 **sudo 드롭인 1회 설치**가 필요하다(비대화 SSH 는 암호 프롬프트에 답할 수 없다).
   절차 = `scripts/workstation_setup/README.md` Step A.
 - 드라이버가 요구 브랜치가 아니면 **loud 하게 멈춘다**. 프로비저닝은 드라이버를 고치지
@@ -98,8 +148,8 @@ REQUIRED 6개(전부 **호스트 절대경로**):
 | `CV_MAX_CONCURRENT` | 운영자 동시성 상한 | **보수적으로 시작**(예: 2). 스케줄러는 이 값을 내리기만 하고 절대 올리지 않는다 |
 | `CV_STATE_DIR` | SQLite 스토어가 사는 디렉토리 | **재배포 사이에 고정**하라. 회귀 baseline 이 이 파일에 산다 — 경로가 바뀌면 비교 기준이 조용히 사라진다 |
 | `CV_OUT_DIR` | 잡 산출물 루트 | 자라는 디렉토리(MCAP·mp4) |
-| `CV_ISAAC_CACHE_ROOT` | **웜 캐시 = 읽기 전용 복사 원본** | 러너 uid 소유. 잡별 쓰기 사본이 아래 스크래치로 만들어진다 |
-| `CV_ISAAC_CACHE_SCRATCH_ROOT` | 잡별 쓰기 가능 캐시 스크래치 | `k × 웜캐시 크기` 만큼 여유 필요 |
+| `CV_ISAAC_CACHE_ROOT` | **웜 캐시 = 읽기 전용 복사 원본** | 러너 uid(1234) 소유여야 한다. **`mkdir` 만으로는 부족하다 — `②''` 가 만든다**(아래) |
+| `CV_ISAAC_CACHE_SCRATCH_ROOT` | 잡별 쓰기 가능 캐시 스크래치 | `k × 웜캐시 크기` 만큼 여유 필요 (실측: 자명 잡 1건이 **930 MB** 를 잠시 쓴다) |
 
 세 가지 함정:
 
@@ -152,6 +202,10 @@ REQUIRED 6개(전부 **호스트 절대경로**):
 > * 고친 **직후 매번** 게이트를 다시 돌려라:
 >   `bash scripts/consent/check_consent.sh; echo $?` → **0** 이어야 한다.
 > * `scripts/detect_gpu.sh >> docker/.env` 는 순수 append 라 안전하다.
+>   ⚠ **`>>` 만 써라. `2>&1` 을 붙이지 마라** — 이 스크립트는 진단 로그를 **stderr** 로 내보내고,
+>   그걸 파일로 흘리면 `KEY=VALUE` 가 아닌 줄이 `.env` 에 섞인다. compose 는 그때
+>   `failed to read docker/.env: line N: unexpected character …` 로 **loud 하게** 죽는다
+>   (2026-08-15 실측 — 조용히 무시하지 않는다는 점은 좋은 거동이다).
 
 ### ② 동의 (NVIDIA EULA) — 운영자만
 
@@ -178,6 +232,41 @@ required variable PRIVACY_CONSENT is missing a value: no operator consent on thi
 run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)
 ```
 
+2026-08-15 clean-host 실측: 동의가 없는 새 OS 사용자에서 `③`(`up -d --build`)은 **exit 1** 로
+멈췄고 **컨테이너 0 · 네트워크 0 · 빌드 0** 이었다 — 부분적으로 올라가다 마는 상태가 없다.
+
+### ②'' 캐시 트리 — 이것을 빼면 모든 잡이 거부된다
+
+```bash
+CV_EULA_CONSENT=<②의 프롬프트에 입력한 그 단어> \
+  bash scripts/measure/warm_cache.sh "$CV_ISAAC_CACHE_ROOT" provision   # 빈 트리 + chown 1234
+#   ... 또는 warm  (빈 트리를 만든 뒤 씬을 한 번 부팅해 자산·셰이더까지 채운다)
+ls -ln "$CV_ISAAC_CACHE_ROOT/cache/"        # kit / home / computecache 셋이 uid 1234 여야 한다
+```
+
+- **왜 필요한가**: 제어 평면은 잡마다 `cache/kit`·`cache/home`·`cache/computecache` **세 티어를
+  복사**해 러너에 준다. 세 디렉토리가 없으면 잡은 시작 전에 거부된다:
+  `cache base tier … does not exist … the warm cache was never provisioned`.
+  **`mkdir -p` 로 때우지 마라** — 소유자가 러너 uid(1234)가 아니면 러너가 캐시에 쓰지 못하고
+  캐시가 **조용히 꺼진다**(G-15/G-34). 이 스크립트는 docker 루트 헬퍼(`--user 0`)로 chown 하므로
+  **호스트 sudo 가 필요 없다.**
+- ⚠ **이 스크립트는 `②` 와 별개의 동의 게이트를 갖는다.** `$HOME/.cv-infra/eula-consent.json` 을
+  **읽지 않고** per-run env 만 본다 — 즉 운영자는 같은 결정을 **두 번** 표명해야 한다. 값은
+  **운영자만** 입력한다(NEG-2). 미설정이면 **exit 3**.
+- **`provision` vs `warm`**:
+
+| 모드 | 트리 | 첫 잡 | 언제 |
+|---|---|---|---|
+| `provision` | 비어 있음 | **콜드 — 실측 141 s**(§9) | 캐시 비용을 정직하게 재고 싶을 때 |
+| `warm` | 씬 클로저까지 채움 | 웜 — 실측 28 s | 실사용 배포. 워밍 자체가 Isaac 부팅 1회 값을 낸다 |
+
+> ### ⚠ 공유 캐시는 **정상 운영으로 스스로 데워지지 않는다** (2026-08-15 실측)
+> 잡은 공유 트리를 **읽기 전용 복사 원본**으로만 쓴다: 잡별 스크래치로 `cp -a` → 러너가 거기에
+> 쓰고 → **잡이 끝나면 스크래치를 통째로 버린다**(stateless, `NFR-EXEC-002`). 실측에서 잡은
+> 스크래치에 **930 MB** 를 만들었지만 잡이 끝난 뒤 **공유 캐시는 여전히 0 바이트 · 파일 0 개**였다.
+> ⇒ **`provision`(빈 트리)으로 두면 모든 잡이 영원히 콜드 비용을 낸다.** 데우는 경로는
+> `warm_cache.sh … warm` **한 가지뿐**이고, 그것은 운영자가 명시적으로 돌려야 한다.
+
 ### ③ 기동
 
 ```bash
@@ -203,10 +292,14 @@ CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
   추가하면 자원인지 동시성 k 가 조용히 깨진다(파일 상단 주석 참조).
 - **기동 전 반드시 확인**: 같은 호스트에 **다른 제어 평면이 떠 있으면 안 된다**.
   두 평면이 같은 docker 데몬을 보면 부팅 시의 라벨 스윕이 **상대의 잡 컨테이너를 지운다**.
+  > **의도적으로 두 배포를 공존시키는 경우**(§2-1)는 이 금지의 예외가 아니라 **더 엄격한
+  > 조건**이다: 스윕이 보는 것은 compose 프로젝트가 아니라 **라벨**이므로 프로젝트 이름을
+  > 나눠도 보호되지 않는다. 아래 첫 명령이 **0** 일 때에만 `up` 하라 — 즉 **상대가 잡을
+  > 돌리고 있지 않은 순간**에만. 그리고 `CV_ORCHESTRATOR_IMAGE` 를 반드시 분리하라(§2-1 표).
   ```bash
   docker ps -a --filter label=cv-infra.job_id -q | wc -l      # 0 이어야 함
-  docker ps --filter publish=8000 --format '{{.Names}}'        # 포트 점유자
-  ss -ltn | grep ':8000'
+  docker ps --filter publish="${CV_PUBLISH_PORT:-8000}" --format '{{.Names}}'   # 포트 점유자
+  ss -ltn | grep ":${CV_PUBLISH_PORT:-8000}"
   # 포트/이름으로는 안 보이는 평면까지 쓸어보는 유일한 방법 —
   # 실측(2026-08-14): 이 호스트에 포트를 공개하지 않은 serve 가 23일째 살아 있었고
   # 위 두 명령 어디에도 나타나지 않았다.
@@ -239,6 +332,11 @@ docker compose -f docker/compose.yaml run --rm --no-deps \
   **클라이언트 프로세스**가 읽는다(오케스트레이터 서비스가 아니다) — 위처럼 일회용 CLI
   컨테이너에 `-e` 로 준다. 미설정이면 **추측하지 않고 exit 3**(소비자 이미지로의 폴백은
   `NFR-SELFTEST-001` 위반이라 코드가 금지한다).
+  > ⚠ **`docker/.env` 에 적는 것으로는 되지 않는다** — 2026-08-15 실측. 이 키는
+  > `docker/.env.example` 에도 `compose.yaml` 의 `environment:` 블록에도 **없으므로**
+  > compose 가 컨테이너로 넘기지 않는다. `.env` 에 적어 둔 채 `-e` 없이 부르면
+  > CLI 컨테이너 안에서 그 변수는 **UNSET** 이고 self-test 는 **exit 3** 이다.
+  > `.env` 의 그 줄은 *"이 배포가 쓰는 stub 은 무엇인가"* 라는 **기록**으로만 가치가 있다.
 - **외부 SUT·소비자 저장소 의존 0**: 잡은 러너 + stub 두 컨테이너만 잡 전용 네트워크에
   띄우고, 러너 마운트는 캐시 스크래치 · `job_spec.json` · 결과 디렉토리뿐이다(§9 실측).
 - self-test 결과는 **운영 대시보드 3면**(`/monitor`·`/monitor.json`·`cv-infra monitor`)에서
@@ -277,7 +375,9 @@ docker logs cv-infra-orchestrator 2>&1 | grep -m1 serve-config
 #    reconciliation 카운트가 전부 들어있다. 여기 찍힌 값이 곧 실제 구성이다.
 
 # 3) API 가 응답하나 (authn 없음 — loopback 에서만)
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/openapi.json   # 200
+#    ⚠ 8000 은 기본값일 뿐이다. CV_PUBLISH_PORT 를 바꿨으면 그 포트를 쓴다 —
+#    한 호스트에 두 배포가 있으면 8000 을 치는 것은 '남의 평면'을 확인하는 것이다(실측).
+curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${CV_PUBLISH_PORT:-8000}/openapi.json"   # 200
 
 # 4) 운영 뷰
 cvi monitor --api http://orchestrator:8000
@@ -320,7 +420,7 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 내리기 | `docker compose -f docker/compose.yaml down` (네트워크까지 제거) |
 | 설정 변경 반영 | `.env` 를 **upsert 로** 고친 뒤(§3-②' 경고) `up -d` 재실행 |
 | 제어 평면 코드 갱신 | 체크아웃 갱신 → `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose -f docker/compose.yaml up -d --build` |
-| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --tag <release-sha> --image <ref> --orchestrator-image <ref>` |
+| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --src <deploy-root> --tag <release-sha> --image <ref> --orchestrator-image <ref>` |
 | CLI 한 번 쓰기 | `docker compose -f docker/compose.yaml run --rm --no-deps orchestrator cv-infra <cmd> --api http://orchestrator:8000` (§4) |
 
 > ⚠ **`up -d --build` 를 `CV_SOURCE_REVISION` 없이 돌리면 빌드가 실패한다** — 그것이
@@ -401,7 +501,8 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 컨테이너 안 앱이 캐시/디렉토리에 못 쓴다 | 마운트 부모를 dockerd 가 `root:root` 로 생성 | 해당 호스트 디렉토리를 **미리** 만들고 러너 uid 소유로 맞춘 뒤 재기동 |
 | 캐시가 웜인데 잡마다 느리다 | 캐시를 **`:ro` 로 러너에 물리면 캐시가 꺼진다**(읽기 폴백이 아니라 비활성화) | 러너에는 **쓰기 가능한 잡별 사본**을 준다. 공유 트리는 복사 *원본*으로만 |
 | 옵션 노브를 넣었는데 부팅이 죽는다 | `KNOB=` 빈 값 | 줄을 **주석 처리**(미설정 = 문서화된 기본값) |
-| 실행 코드가 옛날 것 같다 | 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --tag <sha> --image <ref> --orchestrator-image <ref>` |
+| 실행 코드가 옛날 것 같다 | 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --src <deploy-root> --tag <sha> --image <ref> --orchestrator-image <ref>` |
+| 스큐 게이트가 `runtime-plane path is not a git repo: '…/cv-infra-p2-src/cv-infra-workspace'` 로 **exit 3** | `--src` 의 **기본값이 이 프로젝트 워크스테이션의 디렉토리 레이아웃**(`$HOME/cv-infra-p2-src/cv-infra-workspace`)이다. 체크아웃이 다른 곳에 있는 배포에서는 항상 틀린다 | **`--src <deploy-root>` 를 명시하라.** 2026-08-15 clean-host 실측에서 처음 드러났다(그 전까지는 기본값이 우연히 맞는 호스트에서만 돌았다) |
 | `up --build` 이 `CV_SOURCE_REVISION=<source commit sha> is required` 로 죽는다 | 스탬프 없는 이미지를 만들지 않겠다는 게이트(G-66) | 접두를 붙여 다시: `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose … up -d --build`. `.git` 이 없으면 기록된 릴리즈 sha 를 넣어라 |
 
 ---
@@ -468,3 +569,36 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 - **`.env` 취급**: 파일을 다시 만들지도, 백업하지도 않았다(G-68 ④). `CV_RUNNER_IMAGE` 는
   **제자리 치환 + 프로방넌스 주석(Id/revision) 동시 갱신**, 편집 전후 `check_consent.sh`
   **exit 0**, 줄 수·모드(600) 불변.
+
+**⓪~④ 전체를 "처음부터" 완주한 것은 2026-08-15 이 처음이다** — 같은 호스트의 **새 OS 사용자**
+(`cvm1`, uid 2001, 새 홈·새 체크아웃·새 동의·**콜드 캐시**)로 수행. 증적
+`~cvm1/cv-infra-m1-evidence/` (채널 SSH, 소스 커밋 `ac442ee`). **이 문서의 §2-1 스코프 표와
+§3-⓪·§3-②'' 는 그 실행이 만든 것이다.**
+
+- `①` **미실행 — 실행 불가**(`sudo -n true` exit 1). §1 확인 명령 전항만 통과: 드라이버
+  **580.159.03**(open KMD) · Docker **28.3.3** · Compose **v2.39.2** · `nvidia` 런타임 등록 ·
+  `--gpus all` 스모크 **exit 0 / 0.33 s** · 여유 **1.6 T**.
+- **NEG-2 양성 실증**: 동의 **전** `③` → **exit 1**, 컨테이너/네트워크/빌드 **전부 0**.
+  동의 **후** 같은 명령 → **exit 0**. 레코드는 `consent_channel=interactive`(사람이 입력).
+- `③` `up -d --build` **exit 0 / 0.44 s** — 단, **모든 레이어가 공유 데몬의 BuildKit 캐시
+  히트**였다(이 호스트에서의 실제 제어평면 빌드 비용은 위 T7 블록의 7.9 s).
+- **`④` 콜드 라운드트립 `exit 0` / CLI wall 141.05 s** (웜 대조군 27.7 s = **5.09×**).
+  부트 단계별 콜드 vs 웜: `simulation_app_init` 14.84/13.16 · `scene_load` 20.32/7.76 ·
+  **`robot_spawn` 97.87/1.00 ← 콜드 비용의 지배항** · `first_render_frame` 3.25/0.27 ·
+  `sut_readiness_wait` 3.41/0.36 · `mission` 0.20/0.20 · 부트 합계 **138.26/39.30**.
+  ⇒ **콜드 페널티는 씬 다운로드가 아니라 robot_spawn 에 몰려 있다.**
+- **판정·지표는 콜드/웜이 동일**: `verdict=pass`, `path_len_m=1.9078142372702626e-05`
+  (T7 웜 실행과 **마지막 자리까지 동일**), `collision_count=0`.
+- **캐시는 채워지지 않았다**: 잡 중 스크래치 **930,416,284 B** → 잡 종료 후 공유 캐시
+  **0 B / 파일 0 개**(§3-②'' ⚠ 블록의 근거).
+- **격리 substrate**: 잡 전용 브리지 `cvj-…`, 러너 shm **1 GiB** / stub **64 MiB**,
+  `ros_domain_id=42`(상주 배포의 55 와 다름), 잡 종료 후 컨테이너·네트워크 잔존 **0**.
+- **외부 SUT 0 의존**: 잡 컨테이너 2개(`cv-infra-runner:p5c16` + `cv-infra-selftest-stub:p5c16`),
+  소비자 이미지 참여 **0**, `-e` 없이 부르면 **exit 3**. egress 감사 `external_packets=0`.
+- **3평면 스큐 게이트 `exit 0`**(`--src` 명시 필요 — §8 마지막 행). 음성 대조 2종
+  (옛 러너 이미지 · 미스탬프 제어평면) 각각 **exit 3**.
+- **격리 실측**: 상주 배포(포트 8000)와 포트(8021)·프로젝트(`cv-infra-m1`)·상태/산출물/캐시
+  경로·**제어평면 이미지 태그**(`:m1`)를 전부 분리. 상주 평면의 `:local` 태그 Id **무이동**,
+  상주 컨테이너 8개 **무정지**, 삭제 **0건**.
+- ⚠ **이 실행이 증명하지 않는 것**: docker 데몬·이미지 레이어·BuildKit 캐시·드라이버·커널·
+  호스트 프로비저닝이 **전부 공유**된다. **"완전히 새 기계"의 증거가 아니다.**
