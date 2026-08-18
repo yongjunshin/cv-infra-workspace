@@ -109,11 +109,24 @@ readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # confirme
 # an audit can see exactly what was accepted.
 readonly CV_DOCKER_CE_VERIFIED=(
   "5:28.3.3-1~ubuntu.24.04~noble"   # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
-  "5:29.7.2-1~ubuntu.22.04~jammy"   # p5c17 T4 검증 중 — 미검증 (CEO local RTX 4080/jammy; replace this comment with T4's evidence path, or DELETE the element if T4 fails)
+  # VERIFIED 2026-08-19 by p5c17 T4: the full C-2 walkthrough (①provision → ②consent →
+  # ③compose up --build → ④selftest exit 0) ran green on CEO local RTX 4080 / ubuntu jammy
+  # with this STACK AS INSTALLED — docker-ce 5:29.7.2-1~ubuntu.22.04~jammy · docker-ce-cli
+  # 5:29.7.2-1~ubuntu.22.04~jammy · containerd.io 2.3.3-1~ubuntu.22.04~jammy · docker-buildx-plugin
+  # 0.36.1-1~ubuntu.22.04~jammy · docker-compose-plugin 5.4.0-1~ubuntu.22.04~jammy (Compose v5,
+  # three majors past the preferred pin — the project's FIRST Compose v5 run, no schema change
+  # needed). Evidence: agent-comms/reports/deployment-2026-08-19-p5c17-T4-c2-walkthrough.md;
+  # raw logs on that host at ~/cv-infra-p5c17-t4-evidence/.
+  "5:29.7.2-1~ubuntu.22.04~jammy"
 )
 readonly CV_NVIDIA_TOOLKIT_VERIFIED=(
   "1.17.8-1"                        # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
-  "1.19.1-1"                        # p5c17 T4 검증 중 — 미검증 (CEO local RTX 4080/jammy; replace this comment with T4's evidence path, or DELETE the element if T4 fails)
+  # VERIFIED 2026-08-19 by p5c17 T4 (same walkthrough, same host): nvidia-container-toolkit
+  # 1.19.1-1 with -base / libnvidia-container-tools / libnvidia-container1 all 1.19.1-1,
+  # driver 580.178.04 open KMD. GPU passthrough smoke exit 0 and a live Isaac Sim 5.1.0 job
+  # (runner + stub SUT on a per-job bridge) ran to verdict=pass on it.
+  # Evidence: agent-comms/reports/deployment-2026-08-19-p5c17-T4-c2-walkthrough.md.
+  "1.19.1-1"
 )
 
 # GPU-passthrough smoke image (DoD-P1-02). CUDA 12.8+ covers Blackwell; the in-container

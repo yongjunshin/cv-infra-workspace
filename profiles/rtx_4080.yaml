@@ -54,5 +54,22 @@ id: rtx_4080
 # (detect_gpu.sh exits 3 on a 2+ match, so overlap would break BOTH hosts).
 match_name_pattern: GeForce[ _-]?RTX[ _-]?4080
 
-vram_per_instance_mb:
-vram_per_instance_source:
+# MEASURED 2026-08-19 (p5c17 T4) on the card described above, during one live
+# `cv-infra selftest` job on this host. Recipe = DoD-P2-09 / DoD-P4-10: 0.5 s polling of
+# `nvidia-smi --query-compute-apps=pid,used_memory` cross-checked against GPU-wide
+# `memory.used` minus the idle baseline. 181 samples over a 96.9 s job gave
+#   per-PID compute PEAK   3743 MiB   (median 678, p95 2569 — the peak is TRANSIENT,
+#                                      it lands in scene load / first render, not the mission)
+#   GPU-wide peak 4248 MiB - idle median 463 MiB = 3785 MiB   <- the value below
+# The two agree within 42 MiB. The gap is the display-engine/graphics context that
+# --query-compute-apps does NOT report on a consumer card, so the cross-check is the
+# LARGER of the two and therefore the safe one to budget with. Nothing is rounded.
+# ★ This host runs a DESKTOP: Xorg + shell + browser held ~460 MiB of the 16376 MiB at
+# idle. A headless 4080 has that much more available; the per-instance number is
+# unaffected, the free-VRAM term is not.
+# What it implies for k HERE: avail ~15.9 GiB / 3785 MiB -> the NVML 2nd guard admits 4,
+# so k = min(CV_MAX_CONCURRENT, 4, render_cap). The deployment that measured it ran with
+# CV_MAX_CONCURRENT=2 and k stayed 2 (observed in serve-config). Raising the operator cap
+# is an operator decision, not a consequence of this number.
+vram_per_instance_mb: 3785
+vram_per_instance_source: measured 2026-08-19 (p5c17 T4) on NVIDIA GeForce RTX 4080 16376 MiB sm 8.9 driver 580.178.04, ubuntu/jammy desktop host (display active, ~460 MiB idle baseline) — GPU-wide peak 4248 MiB minus idle median 463 MiB, per-PID compute peak 3743 MiB, 181 samples at 0.5 s over one live selftest job; NOT transferable to a SUPER/Laptop/OEM 4080 (re-measure there); evidence agent-comms/reports/deployment-2026-08-19-p5c17-T4-c2-walkthrough.md and raw samples on that host at ~/cv-infra-p5c17-t4-evidence/12-vram-samples-dense.txt (2 s run-1 cross-check 09-vram-samples.txt, per-PID peak 3712 MiB)

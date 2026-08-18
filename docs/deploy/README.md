@@ -241,11 +241,22 @@ run scripts/consent/accept_eula.sh (NEG-2: this deployment never auto-accepts)
 ### ②'' 캐시 트리 — 이것을 빼면 모든 잡이 거부된다
 
 ```bash
+CV_ISAAC_CACHE_ROOT=<②'에 적은 그 경로>          # 이 셸엔 .env 가 로드돼 있지 않다 (아래 ⚠)
 CV_EULA_CONSENT=<②의 프롬프트에 입력한 그 단어> \
+CV_MEASURE_IMAGE=<③ 이전에 빌드한 러너 이미지 태그> \
   bash scripts/measure/warm_cache.sh "$CV_ISAAC_CACHE_ROOT" provision   # 빈 트리 + chown 1234
 #   ... 또는 warm  (빈 트리를 만든 뒤 씬을 한 번 부팅해 자산·셰이더까지 채운다)
 ls -ln "$CV_ISAAC_CACHE_ROOT/cache/"        # kit / home / computecache 셋이 uid 1234 여야 한다
 ```
+
+> ⚠ **새 호스트가 여기서 두 번 걸린다**(2026-08-19 실측, 두 번째 호스트의 첫 실행):
+> * `$CV_ISAAC_CACHE_ROOT` 는 **`docker/.env` 안에만 있고 당신 셸엔 없다** — compose 가 읽는
+>   파일이지 셸이 source 하는 파일이 아니다. 비운 채로 부르면 `exit 1`(cache root required).
+> * 이 스크립트의 **러너 이미지 기본값은 이 프로젝트 첫 호스트의 옛 태그**다. 새 호스트엔
+>   그 태그가 없으므로 `CV_MEASURE_IMAGE` 를 주지 않으면 docker 가 **레지스트리에서 찾다가**
+>   `pull access denied … may require 'docker login'` 로 **exit 125** 를 낸다 — 인증 문제로
+>   읽히지만 실제 원인은 *"그 태그는 여기 없다"* 이다. 그래서 **`②''` 는 러너 이미지를 빌드한
+>   뒤에** 온다(§7 순서).
 
 - **왜 필요한가**: 제어 평면은 잡마다 `cache/kit`·`cache/home`·`cache/computecache` **세 티어를
   복사**해 러너에 준다. 세 디렉토리가 없으면 잡은 시작 전에 거부된다:
@@ -404,6 +415,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${CV_PUBLISH_PORT:-8
 cvi monitor --api http://orchestrator:8000
 
 # 5) 외부 egress 감사를 무장한다 — 제어 평면을 새로 띄웠으면 **반드시 다시** (G-73)
+#    ⚠ 처음 하는 호스트라면 감사 사이드카 이미지를 먼저 굽는다. 이 이미지는 저장소에
+#      Dockerfile 로 존재하지 않고 2줄짜리 레시피가 scripts/netns_audit.sh 헤더에 있다
+#      (CV_NETNS_AUDIT_IMAGE 항목). 없이 부르면 docker 가 레지스트리를 찾다가 exit 125 다.
 bash scripts/netns_audit.sh arm cv-infra-orchestrator
 #    arm 은 컨테이너 정체성(id + started_at)을 레코드 파일에 남긴다:
 #      ${CV_NETNS_AUDIT_RECORD_DIR:-/tmp}/cv-netns-audit.<chain>.<container>.arm  (+ .history)
@@ -509,7 +523,7 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 
 **재빌드 레시피**(러너 = [`plane-sync.md`](plane-sync.md) ③ · 제어 평면 = 위 `③` · stub SUT =
 [`docker/selftest_stub/README.md`](../../docker/selftest_stub/README.md) §5). 새 호스트에서는
-`①`→`②'`→`②`→(세 이미지 빌드)→`③`→`④` 순서다.
+`①`→`②'`→`②`→(러너·stub 두 이미지 빌드)→`②''`→`③`(제어 평면은 여기서 빌드된다)→`④` 순서다. **`②''` 를 이 목록에서 빠뜨리면 모든 잡이 거부된다** — 그리고 그 단계는 러너 이미지를 필요로 하므로 빌드 **뒤**에 와야 한다(§3-②'' ⚠).
 
 **미채택 경로와 그 실측 비용** (D-6 이 A 를 영구 폐기하지는 않았다 — 재론 트리거는
 ① EULA 재배포 조항이 허용으로 확인되거나 ② 소비자가 재빌드 시간을 수용 불가로 요구할 때):
