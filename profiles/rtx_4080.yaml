@@ -1,0 +1,58 @@
+# profiles/rtx_4080.yaml — adaptive GPU profile (M5 §3.4; REQ-DEPLOY-003, NFR-DEPLOY-001).
+#
+# Read profiles/rtx_pro_6000.yaml first — it carries the grammar rules and the reason
+# this directory exists. Adding THIS file is the whole act of supporting a new card:
+# no code, no compose, no CI was touched to make this host deployable.
+#
+# WHY IT EXISTS: this is the project's SECOND deployment host (cycle p5c17, decision
+# 2026-08-19-p5c17-os-set-pin-set-and-host-purity; target fixed by decision D-6,
+# 2026-08-18). Until now every measurement in this repository came from one machine
+# with one card, so "적응형" had never been exercised by an actual second card.
+#
+# ★ NO MEASURED NUMBER HERE YET — the same rule as profiles/a100.yaml (CLAUDE §2-4).
+# The card is present and its identity was queried live (see the pattern note below),
+# but per-instance VRAM is a RUNNING-JOB measurement and no job has run on it at
+# authoring time (this task is CPU-only by mandate). An invented number would be
+# strictly worse than an empty one here: this card has ~16 GiB total against the
+# 6000-series' ~96 GiB, so a copied budget would mis-size k by ~6x.
+#
+# What an empty value MEANS at deploy time (scripts/detect_gpu.sh honours it):
+#   * selection still succeeds — this host IS supported and deployable;
+#   * the CV_VRAM_PER_INSTANCE_MB line is emitted COMMENTED OUT, so the NVML 2nd
+#     guard stays OFF and k = min(CV_MAX_CONCURRENT, render_cap) — the operator cap
+#     alone, which is the documented default contract (docker/.env.example);
+#   * the script says so LOUDLY on stderr instead of guessing (no silent fallback).
+#
+# To fill it in: run one job, sample per-PID VRAM
+#   nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+# cross-checked against the full (G+C) process table minus idle baseline
+# (DoD-P2-09 / DoD-P4-10 recipe), then write the number here TOGETHER with a
+# vram_per_instance_source line naming the evidence path (G-24).
+#
+# ★ WHEN YOU DO FILL IT IN, NAME THE EXACT CARD in vram_per_instance_source: the
+# pattern below matches a FAMILY (see note), and this family is known to ship in
+# variants (SUPER / Laptop / OEM spellings) whose name strings and VRAM this project
+# has never observed. A number measured on one variant must not be read as measured
+# on another — an operator on a different 4080 variant re-measures.
+#
+# Card facts observed on the deployment host (read-only query, 2026-08-19, T1):
+#   nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader
+#   -> NVIDIA GeForce RTX 4080, 16376 MiB, 580.178.04, 8.9
+# Unlike profiles/a100.yaml this IS a consumer card with a display engine, so the
+# off-screen render path (D-A) has no datacenter-specific caveat here — but it has
+# also never been exercised on it. Observe on first deployment; do not assume.
+
+id: rtx_4080
+
+# Matched case-insensitively (ERE) against `nvidia-smi --query-gpu=name`, whose live
+# output on this host is the literal string "NVIDIA GeForce RTX 4080" (captured above
+# — unlike the other two profiles, this pattern is anchored in a REAL capture).
+# Token-based like its siblings so board-partner/spelling variants of the same family
+# still resolve; "GeForce" is kept in the token deliberately, so the pattern cannot
+# reach across into the professional line. Checked against the other profiles: this
+# pattern matches neither of their SKUs, and neither of theirs matches this card
+# (detect_gpu.sh exits 3 on a 2+ match, so overlap would break BOTH hosts).
+match_name_pattern: GeForce[ _-]?RTX[ _-]?4080
+
+vram_per_instance_mb:
+vram_per_instance_source:

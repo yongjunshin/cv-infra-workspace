@@ -6,8 +6,15 @@
 #                         -> 4) Isaac Sim image pull (DoD-P1-03)
 #
 # Every step is safe to re-run. The GPU driver is NEVER installed or upgraded — only
-# asserted against the floor. Requires the /etc/sudoers.d/cv-infra NOPASSWD drop-in
-# (see README); without it `sudo -n` fails fast and loud rather than hanging (G-06).
+# asserted against the floor.
+#
+# PRIVILEGE: each privileged action is preceded by a READ-ONLY check of the state it
+# would create; if that state already holds, the action is skipped (loudly) and no
+# sudo is used. A host that already satisfies everything therefore provisions with
+# ZERO privileged calls — it must not need a standing NOPASSWD drop-in just to be told
+# "nothing to do". Where something IS missing, the /etc/sudoers.d/cv-infra drop-in is
+# still required (see README); without it `sudo -n` fails fast and loud rather than
+# hanging (G-06).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,8 +34,9 @@ preflight() {
   source /etc/os-release
   [[ "${ID:-}" == "$CV_REQUIRE_OS_ID" ]] \
     || die "Unsupported OS ID '${ID:-?}' (these scripts target $CV_REQUIRE_OS_ID)"
-  [[ "${VERSION_CODENAME:-}" == "$CV_REQUIRE_OS_CODENAME" ]] \
-    || die "Unsupported codename '${VERSION_CODENAME:-?}' (these scripts target $CV_REQUIRE_OS_CODENAME)"
+  # Codename = SET membership (D-1). The message must LIST the set, so an operator on
+  # an unlisted release learns what IS supported from the failure alone.
+  require_supported_codename
   local arch; arch="$(dpkg --print-architecture)"
   [[ "$arch" == "$CV_REQUIRE_ARCH" ]] \
     || die "Unsupported arch '$arch' (these scripts target $CV_REQUIRE_ARCH)"
@@ -46,7 +54,7 @@ preflight() {
     die "Driver $drv is not on the R${CV_DRIVER_BRANCH} branch (Isaac Sim 5.1.0 certified branch; R595+ segfaults the RTX renderer — decision 2026-07-03-driver-r580-realignment). Run scripts/workstation_setup/realign_driver_r580.sh, then re-run."
   fi
 
-  log "OK: $ID/$VERSION_CODENAME arch=$arch driver=$drv (>= $CV_DRIVER_FLOOR, R$CV_DRIVER_BRANCH branch)"
+  log "OK: $ID/$CV_HOST_CODENAME arch=$arch driver=$drv (>= $CV_DRIVER_FLOOR, R$CV_DRIVER_BRANCH branch; supported codenames: ${CV_SUPPORTED_OS_CODENAMES[*]})"
 }
 
 main() {

@@ -24,8 +24,9 @@ main() {
   fi
 
   log "DoD-P1-02 gate -> docker run --rm --gpus all $img nvidia-smi"
-  # `sudo -n docker`: the docker group is not yet effective in this SSH session.
-  if "${CV_SUDO[@]}" docker run --rm --gpus all "$img" nvidia-smi; then
+  # cv_docker: plain `docker` when this session already reaches the daemon, else the
+  # `sudo -n docker` channel (e.g. an SSH session where the group is not yet effective).
+  if cv_docker run --rm --gpus all "$img" nvidia-smi; then
     log "GPU passthrough PASS (exit 0) — DoD-P1-02 command succeeded"
   else
     die "GPU passthrough FAILED: '--gpus all' container could not run nvidia-smi. Check toolkit runtime config (install_nvidia_toolkit.sh) and driver."

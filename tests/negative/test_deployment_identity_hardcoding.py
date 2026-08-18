@@ -221,7 +221,7 @@ _LEGITIMATE_SAMPLES: tuple[str, ...] = (
     "# KNOWN HOST DEBT (discovered 2026-07-03): etri6000 carries an orphan (non-dpkg)",
     "# on etri6000 — non-dpkg, not removable via the sudo whitelist) only warn.",
     "# 2026-07-03 on etri6000; NOT root//root/.cache as the pre-measurement R2 note",
-    "# Authorized user: etri  (the workstation SSH account on etri6000)",
+    "#                  which is the SSH account on the first workstation and a WRONG",
     "# GPU-passthrough smoke image (DoD-P1-02). CUDA 12.8+ covers Blackwell; the in-container",
     # --- 정체성을 런타임에 파생시키는 형태 = 우리가 원하는 것 ---
     'readonly CV_GH_RUNNER_NAME="${CV_GH_RUNNER_NAME:-$(hostname -s)-cv-infra}"',
@@ -243,6 +243,10 @@ _SCAN_SENTINELS = (
     ("scripts", "scripts/detect_gpu.sh"),
     (".github", ".github/workflows/ci.yml"),
 )
+
+#: sudo 드롭인 템플릿 — 여기 계정 이름을 박으면 다른 호스트에서 **틀린 값**이 된다.
+#: (p5c17 이전: 첫 워크스테이션의 SSH 계정이 리터럴로 박혀 있었다.)
+_SUDOERS_TEMPLATE = "scripts/workstation_setup/sudoers.d-cv-infra"
 
 #: 이 스캔을 통과시키려고 **지우면 안 되는** 증적 앵커(G-24). 위 문면 논의 참조.
 _PROVENANCE_ANCHORS = (
@@ -389,3 +393,36 @@ def test_documentation_plane_is_excluded_on_purpose_and_is_not_empty():
         for path in docs
         for host in _KNOWN_HOSTS
     ), "문서에 호스트 언급이 하나도 없다 — 제외 규칙이 공허하다"
+
+
+def _sudoers_user_field(text: str) -> str | None:
+    """드롭인의 user spec(``<user> ALL=(root) …``)에서 **user 필드**만 뽑는다."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        match = re.match(r"^(\S+)\s+ALL=", stripped)
+        if match:
+            return match.group(1)
+    return None
+
+
+def test_sudo_dropin_does_not_hardcode_an_operator_account():
+    """NOPASSWD 드롭인의 계정 이름은 **호스트마다 다르다** — 템플릿이어야 한다.
+
+    ``scripts/`` 안의 정체성 리터럴이므로 `DoD-P5-09`의 관심사인데, 위 R1/R2 스캔은
+    이 축(=OS 계정)을 보지 않는다(호스트명·GPU 모델만 본다). 그래서 여기서 별도로 건다.
+
+    비공허 실증(G-35): 같은 추출기에 **박힌 형태**를 물리면 플레이스홀더가 아니라고
+    답해야 한다 — 추출기가 항상 None 을 돌려주면 위 단정은 저절로 통과한다.
+    """
+    text = (_REPO_ROOT / _SUDOERS_TEMPLATE).read_text(encoding="utf-8")
+    user = _sudoers_user_field(text)
+
+    assert user is not None, f"{_SUDOERS_TEMPLATE}: user spec 을 찾지 못했다"
+    assert user == "cv_infra_operator", (
+        f"{_SUDOERS_TEMPLATE}: user 필드가 '{user}' — 특정 호스트의 계정 이름을 박지 말고 "
+        "플레이스홀더를 두고 설치 시점에 치환하라 (README Step A)"
+    )
+    # 무장 실증: 박힌 계정이면 위 단정이 실제로 깨진다.
+    assert _sudoers_user_field("etri ALL=(root) NOPASSWD: CV_INFRA_MAINT") == "etri"

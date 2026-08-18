@@ -1,7 +1,16 @@
 # cv-infra — unattended maintenance NOPASSWD drop-in (P2+, STANDING)
 # ===========================================================================
 # Install target : /etc/sudoers.d/cv-infra   (mode 0440, owner root:root)
-# Authorized user: etri  (the workstation SSH account on etri6000)
+# Authorized user: cv_infra_operator  <- ★ PLACEHOLDER. Substitute it at INSTALL time
+#                  with the account that runs provisioning on THAT host (README
+#                  Step A does it with one `sed`). It used to be the literal `etri`,
+#                  which is the SSH account on the first workstation and a WRONG
+#                  value on every other host (DoD-P5-09: no deployment-target
+#                  identity hardcoded into scripts/). The placeholder is a legal
+#                  sudoers username token on purpose, so a file that reaches
+#                  /etc/sudoers.d unsubstituted still PARSES (a syntax error there
+#                  can lock an operator out of sudo entirely) while granting nothing
+#                  — the first `sudo -n` then fails loudly, which is the safe order.
 # Scope          : decision 2026-07-07-fu6-sudo-scope-reduction (option B) —
 #                  SUPERSEDES 2026-06-25 (option A, "Phase 1 ONLY / removable").
 #                  Unattended agents keep needing a non-interactive sudo channel
@@ -29,8 +38,11 @@
 # REMOVED vs Phase 1 (FU-6 — one-shot provisioning verbs, no P2+ recurrence):
 #   /usr/sbin/usermod    (was: usermod -aG docker etri — done; group persists)
 #   /usr/bin/nvidia-ctk  (was: nvidia-ctk runtime configure — daemon.json set)
-# Consequence: a FULL provision.sh re-run now stops at those two steps; they
-# become operator actions in an interactive terminal (accepted by the decision).
+# Consequence: a FULL provision.sh re-run stops at those two steps IF they still
+# have work to do; they become operator actions in an interactive terminal
+# (accepted by the decision). Since p5c17 both call sites first CHECK whether the
+# state they create already holds (group membership / registered nvidia runtime)
+# and skip loudly when it does — so an already-correct host never reaches them.
 #
 # SECURITY NOTE (accepted scope): arguments are NOT constrained, so each entry
 # is effectively root-equivalent (`docker run -v /:/host ...`,
@@ -45,4 +57,4 @@ Cmnd_Alias CV_INFRA_MAINT = \
     /usr/bin/systemctl, \
     /usr/bin/docker
 
-etri ALL=(root) NOPASSWD: CV_INFRA_MAINT
+cv_infra_operator ALL=(root) NOPASSWD: CV_INFRA_MAINT

@@ -20,6 +20,7 @@ scripts/detect_gpu.sh                       ← 코드. GPU 모델을 하나도 
    ▼  각 프로파일이 선언한 match_name_pattern에 매칭
 profiles/rtx_pro_6000.yaml                  ← 데이터. GPU 지식의 유일한 자리.
 profiles/a100.yaml
+profiles/rtx_4080.yaml
    │
    ▼  docker/.env 조각(fragment) 출력
 CV_VRAM_PER_INSTANCE_MB=<측정값>            → compose → serve.py → compute_k(NVML 2차 가드)
@@ -124,3 +125,8 @@ python이 없을 수 있다)와 테스트(pyyaml). `tests/test_deploy_gpu_profil
   `02-fragment.env` · `03-stderr.log` · `04-exit.txt`).
 - **A100은 우리가 가진 적이 없다.** `profiles/a100.yaml`은 구조만 있고 숫자는
   `TBD(미실측)`이다. 렌더 경로(D-A)·MIG(LOCKED §18 미사용)도 그 카드에서 미검증이다.
+- **RTX 4080(두 번째 배포 호스트)**: `profiles/rtx_4080.yaml`이 p5c17 T1에 추가됐다.
+  이름 문자열은 **실측 캡처**(`NVIDIA GeForce RTX 4080` · 16376 MiB · sm 8.9 · CPU 전용
+  질의)이지만 `vram_per_instance_mb`는 **TBD(미실측)** — 잡을 돌려야 나오는 값이라
+  같은 사이클 T4 몫이다. 그때까지 이 호스트에서 NVML 2차 가드는 **OFF**로 흐르고
+  k = min(`CV_MAX_CONCURRENT`, render_cap)이다(스크립트가 stderr로 크게 알린다).
