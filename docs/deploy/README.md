@@ -406,7 +406,12 @@ bash scripts/netns_audit.sh arm cv-infra-orchestrator
 #      ${CV_NETNS_AUDIT_RECORD_DIR:-/tmp}/cv-netns-audit.<chain>.<container>.arm  (+ .history)
 #    read 는 그 레코드를 살아있는 컨테이너와 대조하고, 다르면 exit 3 으로 거부한다
 #    ("0 이 아니라 VOID"). 레코드를 증적으로 남길 거면 이 두 파일을 함께 보관하라.
-#    이후 아무 때나:  bash scripts/netns_audit.sh read cv-infra-orchestrator
+#    이후 아무 때나 — 단 **감사 대상 런의 시작 시각을 대야 한다**:
+#      bash scripts/netns_audit.sh read cv-infra-orchestrator --since <그 런의 산출물 경로>
+#    카운터는 arm 시점에 0 이 되므로 arm **보다 먼저** 시작한 런은 애초에 안 들어있다.
+#    --since 는 그 창의 시작을 이름 붙이는 것이고, read 는 armed_at <= 창 시작을 단언한다
+#    (아니면 exit 3 "LATE ARM"). 값은 **런이 남긴 파일 경로**를 권한다 — mtime 은 증거고
+#    직접 타이핑한 타임스탬프는 주장이다. --since 없이 부르면 exit 2(usage).
 #    계측이 살아있는지 의심되면 양성 대조:  … probe … → 카운터가 움직인 뒤 다시 arm
 ```
 
@@ -532,7 +537,8 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 옵션 노브를 넣었는데 부팅이 죽는다 | `KNOB=` 빈 값 | 줄을 **주석 처리**(미설정 = 문서화된 기본값) |
 | 실행 코드가 옛날 것 같다 | 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --src <deploy-root> --tag <sha> --image <ref> --orchestrator-image <ref>` |
 | 스큐 게이트가 `runtime-plane path is not a git repo: '…/cv-infra-p2-src/cv-infra-workspace'` 로 **exit 3** | `--src` 의 **기본값이 이 프로젝트 워크스테이션의 디렉토리 레이아웃**(`$HOME/cv-infra-p2-src/cv-infra-workspace`)이다. 체크아웃이 다른 곳에 있는 배포에서는 항상 틀린다 | **`--src <deploy-root>` 를 명시하라.** 2026-08-15 clean-host 실측에서 처음 드러났다(그 전까지는 기본값이 우연히 맞는 호스트에서만 돌았다) |
-| `netns_audit.sh read` 가 `audit chain … is ABSENT` / `no arm record` / `container was REPLACED or RESTARTED since arm` 로 **exit 3** | 셋 다 같은 사실을 말한다 — **그 런은 감사되지 않았다**. 상주 컨테이너를 교체하는 모든 명령(`up`·`up -d`·`up --build`)이 netns 를 새로 만들고 규칙·카운터를 버린다(G-73) | 다시 `arm` 하고, **감사가 필요한 런을 다시 돌려라**. 이미 나간 런의 감사 결과를 소급해 만들 방법은 없다(0 이 아니라 VOID) |
+| `netns_audit.sh read` 가 `audit chain … is ABSENT` / `no arm record` / `container was REPLACED or RESTARTED since arm` / **`LATE ARM`** 으로 **exit 3** | 넷 다 같은 사실을 말한다 — **그 런은 감사되지 않았다**. 앞 셋은 컨테이너를 교체하는 모든 명령(`up`·`up -d`·`up --build`)이 netns 를 새로 만들기 때문(G-73), **`LATE ARM` 은 컨테이너가 그대로여도** 무장이 런보다 **뒤**였기 때문이다(카운터는 arm 에서 0 이 된다) | 다시 `arm` 하고, **감사가 필요한 런을 다시 돌려라**. 이미 나간 런의 감사 결과를 소급해 만들 방법은 없다(0 이 아니라 VOID) |
+| `netns_audit.sh read` 가 `--since / CV_NETNS_AUDIT_SINCE is REQUIRED` 로 **exit 2** | 카운터만 보고는 **어느 런을 감사한 것인지** 말할 수 없다. 무장 이전의 런은 카운터에 없는데도 0 으로 읽혔다(QA p5c16 D-3) | 감사 대상 런의 시작을 대라 — 그 런의 산출물 경로(`--since <…/result.json>`, mtime 사용)가 가장 좋고, 타임스탬프 문자열도 받는다 |
 | `up --build` 이 `CV_SOURCE_REVISION=<source commit sha> is required` 로 죽는다 | 스탬프 없는 이미지를 만들지 않겠다는 게이트(G-66) | 접두를 붙여 다시: `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose … up -d --build`. `.git` 이 없으면 기록된 릴리즈 sha 를 넣어라 |
 
 ---
