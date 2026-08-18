@@ -9,6 +9,12 @@ remain the wire's fixed point after models.py is gone. Golden literals were
 materialized from the Phase-2 emission at base cc4abb5 (pre-refactor
 ``VerificationResult.to_dict()``) — do not regenerate them from the code under
 test (that would make the guard vacuous).
+
+WIRE MOVE (p5c16, the only one since P3c2): ``origin`` / ``is_self_test`` left the
+``Result`` model, so they left these literals. They had no producer and no reader,
+and the constant ``is_self_test: false`` was WRONG on every self-test job (QA p5c15
+D6) — their one home is ``RequestEnvelope`` (see the ``Result`` docstring). Edited
+BY HAND from the previous literals, one key at a time; still never regenerated.
 """
 
 from __future__ import annotations
@@ -47,8 +53,6 @@ GOLDEN_PASS = {
     ],
     "artifacts": {"mcap": "/cv/result/bag/job.mcap", "mp4": "/cv/result/recording.mp4"},
     "request_identity_key": None,
-    "origin": None,
-    "is_self_test": False,
 }
 
 # --- golden: degraded error emission (main.run's except path: no outcomes/metrics)
@@ -64,8 +68,6 @@ GOLDEN_ERROR = {
     "criteria_results": [],
     "artifacts": {"mcap": None, "mp4": None},
     "request_identity_key": None,
-    "origin": None,
-    "is_self_test": False,
 }
 
 # --- golden: the exact bytes write_result puts on disk (sort_keys + indent=2) ---
@@ -87,7 +89,6 @@ GOLDEN_PASS_TEXT = """\
       "passed": true
     }
   ],
-  "is_self_test": false,
   "job_id": "job-0001",
   "metrics": {
     "collision_count": 0,
@@ -95,7 +96,6 @@ GOLDEN_PASS_TEXT = """\
     "path_len_m": 7.3,
     "time_to_goal_s": 42.5
   },
-  "origin": null,
   "request_identity_key": null,
   "verdict": "pass"
 }

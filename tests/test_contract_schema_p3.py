@@ -364,7 +364,6 @@ def test_result_typed_view_of_emitted_result():
     assert res.metrics.collision_count == 0 and res.metrics.min_clearance_m is None
     assert [c.oracle for c in res.criteria_results] == ["reached_goal", "no_collision"]
     assert res.artifacts.mcap is None and res.artifacts.mp4 is None
-    assert res.is_self_test is False
 
 
 def test_result_minimal_shim_materializes_the_wire_defaults():
@@ -385,9 +384,48 @@ def test_result_minimal_shim_materializes_the_wire_defaults():
         "criteria_results": [],
         "artifacts": {"mcap": None, "mp4": None},
         "request_identity_key": None,
-        "origin": None,
-        "is_self_test": False,
     }
+
+
+def test_result_wire_carries_no_self_test_provenance_markers():
+    """p5c16 (QA p5c15 D6): the runner is never told which envelope it came from
+    (the M3->M2 JOB_SPEC seam is frozen), so a marker copy on the Result could
+    only be empty or WRONG — and it was wrong: every self-test job emitted
+    ``is_self_test: false``. The keys are GONE from the wire, and extra=forbid
+    keeps a producer from putting them back without a contract change."""
+    emitted = _RESULT_EMISSIONS["pass-full"]
+    assert "is_self_test" not in emitted and "origin" not in emitted
+    for marker in ({"is_self_test": True}, {"is_self_test": False}, {"origin": "built-in-stub"}):
+        with pytest.raises(ValidationError):
+            Result.model_validate({**emitted, **marker})
+
+
+def test_self_test_marker_has_exactly_one_home_and_it_is_the_envelope():
+    """One home per field: the fact the Result used to fake is carried truthfully
+    by ``RequestEnvelope`` (orchestrator/selftest.py MARKER PLACEMENT, store v8,
+    domain-model *Request Envelope* attribute) — and ONLY there."""
+    env = RequestEnvelope.model_validate(
+        {
+            "trigger_source": "ci-cd",
+            "is_self_test": True,
+            "origin": "built-in-stub",
+            "requests": [VALID_DOC],
+        }
+    )
+    assert env.is_self_test is True and env.origin == "built-in-stub"
+    assert not {"is_self_test", "origin"} & set(Result.model_fields)
+
+
+def test_request_identity_key_is_unknown_on_the_runner_plane_but_the_slot_is_real():
+    """M1 owns the FIELD, M4 the derivation (LOCKED §7-13; M1 §3.1). The runner
+    has no hash, so the wire says ``None`` = not known on this plane (never
+    fabricated — the ``Artifacts`` convention). The slot is not vacuous: a real
+    key validates and round-trips unchanged."""
+    assert _RESULT_EMISSIONS["pass-full"]["request_identity_key"] is None
+    key = "sha256:" + "0" * 64
+    res = Result.model_validate({**_RESULT_EMISSIONS["pass-full"], "request_identity_key": key})
+    assert res.request_identity_key == key
+    assert res.model_dump()["request_identity_key"] == key
 
 
 def test_result_verdict_domain_is_the_four_locked_values():

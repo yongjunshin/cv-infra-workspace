@@ -447,8 +447,21 @@ class Result(_ForbidExtra):
     the emission-binding tests in tests/test_contract_schema_p3.py against the
     real producer (G-25: guard + positive control, not prose).
 
-    ``request_identity_key`` is a FIELD only — derivation/normalization is
-    M4's (LOCKED §7-13). ``origin`` / ``is_self_test`` are M7 markers.
+    ``request_identity_key`` is a FIELD only — derivation/normalization is M4's
+    (LOCKED §7-13; M1 §3.1 puts the field here). No producer fills it: the
+    runner has no access to the hash, so the wire carries ``None`` = NOT KNOWN
+    ON THIS PLANE (never fabricated, same convention as ``Artifacts``). The
+    derived key rides the report row instead (``report/regression.identity_key``
+    via ``report/aggregate``).
+
+    NOT HERE (p5c16): the self-test provenance markers ``is_self_test`` /
+    ``origin``. Their one home is ``RequestEnvelope`` above — domain-model
+    *Request Envelope* attribute, ``orchestrator/selftest.py`` MARKER PLACEMENT,
+    store v8 ``envelopes`` — and the runner is never told which envelope it came
+    from (the M3->M2 JOB_SPEC seam is frozen, ``orchestrator/api._job_spec_for``).
+    A copy here could only be empty or WRONG, and it was wrong: every self-test
+    job emitted ``is_self_test: false`` (QA p5c15 D6). One home per field
+    (2026-08-04 D-8 idiom); do not re-add without a real producer.
     """
 
     job_id: str = Field(min_length=1)
@@ -457,8 +470,6 @@ class Result(_ForbidExtra):
     criteria_results: list[CriterionResult] = Field(default_factory=list)
     artifacts: Artifacts = Field(default_factory=Artifacts)
     request_identity_key: str | None = None
-    origin: str | None = None
-    is_self_test: bool = False
 
 
 # --------------------------------------------------------------------------- #
