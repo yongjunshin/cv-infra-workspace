@@ -426,3 +426,76 @@ def test_sudo_dropin_does_not_hardcode_an_operator_account():
     )
     # 무장 실증: 박힌 계정이면 위 단정이 실제로 깨진다.
     assert _sudoers_user_field("etri ALL=(root) NOPASSWD: CV_INFRA_MAINT") == "etri"
+
+
+# --------------------------------------------------------------------------- #
+# 호스트 전제 누출 0 — NFR-DEPLOY-005 (p5c17 QA: 산문 앵커를 실행 가능한 것으로 교체)
+# --------------------------------------------------------------------------- #
+
+#: **호스트에 미리 설치돼 있어야 한다고 요구하는** 형태만 겨냥한다. 컨테이너가 스스로
+#: 갖는 것(``nvidia/cuda@sha256:…`` 이미지 참조, 이미지 내부 경로 ``/isaac-sim``)은
+#: 정확히 이 NFR 이 원하는 것이므로 겨냥하지 않는다 — 축은 *CUDA/Isaac 이 언급되는가* 가
+#: 아니라 *호스트 파일시스템/호스트 패키지를 전제하는가* 다.
+_HOST_PREREQ_LEAK = re.compile(
+    r"(?:/usr/local/cuda"
+    r"|/opt/nvidia/isaac[-_]?sim"
+    r"|\bnvcc\b"
+    r"|apt(?:-get)?\s+install[^\n]*\b(?:cuda[-\w]*|isaac[-\w]*)\b)",
+    re.IGNORECASE,
+)
+
+#: 심으면 잡혀야 하는 것(무장 실증).
+_PREREQ_ARMED_SAMPLES = (
+    "ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64",
+    "  nvcc --version || die 'install the CUDA toolkit first'",
+    "sudo -n apt-get install -y cuda-toolkit-12-3",
+    '    "/opt/nvidia/isaac-sim/python.sh",',
+)
+
+#: 잡히면 **오탐**인 것 — 이 NFR 이 요구하는 바로 그 형태들.
+_PREREQ_LEGITIMATE_SAMPLES = (
+    'readonly CV_CUDA_TEST_IMAGE="nvidia/cuda:13.0.1-base-ubuntu24.04"',
+    "  docker run --rm --gpus all $img nvidia-smi",
+    "WORKDIR /isaac-sim",  # 이미지 **내부** 경로 = 동반배포의 증거
+    '  -v "$CACHE_ROOT/cache/kit:/isaac-sim/kit/cache:rw"',
+    "FROM nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb2",
+)
+
+
+def test_deploy_plane_requires_no_host_cuda_or_isaac_install():
+    """`NFR-DEPLOY-005` 를 **실행 가능한 앵커로** 고정한다 — 호스트 전제는 드라이버+toolkit 뿐.
+
+    ★ 왜 이 테스트가 생겼나(p5c17 QA). 이 NFR 의 근거는 그동안 산문 한 줄이었고
+    (*"호스트에 CUDA 툴킷·Isaac 미설치 상태로 성공"*), 그 문장은 **거짓이었다**:
+    이 프로젝트의 GPU 호스트 두 대 모두 호스트 CUDA 를 갖고 있다 — 두 번째 호스트는
+    ``cuda-*-12-3`` + ``/usr/bin/nvcc``(QA 실측 2026-08-19), 첫 호스트는 저장소 자신이
+    ``scripts/workstation_setup/realign_driver_r580.sh`` 헤더에 *"host CUDA toolkit 12.0
+    packages (libcudart12 etc.)"* 로 적어 두고 있다. 즉 **부재로는 이 NFR 을 증명한 적이
+    없고 앞으로도 못 한다** — 증명해야 하는 것은 *부재* 가 아니라 **미의존** 이다.
+
+    그래서 판정을 관측 가능한 것으로 바꾼다: **배포 평면이 호스트 CUDA/Isaac 설치를
+    한 번도 전제하지 않는다.** 컨테이너 쪽 참조(핀된 CUDA 이미지, 이미지 내부
+    ``/isaac-sim``)는 반대 방향의 증거이므로 통과시킨다.
+
+    이 테스트가 덮지 **않는 것**(정직 표기): 런타임 마운트에 호스트 CUDA 경로가 섞이지
+    않는다는 것은 여기서 정적으로 볼 수 없다. 그쪽은 라이브 관측이 앵커다
+    (p5c17: 러너 마운트 8/8 이 전부 cv-infra 디렉토리, 컨테이너 CUDA 13.0 ≠ 호스트 12.3).
+    """
+    leaks = [
+        f"{path.relative_to(_REPO_ROOT)}:{number}: {line.strip()}"
+        for path in _scan_files()
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+        )
+        if _HOST_PREREQ_LEAK.search(line)
+    ]
+    assert leaks == [], f"배포 평면이 호스트 CUDA/Isaac 설치를 전제한다: {leaks}"
+
+    # 무장 실증 (G-35): 심으면 잡히고, 정당한 형태는 안 잡힌다.
+    for sample in _PREREQ_ARMED_SAMPLES:
+        assert _HOST_PREREQ_LEAK.search(sample), f"무장 실패 — 놓친 벡터: {sample!r}"
+    for sample in _PREREQ_LEGITIMATE_SAMPLES:
+        assert not _HOST_PREREQ_LEAK.search(sample), f"오탐 — 정당한 형태를 잡았다: {sample!r}"
+
+    # 스캔이 실제로 무언가를 읽었는가(부재가 통과로 둔갑하지 못하게).
+    assert len(_scan_files()) > 50
