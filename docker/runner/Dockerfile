@@ -256,6 +256,25 @@ RUN test -n "${CV_SOURCE_REVISION}" \
               "(runner-image plane stamp; recipe: docs/deploy/plane-sync.md ③)"; exit 1; }
 LABEL org.opencontainers.image.revision=$CV_SOURCE_REVISION
 
+# Hash-seed pin (CLAUDE §2-7 reproducibility; G-72). CPython randomizes str hashing
+# PER PROCESS, so every set/dict iteration order differs run to run — p5c15 shipped an
+# instrument (telemetry.contact_partners) whose output moved with it, and the spread was
+# nearly attributed to engine/scene non-determinism. The value is read at INTERPRETER
+# STARTUP only, so it cannot be set from inside cv_infra; it must be in the process env.
+# WHY HERE and nowhere else:
+#   * the image ENV covers EVERY interpreter in this container regardless of launcher
+#     (M3 supervisor, plain `docker run`, self-test), including the LD_LIBRARY_PATH
+#     re-exec (os.execv inherits environ) and the `ros2 bag record` subprocess;
+#   * NOT in the orchestrator's per-run env: that would cover supervisor-launched jobs
+#     only, and it is M3-owned (a `docker run -e` still overrides this if ever needed);
+#   * deliberately NOT in the test env — pytest must keep the randomized default so
+#     hash-order defects stay catchable instead of masked (tests pin the seed themselves
+#     where they assert stability: tests/test_runner_core.py).
+# Placed after the apt/wheel layers (same rationale as the stamp above) so adding it
+# does not invalidate them. Hash randomization is a DoS hardening for network servers;
+# this container is a batch job runner with no untrusted-input hashing path.
+ENV PYTHONHASHSEED=0
+
 # Stateless runner (LOCKED §15, NFR-EXEC-002): no job state/scenario/result baked in.
 # JOB_SPEC / RESULT_OUT / caches arrive as env + HOST-ABSOLUTE bind mounts (R-mount);
 # one job -> exactly one result.json -> exit (M2 owns the entrypoint's content).

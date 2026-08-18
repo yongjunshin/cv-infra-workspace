@@ -9,6 +9,9 @@ covered on the workstation in cycles 2-6.
 
 import json
 import math
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -299,3 +302,69 @@ def test_contact_partners_names_distinct_non_chassis_actors():
         "/World/floor",
         "/World/wall_a",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# G-72 — the INSTRUMENT'S OWN determinism. The p5c15 observation ("a stopped
+# robot, one seed, yet the contact-partner set moves run to run") was not the
+# engine: contact_partners picked one of two actors by set-iteration (hash)
+# order. Measure the instrument before attributing spread to the system.
+# --------------------------------------------------------------------------- #
+#: Articulation-aggregated pairs: NEITHER actor is the chassis (wheel/caster
+#: <-> ground), which is the shape that leaves TWO paths in the "others" set —
+#: the case the pre-existing test above never fed in (G-70 input diversity).
+_AGGREGATED_EVENTS = [
+    ContactEvent(0.1, "/World/warehouse/GroundPlane", "/World/carter/wheel_left"),
+    ContactEvent(0.2, "/World/warehouse/GroundPlane", "/World/carter/wheel_right"),
+    ContactEvent(0.3, "/World/warehouse/GroundPlane", "/World/carter/caster"),
+]
+
+
+def test_contact_partners_names_both_actors_when_neither_is_the_chassis():
+    # The documented contract is "distinct non-chassis actor paths seen in
+    # contact events" — with the chassis absent from the pair, BOTH actors are
+    # such paths. Naming one of them dropped a real partner from the debug
+    # surface AND made the choice hash-order dependent.
+    assert telemetry.contact_partners(_AGGREGATED_EVENTS, CHASSIS) == [
+        "/World/carter/caster",
+        "/World/carter/wheel_left",
+        "/World/carter/wheel_right",
+        "/World/warehouse/GroundPlane",
+    ]
+
+
+def test_contact_partners_output_is_hash_seed_independent():
+    """Same input into the instrument N times -> the same value out (G-72).
+
+    Child processes: ``PYTHONHASHSEED`` is read at interpreter startup only, so
+    an in-process ``os.environ`` poke would measure nothing. The seeds are
+    PINNED here (not left to pytest's ambient randomization) so the lock is
+    deterministic rather than flaky. Positive control (p5c16 T3, measured): with
+    ``next(iter(others))`` restored, these same ten seeds returned SIX different
+    answers and this test goes red.
+    """
+    pairs = [(e.actor0_path, e.actor1_path) for e in _AGGREGATED_EVENTS]
+    code = (
+        "from cv_infra.runner.telemetry import ContactEvent, contact_partners\n"
+        f"events = [ContactEvent(0.0, a, b) for a, b in {pairs!r}]\n"
+        f"print(contact_partners(events, {CHASSIS!r}))\n"
+    )
+    # PYTHONPATH stripped like the other child-process tests here: this host's
+    # shell leaks a ROS overlay into it (G-41), and the child must import the
+    # venv's cv_infra, not a py3.10 overlay.
+    base_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    by_output: dict[str, list[str]] = {}
+    for seed in (str(i) for i in range(10)):
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env=dict(base_env, PYTHONHASHSEED=seed),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        by_output.setdefault(proc.stdout.strip(), []).append(seed)
+    assert len(by_output) == 1, (
+        "contact_partners output depends on PYTHONHASHSEED — the instrument is "
+        f"non-deterministic (G-72): {by_output}"
+    )
