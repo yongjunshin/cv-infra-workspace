@@ -113,6 +113,9 @@ def count_real_collisions(
         actors = {e.actor0_path, e.actor1_path}
         if chassis_path not in actors:
             continue  # other-link contact (articulation aggregation artifact)
+        # Determinate by construction (unlike contact_partners' pre-G-72 form):
+        # the guard above proved the chassis IS an actor, so this set holds at
+        # most one path and the pick cannot depend on set-iteration order.
         others = actors - {chassis_path}
         other = next(iter(others)) if others else chassis_path
         if any(_matches(other, ex) for ex in excluded_paths):
@@ -127,11 +130,24 @@ def contact_partners(events: list[ContactEvent], chassis_path: str) -> list[str]
     Bring-up aid (T3/T4): when no_collision counts unexpected contacts, this
     names the offending prims so the consumer can extend
     ``collision_excluded_paths`` with measured values instead of guessing (R7).
+
+    EVERY non-chassis actor of an event is named, never one arbitrary pick. The
+    articulation aggregation documented in ``count_real_collisions`` delivers
+    pairs where NEITHER actor is the chassis (wheel<->ground), so there the
+    "others" set holds TWO paths. The previous ``next(iter(others))`` picked one
+    of them by set-iteration (hash) order, which made THIS INSTRUMENT'S OWN
+    output depend on ``PYTHONHASHSEED``: one fixed event list produced 4
+    different answers over 10 fresh processes, and that spread was nearly
+    attributed to engine/scene non-determinism (G-72). Dropping a real contact
+    partner also contradicted this function's own contract ("distinct
+    non-chassis actor paths"), so naming both is the repair, not just sorting.
     """
     partners: set[str] = set()
     for e in events:
         others = {e.actor0_path, e.actor1_path} - {chassis_path}
-        partners.add(next(iter(others)) if others else chassis_path)
+        # ``or {chassis_path}``: the degenerate self-pair (both actors ARE the
+        # chassis) stays visible instead of vanishing from the debug surface.
+        partners.update(others or {chassis_path})
     return sorted(partners)
 
 
