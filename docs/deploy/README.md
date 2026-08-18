@@ -130,6 +130,12 @@ bash scripts/workstation_setup/provision.sh
   **템플릿**이고 계정 이름은 설치 시점에 치환한다. 절차 = `scripts/workstation_setup/README.md` Step A.
 - 드라이버가 요구 브랜치가 아니면 **loud 하게 멈춘다**. 프로비저닝은 드라이버를 고치지
   않는다 — 유일하게 허가된 드라이버 스크립트는 `realign_driver_r580.sh` 다.
+- ⚠ **`①` 이 만드는 캐시 스캐폴드는 `②'` 의 `CV_ISAAC_CACHE_ROOT` 와 같은 트리가 아닐 수 있다**
+  (2026-08-19 실측). 이 단계는 자기 **기본** 루트(`$HOME/docker/isaac-sim`)에 디렉토리를 만들고,
+  실제 배포가 쓰는 트리는 `②''` 가 `.env` 의 값에 대해 따로 만든다. 두 값이 다르면 `①` 이 만든
+  것은 **아무도 쓰지 않는 고아 디렉토리**가 된다(잡은 정상 동작한다 — 낭비일 뿐이다).
+  같은 트리를 쓰고 싶으면 `②'` 에 그 기본 경로를 적거나, `①` 을 `CV_ISAAC_CACHE_ROOT=<원하는 경로>`
+  를 앞에 붙여 실행하라. **어느 쪽이든 소유권을 맞추는 것은 `②''` 이지 `①` 이 아니다**(G-15).
 
 ### ②' 설정 — `docker/.env`
 
@@ -410,6 +416,14 @@ docker logs cv-infra-orchestrator 2>&1 | grep -m1 serve-config
 #    ⚠ 8000 은 기본값일 뿐이다. CV_PUBLISH_PORT 를 바꿨으면 그 포트를 쓴다 —
 #    한 호스트에 두 배포가 있으면 8000 을 치는 것은 '남의 평면'을 확인하는 것이다(실측).
 curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${CV_PUBLISH_PORT:-8000}/openapi.json"   # 200
+#    ⚠⚠ 200 은 "내 평면에 닿았다"는 뜻이 아니다 (2026-08-19 실측). 이 데스크탑에서 8000 은
+#    에디터(Cursor/VS Code 계열)의 자동 포트포워딩이 잡고 있었고, 그 뒤에 있던 것은 **다른
+#    기계(원격 워크스테이션)의 제어 평면**이었다 — `docker ps --filter publish=8000` 은 비어
+#    있었고 `ss -ltn` 의 소유자는 docker 가 아니라 에디터였다. 즉 커널 포트 확인만으로는
+#    가짜를 못 거른다. 확실한 한 줄은 **평면에게 자기 카드를 물어보는 것**이다:
+curl -sS "http://127.0.0.1:${CV_PUBLISH_PORT:-8000}/monitor.json" \
+  | python3 -c 'import json,sys;r=json.load(sys.stdin)["resources"];print(r["vram_total_mib"],"MiB")'
+#    -> 이 호스트의 nvidia-smi 총 VRAM 과 같아야 한다. 다르면 남의 평면을 보고 있는 것이다.
 
 # 4) 운영 뷰
 cvi monitor --api http://orchestrator:8000
