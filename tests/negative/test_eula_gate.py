@@ -109,8 +109,13 @@ accepts``가 이것을 **가드에서 유도**해 고정한다: 후보 값마다
   아님 + 값이 다른 동의 키 이름)는 합법 관용구로 통과시킨다. 같은 모양의 *bare* 시퀀스
   리터럴을 값으로 악용하는 경우는 줄 단위로 구분 불가다(호출형
   ``setdefault("ACCEPT_EULA", "PRIVACY_CONSENT")`` 쪽은 잡는다 — 아래 오탐 대조 참조).
-* 스캔 **범위 밖**: 운영자의 미추적 ``.env``, 베이스 이미지 레이어, CI 시크릿. 게이트가
-  디렉토리 목록을 고정한다.
+* 스캔 **범위 밖**: 운영자의 로컬 ``.env``(= git 이 무시하는 파일), 베이스 이미지 레이어,
+  CI 시크릿. 게이트가 디렉토리 목록을 고정한다.
+  **★ p5c17 정정 — 이 carve-out 은 5개월간 문장으로만 존재했다.** 구현(``_scan_files``)은
+  ``rglob`` 하나였고 ``docker/.env`` 를 그대로 읽었다. 결과: **배포를 마친 호스트에서 이
+  스위트가 red**(QA 실측 2 fail), 그리고 green 으로 가는 최단 경로가 **운영자 동의 삭제**
+  였다(G-68 의 정확한 재현). CI 체크아웃엔 ``.env`` 가 없어 모순이 한 번도 실행되지
+  않았다(G-35 의 문서판). 이제 제외 집합을 **git 에게 묻는다** — 아래 ``git_ignored_under``.
 
 Stdlib + pytest (+ 기존 픽스처 YAML). 신규 의존 0.
 """
@@ -334,29 +339,94 @@ _CI_DIRS = (".github",)
 _CI_SENTINEL_FILES = (".github/workflows/ci.yml", ".github/workflows/verify.yml")
 
 
-def _scan_files(dirs: tuple[str, ...] = _GATE_DIRS) -> list[Path]:
-    """Every regular file under ``dirs`` (``grep -r`` 등가).
+def git_ignored_under(dirs: tuple[str, ...], root: Path) -> frozenset[Path]:
+    """``dirs`` 아래에서 **git 이 "무시한다"고 답한** 파일 전부.
 
-    ``__pycache__`` only holds compiled copies of sources already scanned, so it is
-    skipped to keep the scan deterministic; nothing else is filtered.
+    carve-out 목록을 손으로 들지 않고 **git 에게 묻는다**(G-56 ② 의 형태): 유일한 출처는
+    ``.gitignore`` 이고 거기엔 이미 ``.env`` 가 선언돼 있다. 목록을 이 파일에 적으면
+    두 선언이 갈라지고, 갈라지는 순간 차집합이 구멍이 된다.
+
+    답을 못 얻으면 **시끄럽게 죽는다.** 이 게이트의 판정 대상은 *저장소가 배송하는
+    바이트* 라서, 어떤 파일이 운영자 로컬 파일인지 모르는 상태에서는 판정 자체가
+    성립하지 않는다 — 조용한 green 도, 조용한 red 도 내지 않는다.
+
+    **공개 이름인 이유**: ``tests/negative/test_deployment_identity_hardcoding.py`` 의
+    스캔도 같은 평면(``docker/``)을 훑으므로 **같은 carve-out 이 필요하다**. 두 파일이
+    각자 제외 규칙을 들면 갈라지고, 갈라지는 순간 차집합이 구멍이 된다(G-56) —
+    ``baked_consent_bindings`` 를 ``test_gh_wiring_static.py`` 가 임포트하는 것과 같은 이유.
     """
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *dirs,
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
+        raise RuntimeError(
+            f"NEG-2 스캔이 무시 목록을 git 에게 묻지 못했다 (root={root}): {exc}."
+            " 이 게이트는 '커밋·베이크되는 것'을 판정하므로, 어떤 파일이 운영자 로컬"
+            " 파일인지 모르면 판정할 수 없다."
+        ) from exc
+    return frozenset(root / name.decode() for name in completed.stdout.split(b"\0") if name)
+
+
+def _scan_files(dirs: tuple[str, ...] = _GATE_DIRS, root: Path = _REPO_ROOT) -> list[Path]:
+    """``dirs`` 아래의 정규 파일 전부 — **git 이 무시하는 것은 빼고**(``grep -r`` 등가).
+
+    ``__pycache__`` 는 이미 스캔된 소스의 컴파일 사본이라 결정성을 위해 건너뛴다.
+    그 밖에 제외되는 것은 **git 이 무시한다고 답한 파일뿐**이며, 그것이 이 파일 헤더가
+    선언해 온 carve-out(*"운영자의 로컬 ``.env``"*) 이다.
+
+    **약화가 아니다.** 이 게이트가 금지하는 것은 *패키지·이미지에 굽힌 동의* 이고,
+    굽히려면 배송돼야 하고, 배송되려면 무시되지 않아야 한다. 아직 커밋되지 않았지만
+    무시되지도 않은 새 파일은 **그대로 스캔된다** — 좁힌 축은 "추적 여부"가 아니라
+    "무시 여부"다(전자로 좁히면 갓 만든 소스 파일이 빠져 진짜 구멍이 된다).
+    """
+    ignored = git_ignored_under(dirs, root)
     files: list[Path] = []
     for name in dirs:
-        for path in sorted((_REPO_ROOT / name).rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts:
-                files.append(path)
+        for path in sorted((root / name).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            if path in ignored:
+                continue
+            files.append(path)
     return files
 
 
-def _hits(predicate, dirs: tuple[str, ...] = _GATE_DIRS) -> list[str]:
-    return [
-        f"{path.relative_to(_REPO_ROOT)}:{number}: {line.strip()}"
-        for path in _scan_files(dirs)
-        for number, line in enumerate(
-            path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
-        )
-        if predicate(line)
-    ]
+def _hits(predicate, dirs: tuple[str, ...] = _GATE_DIRS, root: Path = _REPO_ROOT) -> list[str]:
+    """매치의 **위치와 키 이름**만 돌려준다 — 줄 내용은 절대 싣지 않는다.
+
+    옛 판은 매치한 줄을 그대로 담았고, 실패하면 pytest 가 그것을 콘솔·CI 로그·스크롤백에
+    찍었다. ``docker/.env`` 가 스캔에 들어오던 시절 그 출력은 **운영자가 타이핑한 수락
+    단어** 였다(p5c17 QA 실측: ``AssertionError: … 'docker/.env:145: ACCEPT_EULA=…'``).
+    이 파일은 자기 소스에 수락 값을 담지 않는 규율(G-21)을 지키면서 **실패 경로로 그것을
+    유출**하고 있었다. 진단에 필요한 것은 *어디에 · 어느 키가* 이지 *값이 무엇인지* 가
+    아니다.
+    """
+    found: list[str] = []
+    for path in _scan_files(dirs, root):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for number, line in enumerate(text.splitlines(), 1):
+            if not predicate(line):
+                continue
+            keys = sorted(key for key in _KEY_NAMES if key in line) or ["<consent key>"]
+            found.append(
+                f"{path.relative_to(root)}:{number}:"
+                f" {'+'.join(keys)} bound to a constant (value redacted)"
+            )
+    return found
 
 
 def test_no_acceptance_literal_is_baked_into_the_gate_dirs():
@@ -374,6 +444,56 @@ def test_no_acceptance_value_injection_in_any_syntax():
     본다 — 통과하는 것은 런타임 운영자 입력 형태뿐이다(위 ``_is_operator_supplied``).
     """
     assert _hits(lambda line: bool(baked_consent_bindings(line))) == []
+
+
+def _fake_deployment(root: Path, *, baked: bool) -> Path:
+    """운영자 ``.env`` 가 살아 있는 **배포 체크아웃**의 최소 복제(진짜 git 저장소).
+
+    ``docker/.env`` 는 ``.gitignore`` 가 무시한다(= 운영자 파일, ``②`` 가 쓰는 그것).
+    ``docker/Dockerfile`` 은 무시되지 않는다(= 배송되는 바이트). ``baked`` 면 후자에
+    동의를 굽는다 — 그것이 이 게이트가 실제로 금지하는 행위다.
+    """
+    for name in _GATE_DIRS:
+        (root / name).mkdir(parents=True, exist_ok=True)
+    (root / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (root / "docker" / ".env").write_text(f"{_CONSENT_KEY}=Y\n{_PRIVACY_KEY}=Y\n", encoding="utf-8")
+    ship_line = f"ENV {_CONSENT_KEY}=Y\n" if baked else "ENV TZ=UTC\n"
+    (root / "docker" / "Dockerfile").write_text(f"FROM scratch\n{ship_line}", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    return root
+
+
+def test_the_operator_env_carve_out_is_real_and_armed(tmp_path):
+    """헤더가 약속한 carve-out 을 **양방향으로** 고정한다 (p5c17 D-5 수리).
+
+    ⓐ 운영자 ``.env`` 만 있는 배포에서 **0 hit** — *배포를 마치면 스위트가 red* 이던
+    결함의 회귀 테스트다. 그 red 의 green 경로가 **운영자 동의 삭제** 였다(G-68).
+    ⓑ ★ **positive control (G-35)**: 무시되지 **않는** 파일에 같은 리터럴을 심으면 red.
+    좁히기가 가드를 죽였다면 여기서도 0 이 나온다 — 그건 수리가 아니라 삭제다.
+    ⓒ 진단 문자열에 **수락 값이 없다** — 실패 경로가 운영자 단어를 유출하지 않는다.
+    """
+    binding = lambda line: bool(baked_consent_bindings(line))  # noqa: E731
+
+    # ⓐ 운영자 파일만 — carve-out 이 실재하는가
+    clean = _fake_deployment(tmp_path / "clean", baked=False)
+    assert _hits(binding, _GATE_DIRS, clean) == []
+    assert _hits(lambda line: _GATE_LITERAL in line, _GATE_DIRS, clean) == []
+    assert (clean / "docker" / ".env").is_file(), "대조군이 공허하다 — .env 가 없다"
+    assert _CONSENT_KEY in (clean / "docker" / ".env").read_text(encoding="utf-8")
+
+    # ⓑ 배송되는 파일 — 가드가 살아 있는가
+    armed = _fake_deployment(tmp_path / "armed", baked=True)
+    binding_hits = _hits(binding, _GATE_DIRS, armed)
+    literal_hits = _hits(lambda line: _GATE_LITERAL in line, _GATE_DIRS, armed)
+    assert len(binding_hits) == 1, f"좁히기가 가드를 죽였다: {binding_hits}"
+    assert len(literal_hits) == 1, f"좁히기가 가드를 죽였다: {literal_hits}"
+    assert "docker/Dockerfile:2" in binding_hits[0]
+
+    # ⓒ 값 비유출
+    for hit in binding_hits + literal_hits:
+        assert _GATE_LITERAL not in hit, "진단 출력이 수락 값을 유출한다"
+        assert "value redacted" in hit
+        assert _CONSENT_KEY in hit  # 키 이름과 위치는 남는다 (진단 가능)
 
 
 def test_scan_covers_every_value_the_boot_guard_accepts():
