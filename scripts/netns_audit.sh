@@ -58,9 +58,22 @@
 #                                      measured 2026-08-03: iptables 1.8.11-2, nf_tables backend)
 #   CV_NETNS_AUDIT_CHAIN              audit chain name (default CV_EXT_AUDIT)
 #   CV_NETNS_AUDIT_PROBE_HOST/_PORT   positive-control destination (default a public host)
+#   CV_NETNS_AUDIT_RECORD_DIR         where `arm` keeps its record + history (default
+#                                     ${TMPDIR:-/tmp}). A record lost with the host's /tmp
+#                                     means a reboot, and a reboot already voided the netns.
+#
+# WHY `arm` WRITES A RECORD (G-73, measured p5c15): `docker compose up -d --build` REPLACES
+# the control-plane container, and the replacement is a FRESH netns — rules and counters are
+# gone. The deployment looks healthy, so nobody re-arms, and the next runs are simply not
+# audited (p5c15: 5 runs on the etri plane). The arm-time identity used to live only in the
+# operator's terminal scrollback, so `read` could print "external_packets=0" for a netns that
+# was never armed at all *after* a later re-arm. `arm` therefore persists container_id +
+# started_at, and `read` compares them with the LIVE container and FAILS CLOSED on mismatch.
+# No daemon, no poller: one file written by `arm`, read by `read`.
 #
 # Exit codes: 0 = ok · 2 = usage error · 3 = infra/config error, INCLUDING "audit chain
-#             missing on read" (fail-closed — same class as the plane-skew gate).
+#             missing on read", "no arm record" and "container replaced since arm"
+#             (fail-closed — same class as the plane-skew gate).
 set -euo pipefail
 
 readonly CV_STEP=netns-audit
@@ -71,13 +84,14 @@ CV_NETNS_AUDIT_IMAGE="${CV_NETNS_AUDIT_IMAGE:-cv-netns-audit:p5c8}"
 CV_NETNS_AUDIT_CHAIN="${CV_NETNS_AUDIT_CHAIN:-CV_EXT_AUDIT}"
 CV_NETNS_AUDIT_PROBE_HOST="${CV_NETNS_AUDIT_PROBE_HOST:-api.github.com}"
 CV_NETNS_AUDIT_PROBE_PORT="${CV_NETNS_AUDIT_PROBE_PORT:-443}"
+CV_NETNS_AUDIT_RECORD_DIR="${CV_NETNS_AUDIT_RECORD_DIR:-${TMPDIR:-/tmp}}"
 
 log() { printf '[cv-infra][%s] %s\n' "$CV_STEP" "$*"; }
 err() { printf '[cv-infra][%s][ERROR] %s\n' "$CV_STEP" "$*" >&2; }
 die() { err "$*"; exit "$EXIT_INFRA"; }
 
 usage() {
-  sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   printf '\nUsage: %s {arm|read|probe} <container>\n' "${BASH_SOURCE[0]##*/}"
 }
 
@@ -104,6 +118,21 @@ netns_identity() {
   docker inspect -f 'container_id={{.Id}} started_at={{.State.StartedAt}}' "$c"
 }
 
+# The arm record: one file per (chain, container). Written by `arm`, verified by `read`.
+record_path() { printf '%s/cv-netns-audit.%s.%s.arm' "$CV_NETNS_AUDIT_RECORD_DIR" "$CV_NETNS_AUDIT_CHAIN" "$1"; }
+
+write_record() {
+  local c="$1" rec; rec="$(record_path "$c")"
+  [[ -d "$CV_NETNS_AUDIT_RECORD_DIR" ]] \
+    || die "record dir not found: '$CV_NETNS_AUDIT_RECORD_DIR' (set CV_NETNS_AUDIT_RECORD_DIR)."
+  { printf 'armed_at=%s\nchain=%s\ncontainer=%s\n%s\n' \
+      "$(date -Is)" "$CV_NETNS_AUDIT_CHAIN" "$c" "$(netns_identity "$c")"; } > "$rec" \
+    || die "cannot write the arm record '$rec' — refusing to arm without one (a capture nobody can verify is not a capture)."
+  # Append-only history: every arm of this deployment, in order (the "arm log" of G-73).
+  printf '%s armed %s\n' "$(date -Is)" "$(netns_identity "$c")" >> "${rec}.history" || true
+  printf '%s' "$rec"
+}
+
 # --- commands --------------------------------------------------------------
 
 cmd_arm() {
@@ -126,8 +155,10 @@ cmd_arm() {
     iptables -A OUTPUT -j ${chain}
     iptables -Z ${chain}
   " >/dev/null
+  local rec; rec="$(write_record "$c")"
   log "ARMED chain=${chain} container=${c} at=$(date -Is)"
   log "$(netns_identity "$c")"
+  log "arm record: ${rec} (+ .history) — 'read' verifies the live container against it"
   log "counters zeroed; read them later with: $0 read ${c}"
 }
 
@@ -141,10 +172,24 @@ cmd_read() {
   syn="$(printf '%s\n' "$out" | awk '$0 ~ /tcp/ && $0 ~ /flags:0x17\/0x02/ {print $1}' | tail -1)"
   all="$(printf '%s\n' "$out" | awk 'NF>=8 && $3=="all" && $4=="--" {print $1}' | tail -1)"
   printf '%s\n' "$out"
-  log "$(netns_identity "$c")"
+  local live rec recorded
+  live="$(netns_identity "$c")"
+  log "$live"
   log "external_syn=${syn:-unparsed} external_packets=${all:-unparsed}"
-  log "NEG-1 runtime observation holds iff external_packets == 0 AND the netns identity"
-  log "above matches the one recorded at arm time (a restarted container = fresh netns"
+  # The identity check the header used to leave to the operator's scrollback (G-73).
+  rec="$(record_path "$c")"
+  [[ -f "$rec" ]] \
+    || die "no arm record at '$rec' — these counters cannot be attributed to a known arming. Re-arm ($0 arm ${c}) BEFORE the run you want audited; runs made before that arming are NOT audited."
+  recorded="$(grep -m1 '^container_id=' "$rec" || true)"
+  [[ -n "$recorded" ]] || die "arm record '$rec' is malformed (no container_id) — re-arm."
+  if [[ "$recorded" != "$live" ]]; then
+    err "recorded at arm time : $recorded"
+    err "live now             : $live"
+    die "the audited container was REPLACED or RESTARTED since arm (\`up --build\` does exactly this, G-73) — this capture is VOID, not zero. Re-arm and re-run whatever you needed audited."
+  fi
+  log "arm record verified: $rec (armed_at=$(sed -n 's/^armed_at=//p' "$rec" | head -1))"
+  log "NEG-1 runtime observation holds iff external_packets == 0 AND the identity above"
+  log "matches the arm-time record (verified just now — a restarted container = fresh netns"
   log "= counters and rules lost = the capture is VOID, not zero)."
 }
 

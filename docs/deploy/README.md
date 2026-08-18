@@ -257,7 +257,7 @@ ls -ln "$CV_ISAAC_CACHE_ROOT/cache/"        # kit / home / computecache 셋이 u
 
 | 모드 | 트리 | 첫 잡 | 언제 |
 |---|---|---|---|
-| `provision` | 비어 있음 | **콜드 — 실측 141 s**(§9) | 캐시 비용을 정직하게 재고 싶을 때 |
+| `provision` | 비어 있음 | **콜드 — 실측 120 · 141 · 291 s**(§9, 3회 — 하나의 수가 아니다) | 캐시 비용을 정직하게 재고 싶을 때 |
 | `warm` | 씬 클로저까지 채움 | 웜 — 실측 28 s | 실사용 배포. 워밍 자체가 Isaac 부팅 1회 값을 낸다 |
 
 > ### ⚠ 공유 캐시는 **정상 운영으로 스스로 데워지지 않는다** (2026-08-15 실측)
@@ -285,6 +285,24 @@ CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
   **`docker/.env` 에는 넣지 마라** — 그 순간부터 모든 빌드가 그 옛 커밋을 주장한다
   (스큐 게이트가 잡지만, 애초에 적어 두지 않는 것이 싸다).
 - 빌드 없이 재기동(`up -d`·`ps`·`down`)에는 이 접두가 **필요 없다**.
+- ⚠ **`up --build` 는 "빌드했다"를 뜻하지 않는다.** compose 는 레이어 캐시가 맞으면 전부
+  재사용하고 **초 단위로 끝난다**(실측 2026-08-15: **0.44 s, 전 레이어 CACHED** — 그 배포는
+  이미지 바이트를 하나도 만들지 않았다). 소스가 바뀌지 않았거나 같은 데몬이 이미 그 레이어를
+  갖고 있으면 이것이 정상 동작이다. **정말로 다시 구워야 할 때**(호스트 이관 검증·베이스나
+  apt 인덱스가 움직였는지 확인·캐시 오염 의심)는 `up` 에 `--no-cache` 가 **없으므로** 제품
+  경로의 2행 형태를 쓴다:
+  ```bash
+  CV_SOURCE_REVISION="$(git rev-parse HEAD)" \
+    docker compose -f docker/compose.yaml build --no-cache    # 같은 compose.yaml·같은 build.args
+  docker compose -f docker/compose.yaml up -d                 # 새 이미지로 교체
+  ```
+  실측(2026-08-18, M-1 평면): 제어 평면 `build --no-cache` **12.97 s** → `up -d` **0.61 s**.
+  베이스는 다이제스트 핀이라 **재-pull 되지 않는다**(`--no-cache` 는 우리 레이어만 다시 만든다)
+  — 그래서 새 이미지도 베이스 레이어 **4개는 공유**하고 **우리 레이어 3개만 새로** 생긴다.
+  `docker build` 로 대체하지 마라: 그러면 검증한 것이 제품 경로가 아니게 된다(G-66).
+- ⚠ **`up` 은 상주 컨테이너를 교체한다 = 컨테이너에 붙어 있던 감사·계측이 그 순간 죽는다**
+  (G-73). 재기동 절차는 §4 의 `5) egress 감사 재무장`까지가 **한 세트**다 — 재무장 없이
+  나간 런은 감사되지 않았고, 그 사실은 나중에 `read` 가 **exit 3** 으로만 알려준다.
 
 - 올라오는 것은 **제어 평면 하나**(orchestrator = 제출/스케줄러 API + 운영 read model)뿐이다.
 - 러너와 SUT 는 **compose 서비스가 아니다** — 잡마다 오케스트레이터가 호스트 데몬에
@@ -382,10 +400,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${CV_PUBLISH_PORT:-8
 # 4) 운영 뷰
 cvi monitor --api http://orchestrator:8000
 
-# 5) 외부 egress 감사를 무장한다 (제어 평면을 새로 띄웠으면 반드시 다시)
+# 5) 외부 egress 감사를 무장한다 — 제어 평면을 새로 띄웠으면 **반드시 다시** (G-73)
 bash scripts/netns_audit.sh arm cv-infra-orchestrator
+#    arm 은 컨테이너 정체성(id + started_at)을 레코드 파일에 남긴다:
+#      ${CV_NETNS_AUDIT_RECORD_DIR:-/tmp}/cv-netns-audit.<chain>.<container>.arm  (+ .history)
+#    read 는 그 레코드를 살아있는 컨테이너와 대조하고, 다르면 exit 3 으로 거부한다
+#    ("0 이 아니라 VOID"). 레코드를 증적으로 남길 거면 이 두 파일을 함께 보관하라.
 #    이후 아무 때나:  bash scripts/netns_audit.sh read cv-infra-orchestrator
+#    계측이 살아있는지 의심되면 양성 대조:  … probe … → 카운터가 움직인 뒤 다시 arm
 ```
+
+> **재무장은 배포 재기동 절차의 일부다.** `up`/`up --build`/`up -d` 는 상주 컨테이너를
+> **교체**하고, 교체된 컨테이너는 **새 netns** 라 규칙도 카운터도 없다. 2026-08-15 에
+> 이것이 실제로 일어났고 그 뒤 런 **5건이 전부 미감사**로 나갔다 — 아무 것도 실패하지
+> 않았기 때문에 아무도 눈치채지 못했다. 위 `arm` 을 `up` 과 **같은 절차 안에서** 돌려라.
 
 > `serve-config` 한 줄을 **읽지 않고 넘어가지 말 것.** 마운트나 캐시가 조용히 빠진
 > 배포는 겉보기에 정상으로 돌면서 측정을 전부 콜드로 만든다. 이 줄이 그것을 눈에
@@ -418,9 +446,10 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 로그 | `docker logs -f cv-infra-orchestrator` (json-file, 회전 상한은 `.env` 노브) |
 | 중지 | `docker compose -f docker/compose.yaml stop` |
 | 내리기 | `docker compose -f docker/compose.yaml down` (네트워크까지 제거) |
-| 설정 변경 반영 | `.env` 를 **upsert 로** 고친 뒤(§3-②' 경고) `up -d` 재실행 |
-| 제어 평면 코드 갱신 | 체크아웃 갱신 → `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose -f docker/compose.yaml up -d --build` |
-| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d`. 스큐 확인: `bash scripts/check_plane_skew.sh --src <deploy-root> --tag <release-sha> --image <ref> --orchestrator-image <ref>` |
+| 설정 변경 반영 | `.env` 를 **upsert 로** 고친 뒤(§3-②' 경고) `up -d` 재실행 → **감사 재무장**(§4-5) |
+| 제어 평면 코드 갱신 | 체크아웃 갱신 → `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose -f docker/compose.yaml up -d --build` → **감사 재무장**(§4-5) |
+| 캐시를 무시하고 **정말로 다시 굽기** | `CV_SOURCE_REVISION=… docker compose … build --no-cache` → `up -d` → **감사 재무장**(§3-③ ⚠ 블록) |
+| **러너 이미지 핀 교체** | 새 이미지 빌드 → `.env` 의 `CV_RUNNER_IMAGE` 한 줄을 upsert → `up -d` → **감사 재무장**. 스큐 확인: `bash scripts/check_plane_skew.sh --src <deploy-root> --tag <release-sha> --image <ref> --orchestrator-image <ref>` |
 | CLI 한 번 쓰기 | `docker compose -f docker/compose.yaml run --rm --no-deps orchestrator cv-infra <cmd> --api http://orchestrator:8000` (§4) |
 
 > ⚠ **`up -d --build` 를 `CV_SOURCE_REVISION` 없이 돌리면 빌드가 실패한다** — 그것이
@@ -503,6 +532,7 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 | 옵션 노브를 넣었는데 부팅이 죽는다 | `KNOB=` 빈 값 | 줄을 **주석 처리**(미설정 = 문서화된 기본값) |
 | 실행 코드가 옛날 것 같다 | 평면 스큐 | [`plane-sync.md`](plane-sync.md) + `scripts/check_plane_skew.sh --src <deploy-root> --tag <sha> --image <ref> --orchestrator-image <ref>` |
 | 스큐 게이트가 `runtime-plane path is not a git repo: '…/cv-infra-p2-src/cv-infra-workspace'` 로 **exit 3** | `--src` 의 **기본값이 이 프로젝트 워크스테이션의 디렉토리 레이아웃**(`$HOME/cv-infra-p2-src/cv-infra-workspace`)이다. 체크아웃이 다른 곳에 있는 배포에서는 항상 틀린다 | **`--src <deploy-root>` 를 명시하라.** 2026-08-15 clean-host 실측에서 처음 드러났다(그 전까지는 기본값이 우연히 맞는 호스트에서만 돌았다) |
+| `netns_audit.sh read` 가 `audit chain … is ABSENT` / `no arm record` / `container was REPLACED or RESTARTED since arm` 로 **exit 3** | 셋 다 같은 사실을 말한다 — **그 런은 감사되지 않았다**. 상주 컨테이너를 교체하는 모든 명령(`up`·`up -d`·`up --build`)이 netns 를 새로 만들고 규칙·카운터를 버린다(G-73) | 다시 `arm` 하고, **감사가 필요한 런을 다시 돌려라**. 이미 나간 런의 감사 결과를 소급해 만들 방법은 없다(0 이 아니라 VOID) |
 | `up --build` 이 `CV_SOURCE_REVISION=<source commit sha> is required` 로 죽는다 | 스탬프 없는 이미지를 만들지 않겠다는 게이트(G-66) | 접두를 붙여 다시: `CV_SOURCE_REVISION="$(git rev-parse HEAD)" docker compose … up -d --build`. `.git` 이 없으면 기록된 릴리즈 sha 를 넣어라 |
 
 ---
@@ -569,6 +599,25 @@ ls "$CV_OUT_DIR"/cvj-*/result/result.json
 - **`.env` 취급**: 파일을 다시 만들지도, 백업하지도 않았다(G-68 ④). `CV_RUNNER_IMAGE` 는
   **제자리 치환 + 프로방넌스 주석(Id/revision) 동시 갱신**, 편집 전후 `check_consent.sh`
   **exit 0**, 줄 수·모드(600) 불변.
+
+**캐시-없는 재빌드는 2026-08-18 에 M-1 평면에서 실행됐다**(증적 `~cvm1/cv-infra-m1-evidence/p5c16/`,
+채널 SSH, 소스 커밋 `4a257fb`) — 이 문서의 §3-③ ⚠ 블록이 그 실행에서 나왔다:
+
+- `compose build --no-cache` **12.97 s** → `up -d` **0.61 s**(대조: 같은 평면의 `up --build`
+  2026-08-15 = **0.44 s / 전 레이어 CACHED**). 새 이미지는 이전 이미지와 **베이스 레이어 4개를
+  공유하고 우리 레이어 3개는 고유**하다(`docker inspect … .RootFS.Layers` 집합 연산) —
+  즉 `--no-cache` 는 다이제스트-핀된 베이스를 다시 받지 않고 **우리 레이어만** 다시 만든다.
+- **러너 이미지도 같은 평면에서 캐시 없이 구웠다**: `docker build --no-cache`(제품 경로 =
+  `plane-sync.md` ②) **60.78 s**, 15.46 GB, 이전 러너 이미지와 레이어 **19 공유 / 4 고유**
+  (공유분 = 다이제스트-핀된 Isaac 베이스). **apt 버전 핀 8개가 다시 해석됐다** — D-6 (C)
+  입력 집합이 두 번째로 실측됐다. 그 뒤 3평면 스큐 게이트 **exit 0**(셋 다 `4a257fb`).
+- 재빌드 후 `④` self-test **exit 0**(`report_outcome=pass`) **2회**: 제어 평면만 재빌드한
+  상태에서 CLI wall **291.13 s**, 러너까지 재빌드한 뒤 **120.11 s** — 둘 다 **콜드 캐시**다.
+  지배항은 매번 `robot_spawn`(**243.67 s** / **74.92 s**; 2026-08-15 콜드는 97.87 s).
+  ⇒ **콜드 비용은 하나의 수가 아니다** — 같은 호스트·같은 잡·같은 빈 캐시에서 **120~291 s**
+  로 흔들린다(측정 중 같은 GPU 에 다른 텐넌트가 있었다). 판정·지표는 그 사이에도 불변
+  (`verdict=pass`, `path_len_m=1.9078142372702626e-05` 마지막 자리까지 동일).
+- 잡 종료 후 공유 캐시 **0 B / 파일 0 개** — §3-②'' ⚠ 블록이 두 번 더 재현됐다.
 
 **⓪~④ 전체를 "처음부터" 완주한 것은 2026-08-15 이 처음이다** — 같은 호스트의 **새 OS 사용자**
 (`cvm1`, uid 2001, 새 홈·새 체크아웃·새 동의·**콜드 캐시**)로 수행. 증적
