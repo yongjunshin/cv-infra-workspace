@@ -28,9 +28,10 @@ so an ``origin`` key inside the request document is a 422). REQ-SELFTEST-001's
 the size-1 envelope that contains exactly that request; the value string is
 verbatim (``SELF_TEST_ORIGIN``).
 
-THE STUB SUT HANDLE (open — M7 §3.5 A/B, co-owned Runner+Infra): this module
-supplies the stub REQUEST; the platform-internal image that plays the SUT side
-is a deployment artifact, and this deployment has none yet. The ref is resolved
+THE STUB SUT HANDLE (M7 §3.5 option B — decided p5c15): this module supplies the
+stub REQUEST; the platform-internal image that plays the SUT side is a deployment
+artifact built from ``docker/selftest_stub/`` (recipe in its README), so a given
+deployment either has it or must build it. The ref is resolved
 from an explicit argument or ``CV_SELFTEST_SUT_IMAGE`` and is NEVER defaulted to
 a guess — the same image-as-artifact policy ``CV_RUNNER_IMAGE`` already follows
 (FU-10: no hardcoded default). Unresolved = ``SelfTestNotConfigured``, which the
@@ -199,8 +200,8 @@ def _resolve_sut_image(sut_image_ref: str | None, environ: Mapping[str, str]) ->
         f" {SUT_IMAGE_ENV}=<platform-internal stub image ref> (or pass one explicitly)."
         " The self-test never falls back to a consumer image — that would be the"
         " external-SUT dependency NFR-SELFTEST-001 forbids — and never guesses an"
-        " image ref (image-as-artifact, FU-10). The stub image itself is the open"
-        " M7 §3.5 A/B decision (in-runner driver vs a lightweight stub container)."
+        " image ref (image-as-artifact, FU-10). Build the stub image first —"
+        " recipe: docker/selftest_stub/README.md."
     )
 
 

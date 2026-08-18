@@ -56,7 +56,7 @@ from cv_infra.runner.telemetry import PhysicsTelemetrySampler
 from tests.test_supervisor_min import RUNNER_IMAGE, SUT_IMAGE, FakeClient, make_spec, put_result
 
 #: A PLATFORM-internal stub SUT handle for the CPU tests (the real one is a deployment
-#: artifact — M7 §3.5 open). Deliberately NOT the consumer fixture's ``carter-sut:*``.
+#: artifact built from ``docker/selftest_stub/``). Deliberately NOT ``carter-sut:*``.
 STUB_SUT = "cv-infra-selftest-stub:test"
 
 _STUB_ENV = {SUT_IMAGE_ENV: STUB_SUT}
@@ -64,6 +64,12 @@ _STUB_ENV = {SUT_IMAGE_ENV: STUB_SUT}
 #: The canonical CONSUMER scenario the platform copies for its own tests — the thing a
 #: self-test must never depend on (boundary rule ③ / NFR-SELFTEST-001).
 _CONSUMER_FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: Where the stub SUT image COMES FROM (M7 §3.5 option B, built in p5c15) — the
+#: destination an unconfigured deployment must be sent to.
+_STUB_RECIPE = "docker/selftest_stub/README.md"
 
 
 class _PassRunner:
@@ -244,6 +250,32 @@ def test_stub_sut_handle_is_never_guessed(tmp_path, monkeypatch):
     submission = build_self_test_submission(sut_image_ref="other:1", environ=_STUB_ENV)
     assert submission.sut_image_ref == "other:1"
     assert submission.body["requests"][0]["sut"]["image_ref"] == "other:1"
+
+
+def test_refusal_points_at_the_stub_build_recipe(tmp_path, monkeypatch):
+    """A refusal must be ACTIONABLE — and this one went stale for two cycles.
+
+    Its last sentence used to call the stub image "the open M7 §3.5 A/B decision".
+    That decision landed on option B in p5c15 and the image was BUILT
+    (``docker/selftest_stub/``), so the one surface that mentions the stub told an
+    operator to WAIT where the truth was BUILD. Nothing pinned the message, so the
+    suite stayed green while it rotted.
+
+    Pinned = the two load-bearing facts, not the prose: the refusal fires for BOTH
+    resolution failures, and it names a build recipe that actually exists.
+    """
+    monkeypatch.chdir(tmp_path)  # no repo checkout under the CWD either
+    for environ in ({}, {SUT_IMAGE_ENV: "   "}):  # unset / set-but-empty (G-26)
+        with pytest.raises(SelfTestNotConfigured) as exc:
+            build_self_test_submission(environ=environ)
+        message = str(exc.value)
+        assert SUT_IMAGE_ENV in message  # which knob carries the ref...
+        assert _STUB_RECIPE in message  # ...and where a deployment gets a value for it
+
+    # 비공허: a pointer at something that does not exist is a NEW dead end, so the
+    # recipe the message names is asserted to be a real artifact of this tree.
+    assert (_REPO_ROOT / _STUB_RECIPE).is_file()
+    assert (_REPO_ROOT / "docker/selftest_stub/Dockerfile").is_file()
 
 
 def test_stub_needs_no_consumer_asset_at_all(tmp_path, monkeypatch):
