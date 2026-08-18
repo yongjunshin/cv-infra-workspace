@@ -124,6 +124,7 @@ docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
 | `cv-infra-runner:p5c16-rebuild2` (**D-6 ① 동등성 대조군**) | `sha256:ef66de2401480b9f59f9f4f8e6a95aaa0e6f552b25d52c38e2d039a3939a931e` | 같은 커밋 `ac442ee`, **독립 `git archive` 컨텍스트(diff 공집합) + `--no-cache`**, **1m6s** | **Image Id 는 다르다**(D-6 예고대로) — 나머지는 동일: apt 매니페스트 252/252 · 전체 dpkg **413/413** · wheel 50파일 sha256 · import 스모크 · **같은 self-test 잡의 verdict·지표**. 총 Size 도 바이트 동일(15,461,682,451 B) |
 | `cv-infra-orchestrator:local` (평면 ②') | `sha256:0cbc0b0d284dd1c37fb76d8367f9394c0527aa1d9d6b4a10ead5623441e448f1` | `ac442ee` (`CV_SOURCE_REVISION=… docker compose … up -d --build`, **7.9 s**) | **compose 경로가 처음으로 revision 라벨을 남긴 이미지**(G-66 수리 확인). 리빌드 전 `:local`은 `rev=<unstamped>` → 게이트 exit 3, 후 exit 0 |
 | `cv-infra-selftest-stub:p5c16` (stub SUT 평면) | `sha256:b8a8b4c310d860a2ee84959fdbfa07140b3cd9c29414ef5269c8b62cb7ba861f` | `ac442ee` (`docker/selftest_stub/README.md` §5) | 931 MB · 라이브 self-test 4회에서 readiness 배리어 **0.36 s** 통과. ⚠ 이 빌드는 스탬프 레이어만 새로 굽고 **apt 레이어는 캐시 히트**였다 — 이 이미지의 핀 가용성은 오늘 재확인되지 **않았다** |
+| **`cv-infra-runner:p5c17`** (**G-74 스큐 창 폐쇄**) | `sha256:15f140d5b860bcd7d8fb6caa29b296b5887f64727b7707ab1acda1799162a786` | `8016803e4e5f7e4430d5c652a914af0fe7960f72` (`git archive` 컨텍스트 + `--build-arg`) | **5 s** — ⚠ apt 레이어 **캐시 히트**라 이 빌드는 apt 핀 가용성을 재확인하지 **않았다**(p5c16 의 2m10s 와 대비) · wheel **50파일 ↔ 소스 diff 공집합** · 이미지 안 `./python.sh -c "import isaacsim, cv_infra"` OK(pydantic 2.11.7 · numpy 1.26.0) · 게이트 **exit 0**(3평면) · `cv-infra run` 단독 경로 **exit 3 → exit 0**(같은 잡이 재빌드 전에는 `verdict=pass` 인데 exit 3, G-74) · 라이브 self-test pass · `docker/.env` 핀 갱신 + `up -d` · 증적 `~/cv-infra-p2-out/p5c17/t2/` |
 
 ### 게이트가 ③을 본다 (p5c13, Q1-B) — 그리고 **옛 이미지는 전부 미스탬프**다
 
@@ -332,6 +333,9 @@ fail-closed). **읽기 대조만** 하며 워크스테이션·체크아웃·git 
       `vram_total_mib=97887`·`requests[]`에 2026-07-22 봉투 잔존(**store 연속성 실증**).
       ★ **재기동 후 netns 감사 하네스는 반드시 재무장**한다(`netns_audit.sh arm <새 컨테이너>`)
       — 컨테이너가 바뀌면 이전 무장은 무효고, 빠뜨리면 그 사이클은 감사되지 않은 런이 된다.
+      **순서가 곧 증거다**: `arm` → 라이브 leg → `read <컨테이너> --since <그 leg 의 산출물>`.
+      런보다 늦은 `arm` 은 `read` 가 **exit 3 `LATE ARM`** 으로 거부한다(카운터는 arm 에서 0 이
+      되므로 그 런은 애초에 안 들어있다 — 0 이 아니라 VOID).
 3-bis. **러너 이미지 평면 동기화(③)** — 러너가 실행하는 wheel이 X와 다르면 잡이
    컨테이너 안에서 죽는다(p5c12 실측). X가 `cv_infra/**`를 건드렸다면
    [위 ③ 절](#-러너-이미지-평면--잡-컨테이너-안의-wheel)의 리빌드가 **선행 조건**이다
