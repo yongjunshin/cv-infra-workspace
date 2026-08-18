@@ -35,7 +35,7 @@
 
 | 항목 | 요구 | 확인 명령 |
 |---|---|---|
-| OS | 프로비저닝 스크립트가 단언하는 배포판/코드네임/아키텍처 (핀 = `scripts/workstation_setup/common.sh`) | `. /etc/os-release; echo $ID/$VERSION_CODENAME $(dpkg --print-architecture)` |
+| OS | 프로비저닝 스크립트가 단언하는 배포판/**코드네임 집합**/아키텍처 (핀 = `scripts/workstation_setup/common.sh`) | `. /etc/os-release; echo $ID/$VERSION_CODENAME $(dpkg --print-architecture)` |
 | NVIDIA 드라이버 | **R580 브랜치**(플로어 이상 **AND** major == 580), open kernel module. 프로비저닝은 드라이버를 **절대 설치·업그레이드하지 않는다** — 단언만 한다 | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | Docker CE + Compose v2 | 핀된 버전(`common.sh`) | `docker version --format '{{.Server.Version}}'` · `docker compose version` |
 | NVIDIA Container Toolkit | `nvidia` 런타임 등록 | `docker info --format '{{json .Runtimes}}' \| grep -o '"nvidia"'` |
@@ -74,7 +74,7 @@
 | 단계 | 스코프 | 두 번째 OS 사용자가 다시 해야 하나 | 근거(실측) |
 |---|---|---|---|
 | `⓪` clone | **OS 사용자마다** | **예** — 자기 홈에 자기 체크아웃 | 익명 clone 1.0 s |
-| `①` provision | **호스트 1회 · root 권한** | **아니오 — 실행할 수 없다** | `sudo -n true` → **exit 1**. NOPASSWD 드롭인은 프로비저닝을 한 사용자에게만 부여된다. 이미 충족된 호스트에서는 §1 **확인 명령**만 돌리면 된다 |
+| `①` provision | **호스트 1회 · root 권한**(단, 이미 충족된 항목은 특권 호출 없이 skip) | **아니오 — 실행할 수 없다** | `sudo -n true` → **exit 1**. NOPASSWD 드롭인은 프로비저닝을 한 사용자에게만 부여된다. 이미 충족된 호스트에서는 §1 **확인 명령**만 돌리면 된다(또는 `①` 이 전부 skip 으로 흐른다) |
 | `②'` `.env` | **OS 사용자마다** | **예** — 경로·포트·프로젝트 이름이 전부 그 사용자 것 | 아래 §2-2 격리 파라미터 |
 | `②` 동의 | **OS 사용자마다** | **예** — 레코드가 `$HOME/.cv-infra/eula-consent.json` 이다 | 새 사용자에서 `check_consent.sh` **exit 3**, `③` 이 **loud 거부**. 이것은 결함이 아니라 NEG-2 가 작동한 것이다 |
 | `②''` 캐시 트리 | **OS 사용자마다** | **예** — `CV_ISAAC_CACHE_ROOT` 가 그 사용자 홈이면 그 트리도 새로 만든다 | 다른 사용자의 웜 캐시는 **읽을 수도 없다**(홈 퍼미션 `drwxr-x---`) |
@@ -123,8 +123,11 @@ bash scripts/workstation_setup/provision.sh
 - **이 단계는 호스트 1회 · root 권한이다(§2-1).** 이미 프로비저닝된 호스트에 **새 OS 사용자로**
   들어온 것이라면 **이 단계를 실행하지 마라 — 실행할 수도 없다**(`sudo -n true` → exit 1).
   대신 **§1 표의 확인 명령만** 돌려서 호스트가 이미 충족돼 있음을 확인하라. 전부 읽기 전용이다.
-- 사전에 **sudo 드롭인 1회 설치**가 필요하다(비대화 SSH 는 암호 프롬프트에 답할 수 없다).
-  절차 = `scripts/workstation_setup/README.md` Step A.
+- **sudo 드롭인은 "남은 특권 작업이 있을 때만" 필요하다.** 모든 특권 동작 앞에 그 결과가
+  이미 참인지 읽기전용으로 확인하고, 참이면 특권 호출 없이 `SKIP (already true, checked)`
+  로그만 남긴다 — 이미 충족된 호스트는 특권 호출 **0** 으로 `①` 을 통과한다. 남은 게 있으면
+  드롭인 1회 설치가 필요하다(비대화 SSH 는 암호 프롬프트에 답할 수 없다). 드롭인은
+  **템플릿**이고 계정 이름은 설치 시점에 치환한다. 절차 = `scripts/workstation_setup/README.md` Step A.
 - 드라이버가 요구 브랜치가 아니면 **loud 하게 멈춘다**. 프로비저닝은 드라이버를 고치지
   않는다 — 유일하게 허가된 드라이버 스크립트는 `realign_driver_r580.sh` 다.
 

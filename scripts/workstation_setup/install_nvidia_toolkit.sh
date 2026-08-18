@@ -22,8 +22,20 @@ CV_TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$CV_TMPDIR"' EXIT
 
 main() {
-  if dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null | grep -qxF "$CV_NVIDIA_TOOLKIT_VERSION"; then
-    log "nvidia-container-toolkit $CV_NVIDIA_TOOLKIT_VERSION already installed — re-asserting docker runtime config"
+  local installed
+  installed="$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)"
+
+  if [[ "$installed" == "$CV_NVIDIA_TOOLKIT_VERSION" ]]; then
+    log "nvidia-container-toolkit $CV_NVIDIA_TOOLKIT_VERSION already installed (= the preferred pin) — re-asserting docker runtime config"
+  elif version_in_set "$installed" "${CV_NVIDIA_TOOLKIT_VERIFIED[@]}"; then
+    # D-2 assert mode (see common.sh): an element of the verified SET is accepted as
+    # is — no downgrade to the preferred pin. Loud, and it prints the whole quartet.
+    log "ASSERT MODE: installed nvidia-container-toolkit $installed is an element of the VERIFIED set — NOT installing, NOT downgrading (preferred pin here would be $CV_NVIDIA_TOOLKIT_VERSION)"
+    local p v
+    for p in nvidia-container-toolkit-base libnvidia-container-tools libnvidia-container1; do
+      v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || true)"
+      log "ASSERT MODE:   $p = ${v:-<not installed>}"
+    done
   else
     log "configuring NVIDIA Container Toolkit official apt repository (pinned)"
     # Dearmor the key as the user, then place key + list with bounded `install` ops
@@ -58,10 +70,28 @@ main() {
   fi
 
   # Declarative + idempotent: writes the nvidia runtime into /etc/docker/daemon.json,
-  # then restart docker to pick it up.
-  log "wiring NVIDIA runtime into docker (nvidia-ctk) + restarting docker"
-  "${CV_SUDO[@]}" nvidia-ctk runtime configure --runtime=docker
-  "${CV_SUDO[@]}" systemctl restart docker
+  # then restarts docker to pick it up — UNLESS the daemon already reports the runtime,
+  # in which case there is nothing to write and no reason to restart (a restart would
+  # bounce every running container on someone's host for no gain).
+  # The three outcomes are logged DIFFERENTLY on purpose: already-true / could-not-read
+  # / done. "Could not read" takes the privileged path — never skip on doubt.
+  local runtimes rc=0
+  runtimes="$(docker info --format '{{json .Runtimes}}' 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) || [[ -z "$runtimes" ]]; then
+    warn "could not read the docker runtime list ('docker info' failed) — taking the privileged path rather than assuming"
+    log "wiring NVIDIA runtime into docker (nvidia-ctk) + restarting docker"
+    "${CV_SUDO[@]}" nvidia-ctk runtime configure --runtime=docker
+    "${CV_SUDO[@]}" systemctl restart docker
+  elif grep -q '"nvidia"' <<<"$runtimes"; then
+    log "SKIP (already true, checked): docker reports the 'nvidia' runtime — no 'nvidia-ctk runtime configure', no 'systemctl restart docker', no sudo"
+  else
+    log "wiring NVIDIA runtime into docker (nvidia-ctk) + restarting docker"
+    # NOTE: /usr/bin/nvidia-ctk was REMOVED from the sudo whitelist by decision
+    # 2026-07-07-fu6-sudo-scope-reduction — this branch is an operator action in an
+    # interactive terminal, and it is now only REACHED when the runtime is missing.
+    "${CV_SUDO[@]}" nvidia-ctk runtime configure --runtime=docker
+    "${CV_SUDO[@]}" systemctl restart docker
+  fi
 
   log "NVIDIA Container Toolkit provisioning done"
 }

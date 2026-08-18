@@ -25,26 +25,96 @@ _CV_INFRA_COMMON_LOADED=1
 # PINS — single source of truth
 # ---------------------------------------------------------------------------
 
-# Host platform. These scripts target exactly ONE OS (recon: etri6000, Ubuntu 24.04.4);
-# provision.sh preflight asserts these and refuses to run elsewhere.
+# Host platform. Supported OS is a SET, not one machine's distro (decision
+# 2026-08-19-p5c17-os-set-pin-set-and-host-purity, D-1). Everything that actually
+# DEPENDS on the codename is the three apt version strings below, so supporting a
+# release = adding a row to that table + a member here; consumers are untouched.
+# provision.sh preflight asserts membership and refuses to run outside the set.
 readonly CV_REQUIRE_OS_ID="ubuntu"
-readonly CV_REQUIRE_OS_CODENAME="noble"          # Ubuntu 24.04 LTS
+readonly CV_SUPPORTED_OS_CODENAMES=(noble jammy)  # Ubuntu 24.04 LTS · 22.04 LTS
 readonly CV_REQUIRE_ARCH="amd64"
+
+# The LIVE host codename ("" if /etc/os-release does not state one). Read HERE because
+# the pin table below keys on it; the ASSERT that it is a supported member stays in
+# provision.sh preflight (assert ORDER is load-bearing) via require_supported_codename.
+# Guarded on purpose: this lib is also sourced by scripts that run INSIDE containers
+# (scripts/consent/*, scripts/measure/*) under `set -euo pipefail`, where an assignment
+# from a failing command substitution kills the calling script with no message at all.
+# An unreadable/odd /etc/os-release must degrade to "" here and be reported by the
+# codename assert, not abort a consent check.
+CV_HOST_CODENAME=""
+if [[ -r /etc/os-release ]]; then
+  CV_HOST_CODENAME="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")" \
+    || CV_HOST_CODENAME=""
+fi
+readonly CV_HOST_CODENAME
 
 # NVIDIA driver floor (NFR-DEPLOY-005, DoD-P1-01; R580 branch, Isaac 5.1 floor).
 # Provisioning NEVER installs or upgrades the driver — it ASSERTS this floor only.
 readonly CV_DRIVER_FLOOR="580.65.06"
 
-# Docker CE (official apt repo). Exact apt version strings, CONFIRMED 2026-06-26 against
-# the live download.docker.com noble repo via the madison guard (installed cleanly, no drift).
-readonly CV_DOCKER_CE_VERSION="5:28.3.3-1~ubuntu.24.04~noble"          # confirmed 2026-06-26
+# Docker CE (official apt repo) — the PREFERRED pin, i.e. what we INSTALL when we
+# install. Three of the five strings embed the distro codename, so they are a TABLE
+# keyed by the live codename (D-1). Same upstream versions on both rows: measured
+# 2026-08-19 with `apt-cache madison` on the jammy host, the noble row's versions are
+# offered for jammy too — the barrier was the suffix, never availability.
+case "$CV_HOST_CODENAME" in
+  noble)  # confirmed 2026-06-26 on etri6000 against the live download.docker.com repo
+    _cv_docker_ce="5:28.3.3-1~ubuntu.24.04~noble"
+    _cv_buildx="0.26.1-1~ubuntu.24.04~noble"
+    _cv_compose="2.39.2-1~ubuntu.24.04~noble"
+    ;;
+  jammy)  # offer confirmed 2026-08-19 (madison, CEO local host); NOT yet installed by us
+    _cv_docker_ce="5:28.3.3-1~ubuntu.22.04~jammy"
+    _cv_buildx="0.26.1-1~ubuntu.22.04~jammy"
+    _cv_compose="2.39.2-1~ubuntu.22.04~jammy"
+    ;;
+  *)      # unsupported/unknown host: leave the pins EMPTY and let the codename assert
+    _cv_docker_ce=""; _cv_buildx=""; _cv_compose="" ;;
+esac
+readonly CV_DOCKER_CE_VERSION="$_cv_docker_ce"
+readonly CV_DOCKER_BUILDX_VERSION="$_cv_buildx"
+readonly CV_DOCKER_COMPOSE_VERSION="$_cv_compose"
+unset _cv_docker_ce _cv_buildx _cv_compose
+
+# containerd.io carries NO codename suffix AT THIS VERSION (measured: the same
+# `1.7.27-1` string is offered on both noble and jammy), so it stays a scalar — a
+# one-row table would be over-engineering. ★ That property belongs to the VERSION,
+# not to the package: the current containerd.io line on this repo is
+# `2.3.3-1~ubuntu.22.04~jammy` (measured 2026-08-19), i.e. it DOES carry a suffix.
+# Moving this pin into the 2.x era means moving it into the table above.
 readonly CV_CONTAINERD_VERSION="1.7.27-1"                             # confirmed 2026-06-26
-readonly CV_DOCKER_BUILDX_VERSION="0.26.1-1~ubuntu.24.04~noble"       # confirmed 2026-06-26
-readonly CV_DOCKER_COMPOSE_VERSION="2.39.2-1~ubuntu.24.04~noble"      # confirmed 2026-06-26
 
 # NVIDIA Container Toolkit (official libnvidia-container apt repo). All four packages
-# are pinned to the same version (NVIDIA-recommended). CONFIRMED 2026-06-26 via madison guard.
+# are pinned to the same version (NVIDIA-recommended). CONFIRMED 2026-06-26 via madison
+# guard. Codename-independent (measured on both hosts).
 readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # confirmed 2026-06-26
+
+# --- VERIFIED version SETS (assert mode) -----------------------------------------
+# Decision 2026-08-19-p5c17-os-set-pin-set-and-host-purity, D-2: provisioning does NOT
+# drag an already-working host DOWN to the preferred pin. If the INSTALLED version is
+# an element of the set below, the install step is SKIPPED and only asserted (loudly).
+# Anything else -> the preferred pin above is installed (previous behaviour).
+#
+# ★ These are SETS, never floors. `dpkg --compare-versions ... ge` would admit every
+# future version, which is exactly the shape G-12 caught (a floor-only "R580+" assert
+# admitted R595 and Isaac's RTX renderer segfaulted). A set has an upper bound by
+# construction, and every element carries the evidence that put it there (G-24).
+# Keep the sets SMALL — each element is a stack we promise still works.
+#
+# The membership KEY is the docker-ce version. The companion packages (containerd.io /
+# buildx / compose) ride along and are LOGGED, not compared: enumerating 5-tuples buys
+# nothing, because what makes an element trustworthy is a cycle that ran green on the
+# whole stack as installed. install_docker.sh prints the companions in assert mode so
+# an audit can see exactly what was accepted.
+readonly CV_DOCKER_CE_VERIFIED=(
+  "5:28.3.3-1~ubuntu.24.04~noble"   # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
+  "5:29.7.2-1~ubuntu.22.04~jammy"   # p5c17 T4 검증 중 — 미검증 (CEO local RTX 4080/jammy; replace this comment with T4's evidence path, or DELETE the element if T4 fails)
+)
+readonly CV_NVIDIA_TOOLKIT_VERIFIED=(
+  "1.17.8-1"                        # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
+  "1.19.1-1"                        # p5c17 T4 검증 중 — 미검증 (CEO local RTX 4080/jammy; replace this comment with T4's evidence path, or DELETE the element if T4 fails)
+)
 
 # GPU-passthrough smoke image (DoD-P1-02). CUDA 12.8+ covers Blackwell; the in-container
 # nvidia-smi is injected from the HOST driver, so any recent CUDA base suffices for the
@@ -77,6 +147,50 @@ log()  { printf '[cv-infra][%s] %s\n' "${CV_STEP:-provision}" "$*"; }
 warn() { printf '[cv-infra][%s][WARN] %s\n' "${CV_STEP:-provision}" "$*" >&2; }
 err()  { printf '[cv-infra][%s][ERROR] %s\n' "${CV_STEP:-provision}" "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+# Is the live host codename one of the supported ones? (D-1 — the assert itself lives
+# in provision.sh preflight; install_docker.sh calls it too, since it can run alone.)
+require_supported_codename() {
+  local c
+  for c in "${CV_SUPPORTED_OS_CODENAMES[@]}"; do
+    [[ "$c" == "$CV_HOST_CODENAME" ]] && return 0
+  done
+  die "Unsupported codename '${CV_HOST_CODENAME:-?}' — these scripts support: ${CV_SUPPORTED_OS_CODENAMES[*]}. Adding one = a row in the codename pin table of common.sh (the apt versions must be OFFERED there — check with 'apt-cache madison docker-ce')."
+}
+
+# Exact-string membership in a verified version SET (D-2). NOT a floor comparison:
+# `dpkg --compare-versions ... ge` admits every future version and that is the exact
+# shape G-12 caught. Callers pass the set expanded: version_in_set "$v" "${SET[@]}".
+version_in_set() {
+  local want="$1" v
+  shift
+  for v in "$@"; do
+    [[ "$v" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+# Run docker through the channel this session can actually use, resolved ONCE by
+# OBSERVATION (not by assumption): plain `docker` when the daemon is already reachable
+# (docker group effective), else the `sudo -n docker` channel. A host where the
+# operator is already in the docker group must not be forced to install a NOPASSWD
+# drop-in just to run a read-only smoke.
+cv_docker() {
+  if [[ -z "${_CV_DOCKER_MODE:-}" ]]; then
+    if docker info >/dev/null 2>&1; then
+      _CV_DOCKER_MODE=plain
+      log "docker is reachable WITHOUT sudo (verified: 'docker info' succeeded) — using plain 'docker'"
+    else
+      _CV_DOCKER_MODE=sudo
+      log "docker is NOT reachable without sudo ('docker info' failed) — using the '${CV_SUDO[*]} docker' channel (needs the NOPASSWD drop-in)"
+    fi
+  fi
+  if [[ "$_CV_DOCKER_MODE" == "plain" ]]; then
+    docker "$@"
+  else
+    "${CV_SUDO[@]}" docker "$@"
+  fi
+}
 
 # Fail loud if a required host tool is absent (avoids unpinned auto-installs of base tools).
 require_cmd() {

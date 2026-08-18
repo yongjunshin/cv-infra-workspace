@@ -190,12 +190,16 @@ assert_module_versions() {
 }
 
 deploy_pin() {
-  local src="$PIN_SRC"
+  local src="$CV_TMPDIR/cv-infra-nvidia-r580"
   [[ -f "$PIN_SRC" ]] || die "pin file source missing: $PIN_SRC"
-  if [[ "$STAGE2" -eq 1 ]]; then
-    src="$CV_TMPDIR/cv-infra-nvidia-r580"
-    sed "s/^Pin: version 580\.159\.03\*/Pin: version ${TARGET_UPSTREAM}*/" "$PIN_SRC" > "$src"
-  fi
+  # The canonical file is a TEMPLATE: it never carries one host's driver build (two
+  # hosts, two R580 builds — see its header). Whoever deploys stamps the build it is
+  # actually installing, for BOTH stages.
+  sed "s/@CV_DRIVER_TARGET_UPSTREAM@/${TARGET_UPSTREAM}/" "$PIN_SRC" > "$src"
+  # Arming check: a silently unsubstituted template would hold nothing at 1001 while
+  # still LOOKING deployed (the branch blocks would work, the build hold would not).
+  grep -qxF "Pin: version ${TARGET_UPSTREAM}*" "$src" \
+    || die "apt pin template substitution FAILED — '$PIN_SRC' produced no 'Pin: version ${TARGET_UPSTREAM}*' line (placeholder @CV_DRIVER_TARGET_UPSTREAM@ missing/renamed?). Refusing to deploy a pin file that holds nothing."
   "${CV_SUDO[@]}" install -m 0644 -o root -g root "$src" "$PIN_DST"
   log "apt pin deployed -> $PIN_DST; candidate policy now:"
   apt-cache policy libnvidia-compute-580 | sed 's/^/[cv-infra][driver-r580][policy] /'

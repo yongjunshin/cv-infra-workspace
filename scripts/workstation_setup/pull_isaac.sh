@@ -31,14 +31,15 @@ main() {
 
   prepare_cache
 
-  # `sudo -n docker`: the docker group is not yet effective in this SSH session.
-  if "${CV_SUDO[@]}" docker image inspect "$img" >/dev/null 2>&1; then
+  # cv_docker: plain `docker` when this session already reaches the daemon, else the
+  # `sudo -n docker` channel (e.g. an SSH session where the group is not yet effective).
+  if cv_docker image inspect "$img" >/dev/null 2>&1; then
     log "Isaac image already present locally ($img) — skipping pull (idempotent)"
     return 0
   fi
 
   log "DoD-P1-03 -> docker pull $img (anonymous NGC pull)"
-  if "${CV_SUDO[@]}" docker pull "$img"; then
+  if cv_docker pull "$img"; then
     log "Isaac image pulled OK"
   else
     err "Anonymous NGC pull failed for $img (NGC may require auth — rate-limit / org terms; R13)."

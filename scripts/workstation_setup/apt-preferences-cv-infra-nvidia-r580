@@ -4,30 +4,54 @@
 # renderer (librtx.scenedb.plugin.so, ~50ms after "app ready") on the R595
 # driver branch — confirmed upstream as a known issue with no workaround. The
 # branch Isaac 5.1.0 is certified against is R580 (LTSB, EOL 2028-06). This
-# file (a) holds every R580 userspace component at the realignment target and
-# (b) hard-blocks the R595/R610 branches so a routine `apt upgrade` /
-# unattended-upgrades can never re-ascend past R580 (the original incident:
-# a floor-only ">= 580.65.06" assert admitted 595.71.05).
+# file (a) holds every R580 userspace component at the build the realignment
+# actually installed and (b) hard-blocks the newer branches so a routine
+# `apt upgrade` / unattended-upgrades can never re-ascend past R580 (the
+# original incident: a floor-only ">= 580.65.06" assert admitted 595.71.05).
 #
 # Canonical copy: cv-infra-workspace/scripts/workstation_setup/apt-preferences-cv-infra-nvidia-r580
 # Deployed to:    /etc/apt/preferences.d/cv-infra-nvidia-r580 (by realign_driver_r580.sh)
 #
+# ★ THIS IS A TEMPLATE, NOT A DEPLOYABLE FILE. Stanza 1 carries the placeholder
+# @CV_DRIVER_TARGET_UPSTREAM@, which realign_driver_r580.sh substitutes with the
+# build it is installing on THAT host (and it verifies the substitution happened).
+# Reason: two hosts, two R580 builds — 580.159.03 (Ubuntu noble archive, etri6000,
+# realigned 2026-07-03) and 580.178.04 (CEO local jammy host, realigned 2026-08-18).
+# Hardcoding either one makes the file wrong on the other host: at Pin-Priority 1001
+# apt would try to DOWNGRADE a perfectly good R580 build to the other host's build.
+# What must be pinned is the BRANCH (the ceiling below), not one machine's patch
+# level — and the exact build the operator installed must still be held, so the
+# placeholder keeps a hard hold without ever becoming an unbounded `580*` (an
+# unbounded hold is a floor without a ceiling *inside* the branch — G-12's shape).
+#
 # NOTE: per-kernel module packages (linux-modules-nvidia-580-open-<kver>) carry
 # KERNEL version numbers, so stanza 1 deliberately does not version-hold them —
 # they must track kernel updates; their branch is fixed by the package name.
+#
+# MAINTENANCE RULE for the negative stanzas: they block by PACKAGE NAME, so each
+# newer branch needs its own stanza — a branch that has no stanza is not blocked.
+# R590 was missing here and is visible in apt on the jammy host today (measured
+# 2026-08-19: `apt-cache search --names-only '^nvidia-driver-[0-9]+'`), i.e. the
+# G-12 surface had reopened silently. When a new branch number appears upstream,
+# add a stanza. (Un-blocking one requires evidence that Isaac 5.1.0 runs on it.)
 
-# 1) Hold all R580 userspace components at the stage-1 target build
-#    (realign_driver_r580.sh --stage2 rewrites this stanza to 580.65.06*).
+# 1) Hold all R580 userspace components at the build this host was realigned to.
+#    @CV_DRIVER_TARGET_UPSTREAM@ is substituted at deploy time (see above).
 Package: *nvidia*580*
-Pin: version 580.159.03*
+Pin: version @CV_DRIVER_TARGET_UPSTREAM@*
 Pin-Priority: 1001
 
-# 2) Never install anything from the R595 branch (Isaac 5.1.0 RTX segfault).
+# 2) Never install anything from the R590 branch (uncertified for Isaac 5.1.0).
+Package: *nvidia*590*
+Pin: version *
+Pin-Priority: -1
+
+# 3) Never install anything from the R595 branch (Isaac 5.1.0 RTX segfault).
 Package: *nvidia*595*
 Pin: version *
 Pin-Priority: -1
 
-# 3) Never install anything from the R610 branch (uncertified for Isaac 5.1.0).
+# 4) Never install anything from the R610 branch (uncertified for Isaac 5.1.0).
 Package: *nvidia*610*
 Pin: version *
 Pin-Priority: -1

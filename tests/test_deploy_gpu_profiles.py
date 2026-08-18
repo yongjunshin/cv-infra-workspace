@@ -13,10 +13,10 @@ GPU 모델 리터럴을 한 개도 갖고 있지 않고(패턴은 프로파일�
 
 증명하지 **않는다**: **실제 GPU에서의 관찰.** 여기서 ``nvidia-smi``는 stub 스크립트다
 (``CV_NVIDIA_SMI`` 시임 — 스크립트가 이 시임을 갖는 이유의 절반은 GPU 없는 CI에서
-배포 경로를 검증하기 위함이다). 실제 카드가 내놓는 **정확한 이름 문자열**은 이 저장소가
-캡처한 적이 없으므로 아래 후보 문자열들은 *가정된 표기*이며, 그래서 프로파일의
-``match_name_pattern``은 일부러 토큰 기반으로 느슨하다. 라이브 확인 = ``./scripts/
-detect_gpu.sh`` 1회 실행 + 출력 보존(첫 GPU 사이클 몫, 이번 사이클 GPU 금지).
+배포 경로를 검증하기 위함이다). 아래 후보 문자열 중 **``rtx_4080`` 행 하나만 실측
+캡처**이고(p5c17 T1, 두 번째 배포 호스트에서 ``nvidia-smi --query-gpu=name`` 1회 질의),
+나머지는 여전히 *가정된 표기*다 — 그래서 프로파일의 ``match_name_pattern``은 일부러
+토큰 기반으로 느슨하다. 라이브 확인 = ``./scripts/detect_gpu.sh`` 1회 실행 + 출력 보존.
 
 Stdlib + pytest (+ pyyaml, 이미 의존). 신규 의존 0.
 """
@@ -51,6 +51,19 @@ _NAME_SAMPLES = (
     ("nvidia rtx_pro_6000", "rtx_pro_6000"),
     ("NVIDIA A100-SXM4-40GB", "a100"),
     ("NVIDIA A100 80GB PCIe", "a100"),
+    # ★ 실측 캡처 (p5c17 T1, CEO 로컬 호스트): nvidia-smi 가 실제로 내놓은 문자열.
+    ("NVIDIA GeForce RTX 4080", "rtx_4080"),
+)
+
+#: 위 후보 중 **실측 VRAM 이 없는** 프로파일로 가는 것들. 목록을 손으로 들지 않고
+#: 프로파일에서 유도한다(G-56 ②) — 프로파일이 숫자를 얻으면 이 목록에서 자동으로 빠지고,
+#: 새 미실측 프로파일은 자동으로 들어온다.
+_UNMEASURED_SAMPLES = tuple(
+    (name, profile_id)
+    for name, profile_id in _NAME_SAMPLES
+    if not yaml.safe_load((_PROFILE_DIR / f"{profile_id}.yaml").read_text(encoding="utf-8")).get(
+        "vram_per_instance_mb"
+    )
 )
 
 
@@ -180,13 +193,16 @@ def test_measured_profile_emits_the_knob_and_its_anchor(tmp_path):
     assert document["vram_per_instance_source"] in result.stdout
 
 
-def test_unmeasured_profile_refuses_to_guess(tmp_path):
-    """A100처럼 **실측이 없는** 프로파일: 선택은 되되 숫자를 지어내지 않는다.
+@pytest.mark.parametrize(("gpu_name", "expected"), _UNMEASURED_SAMPLES)
+def test_unmeasured_profile_refuses_to_guess(tmp_path, gpu_name: str, expected: str):
+    """**실측이 없는** 프로파일 전부: 선택은 되되 숫자를 지어내지 않는다.
 
     knob은 주석 처리되어 나가고(=NVML 2차 가드 OFF, 운영자 상한만으로 도는 문서화된
     기본 계약), 그 사실을 stderr가 **크게** 말한다. 조용한 추측 금지(CLAUDE §2-4).
     """
-    result = _run(smi=_stub_smi(tmp_path, "NVIDIA A100-SXM4-40GB"))
+    assert _UNMEASURED_SAMPLES, "미실측 프로파일 후보가 0 — 이 단정이 공허하다"
+    result = _run(smi=_stub_smi(tmp_path, gpu_name))
+    assert f"# profile      : {expected}" in result.stdout
 
     assert result.returncode == 0, result.stderr
     assert _knob(result.stdout) is None
@@ -210,8 +226,14 @@ def test_manual_selection_overrides_detection(tmp_path):
 
 
 def test_unknown_gpu_is_refused_with_instructions(tmp_path):
-    """미지 GPU -> exit 3 + "프로파일을 이렇게 추가하라". 추측 예산을 내주지 않는다."""
-    result = _run(smi=_stub_smi(tmp_path, "NVIDIA GeForce RTX 4080"))
+    """미지 GPU -> exit 3 + "프로파일을 이렇게 추가하라". 추측 예산을 내주지 않는다.
+
+    이름은 **일부러 실재하지 않는 것**을 쓴다: 여기 실재 카드를 적으면 그 테스트는
+    *"우리는 그 카드를 지원하지 않는다"* 를 고정하게 되고, 그 카드를 지원하는 날
+    (= 프로파일 추가) 조용히 거짓이 된다. p5c17 이전 이 자리에는 ``NVIDIA GeForce RTX
+    4080`` 이 있었고, 정확히 그 이유로 red 가 됐다.
+    """
+    result = _run(smi=_stub_smi(tmp_path, "NVIDIA Totally Fake 9999"))
 
     assert result.returncode == _EXIT_UNSUPPORTED
     assert result.stdout == ""
