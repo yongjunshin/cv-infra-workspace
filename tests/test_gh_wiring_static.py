@@ -665,10 +665,11 @@ def test_self_test_tier_reads_no_consumer_repo_or_asset():
 
 
 def test_self_test_tier_is_gated_and_bakes_no_image_ref():
-    """It has never run: no stub SUT image exists yet (M7 §3.5 A/B open). The
-    gate must be an operator-set repo VARIABLE and the image ref must arrive
-    from configuration — a literal baked here would be exactly the guess the CLI
-    refuses to make (FU-10 / NFR-SELFTEST-001)."""
+    """It has never run (measured 2026-08-19: 3 appearances in 41 CI runs, all
+    `skipped`). The stub SUT image itself EXISTS since p5c15 — what is still
+    missing is the operator-set configuration. The gate must be a repo VARIABLE
+    and the image ref must arrive from it — a literal baked here would be exactly
+    the guess the CLI refuses to make (FU-10 / NFR-SELFTEST-001)."""
     job = _load(_PLATFORM_CI)["jobs"]["selftest"]
     assert job["if"] == "${{ vars.CV_SELFTEST_ENABLED == 'true' }}"
     step = next(s for s in job["steps"] if "cv-infra selftest" in str(s.get("run", "")))

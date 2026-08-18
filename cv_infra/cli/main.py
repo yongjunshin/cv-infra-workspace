@@ -403,6 +403,23 @@ def _exit_from_outcome(outcome: Any) -> int:
             f"{_one_line(exc)}",
             file=sys.stderr,
         )
+        # An `extra_forbidden` here is not a corrupt file: it is PLANE SKEW (G-74).
+        # The keys came from the runner image that WROTE this file, so name that
+        # plane and the way to read it — without this line "non-canonical" gives the
+        # operator no path to "my runner image is stale". Duck-typed on a callable
+        # .errors exactly like _render_contract_errors (no pydantic import here).
+        errors = getattr(exc, "errors", None)
+        if callable(errors) and any(e.get("type") == "extra_forbidden" for e in errors()):
+            print(
+                "cv-infra run: those unknown key(s) came from the RUNNER IMAGE that wrote "
+                "this file — its baked code and this CLI are from different source commits "
+                "(usually a runner image older than your checkout). Compare the image stamp "
+                "with your checkout: docker image inspect --format "
+                "'{{index .Config.Labels \"org.opencontainers.image.revision\"}}' <runner-image> "
+                "(or scripts/check_plane_skew.sh), then REBUILD/re-pull the runner image "
+                "and re-run — docs/deploy/README.md §8.",
+                file=sys.stderr,
+            )
         return EXIT_INFRA
     code = _VERDICT_EXIT.get(result.verdict, EXIT_INFRA)
     if result.verdict not in _VERDICT_EXIT:
