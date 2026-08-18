@@ -439,7 +439,7 @@ def test_result_not_recovered_exits_3(monkeypatch, scenario_file, tmp_path):
         '{"job_id": "x"}',  # parses, but non-canonical (verdict missing)
     ],
 )
-def test_bad_result_json_exits_3(monkeypatch, scenario_file, tmp_path, payload):
+def test_bad_result_json_exits_3(monkeypatch, scenario_file, tmp_path, payload, capsys):
     def run_job(job_spec, out_dir, runner_image, sut_image):
         out_dir.mkdir(parents=True, exist_ok=True)
         result_path = out_dir / "result.json"
@@ -450,6 +450,39 @@ def test_bad_result_json_exits_3(monkeypatch, scenario_file, tmp_path, payload):
 
     _install_supervisor(monkeypatch, run_job)
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_INFRA
+    # Negative control for the skew hint below (G-35): neither of these payloads is
+    # producer skew, so a hint that points at the runner image would be a wrong lead.
+    assert "RUNNER IMAGE" not in capsys.readouterr().err
+
+
+def test_extra_key_in_result_json_points_at_the_runner_image_plane(
+    monkeypatch, scenario_file, tmp_path, capsys
+):
+    """G-74 / p5c16 follow-up 4: a runner image older than this checkout still emits a
+    field the contract has since deleted, so ``extra="forbid"`` re-validation folds a
+    ``verdict=pass`` job to exit 3. "non-canonical" alone gives the operator no path to
+    "my runner image is stale" — the second stderr line names that plane and how to read it.
+    """
+
+    def run_job(job_spec, out_dir, runner_image, sut_image):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        result_path = out_dir / "result.json"
+        # ``origin`` was a real Result field until p5c16 deleted it (dead wire); an
+        # image baked before that commit keeps emitting it. verdict=pass on purpose:
+        # the skew discards a verdict the job already earned.
+        payload = {"job_id": job_spec["job_id"], "verdict": "pass", "origin": None}
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        return FakeJobOutcome(
+            job_id=job_spec["job_id"], result_path=result_path, runner_exit_code=0, infra_error=None
+        )
+
+    _install_supervisor(monkeypatch, run_job)
+    assert _run_cli(scenario_file, tmp_path / "out") == EXIT_INFRA
+    err = capsys.readouterr().err
+    assert "extra_forbidden" in err  # the branch really fired (not some other rejection)
+    assert "RUNNER IMAGE" in err
+    assert "org.opencontainers.image.revision" in err
+    assert "docs/deploy/README.md" in err
 
 
 def test_supervisor_import_failure_exits_3(monkeypatch, scenario_file, tmp_path, capsys):
