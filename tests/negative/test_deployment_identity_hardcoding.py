@@ -56,7 +56,16 @@ DoD §6 보조 negative(*"하드코딩 리터럴 0"*) · REQ-DEPLOY-003 · NFR-D
   않는다.
 * **못 잡는 것**: 줄 단위 스캔이라 키와 값이 다른 줄에 있는 대입, 조각에서 조립되는
   이름, ``profiles``에 없는 **모델을 특이한 대소문자로** 박는 경우(R2는 GPU 축을
-  대소문자 구분으로 본다 — 아래 ``_gpu_tokens`` 주석 참조), 운영자의 미추적 ``.env``.
+  대소문자 구분으로 본다 — 아래 ``_gpu_tokens`` 주석 참조), 운영자의 로컬 ``.env``.
+  **★ p5c17 정정 — 마지막 항은 문장으로만 존재했다**(NEG-2 스캔에서 실제로 터진 것과
+  같은 결함, QA findings §12-5). 이 파일의 ``_scan_files`` 도 ``docker/**`` 를 ``rglob``
+  했으므로 운영자 ``.env`` 가 스캔에 들어와 있었다. **오늘 red 가 아니었던 이유는
+  스코프가 아니라 술어의 운이다**: ``②'`` 절차가 ``detect_gpu.sh >> docker/.env`` 를
+  시키므로 **모든 배포 호스트의 ``.env`` 는 GPU 모델 리터럴을 담는데**(실측:
+  ``# detected GPU : NVIDIA GeForce RTX 4080``), 그 줄들이 주석이라 R1(구조)·R2(값)의
+  binding/branching 요건을 만족하지 못했을 뿐이다. 술어를 조이는 날 — 또는 누가 그 값을
+  주석 아닌 형태로 넣는 날 — **전 배포 호스트가 red** 가 된다. 이제 제외를 git 에게
+  묻는다(``test_eula_gate.git_ignored_under`` 공유).
 
 Stdlib + pytest. 신규 의존 0.
 """
@@ -64,7 +73,10 @@ Stdlib + pytest. 신규 의존 0.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
+
+from tests.negative.test_eula_gate import git_ignored_under
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -155,27 +167,37 @@ def identity_hardcoding(line: str, *, yaml_like: bool = False) -> bool:
     return False
 
 
-def _scan_files() -> list[Path]:
+def _scan_files(root: Path = _REPO_ROOT) -> list[Path]:
+    """실행 평면의 파일 전부 — 산문(``.md``)과 **git 이 무시하는 것**은 빼고.
+
+    제외 축은 **"무시 여부"이지 "추적 여부"가 아니다**(D-5 에서 세운 판단과 동일):
+    아직 커밋되지 않았지만 무시되지도 않은 새 파일은 **그대로 스캔된다**. 추적 여부로
+    좁혔다면 갓 만든 소스 파일이 빠져 그게 진짜 구멍이 됐을 것이다.
+    제외 규칙의 정의는 ``test_eula_gate.git_ignored_under`` **하나**다(G-56).
+    """
+    ignored = git_ignored_under(_SCAN_PLANES, root)
     files: list[Path] = []
     for plane in _SCAN_PLANES:
-        for path in sorted((_REPO_ROOT / plane).rglob("*")):
+        for path in sorted((root / plane).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
             if path.suffix in _PROSE_SUFFIXES:
+                continue
+            if path in ignored:
                 continue
             files.append(path)
     return files
 
 
-def _hits() -> list[str]:
+def _hits(root: Path = _REPO_ROOT) -> list[str]:
     hits: list[str] = []
-    for path in _scan_files():
+    for path in _scan_files(root):
         yaml_like = path.suffix in (".yml", ".yaml")
         for number, line in enumerate(
             path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
         ):
             if identity_hardcoding(line, yaml_like=yaml_like):
-                hits.append(f"{path.relative_to(_REPO_ROOT)}:{number}: {line.strip()}")
+                hits.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
     return hits
 
 
@@ -499,3 +521,54 @@ def test_deploy_plane_requires_no_host_cuda_or_isaac_install():
 
     # 스캔이 실제로 무언가를 읽었는가(부재가 통과로 둔갑하지 못하게).
     assert len(_scan_files()) > 50
+
+
+# --------------------------------------------------------------------------- #
+# 운영자 로컬 파일 carve-out — 헤더가 약속한 것을 실행 가능하게 (p5c17 QA, D-5 동형)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_deployment(root: Path, *, baked: bool) -> Path:
+    """운영자 ``.env`` 가 살아 있는 **배포 체크아웃**의 최소 복제(진짜 git 저장소).
+
+    ``docker/.env`` 는 ``.gitignore`` 가 무시한다 — 그리고 **실제 배포의 그것처럼**
+    호스트 정체성을 담는다(``②'`` 가 ``detect_gpu.sh >> docker/.env`` 를 시키므로 GPU
+    모델 줄은 항상 들어간다; 여기서는 술어가 실제로 발화하는 ``HOSTNAME=`` 형태까지
+    넣어 **carve-out 이 없으면 반드시 red 가 되도록** 만든다 = 대조군이 공허하지 않다).
+    ``baked`` 면 무시되지 **않는** 배송 파일에 같은 정체성을 굽는다.
+    """
+    for plane in _SCAN_PLANES:
+        (root / plane).mkdir(parents=True, exist_ok=True)
+    (root / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (root / "docker" / ".env").write_text(
+        f"# detected GPU : NVIDIA {_gpu_tokens()[0]}\nHOSTNAME={_KNOWN_HOSTS[0]}\n",
+        encoding="utf-8",
+    )
+    shipped = f"HOSTNAME={_KNOWN_HOSTS[0]}\n" if baked else "HOSTNAME=$(hostname -s)\n"
+    (root / "docker" / "entrypoint.sh").write_text(f"#!/bin/sh\n{shipped}", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    return root
+
+
+def test_the_operator_env_carve_out_is_real_and_armed(tmp_path):
+    """헤더가 약속한 carve-out(*"운영자의 로컬 ``.env``"*)을 **양방향으로** 고정한다.
+
+    NEG-2 에서 실제로 터진 것과 같은 결함의 두 번째 인스턴스다(QA findings §12-5):
+    그쪽은 배포 호스트에서 **red 였고**, 여기는 술어가 주석을 안 잡아서 **아직 안
+    터졌을 뿐** 이었다. 고쳐진 것과 안 터진 것은 다르다.
+
+    ⓐ 운영자 ``.env`` 만 -> **0 hit**(carve-out 실재).
+    ⓑ ★ **positive control (G-35)**: 무시되지 **않는** 파일에 같은 정체성 -> **red**.
+       좁히기가 스캔을 죽였다면 여기도 0 이 나온다 — 그건 수리가 아니라 삭제다.
+    """
+    # ⓐ — 대조군이 공허하지 않음을 먼저 보인다: 이 .env 의 내용은 스캔되면 발화한다.
+    clean = _fake_deployment(tmp_path / "clean", baked=False)
+    env_lines = (clean / "docker" / ".env").read_text(encoding="utf-8").splitlines()
+    assert any(identity_hardcoding(line) for line in env_lines), "대조군이 공허하다"
+    assert _hits(clean) == []
+
+    # ⓑ — 배송되는 파일이면 잡힌다.
+    armed = _fake_deployment(tmp_path / "armed", baked=True)
+    armed_hits = _hits(armed)
+    assert len(armed_hits) == 1, f"좁히기가 스캔을 죽였다: {armed_hits}"
+    assert "docker/entrypoint.sh:2" in armed_hits[0]

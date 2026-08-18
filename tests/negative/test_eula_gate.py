@@ -115,7 +115,7 @@ accepts``가 이것을 **가드에서 유도**해 고정한다: 후보 값마다
   ``rglob`` 하나였고 ``docker/.env`` 를 그대로 읽었다. 결과: **배포를 마친 호스트에서 이
   스위트가 red**(QA 실측 2 fail), 그리고 green 으로 가는 최단 경로가 **운영자 동의 삭제**
   였다(G-68 의 정확한 재현). CI 체크아웃엔 ``.env`` 가 없어 모순이 한 번도 실행되지
-  않았다(G-35 의 문서판). 이제 제외 집합을 **git 에게 묻는다** — 아래 ``_git_ignored_under``.
+  않았다(G-35 의 문서판). 이제 제외 집합을 **git 에게 묻는다** — 아래 ``git_ignored_under``.
 
 Stdlib + pytest (+ 기존 픽스처 YAML). 신규 의존 0.
 """
@@ -339,7 +339,7 @@ _CI_DIRS = (".github",)
 _CI_SENTINEL_FILES = (".github/workflows/ci.yml", ".github/workflows/verify.yml")
 
 
-def _git_ignored_under(dirs: tuple[str, ...], root: Path) -> frozenset[Path]:
+def git_ignored_under(dirs: tuple[str, ...], root: Path) -> frozenset[Path]:
     """``dirs`` 아래에서 **git 이 "무시한다"고 답한** 파일 전부.
 
     carve-out 목록을 손으로 들지 않고 **git 에게 묻는다**(G-56 ② 의 형태): 유일한 출처는
@@ -349,6 +349,11 @@ def _git_ignored_under(dirs: tuple[str, ...], root: Path) -> frozenset[Path]:
     답을 못 얻으면 **시끄럽게 죽는다.** 이 게이트의 판정 대상은 *저장소가 배송하는
     바이트* 라서, 어떤 파일이 운영자 로컬 파일인지 모르는 상태에서는 판정 자체가
     성립하지 않는다 — 조용한 green 도, 조용한 red 도 내지 않는다.
+
+    **공개 이름인 이유**: ``tests/negative/test_deployment_identity_hardcoding.py`` 의
+    스캔도 같은 평면(``docker/``)을 훑으므로 **같은 carve-out 이 필요하다**. 두 파일이
+    각자 제외 규칙을 들면 갈라지고, 갈라지는 순간 차집합이 구멍이 된다(G-56) —
+    ``baked_consent_bindings`` 를 ``test_gh_wiring_static.py`` 가 임포트하는 것과 같은 이유.
     """
     try:
         completed = subprocess.run(
@@ -388,7 +393,7 @@ def _scan_files(dirs: tuple[str, ...] = _GATE_DIRS, root: Path = _REPO_ROOT) -> 
     무시되지도 않은 새 파일은 **그대로 스캔된다** — 좁힌 축은 "추적 여부"가 아니라
     "무시 여부"다(전자로 좁히면 갓 만든 소스 파일이 빠져 진짜 구멍이 된다).
     """
-    ignored = _git_ignored_under(dirs, root)
+    ignored = git_ignored_under(dirs, root)
     files: list[Path] = []
     for name in dirs:
         for path in sorted((root / name).rglob("*")):
