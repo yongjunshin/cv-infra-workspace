@@ -305,8 +305,9 @@ def test_selftest_always_waits_there_is_no_fire_and_forget(monkeypatch):
 # fan-out, queue/scheduler, rollup, report_outcome — with the job execution
 # faked (``FakeRunner``, the same seam the batch E2E tests use). This is the
 # DoD-P5-07 round-trip MINUS the Isaac execution: a LIVE round-trip additionally
-# needs the platform-internal stub SUT image, which does not exist yet
-# (M7 §3.5 A/B open). Nothing here claims a live run.
+# needs the platform-internal stub SUT image, which EXISTS since p5c15
+# (docker/selftest_stub/, M7 §3.5 option B) and has round-tripped live off CI.
+# Nothing here claims a live run.
 
 
 def _wire_asgi(monkeypatch, app) -> None:

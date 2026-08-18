@@ -23,6 +23,10 @@ name: ci
 on:
   push:
   pull_request:
+  # Manual trigger so tier 2 can have its FIRST run without waiting for an
+  # unrelated code push (it is still gated by `vars.CV_SELFTEST_ENABLED` below).
+  # GitHub only offers this button for the workflow file on the default branch.
+  workflow_dispatch:
 
 # Least privilege: the lint tier only reads the checked-out tree.
 permissions:
@@ -69,19 +73,28 @@ jobs:
   # exit code (0 pass / 1 fail / 2 the stub envelope was rejected / 3 platform or
   # configuration problem) — the job status IS that exit code.
   #
-  # ⚠ GATED OFF, AND IT HAS NEVER RUN. As of p5c15 nothing in this repository
-  # can satisfy its preconditions, so the `if:` below evaluates false unless an
-  # operator sets the repository variable. Enabling requires ALL of:
-  #   (1) a self-hosted runner online with the `cv-infra-gpu` label;
-  #   (2) a resident orchestrator reachable from that runner (`CV_INFRA_API`
-  #       repo variable, or the CLI default 127.0.0.1:8000 on the same host);
-  #   (3) `CV_SELFTEST_SUT_IMAGE` = a PLATFORM-INTERNAL stub SUT image ref. This
-  #       image DOES NOT EXIST YET (M7 §3.5 A/B is open — in-runner driver vs a
-  #       lightweight stub container). Unset/empty => the CLI refuses with exit 3
-  #       and never falls back to a consumer image (NFR-SELFTEST-001) — it is a
-  #       loud, honest failure, not a green run.
-  # Until (3) lands, turning `CV_SELFTEST_ENABLED` on buys an exit-3 job, not a
-  # verdict. The gate is a repo VARIABLE (not a secret): no value is baked here.
+  # ⚠ GATED OFF, AND IT HAS NEVER RUN — measured 2026-08-19: this job appears in
+  # 3 of the 41 CI runs in this repository's history and is `skipped` in all 3
+  # (`gh api repos/<owner>/<repo>/actions/runs/<id>/jobs`). So NFR-SELFTEST-001's
+  # CI clause still has ZERO execution evidence, and what is missing is
+  # CONFIGURATION, not code — the `if:` below is false until an operator sets the
+  # repository variable. Preconditions, each with where it stood on 2026-08-19:
+  #   (1) a self-hosted runner online with the `cv-infra-gpu` label, registered to
+  #       THIS repo — MET: `cv-infra-gh-runner.service` (etri6000-cv-infra ->
+  #       cv-infra-workspace) active/running on the deployment host, alongside the
+  #       separate repo-level runner that serves the consumer repo.
+  #   (2) a resident orchestrator reachable from that runner (`CV_INFRA_API` repo
+  #       variable, or the CLI default 127.0.0.1:8000 on the same host) — MET:
+  #       127.0.0.1:8000 listening, `GET /monitor.json` -> 200.
+  #   (3) `CV_SELFTEST_SUT_IMAGE` = a PLATFORM-INTERNAL stub SUT image ref. The
+  #       image EXISTS since p5c15 (`docker/selftest_stub/` -> build recipe in its
+  #       README; the live self-test round-trips through it) — this comment used
+  #       to say it did not, which went stale the day it was built. Unset/empty =>
+  #       the CLI refuses with exit 3 and never falls back to a consumer image
+  #       (NFR-SELFTEST-001) — a loud, honest failure, not a green run.
+  # Remaining gap = the two repo VARIABLES (`CV_SELFTEST_ENABLED=true` and
+  # `CV_SELFTEST_SUT_IMAGE=<stub ref>`), settable only by a repo admin. They are
+  # VARIABLES (not secrets), and no value for either is baked here.
   selftest:
     name: platform self-test (self-hosted GPU)
     needs: lint
@@ -110,10 +123,12 @@ jobs:
       # (REQ-INTAKE-003); the exit code is the job's status (0/1/2/3).
       #
       # --timeout 1800 is a PROVISIONAL CI budget, not a measured NFR value
-      # (CLAUDE §2-4): the stub's sim-time budget is 30 s but its wall-clock cost
-      # (Isaac boot + Nav2 bringup on this box) has never been measured, because
-      # this tier has never run. Replace it with the measured cost once a live
-      # round-trip exists, in the same commit that records the measurement.
+      # (CLAUDE §2-4): the stub's sim-time budget is 30 s, and the wall-clock cost
+      # of the same round-trip has been measured OFF CI since p5c15 (live: ~28 s
+      # warm on the deployment host, ~141 s cold on another) — never yet from a CI
+      # job, and under non-exclusive conditions, so neither number is written into
+      # an NFR or used to tighten this cap. Replace 1800 with a cost measured from
+      # THIS tier, in the same commit that records the measurement.
       - name: cv-infra selftest (built-in stub round-trip)
         env:
           CV_SELFTEST_SUT_IMAGE: ${{ vars.CV_SELFTEST_SUT_IMAGE }}
