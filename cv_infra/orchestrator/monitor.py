@@ -40,6 +40,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from cv_infra.contract.schema import ResourceBudget  # M1 단일 정의 — import만 (G-56)
 from cv_infra.orchestrator.models import JobState, Verdict
 from cv_infra.orchestrator.store import (
     OperationalJobRow,
@@ -141,11 +142,22 @@ class MonitorResources(BaseModel):
     whose 0 is a BY-CONSTRUCTION constant, not a measurement (the increment branch
     is unreachable while the admission gate holds — ``tests/test_scheduler_budget.py``
     ★ test). Exposing k is an ADDITION next to it, never a false activation of it.
+
+    ``resource_budget`` (p5c18, REQ-DEPLOY-012) is the operator budget object k was
+    computed FROM — the M1 ``ResourceBudget`` verbatim (M5 configures it, M3
+    consumes it), so the operator reads the INPUTS next to the derived output
+    instead of having to infer them. Same operational-not-domain judgement as
+    ``concurrency_budget_k``: a VRAM/concurrency/policy budget is infrastructure,
+    and the NEG-3 disjointness gate covers its field names by derivation. None =
+    the projection was built without a budget (a store-only
+    ``build_operational_record(store)``, or a deployment whose VRAM figure is unset
+    so no complete budget exists) — never a fabricated one.
     """
 
     queue_depth: int
     running_k: int
     concurrency_budget_k: int | None
+    resource_budget: ResourceBudget | None
     over_launch_count: int
     vram_used_mib: int | None
     vram_total_mib: int | None
@@ -247,7 +259,10 @@ def _monitor_request(
 
 
 def build_operational_record(
-    store: Store, *, concurrency_budget_k: int | None = None
+    store: Store,
+    *,
+    concurrency_budget_k: int | None = None,
+    resource_budget: ResourceBudget | None = None,
 ) -> OperationalRecord:
     """Project the store into the ``OperationalRecord`` — READ-ONLY (DoD-P4-13).
 
@@ -261,6 +276,8 @@ def build_operational_record(
     ``concurrency_budget_k`` is the app's admission budget, passed in by the
     caller that owns it (``register`` <- ``api.create_app``'s computed k); the
     store holds no k, so a store-only call reports None rather than inventing one.
+    ``resource_budget`` rides the same seam and the same rule (the store holds no
+    budget either — it is boot config, ``serve.ServeConfig.resource_budget``).
     """
     jobs_by_request: dict[str, list[OperationalJobRow]] = {}
     for row in store.load_operational_jobs():
@@ -293,6 +310,7 @@ def build_operational_record(
             queue_depth=counts.get(JobState.QUEUED.value, 0),  # live store count
             running_k=counts.get(JobState.RUNNING.value, 0),  # live store count
             concurrency_budget_k=concurrency_budget_k,  # admission budget (None = not supplied)
+            resource_budget=resource_budget,  # the budget k came from (REQ-DEPLOY-012)
             over_launch_count=sample.over_launch_count if sample is not None else 0,
             vram_used_mib=sample.vram_used_mib if sample is not None else None,
             vram_total_mib=sample.vram_total_mib if sample is not None else None,
@@ -334,6 +352,21 @@ def _cell(value: object) -> str:
     return html.escape("-" if value is None else str(value))
 
 
+def _budget_cell(budget: ResourceBudget | None) -> str:
+    """One-glance rendering of the held Resource Budget (REQ-DEPLOY-012).
+
+    ``-`` when no complete budget exists (VRAM figure unset) — the same honest
+    absence the JSON reports as ``null``, never a fabricated number.
+    """
+    if budget is None:
+        return "-"
+    return html.escape(
+        f"max_concurrent={budget.max_concurrent}"
+        f"/vram_per_instance_gb={budget.vram_per_instance_gb:g}"
+        f"/{budget.scheduling_policy}"
+    )
+
+
 def render_dashboard_html(record: OperationalRecord) -> str:
     """Render the operational view as ONE static HTML page (NFR-MONITOR-001).
 
@@ -347,6 +380,7 @@ def render_dashboard_html(record: OperationalRecord) -> str:
         f"gpu_reachable={_cell(h.gpu_reachable)} · last_sample_at={_cell(h.last_sample_at)}</p>"
         f"<p class='resources'>queue_depth={r.queue_depth} · running_k={r.running_k} · "
         f"concurrency_budget_k={_cell(r.concurrency_budget_k)} · "
+        f"resource_budget={_budget_cell(r.resource_budget)} · "
         f"over_launch_count={r.over_launch_count} · "
         f"vram={_cell(r.vram_used_mib)}/{_cell(r.vram_total_mib)} MiB · "
         f"gpu_util={_cell(r.gpu_util_pct)}%</p>"
@@ -517,23 +551,36 @@ class ResourceHealthSampler:
 # --------------------------------------------------------------------------- #
 
 
-def register(app: FastAPI, store: Store, *, concurrency_budget_k: int | None = None) -> None:
+def register(
+    app: FastAPI,
+    store: Store,
+    *,
+    concurrency_budget_k: int | None = None,
+    resource_budget: ResourceBudget | None = None,
+) -> None:
     """Register the two operational routes on the M3 app (routes only, no writes).
 
     ``concurrency_budget_k`` is the app's admission budget (``api.create_app``'s
-    computed k) — both surfaces report the SAME value from the one projection.
+    computed k) and ``resource_budget`` the operator budget it was computed from
+    (REQ-DEPLOY-012) — both surfaces report the SAME values from the one projection.
     """
 
     @app.get("/monitor.json")
     async def monitor_json() -> dict:
         return build_operational_record(
-            store, concurrency_budget_k=concurrency_budget_k
+            store,
+            concurrency_budget_k=concurrency_budget_k,
+            resource_budget=resource_budget,
         ).model_dump()
 
     @app.get("/monitor", response_class=HTMLResponse)
     async def monitor_dashboard() -> str:
         return render_dashboard_html(
-            build_operational_record(store, concurrency_budget_k=concurrency_budget_k)
+            build_operational_record(
+                store,
+                concurrency_budget_k=concurrency_budget_k,
+                resource_budget=resource_budget,
+            )
         )
 
 

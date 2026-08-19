@@ -14,9 +14,13 @@ import sys
 import pytest
 
 from cv_infra.orchestrator.scheduler import (
+    FIFO_POLICY,
+    MIB_PER_GIB,
     PynvmlVramGauge,
     SlotAccountant,
+    budget_vram_per_instance_mb,
     compute_k,
+    to_resource_budget,
 )
 
 
@@ -92,6 +96,91 @@ def test_half_configured_vram_guard_is_a_loud_config_error():
 def test_invalid_inputs_raise(kwargs):
     with pytest.raises(ValueError):
         compute_k(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# (a2) Resource Budget seam (REQ-DEPLOY-012, DoD-P5-11) — the operator knobs
+# reflected into the M1 ``ResourceBudget`` and back into compute_k's MiB unit.
+# The rule/signature of compute_k is untouched (LOCKED §7.4); only the SOURCE of
+# its inputs moved.
+# --------------------------------------------------------------------------- #
+
+#: MEASURED per-instance VRAM of the deployment this seam was wired on (p5c17 boot
+#: log, ``CV_VRAM_PER_INSTANCE_MB=3785``). Used instead of a round number because
+#: 3785 MiB has fraction bits in GiB (3.6962890625) — a round example would hide a
+#: conversion mistake (CLAUDE §2-4: the value is measured, never invented here).
+MEASURED_VRAM_PER_INSTANCE_MB = 3785.0
+
+#: MiB values whose DECIMAL (1000) round trip is INEXACT in IEEE-754 binary64.
+#: DERIVED by that very property over a realistic MiB range — a hand list would go
+#: stale silently; the non-empty assert below keeps the counter-example honest.
+_DECIMAL_LOSSY_MB = tuple(float(mb) for mb in range(1, 40001) if mb / 1000 * 1000 != mb)[:3]
+
+
+def test_operator_knobs_reflect_into_the_contract_budget():
+    budget = to_resource_budget(2, vram_per_instance_mb=MEASURED_VRAM_PER_INSTANCE_MB)
+    assert budget.max_concurrent == 2  # authoritative cap, verbatim
+    assert budget.scheduling_policy == FIFO_POLICY  # the one policy that exists (queue.py FIFO)
+    assert budget.vram_per_instance_gb == MEASURED_VRAM_PER_INSTANCE_MB / MIB_PER_GIB
+
+
+@pytest.mark.parametrize(
+    "mb",
+    [MEASURED_VRAM_PER_INSTANCE_MB, 8000.0, 6000.0, 12288.0, 1.0, *_DECIMAL_LOSSY_MB],
+)
+def test_mib_gib_round_trip_is_exact(mb):
+    """mb -> budget -> mb is BIT-identical: the reflection cannot perturb k.
+
+    Exactness is why ``MIB_PER_GIB`` is the binary 1024 and not a decimal 1000 —
+    a power-of-two divisor only shifts the exponent in IEEE-754 binary64.
+    """
+    budget = to_resource_budget(2, vram_per_instance_mb=mb)
+    assert budget_vram_per_instance_mb(budget) == mb  # ==, not approx
+
+
+def test_a_decimal_divisor_would_not_round_trip():
+    """양성 대조: the constant choice is load-bearing, not decoration.
+
+    If ``MIB_PER_GIB`` were the decimal 1000, these same operator values would
+    come back CHANGED — the guard above would then be measuring luck.
+    """
+    assert MIB_PER_GIB == 1024
+    assert _DECIMAL_LOSSY_MB, "counter-example 집합이 비었다 — 대조가 공허하다"
+    for mb in _DECIMAL_LOSSY_MB:
+        assert mb / 1000 * 1000 != mb  # the divisor we did NOT pick loses bits
+        assert mb / MIB_PER_GIB * MIB_PER_GIB == mb  # the one we did picks none
+
+
+def test_k_from_the_budget_equals_k_from_the_raw_operator_scalars():
+    """Wiring the budget in front of ``compute_k`` changes WHERE the inputs come
+    from, never WHAT k is (LOCKED §7.4 rule untouched)."""
+    gauge = FakeGauge(16376.0)  # this host's free VRAM order of magnitude
+    budget = to_resource_budget(8, vram_per_instance_mb=MEASURED_VRAM_PER_INSTANCE_MB)
+    via_budget = compute_k(
+        budget.max_concurrent,
+        vram_gauge=gauge,
+        vram_per_instance_mb=budget_vram_per_instance_mb(budget),
+    )
+    via_scalars = compute_k(8, vram_gauge=gauge, vram_per_instance_mb=MEASURED_VRAM_PER_INSTANCE_MB)
+    assert via_budget == via_scalars == 4  # floor(16376/3785) = 4 < cap 8
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_concurrent": 0, "vram_per_instance_mb": 4096.0},  # contract: cap >= 1
+        {"max_concurrent": 2, "vram_per_instance_mb": 0.0},  # contract: vram > 0
+        {"max_concurrent": 2, "vram_per_instance_mb": -4096.0},
+        {"max_concurrent": 2, "vram_per_instance_mb": 4096.0, "scheduling_policy": ""},
+    ],
+)
+def test_a_misconfigured_budget_is_refused_at_reflection_time(kwargs):
+    """양성 대조: a wrong budget is caught EARLIER than before (boot, by the
+    contract bounds) instead of surviving as a scalar until admission. pydantic's
+    ValidationError IS a ValueError, so the existing loud-boot contract holds."""
+    max_concurrent = kwargs.pop("max_concurrent")
+    with pytest.raises(ValueError):
+        to_resource_budget(max_concurrent, **kwargs)
 
 
 # --------------------------------------------------------------------------- #

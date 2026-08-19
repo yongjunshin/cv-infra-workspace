@@ -48,7 +48,13 @@ from cv_infra.orchestrator.api import _job_spec_for, create_app
 from cv_infra.orchestrator.fanout import fan_out
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.queue import JobQueue
-from cv_infra.orchestrator.scheduler import SlotAccountant
+from cv_infra.orchestrator.scheduler import (
+    FIFO_POLICY,
+    MIB_PER_GIB,
+    SlotAccountant,
+    budget_vram_per_instance_mb,
+    to_resource_budget,
+)
 from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import (
     _REASON_MAX_CHARS,  # NEG 가드: 사유 문자열 상한 (테스트가 상수를 재타이핑하지 않게)
@@ -655,6 +661,14 @@ def _serve_config(tmp_path: Path, **overrides) -> serve.ServeConfig:
     return serve.config_from_env(environ)
 
 
+def _serve_config_line(capsys) -> dict:
+    """The ONE structured boot line, parsed (the last one emitted)."""
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if ln.startswith("[cv-orchestrator] serve-config ")]
+    assert lines, "no serve-config line emitted"
+    return json.loads(lines[-1].removeprefix("[cv-orchestrator] serve-config "))
+
+
 def test_build_app_computes_k_and_emits_the_serve_config_line(tmp_path, capsys):
     """Feature-on gate (G-26): ONE structured boot line carrying the COMPUTED k
     (LOCKED §7.4 — operator cap 8 capped to 4 by the VRAM 2nd guard) and the
@@ -670,6 +684,12 @@ def test_build_app_computes_k_and_emits_the_serve_config_line(tmp_path, capsys):
     body = json.loads(line.removeprefix("[cv-orchestrator] serve-config "))
     assert body["k"] == 4  # min(max_concurrent 8, floor(35000/8000)=4)
     assert body["max_concurrent"] == 8
+    # REQ-DEPLOY-012: the HELD budget object k was computed from rides the same line.
+    assert body["resource_budget"] == {
+        "vram_per_instance_gb": 8000 / MIB_PER_GIB,
+        "max_concurrent": 8,
+        "scheduling_policy": FIFO_POLICY,
+    }
     assert body["runner_image"] == "runner:test"
     assert body["job_timeout_s"] == DEFAULT_JOB_TIMEOUT_S  # inner watchdog, the wrapper's decl
     # p5c7 T2: the outer wall-clock cap is wired + logged (operator-visible), and it is
@@ -678,6 +698,96 @@ def test_build_app_computes_k_and_emits_the_serve_config_line(tmp_path, capsys):
     assert body["outer_wallclock_s"] > body["job_timeout_s"]
     assert body["consent_env_present"] == ["ACCEPT_EULA"]
     assert "operator-consent-token" not in err  # value never rides any log (G-21)
+
+
+def test_config_holds_the_operator_budget_as_a_resource_budget(tmp_path):
+    """REQ-DEPLOY-012 / DoD-P5-11: the two operator knobs are HELD as ONE named
+    contract object — the thing ``build_app`` schedules against."""
+    config = _serve_config(tmp_path, CV_VRAM_PER_INSTANCE_MB="3785")  # p5c17 실측값
+    budget = config.resource_budget
+    assert budget is not None
+    assert budget.max_concurrent == config.max_concurrent  # authoritative cap, verbatim
+    assert budget.scheduling_policy == FIFO_POLICY
+    # unit seam: GiB in the contract, and the EXACT MiB the operator set on the way back.
+    assert budget_vram_per_instance_mb(budget) == config.vram_per_instance_mb
+
+
+def test_budget_is_the_source_of_the_scheduling_input(tmp_path, capsys):
+    """The budget is not a decoration next to k — k is computed FROM it.
+
+    양성 대조 (G-35): move ONLY the budget (a per-instance VRAM the free VRAM
+    cannot fit twice) and the boot line's k moves with it. A k that ignored the
+    budget would stay at the operator cap.
+    """
+    free_mb = 8000.0
+    generous = _serve_config(tmp_path, CV_MAX_CONCURRENT="4", CV_VRAM_PER_INSTANCE_MB="2000")
+    serve.build_app(generous, vram_gauge=_FakeGauge(free_mb=free_mb))
+    body = _serve_config_line(capsys)
+    assert body["k"] == 4 and body["resource_budget"]["vram_per_instance_gb"] == 2000 / MIB_PER_GIB
+
+    tight = _serve_config(tmp_path, CV_MAX_CONCURRENT="4", CV_VRAM_PER_INSTANCE_MB="5000")
+    serve.build_app(tight, vram_gauge=_FakeGauge(free_mb=free_mb))
+    body = _serve_config_line(capsys)
+    assert body["k"] == 1  # floor(8000/5000) — the budget really drove the cap
+    assert body["resource_budget"]["vram_per_instance_gb"] == 5000 / MIB_PER_GIB
+
+
+def test_the_scheduler_reads_the_budget_object_not_the_raw_scalars(tmp_path, capsys, monkeypatch):
+    """★ 양성 대조 (구조): the reflection is k-neutral BY CONSTRUCTION, so no value
+    comparison can distinguish "k from the budget" from "k from the scalars" — the
+    two always agree. Force them apart (hand the config a budget that disagrees
+    with its own env scalars) and k follows the BUDGET. Had ``build_app`` kept
+    reading ``config.max_concurrent``, k would stay 4 and this test would be the
+    thing that noticed."""
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="4", CV_VRAM_PER_INSTANCE_MB="2000")
+    monkeypatch.setattr(
+        serve.ServeConfig,
+        "resource_budget",
+        property(lambda self: to_resource_budget(1, vram_per_instance_mb=2000.0)),
+    )
+    serve.build_app(config, vram_gauge=_FakeGauge(free_mb=8000.0))
+    body = _serve_config_line(capsys)
+    assert body["k"] == 1  # the BUDGET's cap
+    assert body["max_concurrent"] == 4  # the raw env snapshot, unchanged and now differing
+    assert body["resource_budget"]["max_concurrent"] == 1  # what was actually scheduled against
+
+
+def test_no_vram_figure_means_no_budget_object_and_the_cap_alone_bounds_k(tmp_path, capsys):
+    """Guard-OFF deployment (every unmeasured ``profiles/*.yaml``): the contract
+    model needs a VRAM figure the operator never measured, so the budget is
+    reported ABSENT — never a fabricated 0/default (CLAUDE §2-4) — and k falls back
+    to the authoritative cap alone (LOCKED §7.4)."""
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="3")
+    assert config.vram_per_instance_mb is None
+    assert config.resource_budget is None
+
+    serve.build_app(config)  # no gauge needed: the 2nd guard is off
+    body = _serve_config_line(capsys)
+    assert body["k"] == 3 == body["max_concurrent"]
+    assert body["resource_budget"] is None  # honest absence, side by side with
+    assert body["vram_per_instance_mb"] is None  # the raw env snapshot it came from
+
+
+def test_a_misconfigured_budget_is_refused_at_boot(tmp_path):
+    """양성 대조: an impossible operator budget dies at reflection time (contract
+    bounds) rather than surviving into admission. Still a ValueError, so the
+    module's loud-boot contract is unchanged (pydantic ValidationError IS one)."""
+    zero_cap = _serve_config(tmp_path, CV_MAX_CONCURRENT="0", CV_VRAM_PER_INSTANCE_MB="3785")
+    with pytest.raises(ValueError):
+        zero_cap.resource_budget
+    with pytest.raises(ValueError):
+        _serve_config(tmp_path, CV_VRAM_PER_INSTANCE_MB="-1").resource_budget
+
+
+def test_build_app_hands_the_held_budget_to_the_operational_view(tmp_path):
+    """DoD-P5-11 "보유": the budget the app scheduled against is OBSERVABLE on the
+    running deployment's operational surface, not only in the boot line."""
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2", CV_VRAM_PER_INSTANCE_MB="3785")
+    app = serve.build_app(config, vram_gauge=_FakeGauge(free_mb=16376.0))
+    with TestClient(app) as client:
+        resources = client.get("/monitor.json").json()["resources"]
+    assert resources["resource_budget"] == config.resource_budget.model_dump(mode="json")
+    assert resources["concurrency_budget_k"] == 2  # min(cap 2, floor(16376/3785)=4)
 
 
 def test_build_app_reconciles_the_store_at_boot(tmp_path, capsys):

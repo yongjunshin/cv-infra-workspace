@@ -31,6 +31,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from cv_infra.contract.schema import ResourceBudget
 from cv_infra.orchestrator.api import create_app
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.monitor import (
@@ -45,6 +46,7 @@ from cv_infra.orchestrator.monitor import (
     nvml_snapshot,
     render_dashboard_html,
 )
+from cv_infra.orchestrator.scheduler import to_resource_budget
 from cv_infra.orchestrator.store import OperationalJobRow, Store
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
@@ -61,6 +63,13 @@ _PIN_RESOURCES = {
     # so the operator can judge running_k > k himself. Adding it here IS the NEG-3
     # review gate being exercised — the equality assert below reddens without it.
     "concurrency_budget_k",
+    # p5c18 (REQ-DEPLOY-012 / DoD-P5-11): the operator Resource Budget k was computed
+    # FROM, held on the operational surface next to its derived k. Adding it here IS
+    # the NEG-3 review gate being exercised again — the equality assert below reddens
+    # without it; the disjointness verdict (a resource budget is operational, not a
+    # domain result) is derived, not asserted by hand, in
+    # tests/negative/test_monitor_no_domain_leak.py.
+    "resource_budget",
     "over_launch_count",
     "vram_used_mib",
     "vram_total_mib",
@@ -301,7 +310,10 @@ def test_batch8_surfaces_running_then_terminal_counts(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def _sample_record(concurrency_budget_k: int | None = 2) -> OperationalRecord:
+def _sample_record(
+    concurrency_budget_k: int | None = 2,
+    resource_budget: ResourceBudget | None = None,
+) -> OperationalRecord:
     """A minimal hand-built record so the assertions target the TEMPLATE, not data."""
     return OperationalRecord(
         generated_at="2026-07-16T00:00:00+00:00",
@@ -310,6 +322,7 @@ def _sample_record(concurrency_budget_k: int | None = 2) -> OperationalRecord:
             queue_depth=0,
             running_k=0,
             concurrency_budget_k=concurrency_budget_k,
+            resource_budget=resource_budget,
             over_launch_count=0,
             vram_used_mib=None,
             vram_total_mib=None,
@@ -384,6 +397,65 @@ def test_dashboard_renders_the_budget_including_the_absent_branch(budget, render
     page's ``-`` null idiom instead of reading as a real budget of 0."""
     page = render_dashboard_html(_sample_record(concurrency_budget_k=budget))
     assert f"concurrency_budget_k={rendered}" in page
+
+
+# --------------------------------------------------------------------------- #
+# (2d) p5c18 (REQ-DEPLOY-012 / DoD-P5-11): the HELD Resource Budget — the inputs
+# k came from, on the same two surfaces. Both optional branches again (G-59):
+# an app-wired budget AND the store-only None.
+# --------------------------------------------------------------------------- #
+
+#: MEASURED per-instance VRAM of the deployment this was wired on (p5c17 boot log,
+#: ``CV_VRAM_PER_INSTANCE_MB=3785``) — a real operator value, not a round example,
+#: so the MiB->GiB reflection is exercised on a number that actually has fraction
+#: bits (3785/1024 = 3.6962890625).
+_MEASURED_VRAM_PER_INSTANCE_MB = 3785.0
+
+
+def test_monitor_surfaces_the_held_resource_budget(tmp_path):
+    """The operator budget is OBSERVABLE, not just its derived k (DoD-P5-11).
+
+    ``concurrency_budget_k`` alone tells an operator the outcome; it does not tell
+    him WHICH term produced it. The held ``ResourceBudget`` puts the inputs (cap ·
+    per-instance VRAM · policy) on the same header, and the no-leak assertions run
+    in the SAME window so the addition is not a domain-detail door.
+    """
+    budget = to_resource_budget(2, vram_per_instance_mb=_MEASURED_VRAM_PER_INSTANCE_MB)
+    with Store(tmp_path / "cv.sqlite3") as store:
+        # Store-only projection: no app, so no budget — None, never fabricated (G-59).
+        assert build_operational_record(store).resources.resource_budget is None
+
+        app = create_app(store, GatedScriptedRunner(), k=2, resource_budget=budget)
+        with TestClient(app) as client:
+            envelope_id = _submit(client, [_request_doc()])
+            _wait_status(client, envelope_id, "completed")
+            raw = client.get("/monitor.json").text
+            page = client.get("/monitor").text
+
+    resources = json.loads(raw)["resources"]
+    # The budget rides VERBATIM (the M1 model serialized, no re-derivation).
+    assert resources["resource_budget"] == budget.model_dump(mode="json")
+    assert resources["resource_budget"]["max_concurrent"] == 2
+    assert resources["resource_budget"]["scheduling_policy"] == "fifo"
+    # k stays bounded by the cap the operator set — readable from ONE surface now.
+    assert resources["concurrency_budget_k"] <= resources["resource_budget"]["max_concurrent"]
+    # HTML one-glance header carries the same budget (compact one-line form).
+    assert "max_concurrent=2" in page
+    assert f"{budget.vram_per_instance_gb:g}" in page
+    assert budget.scheduling_policy in page
+    # NEG-3 in the same window: an operational addition, not a domain door.
+    for needle in _DOMAIN_STRINGS:
+        assert needle not in raw, f"domain leak: {needle!r}"
+        assert needle not in page, f"domain leak (HTML): {needle!r}"
+
+
+def test_dashboard_renders_the_resource_budget_including_the_absent_branch():
+    """Absent budget degrades to the page's ``-`` null idiom — never a rendered 0."""
+    budget = to_resource_budget(8, vram_per_instance_mb=_MEASURED_VRAM_PER_INSTANCE_MB)
+    present = render_dashboard_html(_sample_record(resource_budget=budget))
+    assert "resource_budget=max_concurrent=8/vram_per_instance_gb=" in present
+    absent = render_dashboard_html(_sample_record(resource_budget=None))
+    assert "resource_budget=-" in absent
 
 
 # --------------------------------------------------------------------------- #
