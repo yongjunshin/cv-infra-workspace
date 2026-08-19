@@ -82,6 +82,19 @@ class Job:
     ``ros_domain_ids`` table + container labels at restart, M3 §3.9) and re-set on every
     admission; None = no allocator attached (single-run / CPU-fake path -> run_job pure-hash
     fallback, P2 ``cv-infra run`` 계약 불변).
+
+    ``request_identity_key`` (p5c18 T4, DoD-P2-06 ① / REQ-REPORT-002): this job's REQUEST
+    identity key — ``report.regression.identity_key`` (M4 단일 정의, IMPORTED never re-derived)
+    applied ONCE at admission to the same request wire dump the completion-time report
+    assembly uses, so the job plane's key and the report row's key are byte-identical BY
+    CONSTRUCTION. Denormalized onto the job like the anchor above so the runner seam can
+    hand it to ``run_job(request_identity_key=...)`` -> ``CV_REQUEST_IDENTITY_KEY`` in the
+    runner container, which is how a ``result.json`` gets to say WHICH request produced it.
+    Same transient-carrier status as ``ros_domain_id``: NOT persisted (no store column), so a
+    job restored from the store carries None and the runner reports it honestly absent —
+    never a re-derived lookalike (a key built from different inputs would be *a different key
+    with the same name*, which is worse than null). None = the CPU-skeleton/single-run paths
+    that have no admitted request.
     """
 
     request_id: str
@@ -93,6 +106,7 @@ class Job:
     runner_exit_code: int | None = None
     infra_error: str | None = None
     ros_domain_id: int | None = None
+    request_identity_key: str | None = None
 
 
 @dataclass

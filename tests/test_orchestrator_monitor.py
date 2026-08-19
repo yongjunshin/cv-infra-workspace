@@ -405,11 +405,12 @@ def test_dashboard_renders_the_budget_including_the_absent_branch(budget, render
 # an app-wired budget AND the store-only None.
 # --------------------------------------------------------------------------- #
 
-#: MEASURED per-instance VRAM of the deployment this was wired on (p5c17 boot log,
-#: ``CV_VRAM_PER_INSTANCE_MB=3785``) — a real operator value, not a round example,
-#: so the MiB->GiB reflection is exercised on a number that actually has fraction
-#: bits (3785/1024 = 3.6962890625).
-_MEASURED_VRAM_PER_INSTANCE_MB = 3785.0
+#: MEASURED per-instance VRAM of the deployment this was wired on
+#: (``profiles/rtx_4080.yaml``, p5c18 T1-F1 — the moving-job re-measurement that
+#: superseded p5c17's parked-robot 3785) — a real operator value, not a round
+#: example, so the MiB->GiB reflection is exercised on a number that actually has
+#: fraction bits (4596/1024 = 4.48828125).
+_MEASURED_VRAM_PER_INSTANCE_MB = 4596.0
 
 
 def test_monitor_surfaces_the_held_resource_budget(tmp_path):

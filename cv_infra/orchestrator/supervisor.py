@@ -139,6 +139,13 @@ CACHE_MOUNTS: tuple[tuple[str, str], ...] = CACHE_BASE_MOUNTS + CACHE_SCRATCH_MO
 # the SUT never sees the mount or the env (blackbox no-leak invariant).
 ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
 
+# p5c18 T4 (DoD-P2-06 ①, REQ-REPORT-002): the request identity key handed to the RUNNER
+# only, same blackbox rule as the plugin dir above (the SUT never sees it). The VALUE is
+# ``report.regression.identity_key`` derived ONCE at admission (api submit path) and carried
+# verbatim — nothing here re-derives it. M2 reads this name to fill its ``sim_config`` line
+# and ``Result.request_identity_key``; absent = the runner reports it honestly absent.
+REQUEST_IDENTITY_KEY_ENV = "CV_REQUEST_IDENTITY_KEY"
+
 _TEARDOWN_STOP_TIMEOUT_S = 10  # graceful stop window before force-remove
 _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immediately)
 
@@ -704,6 +711,7 @@ def run_job(
     poll_interval_s: float = 1.0,
     ros_domain_id: int | None = None,
     shm_size: str | int | None = DEFAULT_RUNNER_SHM_SIZE,
+    request_identity_key: str | None = None,
 ) -> JobOutcome:
     """Run ONE verification job end-to-end and return its ``JobOutcome`` (D-2 seam).
 
@@ -767,6 +775,17 @@ def run_job(
     it passes the allocated id here so run_job does NOT re-derive a colliding pure-hash id
     (the p4c5 defect: k>=~6 동시 admission에서 두 잡이 같은 도메인 — cross-talk은 잡별 전용
     브리지+host_net=0으로 구조 차단되나 "잡별 고유 도메인" 하위 불변식이 확률적 파손).
+
+    ``request_identity_key`` (p5c18 T4, DoD-P2-06 ① / REQ-REPORT-002): when not None it is
+    announced to the RUNNER as ``CV_REQUEST_IDENTITY_KEY=<key>`` (runner-only, same blackbox
+    rule as the plugin dir) so the job plane can stamp WHICH request produced a given
+    ``result.json`` — until p5c18 the key existed only on the report plane and every
+    runner logged ``identity_key=none`` (T3 GPU N=5 실측). The value is M4's
+    ``report.regression.identity_key`` computed ONCE at admission on the request wire dump;
+    this function only forwards it. None (the default — ``cv-infra run`` single-run path and
+    any job with no admitted request) = the env key is ABSENT: an honestly missing key, never
+    a re-derived one from different inputs (that would be a different key wearing the same
+    name).
 
     ``shm_size`` (p5c15, LOCKED risk R-shm) sizes the RUNNER container's ``/dev/shm``
     (docker default 64m is below what Kit expects — see ``DEFAULT_RUNNER_SHM_SIZE`` for the
@@ -877,6 +896,12 @@ def run_job(
             # D-1: announce the mounted plugin dir to the runner ONLY (supervisor-
             # owned, so it overrides operator runner_env like the seam keys above).
             environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
+        if request_identity_key is not None:
+            # p5c18 T4: same supervisor-owned seam-key idiom — the request identity key
+            # (derived ONCE by M4's identity_key at admission) reaches the job plane so
+            # the runner can name its own request. Omitted entirely when unknown: a
+            # fabricated key would be worse than the honest absence (T3 실측 근거).
+            environment[REQUEST_IDENTITY_KEY_ENV] = request_identity_key
         # FU-14: scenario-derived ROS env — injected only when the key exists in
         # interface.adapter_config (scenario is the SoT, so these supervisor-owned
         # keys override operator runner_env like the seam keys above). Image-internal
@@ -1307,6 +1332,11 @@ class RunJobRunner:
       rides into ``run_job(ros_domain_id=...)`` so the container env/label carries
       the ALLOCATED id, not a re-derived colliding pure-hash one. None (a job with
       no allocator) => run_job's frozen pure-hash fallback.
+    * ``job.request_identity_key`` (p5c18 T4) — the M4-derived request identity key
+      the api submit path put on the job — rides into
+      ``run_job(request_identity_key=...)`` -> ``CV_REQUEST_IDENTITY_KEY`` on the
+      runner container. None (a restored/CPU-skeleton job) => the env key is absent,
+      never a re-derived stand-in.
     * ``job_timeout_s`` is a PUBLIC attribute — the duck-typed inner-watchdog
       declaration the ``ParallelSupervisor`` coherence gate reads (p4c1 후속 ②)
       — and the SAME attribute is what every ``run_job`` call receives (single
@@ -1368,6 +1398,9 @@ class RunJobRunner:
             # allocator is attached -> run_job's pure-hash fallback).
             ros_domain_id=job.ros_domain_id,
             shm_size=self.shm_size,  # p5c15 R-shm (construction-time knob, one source)
+            # p5c18 T4: the admission-derived request identity key -> runner env
+            # (None on a spec-restored/CPU-skeleton job -> key simply absent).
+            request_identity_key=job.request_identity_key,
         )
         return _job_result_of(job, outcome)
 
