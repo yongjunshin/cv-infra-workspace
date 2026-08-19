@@ -458,7 +458,7 @@ class SimRuntime:
             print(f"[cv-runner] WARNING: sim_config {'; '.join(notes)}", flush=True)
         return line
 
-    def load_scene(self) -> None:  # pragma: no cover - GPU path (T3 proves)
+    def load_scene(self, identity_key: str | None = None) -> None:  # pragma: no cover - GPU
         """open_stage(sample scene) + locate pre-wired robot; pin dt/seed; reset.
 
         REUSE (do-not-reinvent): the sample scene ships the Nova Carter robot with
@@ -525,7 +525,9 @@ class SimRuntime:
         # above and the World now holds the dt, and everything after this point
         # (robot resolve, initial pose, reset) can fail. Emitting later would lose
         # exactly the runs whose settings a reader most wants to compare.
-        self.emit_sim_config()
+        # ``identity_key`` is M3's (CV_REQUEST_IDENTITY_KEY, read by main.run) —
+        # passed through VERBATIM; None keeps the honest ``identity_key=none``.
+        self.emit_sim_config(identity_key)
 
         if asset.robot_prim_candidates:
             stage = omni.usd.get_context().get_stage()

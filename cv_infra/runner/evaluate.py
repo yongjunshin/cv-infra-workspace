@@ -106,6 +106,7 @@ def build_result_dict(
     outcomes: list[OracleOutcome],
     metrics: dict[str, float | None],
     artifacts: Artifacts | None = None,
+    request_identity_key: str | None = None,
 ) -> dict:
     """Assemble ``result.json`` as the M1 canonical ``Result.model_dump()``.
 
@@ -117,6 +118,14 @@ def build_result_dict(
     is not a canonical field). ``artifacts`` defaults to the canonical None fields
     until the recorders produce files. The emitted key tree/values are frozen by
     the golden shape test (D-4' wire invariance — supersedes nothing on the wire).
+
+    ``request_identity_key`` (p5c18 T5, DoD-P2-06 ①) is M3's injected
+    ``CV_REQUEST_IDENTITY_KEY`` carried VERBATIM: it is M4's key
+    (``report.regression.identity_key``, derived ONCE at admission), so this
+    module neither re-derives nor validates it — a runner-made substitute would
+    be a different key wearing the same name (T4 변이 ②). Absent stays
+    ``None``: which request produced this artifact is then unanswerable, not
+    guessable.
     """
     result = Result(
         job_id=job_id,
@@ -127,5 +136,6 @@ def build_result_dict(
             for o in outcomes
         ],
         artifacts=artifacts if artifacts is not None else Artifacts(),
+        request_identity_key=request_identity_key,
     )
     return result.model_dump()

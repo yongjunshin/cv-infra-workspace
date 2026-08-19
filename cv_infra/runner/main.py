@@ -70,6 +70,15 @@ READINESS_TIMEOUT_S = 180.0
 # class): change it only with a decisions/ update on both sides.
 ORACLE_PLUGIN_DIR_ENV = "CV_ORACLE_PLUGIN_DIR"
 
+# p5c18 T4->T5 supervisor->runner env carrying the request identity key (M4's
+# ``report.regression.identity_key``, derived ONCE at admission). Same cross-team
+# wire class as the plugin dir above: M3 injects it character-exact
+# (``orchestrator/supervisor.py::REQUEST_IDENTITY_KEY_ENV``) and the literal is
+# pinned on both sides by test. NOT a job identifier — the key is deliberately
+# blind to SUT/apiVersion/repeats (M4 deny-list), so two runs of the same scenario
+# against DIFFERENT SUT images share it. ``job_id`` remains the unique run name.
+REQUEST_IDENTITY_KEY_ENV = "CV_REQUEST_IDENTITY_KEY"
+
 # verdict (result.json) -> process exit code. timeout collapses to FAIL at the exit
 # level (only 4 slots); the precise verdict stays in result.json for M3/M8.
 _VERDICT_EXIT = {
@@ -284,6 +293,23 @@ def insert_oracle_plugin_dir(env: dict | None = None) -> str | None:
     return plugin_dir
 
 
+def read_request_identity_key(env: dict | None = None) -> str | None:
+    """The M3-injected request identity key, or None when it was not injected.
+
+    VERBATIM by contract (T4 §④): nothing here parses, normalizes or re-derives
+    the value. M4 owns its ONE definition and a runner-made substitute would be a
+    different key wearing the same name — T4's mutation ② proved that such a key
+    is non-null, well-formed and per-request distinct, i.e. indistinguishable
+    from the right one except by cross-plane equality.
+
+    An EMPTY string counts as ABSENT (G-26 empty-env variant): "unknown" must not
+    render as a value. Absent -> the sim_config line says ``identity_key=none``
+    and ``Result.request_identity_key`` stays null, which is the honest report.
+    """
+    environ = os.environ if env is None else env
+    return environ.get(REQUEST_IDENTITY_KEY_ENV) or None
+
+
 def build_oracles(request: VerificationRequest | None = None) -> list:
     """Compose one oracle instance per acceptance criterion via the M1 loader.
 
@@ -403,6 +429,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     plugin_dir = insert_oracle_plugin_dir(env)
     if plugin_dir is not None:
         print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
+    # DoD-P2-06 ①: read the request identity key ONCE, pre-boot, so BOTH consumers
+    # (the sim_config line and result.json) carry the same value even if the job
+    # dies mid-mission. Absent stays absent — never substituted.
+    identity_key = read_request_identity_key(env)
     oracles = build_oracles(request)
     validate_oracle_params(oracles, criteria)  # D-1 (b): pre-boot params gate
     engine = EvaluationEngine(oracles)
@@ -456,7 +486,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         sensor_topics = [s.topic for s in adapter_config.sensors]
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
-        sim.load_scene()  # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind)
+        # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
+        # key rides along so the applied-settings line names its request.
+        sim.load_scene(identity_key)
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)
@@ -537,6 +569,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
                 mcap=str(mcap_path) if mcap_path is not None else None,
                 mp4=str(mp4_path) if mp4_path is not None else None,
             ),
+            request_identity_key=identity_key,
         )
         write_result(result, result_path)  # step 10: exactly one result
         return exit_code_for_verdict(verdict)
@@ -544,7 +577,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         raise
     except Exception as exc:  # step 10 (degraded): still emit a (canonical) result for M3
         print(f"[cv-runner] runner error: {exc!r}", file=sys.stderr, flush=True)
-        write_result(build_result_dict(job_id, VERDICT_ERROR, [], {}), result_path)
+        # A degraded result must still name its request — that is exactly the job
+        # whose provenance a reviewer needs most.
+        write_result(
+            build_result_dict(job_id, VERDICT_ERROR, [], {}, request_identity_key=identity_key),
+            result_path,
+        )
         return EXIT_PLATFORM
     finally:
         # Diagnostics FIRST (p4c5 T1): the boot fold + the cache write-side delta must
