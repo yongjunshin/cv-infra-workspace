@@ -137,6 +137,7 @@ from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import ParallelSupervisor
 from cv_infra.report.aggregate import RequestReportInput, build_report
 from cv_infra.report.baseline import update_baseline
+from cv_infra.report.regression import identity_key
 
 _DOC_LINK = "M3-orchestrator.md §7 (submit wire — D-1 internal representation)"
 
@@ -597,6 +598,19 @@ def create_app(
         jobs = fan_out_requests(list(zip(request_ids, repeats)))
         anchor_of = dict(zip(request_ids, plugin_dirs, strict=True))
         admitted_of = dict(zip(request_ids, admitted, strict=True))
+        # ONE wire dump per request, computed here and reused by BOTH consumers: the
+        # runner-facing identity key just below and the completion-time report assembly
+        # (``_EnvelopeRecord.request_dumps``). Same bytes in => same key out, so the
+        # runner's CV_REQUEST_IDENTITY_KEY equals the report row's request_identity_key
+        # by construction rather than by a parallel derivation.
+        request_dumps = {
+            rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
+            for rid in request_ids
+        }
+        # p5c18 T4 (DoD-P2-06 ①): the M4 단일 정의를 IMPORT 해서 부른다 (G-56). Deriving
+        # the key from any other input (e.g. the JOB_SPEC) would produce *a different key
+        # under the same name* — worse than the null the job plane reported until now.
+        identity_of = {rid: identity_key(dump) for rid, dump in request_dumps.items()}
         for job in jobs:
             # D-1 wiring #3 (p4c4): the stage-5 anchor rides each fanned-out job
             # so the runner seam can hand it to run_job(oracle_plugin_dir=...).
@@ -605,6 +619,9 @@ def create_app(
             # canonical per-job JOB_SPEC riding (and persisting with) the job —
             # the production runner seam (RunJobRunner) drives run_job off it.
             job.job_spec = _job_spec_for(admitted_of[job.request_id].request, job_key(job))
+            # p5c18 T4: the request identity key rides the job to the runner env, so the
+            # job plane's own artifacts can name the request that produced them.
+            job.request_identity_key = identity_of[job.request_id]
         # Durable registry FIRST (p4c4 영속): a restart can then serve status for
         # this envelope even though the in-memory record below dies with us. The
         # self-test markers ride the SAME write (v8) — the operational projection
@@ -633,10 +650,8 @@ def create_app(
             # Capture each request's M1 wire dump AT SUBMIT (p5c2 report seam): the
             # completion-time assembly consumes it for identity_key/sut_ref/scenario
             # (전달-not-재도출) — the admitted models would otherwise be gone by then.
-            request_dumps={
-                rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
-                for rid in request_ids
-            },
+            # Same object the job-plane keys above were derived from (one dump, two uses).
+            request_dumps=request_dumps,
             # p5c3: submitted value (or default), recorded verbatim
             trigger_source=envelope.trigger_source,
         )

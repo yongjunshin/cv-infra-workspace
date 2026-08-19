@@ -105,11 +105,13 @@ def test_invalid_inputs_raise(kwargs):
 # its inputs moved.
 # --------------------------------------------------------------------------- #
 
-#: MEASURED per-instance VRAM of the deployment this seam was wired on (p5c17 boot
-#: log, ``CV_VRAM_PER_INSTANCE_MB=3785``). Used instead of a round number because
-#: 3785 MiB has fraction bits in GiB (3.6962890625) — a round example would hide a
-#: conversion mistake (CLAUDE §2-4: the value is measured, never invented here).
-MEASURED_VRAM_PER_INSTANCE_MB = 3785.0
+#: MEASURED per-instance VRAM of the deployment this seam was wired on
+#: (``profiles/rtx_4080.yaml`` — p5c18 T1-F1 re-measurement on a MOVING carter job;
+#: it superseded the p5c17 3785 MiB, which had been sampled on a parked robot and
+#: over-committed the card). Used instead of a round number because 4596 MiB has
+#: fraction bits in GiB (4.48828125) — a round example would hide a conversion
+#: mistake (CLAUDE §2-4: the value is measured, never invented here).
+MEASURED_VRAM_PER_INSTANCE_MB = 4596.0
 
 #: MiB values whose DECIMAL (1000) round trip is INEXACT in IEEE-754 binary64.
 #: DERIVED by that very property over a realistic MiB range — a hand list would go
@@ -162,7 +164,7 @@ def test_k_from_the_budget_equals_k_from_the_raw_operator_scalars():
         vram_per_instance_mb=budget_vram_per_instance_mb(budget),
     )
     via_scalars = compute_k(8, vram_gauge=gauge, vram_per_instance_mb=MEASURED_VRAM_PER_INSTANCE_MB)
-    assert via_budget == via_scalars == 4  # floor(16376/3785) = 4 < cap 8
+    assert via_budget == via_scalars == 3  # floor(16376/4596) = 3 < cap 8
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,7 @@ from cv_infra.orchestrator.supervisor import (
     JOB_SPEC_MOUNT,
     LABEL_JOB_ID,
     ORACLE_PLUGIN_DIR_ENV,
+    REQUEST_IDENTITY_KEY_ENV,
     RESULT_OUT_MOUNT,
     ROS_DOMAIN_ID_SPACE,
     JobOutcome,
@@ -1033,6 +1034,56 @@ def test_oracle_plugin_dir_never_leaks_to_sut(tmp_path):
     _, (_, sut_kwargs) = client.run_calls
     assert "volumes" not in sut_kwargs  # no mount on the SUT (blackbox)
     assert set(sut_kwargs["environment"]) == {"ROS_DOMAIN_ID"}  # no env leak either
+
+
+# --------------------------------------------------------------------------- #
+# (9b) p5c18 T4: request identity key -> runner env (DoD-P2-06 ①, REQ-REPORT-002).
+# Until now every runner logged ``identity_key=none`` (T3 GPU N=5 실측) and a
+# result.json could not name its own request. The key is DERIVED ELSEWHERE (M4
+# regression.identity_key at admission); this seam only carries it.
+# --------------------------------------------------------------------------- #
+
+#: Shape-faithful stand-in for a real key (sha256 hex digest form). A literal is fine
+#: here precisely BECAUSE this seam must not interpret the value — it carries bytes.
+_IDENTITY_KEY = "sha256:" + "3ed4011ca34c5a1c" * 4
+
+
+def test_request_identity_key_rides_the_runner_env(tmp_path):
+    """The env key really lands in the container spec docker is asked to create —
+    asserted on the recorded ``containers.run`` kwargs, not on a log line."""
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client, request_identity_key=_IDENTITY_KEY)
+    (_, runner_kwargs), (_, sut_kwargs) = client.run_calls
+    assert REQUEST_IDENTITY_KEY_ENV == "CV_REQUEST_IDENTITY_KEY"  # the M2-facing name
+    assert runner_kwargs["environment"][REQUEST_IDENTITY_KEY_ENV] == _IDENTITY_KEY
+    # Blackbox invariant: the SUT never learns our request identity (same rule as D-1).
+    assert set(sut_kwargs["environment"]) == {"ROS_DOMAIN_ID"}
+
+
+def test_absent_request_identity_key_omits_the_env_entirely(tmp_path):
+    """None = the key is ABSENT, never an empty/placeholder value — the runner must be
+    able to tell 'nobody told me' from 'the key is ""' (G-26)."""
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(tmp_path, client)  # default: no key supplied
+    (_, runner_kwargs), _ = client.run_calls
+    assert REQUEST_IDENTITY_KEY_ENV not in runner_kwargs["environment"]
+
+
+def test_request_identity_key_is_a_seam_key_and_beats_operator_runner_env(tmp_path):
+    """Same idiom as the other supervisor-owned seam keys (RESULT_OUT/ROS_DOMAIN_ID):
+    an operator-set value of the same name must not be able to mislabel a job."""
+    put_result(tmp_path)
+    client = FakeClient()
+    run_min(
+        tmp_path,
+        client,
+        runner_env={REQUEST_IDENTITY_KEY_ENV: "sha256:operator-forged"},
+        request_identity_key=_IDENTITY_KEY,
+    )
+    (_, runner_kwargs), _ = client.run_calls
+    assert runner_kwargs["environment"][REQUEST_IDENTITY_KEY_ENV] == _IDENTITY_KEY
 
 
 def test_missing_oracle_plugin_dir_raises_before_any_resource(tmp_path):

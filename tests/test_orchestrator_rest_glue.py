@@ -703,7 +703,7 @@ def test_build_app_computes_k_and_emits_the_serve_config_line(tmp_path, capsys):
 def test_config_holds_the_operator_budget_as_a_resource_budget(tmp_path):
     """REQ-DEPLOY-012 / DoD-P5-11: the two operator knobs are HELD as ONE named
     contract object — the thing ``build_app`` schedules against."""
-    config = _serve_config(tmp_path, CV_VRAM_PER_INSTANCE_MB="3785")  # p5c17 실측값
+    config = _serve_config(tmp_path, CV_VRAM_PER_INSTANCE_MB="4596")  # profiles/rtx_4080 실측값
     budget = config.resource_budget
     assert budget is not None
     assert budget.max_concurrent == config.max_concurrent  # authoritative cap, verbatim
@@ -772,7 +772,7 @@ def test_a_misconfigured_budget_is_refused_at_boot(tmp_path):
     """양성 대조: an impossible operator budget dies at reflection time (contract
     bounds) rather than surviving into admission. Still a ValueError, so the
     module's loud-boot contract is unchanged (pydantic ValidationError IS one)."""
-    zero_cap = _serve_config(tmp_path, CV_MAX_CONCURRENT="0", CV_VRAM_PER_INSTANCE_MB="3785")
+    zero_cap = _serve_config(tmp_path, CV_MAX_CONCURRENT="0", CV_VRAM_PER_INSTANCE_MB="4596")
     with pytest.raises(ValueError):
         zero_cap.resource_budget
     with pytest.raises(ValueError):
@@ -782,12 +782,12 @@ def test_a_misconfigured_budget_is_refused_at_boot(tmp_path):
 def test_build_app_hands_the_held_budget_to_the_operational_view(tmp_path):
     """DoD-P5-11 "보유": the budget the app scheduled against is OBSERVABLE on the
     running deployment's operational surface, not only in the boot line."""
-    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2", CV_VRAM_PER_INSTANCE_MB="3785")
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2", CV_VRAM_PER_INSTANCE_MB="4596")
     app = serve.build_app(config, vram_gauge=_FakeGauge(free_mb=16376.0))
     with TestClient(app) as client:
         resources = client.get("/monitor.json").json()["resources"]
     assert resources["resource_budget"] == config.resource_budget.model_dump(mode="json")
-    assert resources["concurrency_budget_k"] == 2  # min(cap 2, floor(16376/3785)=4)
+    assert resources["concurrency_budget_k"] == 2  # min(cap 2, floor(16376/4596)=3)
 
 
 def test_build_app_reconciles_the_store_at_boot(tmp_path, capsys):
@@ -1047,6 +1047,73 @@ def test_e2e_mixed_outcomes_with_a_crash_runner_stay_isolated(monkeypatch, tmp_p
     jobs = {j["request_id"].rsplit("/", 1)[-1]: j for j in body["jobs"]}
     assert "simulated runner-seam crash" in jobs["r3"]["infra_error"]
     assert jobs["r2"]["infra_error"].startswith(JOB_TIMEOUT_MARKER)
+
+
+# --------------------------------------------------------------------------- #
+# (e2) p5c18 T4: the request identity key reaches the JOB plane (DoD-P2-06 ①).
+# The defect T3 measured on GPU (N=5): every runner logged ``identity_key=none``
+# and every result.json carried null, while the REPORT plane had the real key —
+# so "all runs identical" was null == null, a vacuous equality (G-35).
+# --------------------------------------------------------------------------- #
+
+
+def _submit_and_wait(client: TestClient, documents: list[dict], timeout_s: float = 10.0) -> str:
+    response = client.post("/envelopes", json={"requests": documents})
+    assert response.status_code == 202, response.text
+    envelope_id = response.json()["envelope_id"]
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if client.get(f"/envelopes/{envelope_id}").json()["status"] == "completed":
+            return envelope_id
+        time.sleep(0.02)
+    raise AssertionError(f"envelope {envelope_id} never completed")
+
+
+def test_request_identity_key_reaches_run_job_and_matches_the_report_plane(tmp_path):
+    """★ 양성 대조 겸 교차평면 앵커: the key handed to ``run_job`` is BYTE-IDENTICAL to
+    the one the report plane publishes for the same request.
+
+    Equality is the whole point — a key re-derived from a different input (the JOB_SPEC,
+    say) would be a well-formed ``sha256:`` string that silently names a DIFFERENT
+    request. So this asserts (a) the seam got a key at all — non-null, ``sha256:``
+    shape — and (b) it equals the report row's ``request_identity_key``. Remove the
+    wiring and (a) fails on None; re-derive it elsewhere and (b) fails.
+    """
+    calls: dict[str, dict] = {}
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2")
+    app = serve.build_app(config, run_job_fn=_scripted_run_job({}, calls))
+    with TestClient(app) as client:
+        envelope_id = _submit_and_wait(client, [_request_doc()])
+        report = client.get(f"/envelopes/{envelope_id}/report").json()
+
+    handed = {call["request_identity_key"] for call in calls.values()}
+    assert calls, "no job reached the runner seam — the assertion below would be vacuous"
+    assert len(handed) == 1  # one request -> one key across its repeats
+    key = handed.pop()
+    assert key is not None and key.startswith("sha256:")  # (a) 실재하는 키다 (null 아님)
+
+    published = {row["request_identity_key"] for row in report["matrix"]}
+    assert published == {key}  # (b) 잡 평면 키 == 리포트 평면 키 (같은 유도, 한 정의)
+
+
+def test_two_different_requests_get_two_different_identity_keys(tmp_path):
+    """비공허 대조: the key actually DISCRIMINATES. If it were a constant (or the
+    envelope/job id in disguise) the equality above would still pass."""
+    calls: dict[str, dict] = {}
+    other = _request_doc()
+    other["scenario"]["seed"] = _CANONICAL_DOC["scenario"]["seed"] + 1  # 다른 요청
+    config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2")
+    app = serve.build_app(config, run_job_fn=_scripted_run_job({}, calls))
+    with TestClient(app) as client:
+        envelope_id = _submit_and_wait(client, [_request_doc(), other])
+
+    key_of = {
+        job_id.rsplit("/", 1)[-1].split(":")[0]: call["request_identity_key"]
+        for job_id, call in calls.items()
+    }
+    assert set(key_of) == {"r0", "r1"}
+    assert key_of["r0"] != key_of["r1"]  # 시나리오가 다르면 키가 다르다
+    assert envelope_id not in key_of["r0"]  # 봉투/잡 식별자가 아니라 요청 정체성이다
 
 
 # --------------------------------------------------------------------------- #
