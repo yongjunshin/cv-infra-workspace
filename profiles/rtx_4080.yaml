@@ -25,6 +25,9 @@
 # produced it was `cv-infra selftest`, whose robot does not move, so the budget was
 # measured on a parked robot and read 21% low. See the ★ block above vram_per_instance_mb.
 # Second lesson: "a live job ran" is not the same claim as "a workload ran".
+# Then it moved ONCE MORE inside the same cycle (4596 -> 4659) when T3/T5 re-ran the
+# per-PID method at 0.5 s instead of 2 s: the adoption rule never changed, the sampling
+# resolution did. Third lesson: a coarse sampler makes a method look smaller than it is.
 #
 # Consequence at deploy time, now that the number is here: scripts/detect_gpu.sh
 # emits the CV_VRAM_PER_INSTANCE_MB line UNCOMMENTED, so the NVML 2nd guard is ON
@@ -71,43 +74,47 @@ id: rtx_4080
 # (detect_gpu.sh exits 3 on a 2+ match, so overlap would break BOTH hosts).
 match_name_pattern: GeForce[ _-]?RTX[ _-]?4080
 
-# MEASURED 2026-08-19 (p5c18 T1) on the card described above, over FOUR live
-# `nova_carter_warehouse_goal` jobs (1 cold-cache + 3 warm-cache) on this host, in an
-# exclusive GPU window (no foreign CUDA tenant in any of 2,426 samples). Recipe is
-# unchanged (DoD-P2-09 / DoD-P4-10): GPU-wide `memory.used` at 0.5 s minus the idle
-# baseline, cross-checked against per-PID `--query-compute-apps`.
-#   GPU-wide peak - idle median, per job:  4447 / 4589 / 4596 / 4572 MiB
-#   worst of the four:                     5397 - 801 = 4596 MiB   <- the value below
-#   per-PID compute peak (cross-check):    4541 MiB
-# The two methods agree within 55 MiB and, as before, the GPU-wide-minus-idle figure is
-# the LARGER and therefore the one safe to budget with (--query-compute-apps does not
-# report the display-engine/graphics context on a consumer card). NOTHING IS ROUNDED —
-# the conservative lever is the operator's CV_MAX_CONCURRENT, not an inflated constant
-# here (an invented margin would be indistinguishable from a measurement; CLAUDE §2-4).
-# Idle baseline = 801 MiB median over 121 samples taken inside the same windows while
-# no compute app was resident (desktop: Xorg + shell + browser). A headless 4080 has
-# that much more free; the per-instance number is unaffected, the free-VRAM term is not.
+# MEASURED 2026-08-19 on the card described above, across THREE batches of live jobs in
+# exclusive GPU windows. ADOPTION RULE (unchanged since p5c18 T1): the budget is the
+# LARGER of the two measurement methods, because they miss different things —
+#   (A) GPU-wide `memory.used` peak MINUS the idle baseline   [catches the display-engine
+#       / graphics context that --query-compute-apps omits on a consumer card]
+#   (B) per-PID `nvidia-smi --query-compute-apps` peak         [catches only compute, but
+#       attributes it to OUR process, so a foreign tenant cannot inflate it]
 #
-# ★ WHY THIS REPLACED 3785: that number was measured (p5c17 T4) on a `cv-infra selftest`
-# job — the scenario whose robot does not move (G-80). It understated a real mission by
-# 811 MiB (21%). G-80 had already banned that scenario as NFR-EXEC-001 evidence; the
-# same root bit a SECOND time here, in the resource budget, because "a job ran and we
-# sampled it" felt like enough. It is not: WHICH job decides what the number means.
-# The p5c17 measurement was not wrong about what it measured, only about what it was
-# used for. Its raw evidence is kept in the source line below.
+#   batch      method  sampling  peaks (MiB)                        max
+#   T1 (n=4)   A       0.5 s     4447 / 4589 / 4596 / 4572          4596
+#   T1 (n=4)   B       2 s       (4541)  <- too coarse, see below
+#   T3 (n=5)   B       0.5 s     4470 / 4539 / 4584 / 4627 / 4627   4627
+#   T5 (n=5)   B       0.5 s     4539 / 4625 / 4627 / 4627 / 4659   4659   <- the value below
 #
-# KNOWN LIMITS of this number (state them, do not silently inherit them):
-#   * it is a peak over ONE scenario. A heavier one (more sensors, longer mission,
-#     higher render load) can exceed it — this is a measured floor on the worst case,
-#     not a proof of a bound.
-#   * the per-PID cross-check here was sampled at 2 s (p5c17 used 0.5 s), so it may
-#     under-sample a transient. The GPU-wide series IS 0.5 s — a second reason the
-#     larger, better-resolved figure is the one budgeted.
+# ★ WHY THE VALUE MOVED 4596 -> 4659: the rule did not change, the EVIDENCE did. At T1
+# method (B) was sampled at 2 s and returned 4541, so (A)'s 4596 was the larger and was
+# adopted — with the limitation "the 2 s per-PID series may under-sample a transient"
+# written into this very block. T3/T5 re-ran (B) at 0.5 s over 10 more jobs (1,292
+# samples) and it reached 4659. So the T1 number was 63 MiB low BY ITS OWN RULE, and the
+# stated limitation is exactly what bit. The lesson is not "the number was wrong" but
+# "a coarser sampler makes a method look smaller than it is — never let sampling
+# resolution decide which method wins."
 #
-# What it implies for k HERE: with ~15.6 GiB free, floor(avail / 4596) admits 3, so
-# k = min(CV_MAX_CONCURRENT, 3, render_cap). At the old 3785 the guard admitted 4 —
-# i.e. the stale number would have let the scheduler over-commit the card by one
-# instance. The deployment that measured this runs CV_MAX_CONCURRENT=2, so k stays 2;
-# raising the operator cap is an operator decision, not a consequence of this number.
-vram_per_instance_mb: 4596
-vram_per_instance_source: measured 2026-08-19 (p5c18 T1) on NVIDIA GeForce RTX 4080 16376 MiB sm 8.9 driver 580.178.04, ubuntu/jammy desktop host (display active, 801 MiB idle median over 121 samples) — GPU-wide peak 5397 MiB minus idle median 801 MiB, worst of FOUR live nova_carter_warehouse_goal jobs (1 cold + 3 warm, per-job 4447/4589/4596/4572), per-PID compute peak 4541 MiB (2 s), exclusive GPU window (0 foreign CUDA tenants in 2,426 samples at 0.5 s); NOT transferable to a SUPER/Laptop/OEM 4080 (re-measure there) and NOT a proven bound (one scenario); evidence agent-comms/reports/deployment-2026-08-19-p5c18-T1-cache-warming.md and raw samples on that host at ~/cv-infra-p5c18-t1-evidence/{cold,warm1,warm2,warm3}/tenancy_0.5s.csv + {cold,warm1,warm2,warm3}-observe/vram_compute_apps_samples.csv. SUPERSEDES the p5c17 T4 value 3785, which was measured on a `cv-infra selftest` job whose robot does not move (G-80) and understated a real mission by 811 MiB; that raw evidence remains at ~/cv-infra-p5c17-t4-evidence/12-vram-samples-dense.txt
+# NOTHING IS ROUNDED. No safety margin is welded into this constant: an invented margin
+# is indistinguishable from a measurement to the next reader (CLAUDE §2-4), and the
+# conservative lever is the operator's CV_MAX_CONCURRENT, which is the authoritative cap
+# in compute_k. This is the observed maximum, verbatim.
+#
+# KNOWN LIMITS (state them, do not silently inherit them):
+#   * peak over ONE scenario family (nova_carter_warehouse_goal). A heavier scenario
+#     (more sensors, longer mission, higher render load) can exceed it — this is a
+#     measured floor on the worst case, not a proof of a bound.
+#   * method (A) has not been re-run at T3/T5; if it were, it could land higher still,
+#     since it also counts the graphics context. 4659 is the max of what was OBSERVED.
+#   * desktop host: Xorg + shell + browser held ~800 MiB at idle. A headless 4080 has
+#     that much more free; the per-instance number is unaffected, the free-VRAM term is not.
+#
+# What it implies for k HERE: with ~15.3-16.0 GiB free, floor(avail / 4659) = 3, which is
+# also floor(avail / 4596) — so this correction does NOT move k. At k=3 the card holds
+# 3 x 4659 MiB + idle ~= 14.7 GiB < 16.0 GiB. (The stale p5c17 value 3785 DID move k: it
+# admitted 4 and would have over-committed the card by one instance.) This deployment
+# runs CV_MAX_CONCURRENT=2, so k stays 2; raising the operator cap is an operator decision.
+vram_per_instance_mb: 4659
+vram_per_instance_source: measured 2026-08-19 (p5c18 T5) on NVIDIA GeForce RTX 4080 16376 MiB sm 8.9 driver 580.178.04, ubuntu/jammy desktop host — per-PID `nvidia-smi --query-compute-apps` peak at 0.5 s over 5 live nova_carter_warehouse_goal jobs (683 samples; per-job peaks 4539/4625/4627/4627/4659). ADOPTION RULE = the larger of (A) GPU-wide peak minus idle and (B) per-PID peak; here (B) wins. Corroborating batches on the same card, same day, same scenario = T3 (B) 0.5 s, 609 samples, max 4627; T1 (A) 0.5 s, max 4596 (GPU-wide peak 5397 minus idle median 801 over 4 jobs) and T1 (B) at 2 s = 4541, which was too coarse and is why the adopted value rose from 4596. NOT transferable to a SUPER/Laptop/OEM 4080 (re-measure there) and NOT a proven bound (one scenario family). Evidence = T5 ~/cv-infra-p5c18-t5-evidence/n5/gpu_perpid_0.5s.csv (+ n5/17-vram.txt); T3 ~/cv-infra-p5c18-t3-evidence/n5/18-vram-perpid.txt; T1 ~/cv-infra-p5c18-t1-evidence/{cold,warm1,warm2,warm3}/tenancy_0.5s.csv + *-observe/vram_compute_apps_samples.csv; reports agent-comms/reports/deployment-2026-08-19-p5c18-T1-cache-warming.md. SUPERSEDES 4596 (p5c18 T1, same rule, coarser (B) sampling) and 3785 (p5c17 T4, measured on a `cv-infra selftest` job whose robot does not move — G-80); the p5c17 raw samples remain at ~/cv-infra-p5c17-t4-evidence/12-vram-samples-dense.txt
