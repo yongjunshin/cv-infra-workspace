@@ -27,11 +27,20 @@ the operator consent keys ``ACCEPT_EULA``/``PRIVACY_CONSENT`` forwarded VERBATIM
 ``runner_env`` only when present (decision 2026-07-03 — values are never
 committed/logged; absent = the runner boot guard honestly refuses, LOCKED §7.8).
 
+The two budget knobs (``CV_MAX_CONCURRENT`` + ``CV_VRAM_PER_INSTANCE_MB``) are
+REFLECTED into the M1 ``ResourceBudget``
+(``ServeConfig.resource_budget``, REQ-DEPLOY-012) and it is that object — not the
+loose scalars — that ``build_app`` reads ``compute_k``'s inputs from, logs whole
+on the boot line, and hands to the operational read model. Unset
+``CV_VRAM_PER_INSTANCE_MB`` = no complete budget (``null``), never a fabricated
+VRAM figure.
+
 Boot order: config -> ``reconcile_at_restart`` (R14: label sweep + domain-id
 clear + RUNNING-orphan re-label + envelope loud markers — this module is the
-production caller of the T1 reconciliation) -> app -> ONE structured
-``serve-config`` stderr line (G-26 feature-on: k, mounts roots, consent key
-NAMES, reconciliation counts — assertable, never silent) -> uvicorn.
+production caller of the T1 reconciliation) -> Resource Budget -> k -> app -> ONE
+structured ``serve-config`` stderr line (G-26 feature-on: k, the held budget,
+mounts roots, consent key NAMES, reconciliation counts — assertable, never
+silent) -> uvicorn.
 
 The OUTER ``ParallelSupervisor`` wall-clock watchdog IS configured here (p5c7 T2,
 decision 2026-07-24 D-2): ``build_app`` passes ``job_timeout_s=config.outer_wallclock_s``
@@ -56,9 +65,16 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from cv_infra.contract.schema import ResourceBudget  # M1 단일 정의 — import만 (G-56)
 from cv_infra.orchestrator.api import create_app
 from cv_infra.orchestrator.monitor import ResourceHealthSampler, attach_sampler
-from cv_infra.orchestrator.scheduler import PynvmlVramGauge, VramGauge, compute_k
+from cv_infra.orchestrator.scheduler import (
+    PynvmlVramGauge,
+    VramGauge,
+    budget_vram_per_instance_mb,
+    compute_k,
+    to_resource_budget,
+)
 from cv_infra.orchestrator.store import Store
 from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
@@ -117,6 +133,32 @@ class ServeConfig:
     port: int
     outer_wallclock_s: float  # outer wall-clock cap over pull(s)+mission (default on unset)
     runner_shm_size: str | int  # runner /dev/shm size (R-shm; default on unset)
+
+    @property
+    def resource_budget(self) -> ResourceBudget | None:
+        """The operator budget REFLECTED into the M1 ``ResourceBudget`` (REQ-DEPLOY-012).
+
+        This is what ``build_app`` schedules against — ``compute_k``'s inputs are
+        read off this object, not off the scattered scalars (the scalars stay the
+        raw env snapshot the boot line already reports). MiB->GiB happens in the
+        one seam ``to_resource_budget`` and is exactly inverted on the way into
+        ``compute_k``, so the reflection is k-neutral.
+
+        ``None`` when the operator set NO per-instance VRAM figure
+        (``CV_VRAM_PER_INSTANCE_MB`` unset = the NVML 2nd guard is off, the
+        documented default of every unmeasured ``profiles/*.yaml``): the contract
+        model requires ``vram_per_instance_gb > 0``, and inventing one — a 0, a
+        constant, a guess — is exactly what CLAUDE §2-4 forbids, so a partial
+        budget is reported as absent rather than fabricated. In that deployment
+        the authoritative cap alone bounds k (``max_concurrent``, LOCKED §7.4),
+        and the boot line says so with ``resource_budget: null`` next to a
+        ``vram_per_instance_mb: null``.
+        """
+        if self.vram_per_instance_mb is None:
+            return None
+        return to_resource_budget(
+            self.max_concurrent, vram_per_instance_mb=self.vram_per_instance_mb
+        )
 
 
 def _get(environ: Mapping[str, str], name: str) -> str | None:
@@ -186,7 +228,7 @@ def build_app(
     run_job_fn: Callable[..., Any] | None = None,
     start_sampler: bool = False,
 ) -> FastAPI:
-    """Compose the production app: store -> reconcile (R14) -> k -> runner -> api.
+    """Compose the production app: store -> reconcile (R14) -> budget -> k -> runner -> api.
 
     The three kw-only seams are CPU-test injection points (G-20 주입식 fakes);
     production (``main``) passes the real docker client and leaves the rest
@@ -200,14 +242,17 @@ def build_app(
     """
     store = Store(config.store_path)  # process-lifetime (the app owns it from here)
     _, reconciliation = reconcile_at_restart(store, docker_client)
-    if config.vram_per_instance_mb is not None:
+    budget = config.resource_budget  # REQ-DEPLOY-012: the held Resource Budget
+    if budget is not None:
         gauge = vram_gauge if vram_gauge is not None else PynvmlVramGauge()
         k = compute_k(
-            config.max_concurrent,
+            budget.max_concurrent,
             vram_gauge=gauge,
-            vram_per_instance_mb=config.vram_per_instance_mb,
+            vram_per_instance_mb=budget_vram_per_instance_mb(budget),
         )
     else:
+        # No VRAM figure was set -> no complete budget object exists; the
+        # authoritative cap alone bounds k (LOCKED §7.4), never a fabricated one.
         k = compute_k(config.max_concurrent)
     runner = RunJobRunner(
         out_dir=config.out_dir,
@@ -222,13 +267,20 @@ def build_app(
     # p5c7 T2 (D-2): wire the OUTER wall-clock cap — the only bound spanning the image pull.
     # It rides create_app -> ParallelSupervisor, whose strict coherence gate refuses an
     # outer_wallclock_s that is not > the runner's inner watchdog (loud at first submit).
-    app = create_app(store, runner, k=k, job_timeout_s=config.outer_wallclock_s)
+    app = create_app(
+        store,
+        runner,
+        k=k,
+        job_timeout_s=config.outer_wallclock_s,
+        resource_budget=budget,  # operational surface holds the budget behind k
+    )
     if start_sampler:
         # M6 §3.4: the resident deployment's SOLE periodic NVML poller.
         attach_sampler(app, ResourceHealthSampler(store))
     _log_serve_config(
         config,
         k=k,
+        budget=budget,
         inner_watchdog_s=runner.job_timeout_s,
         outer_wallclock_s=config.outer_wallclock_s,
         recon=reconciliation,
@@ -240,6 +292,7 @@ def _log_serve_config(
     config: ServeConfig,
     *,
     k: int,
+    budget: ResourceBudget | None,
     inner_watchdog_s: float,
     outer_wallclock_s: float,
     recon: RestartReconciliation,
@@ -248,6 +301,15 @@ def _log_serve_config(
 
     Consent env surfaces as key NAMES only — values are never logged (G-21).
     Same idiom as the supervisor's ``runner-mounts`` line.
+
+    ``resource_budget`` is the HELD budget object k was computed from
+    (REQ-DEPLOY-012) — serialized whole, so an operator reading one line sees the
+    inputs next to the output instead of only the derived ``k``. ``null`` = no
+    complete budget (VRAM figure unset; see ``ServeConfig.resource_budget``). The
+    flat ``max_concurrent`` / ``vram_per_instance_mb`` keys stay exactly as they
+    were — they are the RAW env snapshot the deploy manual and
+    ``docs/deploy/gpu-profiles.md`` already key off, and the budget is their
+    reflection, not a second source.
     """
     line = json.dumps(
         {
@@ -258,6 +320,8 @@ def _log_serve_config(
             "k": k,
             "max_concurrent": config.max_concurrent,
             "vram_per_instance_mb": config.vram_per_instance_mb,
+            # REQ-DEPLOY-012: the reflected budget object itself (null = incomplete)
+            "resource_budget": budget.model_dump(mode="json") if budget is not None else None,
             "cache_root": config.cache_root,
             "cache_scratch_root": config.cache_scratch_root,
             "consent_env_present": sorted(config.consent_env),

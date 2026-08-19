@@ -124,7 +124,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from cv_infra.contract.errors import ContractError
 from cv_infra.contract.loader import AdmittedRequest, load_request
-from cv_infra.contract.schema import RequestEnvelope
+from cv_infra.contract.schema import RequestEnvelope, ResourceBudget
 from cv_infra.orchestrator.allocator import DomainIdAllocator
 from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.fanout import fan_out_requests
@@ -481,6 +481,7 @@ def create_app(
     max_attempts: int = 1,
     retry_on_timeout: bool = True,
     job_timeout_s: float | None = None,
+    resource_budget: ResourceBudget | None = None,
 ) -> FastAPI:
     """Build the submit-surface app around an injected store + runner seam.
 
@@ -489,6 +490,13 @@ def create_app(
     the env-configured wiring is ``serve.build_app``). ``k`` is the computed
     concurrency cap (``compute_k`` output — never a constant); the queue
     policy knobs mirror ``JobQueue``.
+
+    ``resource_budget`` is the operator Resource Budget k was computed FROM
+    (REQ-DEPLOY-012, built by ``serve``); it is carried, never re-derived, and
+    only reaches the operational read model — no scheduling decision reads it
+    here, and it never touches a domain result surface. Default None = the
+    caller supplied no budget (CPU test apps, and any deployment whose VRAM
+    figure is unset), reported as ``null`` rather than invented.
     """
     app = FastAPI(title="cv-infra orchestrator", docs_url=None, redoc_url=None)
     envelopes: dict[str, _EnvelopeRecord] = {}
@@ -718,8 +726,9 @@ def create_app(
     # M6 operational view (DoD-P4-12/13): read-only projection surfaces on the
     # SAME app (no separate server). Routes only — the resident sampler is wired
     # in production (serve.build_app), never on the TestClient path. The admission
-    # budget k rides along so the operator reads it next to running_k (D-7 (C)).
-    register_monitor(app, store, concurrency_budget_k=k)
+    # budget k rides along so the operator reads it next to running_k (D-7 (C)),
+    # together with the Resource Budget it was computed from (REQ-DEPLOY-012).
+    register_monitor(app, store, concurrency_budget_k=k, resource_budget=resource_budget)
     return app
 
 

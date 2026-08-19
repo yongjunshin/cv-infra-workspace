@@ -1,12 +1,16 @@
 """Resource-aware scheduling: k computation + slot accounting (M3 §3.4).
 
-Three pieces live here:
+Four pieces live here:
 
 * ``compute_k`` — the LOCKED §7.4 cap rule
   ``k = min(max_concurrent, floor(availVRAM / per_instance), render_cap)``:
   operator budget is the AUTHORITATIVE cap, NVML VRAM is the 2nd guard,
   ``render_cap`` an independent cap term. Every input is injected — no k
   constant is hardcoded (NFR-ORCH-001 규율).
+* ``to_resource_budget`` / ``budget_vram_per_instance_mb`` — the operator budget
+  seam (``REQ-DEPLOY-012``): the M5-configured knobs reflected into the M1
+  ``ResourceBudget`` and back into the MiB unit ``compute_k`` takes. The ONE
+  MiB<->GiB conversion site (``MIB_PER_GIB``), exact in both directions.
 * ``VramGauge`` / ``PynvmlVramGauge`` — the injectable NVML seam (CPU tests
   mock it; the real gauge lazy-imports ``pynvml`` so GPU-free hosts import this
   module harmlessly, D-A/R-NV).
@@ -28,6 +32,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Protocol
 
+from cv_infra.contract.schema import ResourceBudget  # M1 단일 정의 — import만 (G-56)
 from cv_infra.orchestrator.fake_runner import Runner
 from cv_infra.orchestrator.models import Job, JobResult, JobState
 
@@ -82,6 +87,61 @@ class PynvmlVramGauge:
                 " (NVIDIA_DRIVER_CAPABILITIES=utility, M5 compose contract; R-NV)"
             ) from exc
         return free_bytes / (1024 * 1024)
+
+
+#: MiB in one GiB — the ONE place the operator's MiB VRAM budget meets the M1
+#: contract's ``vram_per_instance_gb``. "gb" is read as BINARY GiB because every
+#: VRAM figure in this system already is NVML bytes // 1024**2
+#: (``PynvmlVramGauge`` · ``monitor.nvml_snapshot`` · the ``profiles/*.yaml``
+#: ``vram_per_instance_mb``), so one consistent divisor keeps the operator's
+#: measured number and the guard's number the same quantity. Being a power of two
+#: it is also EXACT in IEEE-754 binary64: mb -> budget -> mb round-trips
+#: bit-identically (``tests/test_orchestrator_scheduler_k.py``), so reflecting the
+#: budget can never perturb k. A decimal 1000 divisor would NOT round-trip (the
+#: same test shows the counter-example).
+MIB_PER_GIB = 1024
+
+#: The one scheduling policy this control plane implements: ``JobQueue`` hands
+#: jobs out FIFO (``queue.py`` docstring / ``popleft``) and the Phase-4 supervisor
+#: admits in that order. The ``scheduling_policy`` vocabulary is M3's to extend
+#: (M1 ``ResourceBudget`` docstring); it is deliberately NOT an operator env knob
+#: — a second value would name a policy no code implements, i.e. a lie surface.
+FIFO_POLICY = "fifo"
+
+
+def to_resource_budget(
+    max_concurrent: int,
+    *,
+    vram_per_instance_mb: float,
+    scheduling_policy: str = FIFO_POLICY,
+) -> ResourceBudget:
+    """Reflect the operator's budget knobs into the M1 ``ResourceBudget`` (REQ-DEPLOY-012).
+
+    The operator sets MiB (``CV_VRAM_PER_INSTANCE_MB`` / ``profiles/*.yaml``);
+    the contract model carries GiB. This is the ONLY place that division happens
+    — ``budget_vram_per_instance_mb`` is its exact inverse, and ``compute_k``
+    keeps taking MiB (its signature is LOCKED §7.4 and unchanged).
+
+    Bounds are the CONTRACT's (``max_concurrent >= 1``, ``vram_per_instance_gb >
+    0``): a misconfigured budget is refused by pydantic at reflection time
+    instead of surviving as a scalar until ``compute_k`` — one loud boot error,
+    no fabricated defaults (CLAUDE §2-4).
+    """
+    return ResourceBudget(
+        vram_per_instance_gb=vram_per_instance_mb / MIB_PER_GIB,
+        max_concurrent=max_concurrent,
+        scheduling_policy=scheduling_policy,
+    )
+
+
+def budget_vram_per_instance_mb(budget: ResourceBudget) -> float:
+    """The budget's per-instance VRAM in the MiB unit ``compute_k`` takes.
+
+    Exact inverse of ``to_resource_budget``'s division (power-of-two divisor), so
+    a budget built from a measured MiB value feeds ``compute_k`` that same value
+    bit-for-bit — the reflection is k-neutral by construction.
+    """
+    return budget.vram_per_instance_gb * MIB_PER_GIB
 
 
 def compute_k(
