@@ -73,6 +73,17 @@ readonly CV_SAMPLE_INTERVAL_S="${CV_SAMPLE_INTERVAL_S:-2}"
 # committed file carries the acceptance literal (run_smoke.sh / headless_smoke.py idiom).
 # Sets CV_EULA_DOCKER_ARGS for the caller's `docker run`.
 measure_eula_gate() {
+  local _boots="${1:-boot}"
+
+  if ! bash "$_CV_MEASURE_DIR/../consent/check_consent.sh" --quiet; then
+    err "This host has no valid NVIDIA Isaac Sim consent record — refusing (NEG-2; M5 §3.7 D-O/F7)."
+    err "That record is what makes running this image lawful here, and only an operator"
+    err "can create it:  bash scripts/consent/accept_eula.sh"
+    exit 3
+  fi
+
+  [[ "$_boots" == "boot" ]] || return 0
+
   if [[ "${CV_EULA_CONSENT:-}" != "yes" ]]; then
     err "NVIDIA Isaac Sim EULA consent is REQUIRED before Isaac Sim may boot (NEG-2)."
     err "License: https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/"

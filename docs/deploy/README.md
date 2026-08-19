@@ -270,9 +270,17 @@ ls -ln "$CV_ISAAC_CACHE_ROOT/cache/"        # kit / home / computecache 셋이 u
   **`mkdir -p` 로 때우지 마라** — 소유자가 러너 uid(1234)가 아니면 러너가 캐시에 쓰지 못하고
   캐시가 **조용히 꺼진다**(G-15/G-34). 이 스크립트는 docker 루트 헬퍼(`--user 0`)로 chown 하므로
   **호스트 sudo 가 필요 없다.**
-- ⚠ **이 스크립트는 `②` 와 별개의 동의 게이트를 갖는다.** `$HOME/.cv-infra/eula-consent.json` 을
-  **읽지 않고** per-run env 만 본다 — 즉 운영자는 같은 결정을 **두 번** 표명해야 한다. 값은
-  **운영자만** 입력한다(NEG-2). 미설정이면 **exit 3**.
+- ⚠ **이 스크립트의 동의 게이트는 2단이다**(p5c18 개정 — 그 전에는 레코드를 **읽지 않고**
+  per-run env 만 봤다. 그래서 *동의한 적 없는 호스트에서도* `CV_EULA_CONSENT=yes` 하나로
+  Isaac 이 부팅됐다 = `NFR-DEPLOY-004` 가 금지하는 합성 우회. 제품 compose 경로에는 없던 구멍이다):
+  1. **레코드 전제 — 모든 모드.** `②` 가 만든 `$HOME/.cv-infra/eula-consent.json` 이 유효하지 않으면
+     `provision`·`strip-gpu` 를 포함해 **무엇이든 exit 3**(판정은 `check_consent.sh` 에 위임 — 재구현 안 한다).
+  2. **per-run 입력 — 부팅하는 모드만.** `warm` 만 추가로 `CV_EULA_CONSENT=yes` 를 요구하고
+     수락 env 를 런타임에 합성한다. 값은 **운영자만** 입력한다(NEG-2). 미설정이면 **exit 3**.
+  ⇒ `warm` 은 이제 **레코드 AND per-run 입력 둘 다** 필요하다(개정 전보다 **엄격**). 반대로
+  Isaac 을 부팅하지 않는 `provision`/`strip-gpu` 는 per-run 입력을 더 이상 요구하지 않는다(과잉게이트 해소).
+  레코드는 boot env 가 존재해도 되는 **이유**이지 boot 결정의 두 번째 진실원이 아니다
+  (M5 §3.7 D-O/F7 — 두 게이트를 붕괴시키지 않는다, CEO 결정 2026-08-19 D-2).
 - **`provision` vs `warm`**:
 
 | 모드 | 트리 | 첫 잡 | 언제 |

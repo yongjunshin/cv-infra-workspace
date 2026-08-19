@@ -37,7 +37,7 @@ source "$SCRIPT_DIR/common.sh"
 # EULA gate FIRST — before touching args or the filesystem. Booting Isaac to warm needs
 # per-run operator consent (NEG-2). Verification: `unset CV_EULA_CONSENT;
 # warm_cache.sh /tmp/nonexistent` -> exit 3 (this line, before the root is ever used).
-measure_eula_gate
+measure_eula_gate no-boot
 
 CACHE_ROOT="${1:-$_OPERATOR_CACHE_ROOT}"
 MODE="${2:-warm}"
@@ -51,6 +51,8 @@ case "$MODE" in
   provision | warm | strip-gpu) : ;;
   *) die "unknown mode '$MODE' (want: provision | warm | strip-gpu)" ;;
 esac
+
+[[ "$MODE" == "warm" ]] && measure_eula_gate boot
 
 require_cmd docker
 IMG="$CV_MEASURE_IMAGE"

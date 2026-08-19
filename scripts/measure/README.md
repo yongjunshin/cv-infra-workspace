@@ -11,11 +11,18 @@ structure-only.
 
 ## Ground rules baked into every script
 
-- **EULA (NEG-2 / LOCKED §8)** — any script that *boots Isaac* (`warm_cache.sh`,
-  `isaac_baseline_run.sh`) refuses without per-run operator consent (`CV_EULA_CONSENT=yes`)
-  and **exits 3**; it synthesises the acceptance env at run time. `observe_cv_infra_run.sh`
-  boots nothing (it watches a `cv-infra run` that carries the operator's own consent), so
-  it has **no** gate. No EULA acceptance literal is committed anywhere.
+- **EULA (NEG-2 / LOCKED §8)** — the gate is TWO-STAGE (p5c18; before that it read only the
+  per-run env, so a host where nobody had ever consented still booted Isaac on
+  `CV_EULA_CONSENT=yes` alone). **(1) Recorded operator consent is required by EVERY mode** of
+  a gated script — `measure_eula_gate` delegates the verdict to `scripts/consent/check_consent.sh`
+  (never re-implemented) and **exits 3** when the host has no valid record, including for modes
+  that boot nothing. **(2) The per-run input is required only by modes that actually boot Isaac**
+  (`warm_cache.sh warm`, `isaac_baseline_run.sh`): missing `CV_EULA_CONSENT=yes` -> **exit 3**,
+  and the acceptance env is synthesised at run time. So `warm` now needs BOTH (stricter than
+  before), while `warm_cache.sh provision`/`strip-gpu` — which run `--entrypoint bash` and never
+  start Isaac — no longer demand a boot input they cannot use. `observe_cv_infra_run.sh` boots
+  nothing and calls no gate (it watches a `cv-infra run` that carries the operator's own consent).
+  No EULA acceptance literal is committed anywhere; the record lives in `$HOME` and is git-ignored.
 - **No `sudo`** — T0 measured plain `docker` is enough (`etri` is in the docker group).
   File permissions for the uid-1234 (`isaac-sim`) app go through a **docker root helper**
   (`--user 0`), never host sudo (G-15).
