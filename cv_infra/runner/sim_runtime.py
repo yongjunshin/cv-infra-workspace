@@ -436,10 +436,12 @@ class SimRuntime:
         that dies later has ALREADY left this line in its log.
 
         ``identity_key`` is a parameter, not something this runner derives: the key
-        is M4's (``report/regression.identity_key`` over the request wire dump) and
-        nothing hands one to the runner today, so the field renders ``none`` here
-        and the observation for ① lives on the report plane. Wiring one in later is
-        this one argument.
+        is M4's (``report/regression.identity_key`` over the request wire dump).
+        Since p5c18 T4/T5 it IS handed in — the supervisor injects
+        ``CV_REQUEST_IDENTITY_KEY``, ``main.run`` reads it once and passes it here
+        (measured live: 5/5 jobs carried the report plane's own key). ``None``
+        still renders ``none``: that is the honest report for an entry point that
+        does not supply one (``cv-infra run`` today), never a value to invent.
         """
         physics_dt, physics_ok = self._applied_dt("get_physics_dt", self.config.physics_dt)
         rendering_dt, rendering_ok = self._applied_dt("get_rendering_dt", self.config.rendering_dt)

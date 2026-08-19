@@ -128,8 +128,9 @@ def test_emit_survives_a_read_back_that_raises(capsys):
 
 
 def test_emit_carries_an_identity_key_when_one_is_supplied():
-    # Nothing hands the runner a key today (M4 derives it — see the method
+    # M4 derives the key and M3 injects it (p5c18 T4/T5 — see the method
     # docstring); this pins that the field is plumbed, not hardcoded to none.
+    # The END-TO-END wire lives in tests/test_runner_request_identity_key.py.
     runtime = _runtime(_FakeWorld(0.02, 0.02), physics_dt=0.02, rendering_dt=0.02)
     assert runtime.emit_sim_config("sha256:deadbeef").endswith("identity_key=sha256:deadbeef")
 
