@@ -158,6 +158,20 @@ def test_the_runner_never_derives_an_identity_key_of_its_own():
     """A key the runner computes would be non-null, well-formed and per-request
     distinct — and WRONG. The only correct value is the one M3 injected, so the
     runner plane must contain no derivation at all.
+
+    ★ THIS IS A DEFENCE LINE, NOT A STYLE CHECK. QA measured (p5c18) that a
+    mutation which re-derives the key turns exactly ONE test in the whole suite
+    red. Weaken this assert and a wrong key passes 1082 green tests, because
+    every OTHER check it faces is a shape check and the wrong key has the right
+    shape. If you must relax it, relax it toward MORE specific, never toward
+    deletion.
+
+    It is STRUCTURAL (no derivation code exists). Its mechanism-independent
+    partner is ``test_the_key_reaches_both_sinks_unchanged_and_absence_is_not
+    _filled_in`` below, which would catch a derivation this AST walk cannot
+    name (a hand-rolled digest, an inlined fallback). Keep BOTH: one asks
+    "is there a second source in the tree", the other asks "did a second source
+    reach the output".
     """
     offenders = []
     for path in sorted(Path(main.__file__).parent.rglob("*.py")):
@@ -172,3 +186,53 @@ def test_the_runner_never_derives_an_identity_key_of_its_own():
     assert (
         offenders == []
     ), f"the runner derives an identity key instead of carrying M3's: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# The behavioural layer — the composition run.run() performs, both arms (G-35).
+# --------------------------------------------------------------------------- #
+def _both_sinks(env: dict) -> tuple[str, object]:
+    """Reproduce the exact chain ``run()`` performs: read once, feed both sinks.
+
+    ``run()`` itself is a ``# pragma: no cover`` GPU body, so the AST guards above
+    prove the WIRING and this proves the VALUE that travels through it.
+    """
+    from cv_infra.runner.sim_runtime import sim_config_log_line
+
+    key = main.read_request_identity_key(env)
+    line = sim_config_log_line(1.0 / 60.0, 1.0 / 60.0, 42, key)
+    result = build_result_dict("job-0001", "pass", [], {}, request_identity_key=key)
+    return line, result["request_identity_key"]
+
+
+def test_the_key_reaches_both_sinks_unchanged_and_absence_is_not_filled_in():
+    """Presence and ABSENCE, asserted together — the pair is the point.
+
+    Cross-plane equality (job plane key == report plane key) is proven on M3's
+    side, where both planes exist (T4: one wire dump, two consumers). The runner
+    half of that chain is this: whatever key arrived, BOTH runner outputs carry
+    it byte-identically, and when none arrived neither output invents one. If
+    either half fails, the two planes can disagree no matter how careful M3 was.
+
+    The sentinel is SHAPED like a real key but is not derivable from any runner
+    input, so it catches both failure modes at once: a substituted value cannot
+    coincide with it, AND a transform that keys off the ``sha256:`` shape (strip,
+    normalize, re-case) makes the two sinks disagree instead of sailing past a
+    shapeless marker. That distinction is measured, not assumed — a shapeless
+    sentinel let a prefix-stripping mutation through this assert.
+
+    The absence arm catches a fabrication mechanism the structural guard cannot
+    see: an inlined ``or <derive>`` fallback is invisible to an AST walk looking
+    for M4's name, but it CANNOT keep this arm green.
+    """
+    sentinel = "sha256:" + "de1ec7ab1e" + "5" * 54  # key-shaped, non-derivable
+    line, field = _both_sinks({"CV_REQUEST_IDENTITY_KEY": sentinel})
+    assert line.endswith(f"identity_key={sentinel}")
+    assert field == sentinel, "the two sinks disagree — one of them transformed the key"
+
+    line, field = _both_sinks({})
+    assert line.endswith("identity_key=none"), (
+        "no key was injected yet the settings line reports one — the runner "
+        "fabricated provenance (the failure mode T4 변이 ② demonstrated)"
+    )
+    assert field is None, "no key was injected yet result.json claims a request"
