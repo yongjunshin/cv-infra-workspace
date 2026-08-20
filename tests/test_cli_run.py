@@ -21,19 +21,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
+import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 import cv_infra.contract.version as version_mod
 from cv_infra.cli.main import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS, main
 from cv_infra.contract.version import DeprecatedVersion
+from cv_infra.orchestrator.api import create_app
+from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
+from cv_infra.orchestrator.store import Store
 
 RUNNER_IMAGE = "cv-infra-runner:p2"
 
@@ -73,13 +79,14 @@ class RecordingSupervisor:
         self.verdict = verdict
         self.calls: list[dict] = []
 
-    def __call__(self, job_spec, out_dir, runner_image, sut_image):
+    def __call__(self, job_spec, out_dir, runner_image, sut_image, **kwargs):
         self.calls.append(
             {
                 "job_spec": job_spec,
                 "out_dir": out_dir,
                 "runner_image": runner_image,
                 "sut_image": sut_image,
+                **kwargs,
             }
         )
         job_dir = out_dir / job_spec["job_id"]
@@ -216,7 +223,7 @@ def test_recovered_verdict_outranks_runner_exit_code(monkeypatch, scenario_file,
     # Runner exit code says 1, recovered result.json says pass -> exit 0.
     stub = RecordingSupervisor("pass")
 
-    def run_job(job_spec, out_dir, runner_image, sut_image):
+    def run_job(job_spec, out_dir, runner_image, sut_image, **kwargs):
         outcome = stub(job_spec, out_dir, runner_image, sut_image)
         outcome.runner_exit_code = 1
         return outcome
@@ -409,7 +416,7 @@ def test_unrecognized_extra_argument_exits_2(monkeypatch, scenario_file, tmp_pat
 
 
 def test_infra_error_exits_3(monkeypatch, scenario_file, tmp_path, capsys):
-    def run_job(job_spec, out_dir, runner_image, sut_image):
+    def run_job(job_spec, out_dir, runner_image, sut_image, **kwargs):
         return FakeJobOutcome(
             job_id=job_spec["job_id"],
             result_path=None,
@@ -423,7 +430,7 @@ def test_infra_error_exits_3(monkeypatch, scenario_file, tmp_path, capsys):
 
 
 def test_result_not_recovered_exits_3(monkeypatch, scenario_file, tmp_path):
-    def run_job(job_spec, out_dir, runner_image, sut_image):
+    def run_job(job_spec, out_dir, runner_image, sut_image, **kwargs):
         return FakeJobOutcome(
             job_id=job_spec["job_id"], result_path=None, runner_exit_code=3, infra_error=None
         )
@@ -440,7 +447,7 @@ def test_result_not_recovered_exits_3(monkeypatch, scenario_file, tmp_path):
     ],
 )
 def test_bad_result_json_exits_3(monkeypatch, scenario_file, tmp_path, payload, capsys):
-    def run_job(job_spec, out_dir, runner_image, sut_image):
+    def run_job(job_spec, out_dir, runner_image, sut_image, **kwargs):
         out_dir.mkdir(parents=True, exist_ok=True)
         result_path = out_dir / "result.json"
         result_path.write_text(payload, encoding="utf-8")
@@ -464,7 +471,7 @@ def test_extra_key_in_result_json_points_at_the_runner_image_plane(
     "my runner image is stale" — the second stderr line names that plane and how to read it.
     """
 
-    def run_job(job_spec, out_dir, runner_image, sut_image):
+    def run_job(job_spec, out_dir, runner_image, sut_image, **kwargs):
         out_dir.mkdir(parents=True, exist_ok=True)
         result_path = out_dir / "result.json"
         # ``origin`` was a real Result field until p5c16 deleted it (dead wire); an
@@ -549,6 +556,26 @@ def no_ambient_consent(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+def _conditional_kwargs(stub: ConsentRecordingSupervisor) -> list[dict]:
+    """Seam kwargs MINUS the unconditional ``request_identity_key`` (p5c20 ③).
+
+    That key rides EVERY run (this entrypoint always holds an admitted request),
+    while the cases below assert the *conditional* kwargs EXACTLY — the "no extras
+    leak" property they were written for. So the constant is split off here rather
+    than retyped into eight expectations. Splitting it off must not be able to
+    absorb a regression, so the pop is gated: the key must be present and truthy
+    (a return to the old ``identity_key=none`` makes every one of those cases red,
+    not green). Its VALUE — and that it is the envelope path's value — is asserted
+    in section (8).
+    """
+    conditional = []
+    for kwargs in stub.kwargs_calls:
+        assert "request_identity_key" in kwargs, f"seam lost the identity key: {kwargs}"
+        assert kwargs["request_identity_key"], f"identity key is empty/None: {kwargs}"
+        conditional.append({k: v for k, v in kwargs.items() if k != "request_identity_key"})
+    return conditional
+
+
 def test_consent_env_both_present_pass_through_verbatim(
     monkeypatch, scenario_file, tmp_path, no_ambient_consent
 ):
@@ -559,7 +586,7 @@ def test_consent_env_both_present_pass_through_verbatim(
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
     # Exactly runner_env, exactly the two keys, values verbatim (no extras leak).
-    assert stub.kwargs_calls == [
+    assert _conditional_kwargs(stub) == [
         {
             "runner_env": {
                 "ACCEPT_EULA": "opaque-token-eula-7f3a",
@@ -577,7 +604,7 @@ def test_consent_env_absent_passes_nothing(
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
     # Absent => runner_env NOT passed at all (boot guard refuses honestly; FU-8 is P5).
-    assert stub.kwargs_calls == [{}]
+    assert _conditional_kwargs(stub) == [{}]
 
 
 @pytest.mark.parametrize("present", CONSENT_KEYS)
@@ -589,7 +616,7 @@ def test_consent_env_partial_forwards_only_present_key(
     monkeypatch.setenv(present, "opaque-token-partial-05d8")
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
-    assert stub.kwargs_calls == [{"runner_env": {present: "opaque-token-partial-05d8"}}]
+    assert _conditional_kwargs(stub) == [{"runner_env": {present: "opaque-token-partial-05d8"}}]
 
 
 def test_bag_sensors_env_pass_through_uses_recording_canonical_key(
@@ -604,7 +631,7 @@ def test_bag_sensors_env_pass_through_uses_recording_canonical_key(
     monkeypatch.setenv("ACCEPT_EULA", "opaque-token-eula-bag")
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
-    assert stub.kwargs_calls == [
+    assert _conditional_kwargs(stub) == [
         {
             "runner_env": {
                 "ACCEPT_EULA": "opaque-token-eula-bag",
@@ -625,7 +652,7 @@ def test_bag_sensors_env_absent_does_not_inject_key(
     monkeypatch.delenv(BAG_SENSORS_ENV, raising=False)
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
-    assert stub.kwargs_calls == [{"runner_env": {"ACCEPT_EULA": "opaque-token-eula-only"}}]
+    assert _conditional_kwargs(stub) == [{"runner_env": {"ACCEPT_EULA": "opaque-token-eula-only"}}]
     assert BAG_SENSORS_ENV not in stub.kwargs_calls[0]["runner_env"]
 
 
@@ -654,7 +681,7 @@ def test_custom_criterion_passes_scenario_parent_as_oracle_plugin_dir(
     scenario.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     assert _run_cli(scenario, tmp_path / "out") == EXIT_PASS
-    assert stub.kwargs_calls == [{"oracle_plugin_dir": str(nested.resolve())}]
+    assert _conditional_kwargs(stub) == [{"oracle_plugin_dir": str(nested.resolve())}]
 
 
 def test_mvp_only_criteria_pass_oracle_plugin_dir_none(
@@ -667,4 +694,136 @@ def test_mvp_only_criteria_pass_oracle_plugin_dir_none(
     _install_supervisor(monkeypatch, stub)
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
-    assert stub.kwargs_calls == [{}]  # no oracle_plugin_dir key -> default None
+    assert _conditional_kwargs(stub) == [{}]  # no oracle_plugin_dir key -> default None
+
+
+# --- (8) request_identity_key: the two entrypoints emit the SAME key ---------
+# p5c20 ③ (DoD-P2-06 ① / REQ-REPORT-002). p5c18 closed the envelope/REST half
+# (M3 derives the key at admission and injects CV_REQUEST_IDENTITY_KEY); the
+# single-run half stayed open, so a `result.json` produced by `cv-infra run`
+# could not name the request that produced it (`identity_key=none`).
+#
+# ★ 형태 단정으로는 부족하다. p5c18 T4's mutation re-derived the key from the
+# JOB_SPEC: the result was a non-null, well-formed `sha256:` string that DIFFERED
+# per request — and was still the WRONG key. Only a CROSS-PLANE identity assertion
+# caught it. So these tests take the same request document down the OTHER
+# entrypoint (REST envelope -> job plane + report plane) and require byte
+# equality, not merely a plausible shape.
+
+
+class _KeyCapturingRunner:
+    """Injected M3 runner seam that records the key riding each job (CPU, no docker)."""
+
+    def __init__(self) -> None:
+        self.keys: list[str | None] = []
+
+    def run(self, job: Job) -> JobResult:
+        self.keys.append(job.request_identity_key)
+        return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+
+def _envelope_identity_keys(document: dict, tmp_path: Path) -> tuple[set, set]:
+    """Run ONE document through the REST envelope entrypoint (M3, real admission).
+
+    Returns ``(keys handed to the job plane, keys published on the report plane)``.
+    The runner seam is injected (``create_app``), so no docker and no ``run_job``
+    stub is involved — this is the production admission path, not a re-derivation.
+    """
+    runner = _KeyCapturingRunner()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, runner, k=1)
+        with TestClient(app) as client:
+            response = client.post("/envelopes", json={"requests": [document]})
+            assert response.status_code == 202, response.text
+            envelope_id = response.json()["envelope_id"]
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if client.get(f"/envelopes/{envelope_id}").json()["status"] == "completed":
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError(f"envelope {envelope_id} never completed")
+            report = client.get(f"/envelopes/{envelope_id}/report").json()
+    assert runner.keys, "no job reached the injected seam — the comparison would be vacuous"
+    return set(runner.keys), {row["request_identity_key"] for row in report["matrix"]}
+
+
+def _cli_identity_key(monkeypatch, scenario: Path, out_dir: Path) -> str:
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    assert main(
+        ["run", str(scenario), "--runner-image", RUNNER_IMAGE, "--out-dir", str(out_dir)]
+    ) == EXIT_PASS
+    (kwargs,) = stub.kwargs_calls
+    return kwargs["request_identity_key"]
+
+
+def test_run_hands_the_seam_the_same_key_the_envelope_path_does(
+    monkeypatch, scenario_file, tmp_path
+):
+    """★ 출처 동일성: same request document -> same key from BOTH entrypoints.
+
+    (a) 양성 대조 — the CLI hands a real key (non-null, ``sha256:``), where the
+        pre-p5c20 CLI handed nothing at all and the runner logged ``none``;
+    (b) that key is byte-identical to the one M3's admission hands the job plane
+        AND to the one M4 publishes on the report row. A key derived here from any
+        other input would satisfy (a) and fail (b) — that is the whole point.
+    """
+    # Envelope leg FIRST: it needs the REAL orchestrator module graph, which
+    # ``_install_supervisor`` (below, inside the CLI leg) replaces in sys.modules.
+    job_keys, report_keys = _envelope_identity_keys(
+        yaml.safe_load(CARTER_YAML), tmp_path / "envelope"
+    )
+    cli_key = _cli_identity_key(monkeypatch, scenario_file, tmp_path / "out")
+
+    assert cli_key is not None and cli_key.startswith("sha256:")  # (a) 실재하는 키다
+    assert job_keys == {cli_key}  # (b) 잡 평면: 두 진입면이 같은 키
+    assert report_keys == {cli_key}  # (b) 리포트 평면도 같은 키
+
+
+def test_run_key_discriminates_requests_and_is_not_an_identifier_in_disguise(
+    monkeypatch, tmp_path
+):
+    """비공허 대조: a constant (or the job id spelled differently) would pass the
+    equality above. Two materially different scenarios must get two keys, and the
+    key must not merely echo the job/scenario identifiers the CLI already had."""
+    document = yaml.safe_load(CARTER_YAML)
+    other = yaml.safe_load(CARTER_YAML)
+    other["scenario"]["seed"] = document["scenario"]["seed"] + 1
+
+    # Distinctive stems: the generated job_id embeds the stem, so "the key is not
+    # the job id in disguise" is a real predicate rather than a hex-digit accident.
+    first = tmp_path / "scenario-alpha.yaml"
+    first.write_text(yaml.safe_dump(document), encoding="utf-8")
+    second = tmp_path / "scenario-bravo.yaml"
+    second.write_text(yaml.safe_dump(other), encoding="utf-8")
+
+    key_a = _cli_identity_key(monkeypatch, first, tmp_path / "out-a")
+    monkeypatch.undo()
+    key_b = _cli_identity_key(monkeypatch, second, tmp_path / "out-b")
+
+    assert key_a != key_b  # 요청이 다르면 키가 다르다
+    for key in (key_a, key_b):  # job id/파일명이 아니라 요청 내용의 해시다
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", key), key
+        assert first.stem not in key and second.stem not in key
+
+
+def test_run_key_ignores_the_sut_ref_exactly_like_the_report_plane(monkeypatch, tmp_path):
+    """The SUT is the ONE axis excluded from the identity (REQ-REPORT-002: a
+    baseline must survive a SUT bump). Asserting that here proves the CLI is
+    calling M4's projection rather than hashing whatever it happens to hold."""
+    document = yaml.safe_load(CARTER_YAML)
+    bumped = yaml.safe_load(CARTER_YAML)
+    bumped["sut"]["image_ref"] = "carter-sut:some-other-tag"
+    assert bumped["sut"]["image_ref"] != document["sut"]["image_ref"]
+
+    first = tmp_path / "a.yaml"
+    first.write_text(yaml.safe_dump(document), encoding="utf-8")
+    second = tmp_path / "b.yaml"
+    second.write_text(yaml.safe_dump(bumped), encoding="utf-8")
+
+    key_a = _cli_identity_key(monkeypatch, first, tmp_path / "out-a")
+    monkeypatch.undo()
+    key_b = _cli_identity_key(monkeypatch, second, tmp_path / "out-b")
+    assert key_a == key_b
