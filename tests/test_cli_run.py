@@ -39,7 +39,7 @@ RUNNER_IMAGE = "cv-infra-runner:p2"
 
 # Platform-side copy of the consumer instance
 # cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml — cycle-5
-# bringup-measured fill; sut.image_ref = carter-sut:p2. The body is
+# bringup-measured fill. The body is
 # semantically identical to the source; only the fixture's platform header
 # differs (its SOURCE OF TRUTH anchor + re-sync policy live in that header —
 # no hash is retyped here, G-25: the drift guard is
@@ -131,7 +131,8 @@ def test_job_spec_reaches_stub_in_canonical_shape(monkeypatch, scenario_file, tm
     # Canonical VerificationRequest dict: exact key set, sut.image_ref flattened.
     assert set(spec) == {"job_id", "scenario", "sut_image_ref", "interface", "acceptance_criteria"}
     assert "sut" not in spec
-    assert spec["sut_image_ref"] == "carter-sut:p2"
+    # 픽스처에서 유도(G-25) — 리터럴 재타이핑은 사본의 사본을 만든다.
+    assert spec["sut_image_ref"] == yaml.safe_load(CARTER_YAML)["sut"]["image_ref"]
     assert spec["job_id"].startswith("nova_carter_warehouse_goal-")  # stem + UTC stamp
 
     # scenario / interface / acceptance_criteria pass through as-is.

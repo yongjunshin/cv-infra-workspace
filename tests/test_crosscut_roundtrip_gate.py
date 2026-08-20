@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 import docker  # real module on purpose (G-20) — entrypoint patched per-test
 from cv_infra.cli.main import main
@@ -29,7 +30,9 @@ from tests.test_supervisor_min import FakeClient
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
 RUNNER_IMAGE = "cv-infra-runner:p2"
-SUT_IMAGE = "carter-sut:p2"  # scenario-sourced (fixture sut.image_ref) — not a CLI arg
+# 픽스처에서 유도한다 — 이 값은 시나리오 소유이고 CLI 인자가 아니다. 리터럴로 다시 치면
+# 픽스처가 움직일 때(2026-08-20 실제로 움직였다) 조용히 어긋난다(G-25).
+SUT_IMAGE = yaml.safe_load(FIXTURE.read_text(encoding="utf-8"))["sut"]["image_ref"]
 
 
 @pytest.fixture()
