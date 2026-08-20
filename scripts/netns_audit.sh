@@ -48,14 +48,19 @@
 # Inputs — all arg/env, NO host/GPU/container literals baked in (DoD-P5-09 spirit):
 #   <container>                       the container whose netns is audited (required arg)
 #   CV_NETNS_AUDIT_IMAGE              sidecar image carrying `iptables` (default below).
-#                                     Build it once — the whole image is two lines, and the
-#                                     base is digest-pinned (CLAUDE.md §2-7):
-#                                       FROM python@sha256:<digest of the host's python:3.11-slim>
-#                                       RUN apt-get update \
-#                                        && apt-get install -y --no-install-recommends iptables \
-#                                        && rm -rf /var/lib/apt/lists/*
-#                                     (`docker build -t cv-netns-audit:p5c8 -f Dockerfile.audit .`;
-#                                      measured 2026-08-03: iptables 1.8.11-2, nf_tables backend)
+#                                     The recipe is a FILE, not this comment — it used to be
+#                                     five lines here, and an image the repo cannot rebuild is
+#                                     an audit a fresh host silently deploys WITHOUT:
+#                                       docker/netns_audit/Dockerfile
+#                                     Build it on every host you deploy to (digest-pinned base
+#                                     + fully pinned iptables closure, CLAUDE.md §2-7):
+#                                       docker build -f docker/netns_audit/Dockerfile \
+#                                         -t cv-netns-audit:<tag> docker/netns_audit
+#                                     That file builds the DEFAULT tag below; read that line
+#                                     rather than inferring the name from a sibling script's
+#                                     convention (G-86). Build a NEW tag instead of rebuilding
+#                                     over one an armed plane is using, and when a new tag
+#                                     becomes the default, move it below in the same commit.
 #   CV_NETNS_AUDIT_CHAIN              audit chain name (default CV_EXT_AUDIT)
 #   CV_NETNS_AUDIT_PROBE_HOST/_PORT   positive-control destination (default a public host)
 #   CV_NETNS_AUDIT_RECORD_DIR         where `arm` keeps its record + history (default
@@ -98,6 +103,9 @@ readonly CV_STEP=netns-audit
 readonly EXIT_USAGE=2
 readonly EXIT_INFRA=3
 
+# Default sidecar tag — THIS line is the definition (G-86: read it, never infer it from a
+# sibling script). The image is built from docker/netns_audit/Dockerfile; `:p5c8` is the
+# tag the armed planes are audited with today. Change it here and rebuild in one commit.
 CV_NETNS_AUDIT_IMAGE="${CV_NETNS_AUDIT_IMAGE:-cv-netns-audit:p5c8}"
 CV_NETNS_AUDIT_CHAIN="${CV_NETNS_AUDIT_CHAIN:-CV_EXT_AUDIT}"
 CV_NETNS_AUDIT_PROBE_HOST="${CV_NETNS_AUDIT_PROBE_HOST:-api.github.com}"
