@@ -731,8 +731,14 @@ def _matrix_view(report: dict[str, Any]) -> dict[str, Any]:
     renders as a value and an absent/None one keeps ``render_text``'s ``-`` null
     idiom (no verdict-bearing repeat -> no flakiness). Surfacing it is the CLI
     half of the flaky surface CEO 결정 M-2 pinned; the full per-row detail stays
-    available via ``--json``. Fields read here are anchored to the canonical
-    fixture (``tests/test_report_verification_report.py``)."""
+    available via ``--json``. ``request_identity_key`` is likewise a ROW-level
+    sibling and is passed through verbatim (p5c20 ⑦) — it is the axis the
+    regression judgement is made on (C-1 baseline PK), so a reviewer asking "어느
+    identity 로 비교됐나" must see it here; M4's ``render_text`` abbreviates it for
+    the table and renders a missing/``None`` one as ``-`` (no fabrication —
+    the ``run`` single-execution plane may carry no key). Fields read here are
+    anchored to the canonical fixture
+    (``tests/test_report_verification_report.py``)."""
     summary = report.get("summary", {})
     rows: list[dict[str, Any]] = []
     for row in report.get("matrix", []):
@@ -745,6 +751,7 @@ def _matrix_view(report: dict[str, Any]) -> dict[str, Any]:
                 "flakiness": row.get("flakiness"),
                 "jobs": rollup.get("repeats", len(verdicts)),
                 "counts": {"pass": verdicts.count("pass"), "fail": verdicts.count("fail")},
+                "request_identity_key": row.get("request_identity_key"),
             }
         )
     return {

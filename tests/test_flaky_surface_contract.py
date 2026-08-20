@@ -249,9 +249,12 @@ def test_cli_report_renders_the_flakiness_value_and_counts(monkeypatch, tmp_path
     _wire(monkeypatch, _mixed_report(tmp_path))
     assert main(["report", "env-1"]) == EXIT_PASS
     out = capsys.readouterr().out
-    # request_id  verdict  flakiness  jobs  pass  fail   (M4 render_text columns)
-    assert _text_cells(out, "req-flaky") == ["req-flaky", "fail", "0.333", "3", "2", "1"]
-    assert _text_cells(out, "req-stable") == ["req-stable", "pass", "0.000", "2", "2", "0"]
+    # request_id  verdict  flakiness  jobs  pass  fail  [identity_key]
+    # (M4 render_text columns; the 7th ``identity_key`` column was appended at
+    # p5c20 ⑦ and is pinned in tests/test_cli_report.py — sliced off here so this
+    # file keeps asserting exactly the M-2 flaky surface it owns.)
+    assert _text_cells(out, "req-flaky")[:6] == ["req-flaky", "fail", "0.333", "3", "2", "1"]
+    assert _text_cells(out, "req-stable")[:6] == ["req-stable", "pass", "0.000", "2", "2", "0"]
 
 
 def test_cli_report_renders_dash_when_there_is_no_flakiness(monkeypatch, tmp_path, capsys):
@@ -260,5 +263,5 @@ def test_cli_report_renders_dash_when_there_is_no_flakiness(monkeypatch, tmp_pat
     _wire(monkeypatch, _mixed_report(tmp_path, extra=[_errored_input()]))
     assert main(["report", "env-1"]) == EXIT_PASS
     out = capsys.readouterr().out
-    assert _text_cells(out, "req-zerr") == ["req-zerr", "errored", "-", "0", "0", "0"]
+    assert _text_cells(out, "req-zerr")[:6] == ["req-zerr", "errored", "-", "0", "0", "0"]
     assert _text_cells(out, "req-flaky")[2] == "0.333"  # the value case still renders

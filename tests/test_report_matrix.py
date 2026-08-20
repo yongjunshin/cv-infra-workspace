@@ -5,7 +5,9 @@ landed M3 code, not prose) — into ``build_matrix`` / ``render_text`` and pins:
 mixed-verdict correctness, empty input, flakiness surfacing, the LOCKED §7.12
 boundary (rollup verdict/flakiness consumed verbatim, NEVER recomputed from
 ``verdicts`` — asserted with contradictory hand-crafted rollups as positive
-controls), and a byte-for-byte render golden. Stdlib + pytest only.
+controls), a byte-for-byte render golden, and the appended ``identity_key``
+column (p5c20 ⑦ — value case AND honest-absence case, paired per G-35). Stdlib
++ pytest only.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 from cv_infra.orchestrator.models import Job, JobResult, JobState, RequestRollup, Verdict
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.report.matrix import build_matrix, render_text
+from cv_infra.report.regression import identity_key
 
 
 def _results(request_id: str, verdicts: list[Verdict | None]) -> list[JobResult]:
@@ -73,7 +76,7 @@ def test_empty_input_yields_zero_rows_and_zero_summary():
     rendered = render_text(matrix)  # must not crash on width computation
     assert rendered == (
         "Report matrix (0 requests: 0 passed, 0 failed, 0 errored)\n"
-        "request_id  verdict  flakiness  jobs  pass  fail"
+        "request_id  verdict  flakiness  jobs  pass  fail  identity_key"
     )
 
 
@@ -144,12 +147,79 @@ def test_rollup_flakiness_wins_over_recomputation():
 
 def test_render_text_golden():
     rendered = render_text(build_matrix(_mixed_rollups()))
+    # ``identity_key`` is ``-`` on every row here and NO abbreviation legend is
+    # emitted: these rows come from ``build_matrix``, which consumes rollups and
+    # never sees a request, so it genuinely has no key to show (p5c20 ⑦ — the
+    # value case is pinned on the report/CLI path, where the key exists).
     assert rendered == (
         "Report matrix (3 requests: 1 passed, 1 failed, 1 errored)\n"
-        "request_id     verdict  flakiness  jobs  pass  fail\n"
-        "carter-goal-a  pass     0.000      3     3     0\n"
-        "carter-goal-b  fail     0.333      3     2     1\n"
-        "carter-goal-c  errored  -          0     0     0"
+        "request_id     verdict  flakiness  jobs  pass  fail  identity_key\n"
+        "carter-goal-a  pass     0.000      3     3     0     -\n"
+        "carter-goal-b  fail     0.333      3     2     1     -\n"
+        "carter-goal-c  errored  -          0     0     0     -"
     )
     # Determinism: same input (fresh objects) → byte-identical output.
     assert render_text(build_matrix(_mixed_rollups())) == rendered
+
+
+# ---------------------------------------------------------------------------
+# (6) identity_key column (p5c20 ⑦) — the regression axis on the text surface
+#     REQ-REPORT-002/003: the key IS the C-1 baseline PK, so "어느 identity 로
+#     비교됐나" must be answerable from the table. Keys are DERIVED from the real
+#     producer (``regression.identity_key``), never a typed-in hex literal.
+# ---------------------------------------------------------------------------
+
+
+def _one_row_matrix(request_id: str, key: str | None) -> dict:
+    """A real ``build_matrix`` row + the identity field the CLI adapter attaches
+    (``cli/batch._matrix_view`` — the row shape ``render_text`` actually gets)."""
+    matrix = build_matrix([roll_up(request_id, _results(request_id, [Verdict.PASS]))])
+    if key is not None:
+        matrix["matrix"][0]["request_identity_key"] = key
+    return matrix
+
+
+def _cells(rendered: str, lead: str) -> list[str]:
+    line = next((ln for ln in rendered.splitlines() if ln.startswith(lead)), None)
+    assert line is not None, f"no row for {lead!r} in:\n{rendered}"
+    return line.split()
+
+
+def test_identity_cell_is_a_literal_prefix_of_the_key_and_says_it_is_abbreviated():
+    key = identity_key({"scenario": {"scene": "nova_carter_warehouse", "seed": 42}})
+    assert key.startswith("sha256:") and len(key) == len("sha256:") + 64  # producer premise
+    rendered = render_text(_one_row_matrix("req-0", key))
+    cell = _cells(rendered, "req-0")[6]
+    assert cell != "-"  # the column carries a VALUE (not vacuously empty)
+    assert cell.endswith("…")  # truncation is marked in the cell...
+    assert "abbreviated prefix" in rendered  # ...and declared in the legend
+    # Only a SUFFIX was dropped -> the shown text is usable to look the baseline
+    # up by prefix, and it can never be mistaken for a different key.
+    assert key.startswith(cell.removesuffix("…"))
+    assert len(cell.removesuffix("…")) >= len("sha256:") + 8
+
+
+def test_different_identities_render_different_cells():
+    """A constant/hardcoded cell (or one derived from request_id) cannot pass:
+    two requests differing only in seed have different keys."""
+    key_a = identity_key({"scenario": {"scene": "s", "seed": 1}})
+    key_b = identity_key({"scenario": {"scene": "s", "seed": 2}})
+    assert key_a != key_b  # premise
+    cell_a = _cells(render_text(_one_row_matrix("req-0", key_a)), "req-0")[6]
+    cell_b = _cells(render_text(_one_row_matrix("req-0", key_b)), "req-0")[6]
+    assert cell_a != cell_b
+
+
+def test_absent_identity_renders_the_null_idiom_and_no_legend():
+    """§2-4 honesty: ``None`` (a producer that carried no key — e.g. the single
+    ``run`` plane) and a row with no such field at all (the ``build_matrix``
+    preview shape) both render ``-``. Nothing was abbreviated -> no legend
+    claiming an abbreviation."""
+    explicit_none = _one_row_matrix("req-0", None)
+    explicit_none["matrix"][0]["request_identity_key"] = None
+    missing = _one_row_matrix("req-0", None)
+    assert "request_identity_key" not in missing["matrix"][0]  # the two cases differ
+    for matrix in (explicit_none, missing):
+        rendered = render_text(matrix)
+        assert _cells(rendered, "req-0")[6] == "-"
+        assert "abbreviated prefix" not in rendered
