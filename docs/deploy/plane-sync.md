@@ -263,7 +263,8 @@ fail-closed). **읽기 대조만** 하며 워크스테이션·체크아웃·git 
    이때 ①만 움직인다. G-44: **태그 push ≠ 브랜치 push** — 태그만 옮겼다고 런타임이
    따라오지 않는다.
 3. **런타임 평면 동기화(② — MANDATORY, 이 단계가 G-43의 핵심)** — GPU 호스트에서:
-   1. 체크아웃 전진: `git -C <src> fetch --tags && git -C <src> checkout X`
+   1. 체크아웃 전진: `git -C <src> fetch --tags --force && git -C <src> checkout X`
+      ⚠ **`--force` 는 선택이 아니다** — 아래 STALE-LOCAL-TAG 항 참조.
       (`<src>` = 런타임 평면 체크아웃, 기본 `~/cv-infra-p2-src/cv-infra-workspace`).
    2. editable 패키지 **전파 확인** — 대개 **재설치는 필요 없다**(2026-08-03 실측으로
       확정). 런타임 평면의 두 venv는 모두 editable 설치이고
@@ -509,7 +510,13 @@ CPU 등가는 이미 스위트에 있다 — `tests/test_deploy_image_provenance
   **stale**해 게이트가 **거짓 통과**할 수 있다. 실측(2026-07-24): 워크스테이션 체크아웃의
   로컬 `v1`은 여전히 stale `0e9ec21`로 peel됐다 → 만약 `--tag-repo`를 그 체크아웃으로
   두면 런타임(0e9ec21)==태그(0e9ec21)로 **통과**하지만 둘 다 main보다 뒤다. 방어:
-  - peel 전 `--tag-repo` 쪽에서 태그를 authoritative하게: `git -C <tag-repo> fetch --tags`
+  - peel 전 `--tag-repo` 쪽에서 태그를 authoritative하게: **`git -C <tag-repo> fetch --tags --force`**
+    ⚠ **`--force` 없이는 안 된다.** 평범한 `git fetch --tags` 는 **옮겨진 태그를 조용히 거부**하고
+    (`! [rejected] v1 -> v1 (would clobber existing tag)`) **exit 0** 으로 끝나서, 로컬 ref 가 **옛
+    릴리즈를 계속 가리킨다**. 실측 2026-08-21(p5c19 F-6): 배포 호스트의 `v1` 이 평범한 fetch 를 거쳐도
+    **4주 전**에 머물렀고, 그래서 **기본 게이트 호출**(`--tag v1`)이 평면을 **7월 커밋과** 대조했다.
+    오늘은 평면이 stale 태그보다 **앞서 있어서 false FAIL** 로 드러났을 뿐 — **false PASS 방향은 같은
+    결함이고 그쪽은 조용하다.**
     (본인 쪽에서 실행), **또는**
   - 검증한 릴리즈 대상 커밋을 **명시 전달**: `--tag <sha>`, **또는**
   - fresh clone에서 peel, **또는**

@@ -79,7 +79,15 @@
 # refs. If that repo has not fetched the moved release tag, the peel is stale and
 # the gate can FALSELY pass (measured 2026-07-24: the workstation checkout's
 # local `v1` still peeled to the stale 0e9ec21). Before trusting a pass, make the
-# tag authoritative on the --tag-repo side: `git -C <tag-repo> fetch --tags`
+# tag authoritative on the --tag-repo side: `git -C <tag-repo> fetch --tags --force`
+#   ^^^^^^^ --force is REQUIRED, not optional. Plain `git fetch --tags` SILENTLY
+#   REFUSES a moved tag ("! [rejected] v1 -> v1 (would clobber existing tag)") and
+#   exits 0, so the local ref keeps pointing at the OLD release. Measured 2026-08-21
+#   (p5c19 F-6): the deployment host's `v1` stayed four weeks behind through a plain
+#   fetch, and the DEFAULT gate invocation (--tag v1) therefore judged the planes
+#   against a July commit. It surfaced as a false FAIL only because the plane happened
+#   to be AHEAD of the stale tag — the false PASS direction is the same defect with
+#   luckier timing, and that one is silent.
 # (do that on YOUR side), OR pass the verified release-target commit explicitly
 # (`--tag <sha>`), OR peel from a fresh clone. `git ls-remote --tags <remote> vN`
 # reads the pushed tag without touching local refs (see plane-sync.md).
