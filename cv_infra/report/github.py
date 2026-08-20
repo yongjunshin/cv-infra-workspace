@@ -5,12 +5,22 @@ else: a Check Run payload, a sticky PR-comment markdown, a step-summary markdown
 and an artifact upload manifest. The actual GitHub API calls / uploads are the M8
 Action plane's job (LOCKED §7.14) — this module holds NO GitHub token, opens NO
 socket, touches NO network (M4-09 이식성 negative): a developer can produce every
-surface from a report JSON standalone. Consequently it imports ONLY the stdlib and two
-stdlib-only leaves — ``cv_infra.cli.exit_codes`` (M8 exit table) and
-``cv_infra.report.identity_display`` (the shared ``request_identity_key`` display
-rule) — so the import drags no orchestrator/fastapi/network graph (the property
-M4-09 rests on; ``report/matrix.py`` deliberately is NOT imported here because it
-pulls the M3 orchestrator models).
+surface from a report JSON standalone. Consequently its own imports are the stdlib
+plus three DEPENDENCY-FREE leaves — ``cv_infra.cli.exit_codes`` (M8 exit table),
+``cv_infra.report.identity_display`` (shared ``request_identity_key`` display rule)
+and ``cv_infra.report.regression`` (the ``STATUS_*`` vocabulary; itself stdlib-only)
+— so this FILE depends on no orchestrator/fastapi/network module. ``report/matrix.py``
+is deliberately not imported: it pulls the M3 orchestrator models, and a direct edge
+would tie the renderer's own dependency set to M3's.
+
+⚠ Measured, so nobody over-reads the line above (p5c20 ⑦ 후속 2): at RUNTIME the
+loaded module set is decided by ``cv_infra/report/__init__.py``, which imports all
+five siblings — importing ``cv_infra.report.github`` alone already loads
+``orchestrator.models``/``store``/``contract.schema`` (24 cv_infra modules, heavy = 0).
+What the file-level discipline buys is that this module stays importable-in-isolation
+if that package ``__init__`` is ever slimmed, and that its dependency set never
+silently widens through M3. The M4-09 gate itself is about network/server/token
+modules, and those are absent either way.
 
 The exit -> Check conclusion table lives in ONE place — ``cv_infra.cli.exit_codes``,
 the M8 single source (LOCKED §7.9 / D-I) — and is IMPORTED, never re-declared here:
@@ -41,6 +51,7 @@ from cv_infra.cli.exit_codes import (
     exit_code_for_report_outcome,
 )
 from cv_infra.report.identity_display import ABBREVIATED_HEX, identity_cell, was_abbreviated
+from cv_infra.report.regression import STATUS_NO_BASELINE, STATUS_REGRESSED
 
 #: Hidden HTML comment anchoring the sticky PR comment for in-place upsert (P5-14).
 #: MUST appear in every rendered sticky comment; the Action finds+updates the
@@ -253,6 +264,9 @@ def _regression_section(report: dict[str, Any]) -> str:
     *"왜 이게 회귀지"* cannot be answered from the PR. Full (not abbreviated) here
     because a PR reader's only other copy is inside the artifact zip; the value is
     the row's, never re-derived."""
+    # NOTE: these are ``baseline_summary`` FIELD names (§3.4 report JSON schema),
+    # not regression STATUS values — same spelling, different namespace. Only the
+    # status comparisons below key off the imported ``STATUS_*`` vocabulary.
     bsum = report.get("baseline_summary") or {}
     absent = bsum.get("absent", 0)
     regressed = bsum.get("regressed", 0)
@@ -265,11 +279,11 @@ def _regression_section(report: dict[str, Any]) -> str:
         )
         lines += [
             f"  - {_md_cell(row.get('request_id', _NA))} — identity {_identity_ref(row)}"
-            for row in _rows_with_status(report, "no-baseline")
+            for row in _rows_with_status(report, STATUS_NO_BASELINE)
         ]
     if regressed:
         lines.append(f"- 회귀 {regressed}건:")
-        for row in _rows_with_status(report, "regressed"):
+        for row in _rows_with_status(report, STATUS_REGRESSED):
             reg = row.get("regression") or {}
             lines.append(f"  - {reg.get('detail')} — identity {_identity_ref(row)}")
     if improved:

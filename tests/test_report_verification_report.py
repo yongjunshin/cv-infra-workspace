@@ -12,9 +12,12 @@ the REAL M1 models (G-17). Stdlib + pytest.
 
 from __future__ import annotations
 
+import pytest
+
 from cv_infra.contract.schema import Result, VerificationRequest
 from cv_infra.orchestrator.models import RequestRollup, Verdict
 from cv_infra.orchestrator.store import Store
+from cv_infra.report import aggregate, regression
 from cv_infra.report.aggregate import RequestReportInput, build_report
 from cv_infra.report.baseline import update_baseline
 from cv_infra.report.regression import identity_key
@@ -322,3 +325,52 @@ def test_no_cap_keeps_mcap(tmp_path):
         report = _report(inputs, store, max_mcap_bytes=None)
     entry = report["matrix"][0]["artifacts"]["selected"][0]
     assert entry["rosbag_mcap"] == "big.mcap" and entry["excluded"] == []
+
+
+# --------------------------------------------------------------------------- #
+# (7) baseline_summary counters key off the STATUS_* definition, not literals
+# --------------------------------------------------------------------------- #
+# G-56 (p5c20 ⑦ 후속 2): ``aggregate`` imported ``STATUS_REGRESSED`` but compared the
+# other three statuses as its own literals — a rename in ``regression.py`` would have
+# silently mis-counted the report's OWN numbers (a skipped request counted as
+# ``matched``). Each case renames the value at the DEFINITION (``judge_regression``
+# reads its module global at call time) AND at this consumer's imported copy: a
+# consumer that keys off the name follows, one holding a literal does not.
+
+
+@pytest.mark.parametrize(
+    ("constant", "seed_verdict", "current", "counter"),
+    [
+        ("STATUS_NO_BASELINE", None, Verdict.PASS, "absent"),
+        ("STATUS_IMPROVED", "fail", Verdict.PASS, "improved"),
+        ("STATUS_UNCHANGED", "pass", Verdict.PASS, "unchanged"),
+    ],
+)
+def test_baseline_summary_counts_follow_the_status_constants(
+    tmp_path, monkeypatch, constant, seed_verdict, current, counter
+):
+    renamed = f"{constant.lower()}-v2"
+    monkeypatch.setattr(regression, constant, renamed)
+    monkeypatch.setattr(aggregate, constant, renamed)
+    request = _request()
+    inputs = [
+        RequestReportInput(
+            request=request,
+            rollup=_rollup("req-0", current, [current]),
+            results=[_result("req-0:0", current.value)],
+        )
+    ]
+    with Store(tmp_path / "cv.sqlite3") as store:
+        if seed_verdict is not None:
+            update_baseline(
+                store,
+                request_identity_key=identity_key(request),
+                sut_ref="carter-sut:old",
+                verdict=seed_verdict,
+                established_at="2026-07-10T00:00:00+00:00",
+            )
+        report = _report(inputs, store)
+    # the producer emitted the RENAMED status ...
+    assert report["matrix"][0]["regression"]["status"] == renamed
+    # ... and the counter followed it (a literal comparison would miss and count 0)
+    assert report["baseline_summary"][counter] == 1

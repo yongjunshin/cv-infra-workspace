@@ -31,7 +31,14 @@ from cv_infra.orchestrator.models import RequestRollup
 from cv_infra.orchestrator.store import Store
 from cv_infra.report.baseline import find_baseline
 from cv_infra.report.matrix import build_matrix
-from cv_infra.report.regression import STATUS_REGRESSED, identity_key, judge_regression
+from cv_infra.report.regression import (
+    STATUS_IMPROVED,
+    STATUS_NO_BASELINE,
+    STATUS_REGRESSED,
+    STATUS_UNCHANGED,
+    identity_key,
+    judge_regression,
+)
 
 #: Artifact selection policy provenance (decisions/2026-07-16-p5-artifact-return.md).
 _ARTIFACT_POLICY = (
@@ -99,13 +106,13 @@ def build_report(
         status = reg.status
         if status == STATUS_REGRESSED:
             regressed += 1
-        elif status == "improved":
+        elif status == STATUS_IMPROVED:
             improved += 1
-        elif status == "unchanged":
+        elif status == STATUS_UNCHANGED:
             unchanged += 1
         # matched = a baseline was actually compared; absent = skipped (no baseline
         # OR errored current) — keeps matched+absent == total and consistent w/ status.
-        if status == "no-baseline":
+        if status == STATUS_NO_BASELINE:
             absent += 1
         else:
             matched += 1

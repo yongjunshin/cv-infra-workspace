@@ -564,3 +564,50 @@ def test_table_abbreviation_uses_the_same_rule_as_the_cli_table(tmp_path):
         expected = shared_cell(row["request_identity_key"], absent="n/a")
         assert _md_row_cells(body, row["request_id"])[7] == expected
         assert expected != "n/a"  # the comparison is not vacuous
+
+
+# --------------------------------------------------------------------------- #
+# (8) status vocabulary comes from its definition, not local literals (G-56)
+# --------------------------------------------------------------------------- #
+# ``regression.py`` DEFINES the status values; this renderer used to compare
+# ``"regressed"`` / ``"no-baseline"`` as literals of its own. A literal cannot
+# drift loudly: if the definition ever changed a value, the producer would emit
+# the new one and this file would silently match NOTHING — the count line would
+# say 회귀 1건 with no row beneath it. The tests below rename the vocabulary and
+# assert the renderer FOLLOWS (they fail on the pre-fix literal implementation).
+
+
+def test_no_baseline_status_literal_in_github_source():
+    # ``"no-baseline"`` can only ever be a status value, so its absence from the
+    # source is a real gate. (``"regressed"`` is NOT gated this way: the §3.4
+    # ``baseline_summary`` carries a FIELD of the same spelling — a different
+    # namespace that legitimately stays a literal. The drift test below covers it.)
+    assert '"no-baseline"' not in _github_source()
+
+
+def test_regression_enumeration_follows_the_status_constant(tmp_path, monkeypatch):
+    report = _regressed_report(tmp_path)
+    row = report["matrix"][0]
+    assert row["regression"]["status"] == "regressed"  # premise: the real value today
+    renamed = "regressed-v2"
+    row["regression"]["status"] = renamed  # the definition renamed -> producer emits it
+    monkeypatch.setattr(github, "STATUS_REGRESSED", renamed)  # the consumer's copy follows
+    body = github.render_step_summary(report)
+    # the regressed row is still enumerated WITH its identity (a literal would
+    # have matched nothing here — 회귀 1건 with an empty list)
+    line = next(ln for ln in body.splitlines() if row["regression"]["detail"] in ln)
+    assert f"identity `{row['request_identity_key']}`" in line
+
+
+def test_absent_enumeration_follows_the_status_constant(tmp_path, monkeypatch):
+    report = _two_identity_report(tmp_path)
+    assert report["baseline_summary"]["absent"] == 2  # premise
+    renamed = "skipped-v2"
+    for row in report["matrix"]:
+        assert row["regression"]["status"] == "no-baseline"
+        row["regression"]["status"] = renamed
+    monkeypatch.setattr(github, "STATUS_NO_BASELINE", renamed)
+    body = github.render_step_summary(report)
+    named = [ln for ln in body.splitlines() if ln.startswith("  - ") and "identity `sha256:" in ln]
+    # the enumeration still matches the count above it (the invariant a literal breaks)
+    assert len(named) == report["baseline_summary"]["absent"]
