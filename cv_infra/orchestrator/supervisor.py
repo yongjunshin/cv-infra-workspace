@@ -196,6 +196,8 @@ DEFAULT_RUNNER_SHM_SIZE = "1g"
 # PREMISE CORRECTION (p5c6 T0 진단, reports/deployment-2026-07-22-p5c6-stall-diag.md): the
 # p5c5 comment here called that pull "wedged" and anchored on a "~85 MB stall point". BOTH
 # are disproved — that pull SUCCEEDED (`~/cv-infra-ci/logs/sut-pull.log`: `Status: Downloaded
+# [앵커 만료 2026-08-20 — 이 경로는 더 이상 존재하지 않는다. 측정이 일어난 사실은 유효하고,
+#  파일 목록·sha256는 docs/evidence-anchors.md가 가리키는 매니페스트에 있다. 재현은 불가.]
 # newer image`) and the only original record (`relay/bigblob.log`) shows 37 DIFFERENT interruption
 # offsets (1.4 MB ~ 183 MB), i.e. probabilistic, not a byte threshold. The measured mechanism
 # is PATH QUALITY: our GHCR blob is never resident on the Fastly IAD shield (`x-cache: MISS`,
