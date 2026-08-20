@@ -285,8 +285,11 @@ def test_stub_needs_no_consumer_asset_at_all(tmp_path, monkeypatch):
     The stub is built with the working directory somewhere empty, so a hidden file
     read would raise rather than silently succeed.
     """
-    consumer_sut = "carter-sut:p2"
-    assert consumer_sut in _CONSUMER_FIXTURE.read_text(encoding="utf-8")  # 대조군 실재
+    # ★ 대조군은 픽스처의 **실제 sut.image_ref** 여야 한다. 예전엔 리터럴 "carter-sut:p2" 를
+    # 다시 쳤는데, 2026-08-20 픽스처가 다이제스트로 옮겨간 뒤에도 그 문자열이 **주석 산문에**
+    # 남아 있어 이 단정이 계속 green 이었다 — 공허 대조군(G-35). 이제 값에서 유도한다.
+    consumer_sut = yaml.safe_load(_CONSUMER_FIXTURE.read_text(encoding="utf-8"))["sut"]["image_ref"]
+    assert consumer_sut  # 비공허: 픽스처가 실제로 SUT ref 를 갖는다
 
     monkeypatch.chdir(tmp_path)
     body = build_self_test_submission(environ=_STUB_ENV).body

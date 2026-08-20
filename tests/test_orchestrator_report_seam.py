@@ -102,7 +102,8 @@ def test_report_200_is_the_assembled_verification_report(tmp_path):
             assert report["summary"]["report_outcome"] == "pass"
             (row,) = report["matrix"]
             # 픽스처에서 유도 — 리터럴 재타이핑은 픽스처가 움직일 때 조용히 어긋난다(G-25).
-            assert row["sut_ref"] == _CANONICAL_DOC["sut"]["image_ref"]  # from the request wire dump
+            # (값의 출처 = 요청 wire dump)
+            assert row["sut_ref"] == _CANONICAL_DOC["sut"]["image_ref"]
             assert row["rollup"]["repeats"] == 2 and row["rollup"]["verdict"] == "pass"
             assert row["regression"]["status"] == "no-baseline"  # skip = normal
             # control plane carries no domain metrics/artifacts -> empty, shape intact.
