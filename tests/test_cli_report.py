@@ -478,3 +478,84 @@ def test_empty_matrix_renders_no_metric_or_artifact_noise(monkeypatch, tmp_path,
     assert "metrics (" not in out
     assert "artifacts (" not in out
     assert "outcome: verdict=pass report_outcome=pass" in out
+
+
+# --------------------------------------------------------------------------- #
+# (7) identity_key column (p5c20 ⑦) — REQ-REPORT-002/003 on the review surface
+# --------------------------------------------------------------------------- #
+# ``request_identity_key`` IS the C-1 baseline PK (``request_baselines``), i.e.
+# the axis every regression judgement is made on. Without it on the terminal,
+# "baseline 부재 2건 — 회귀 판정 skip" cannot be traced to WHICH identity was not
+# matched. The value was already in the report JSON row (``aggregate``); only the
+# renderers dropped it. These tests pin the CLI cell CONTENT: a real key renders
+# (abbreviated, declared as such, still a literal prefix) and an absent one
+# renders absent. (The GitHub markdown matrix does not carry the key either —
+# separate surface, not in this change's scope.)
+
+
+def _matrix_cells(out: str, request_id: str) -> list[str]:
+    """Cells of the CLI fixed-width matrix row for ``request_id``."""
+    line = next((ln for ln in out.splitlines() if ln.startswith(f"{request_id} ")), None)
+    assert line is not None, f"no matrix row for {request_id!r} in:\n{out}"
+    return line.split()
+
+
+def _distinct_identity_report(tmp_path) -> dict:
+    """Two requests with DIFFERENT identities (differing scenario seed) — so a
+    constant or request_id-derived cell cannot pass."""
+    return _make_report(
+        tmp_path,
+        [
+            RequestReportInput(
+                request=_request(),
+                rollup=_rollup("req-0", Verdict.PASS, [Verdict.PASS]),
+                results=[_result("req-0:0", "pass")],
+            ),
+            RequestReportInput(
+                request=_request(scenario={**_BASE_REQUEST["scenario"], "seed": 7}),
+                rollup=_rollup("req-1", Verdict.PASS, [Verdict.PASS]),
+                results=[_result("req-1:0", "pass")],
+            ),
+        ],
+    )
+
+
+def test_matrix_carries_the_request_identity_key(monkeypatch, tmp_path, capsys):
+    report = _distinct_identity_report(tmp_path)
+    keys = {row["request_id"]: row["request_identity_key"] for row in report["matrix"]}
+    # premise: the producer really put two DIFFERENT full keys in the report JSON
+    assert keys["req-0"] != keys["req-1"]
+    assert all(key.startswith("sha256:") and len(key) == 71 for key in keys.values())
+    out = _render(monkeypatch, report, capsys)
+    cell_0, cell_1 = _matrix_cells(out, "req-0")[6], _matrix_cells(out, "req-1")[6]
+    assert cell_0 != "-" and cell_1 != "-"  # the column carries VALUES...
+    assert cell_0 != cell_1  # ...and per-row ones (no constant/one-key rendering)
+    # What the terminal shows is a literal PREFIX of the key the baseline row is
+    # keyed on -> it can be pasted into a prefix lookup; the untruncated value is
+    # one --json away (assert 그 자체: the JSON key starts with the shown text).
+    assert keys["req-0"].startswith(cell_0.removesuffix("…"))
+    assert keys["req-1"].startswith(cell_1.removesuffix("…"))
+    assert "abbreviated prefix" in out  # the truncation is DECLARED, not silent
+
+
+def test_sut_only_difference_shares_one_identity_cell(monkeypatch, tmp_path, capsys):
+    """REQ-REPORT-002 as the reviewer sees it: two requests differing ONLY in SUT
+    are the SAME identity — which is exactly why a baseline recorded under the old
+    SUT is comparable. The table must show one shared key, not two."""
+    report = _review_report(tmp_path)  # req-0/req-1 differ only in sut.image_ref
+    row_0, row_1 = report["matrix"]
+    assert row_0["sut_ref"] != row_1["sut_ref"]  # premise: the SUT really differs
+    out = _render(monkeypatch, report, capsys)
+    shared = _matrix_cells(out, "req-0")[6]
+    assert shared != "-" and _matrix_cells(out, "req-1")[6] == shared
+
+
+def test_absent_identity_key_renders_as_absent_not_fabricated(monkeypatch, tmp_path, capsys):
+    """§2-4 honesty: a row whose producer carried NO key (the single ``run`` plane
+    does not hand one over yet) renders ``-``, while its sibling that HAS one still
+    shows it — honest absence, not a dead column (G-35 pairing)."""
+    report = _distinct_identity_report(tmp_path)
+    report["matrix"][1]["request_identity_key"] = None
+    out = _render(monkeypatch, report, capsys)
+    assert _matrix_cells(out, "req-1")[6] == "-"
+    assert _matrix_cells(out, "req-0")[6].startswith("sha256:")  # the value case survives
