@@ -6,6 +6,14 @@
 > 후속 사이클에서 확장). 요구사항 원문은 재서술하지 않고 ID로만 참조한다
 > (REQ-DEPLOY-001·003, NFR-DEPLOY-001~003; 정본 = deployment 그룹 명세).
 
+
+> ### ⚠ 2026-08-20 — 이 문서의 워크스테이션 증적 경로는 **죽은 링크**다 (의도적 만료)
+> 아래에 인용된 `~/cv-infra-p2-out/**` · `~/cv-infra-ci/**` 는 **2026-08-20 프로덕션
+> 컷오버에서 전량 삭제**됐다(CEO 결정 `p5c19` D-1 — *증거 부족이 아니라 판정된 만료*).
+> **무엇이 있었는가**는 남아 있다: 전체 파일 목록 + 바이트 + `sha256`(17,432 파일) +
+> store 스키마·행수가 메타 저장소의 증적 매니페스트에 있다. **재현은 불가**다 —
+> *"존재했음"* 과 *"재현 가능"* 을 혼동하지 마라. 그 경로를 새 증거로 인용하지 말고,
+> 필요하면 **다시 측정**하라. 운영 평면의 현 경로는 `~/cv-infra-prod/{store,out,cache-warm,cache-scratch}`.
 ## 왜 (세 평면)
 
 플랫폼은 릴리즈 태그가 **함께 옮기지 못하는 세 배포 평면**으로 배송된다
@@ -91,6 +99,12 @@ docker image inspect cv-infra-runner:<tag> \
 ```
 
 **이전 태그는 지우지 않는다** — 과거 게이트/앵커가 그 Id를 인용하고 있다(FU-10 핀 대장).
+**단, 2026-08-20 프로덕션 컷오버에서 이 규칙이 한 번 명시적으로 뒤집혔다**: 개발기 러너
+태그 15종(`p2`~`p5c17`)과 제어평면 3종이 CEO 결정으로 **삭제**됐다. 규칙이 폐기된 것이
+아니라 *"MVP 개발기 핀 대장은 릴리즈 시점에 만료된다"* 는 판정이 내려진 것이다 — 삭제
+전에 **repo:tag + 전체 sha256 Id + 크기 + 생성일을 전수 기록**했고(그 기록이 이제 핀 대장
+이다), 아래 리빌드 표의 Id 들은 **그 이미지가 더 이상 이 호스트에 없다는 뜻**이다.
+릴리즈 이후 태그는 다시 이 규칙(지우지 않는다)의 적용을 받는다.
 
 **apt 버전 핀(p5c15, D-6 선행)**: 이 Dockerfile이 호명하는 apt 패키지 8개는 이제
 `=<정확한 버전>`으로 핀돼 있다(값의 출처·전량 핀을 포기한 근거·재핀 절차는 Dockerfile의
@@ -124,6 +138,8 @@ docker run --rm --entrypoint /bin/bash cv-infra-runner:<tag> -c \
 | `cv-infra-runner:p5c16-rebuild2` (**D-6 ① 동등성 대조군**) | `sha256:ef66de2401480b9f59f9f4f8e6a95aaa0e6f552b25d52c38e2d039a3939a931e` | 같은 커밋 `ac442ee`, **독립 `git archive` 컨텍스트(diff 공집합) + `--no-cache`**, **1m6s** | **Image Id 는 다르다**(D-6 예고대로) — 나머지는 동일: apt 매니페스트 252/252 · 전체 dpkg **413/413** · wheel 50파일 sha256 · import 스모크 · **같은 self-test 잡의 verdict·지표**. 총 Size 도 바이트 동일(15,461,682,451 B) |
 | `cv-infra-orchestrator:local` (평면 ②') | `sha256:0cbc0b0d284dd1c37fb76d8367f9394c0527aa1d9d6b4a10ead5623441e448f1` | `ac442ee` (`CV_SOURCE_REVISION=… docker compose … up -d --build`, **7.9 s**) | **compose 경로가 처음으로 revision 라벨을 남긴 이미지**(G-66 수리 확인). 리빌드 전 `:local`은 `rev=<unstamped>` → 게이트 exit 3, 후 exit 0 |
 | `cv-infra-selftest-stub:p5c16` (stub SUT 평면) | `sha256:b8a8b4c310d860a2ee84959fdbfa07140b3cd9c29414ef5269c8b62cb7ba861f` | `ac442ee` (`docker/selftest_stub/README.md` §5) | 931 MB · 라이브 self-test 4회에서 readiness 배리어 **0.36 s** 통과. ⚠ 이 빌드는 스탬프 레이어만 새로 굽고 **apt 레이어는 캐시 히트**였다 — 이 이미지의 핀 가용성은 오늘 재확인되지 **않았다** |
+| **`cv-infra-runner:prod-5ae46d5`** (**첫 릴리즈 각인 — 프로덕션 컷오버**) | `sha256:bb04b8b5fe5794ecfed22bc4f3ea5a0808f3c561cb032bed713fb2a95a169f17` | `5ae46d59acb5a296aefb966b58d76f60a30b62e9` (`git archive` 컨텍스트 + `--build-arg`) | **7 s** — ⚠ `docker/runner/Dockerfile` 무변경이라 apt 레이어 **캐시 히트**, 이 빌드도 apt 핀 가용성을 재확인하지 **않았다**(p5c16 의 2m10s 가 마지막 실검증) · wheel **50파일 ↔ 소스 diff 공집합** · 이미지 안 `./python.sh -c "import isaacsim, cv_infra"` OK(numpy 1.26.0 · pydantic 2.11.7) · 게이트 **exit 0**(3평면) · 라이브 self-test **2회 pass**(31 s / 32 s) · 태그가 **사이클 슬러그가 아니라 릴리즈 각인**인 첫 이미지 · 증적 = 메타 저장소 `evidence-manifests/2026-08-20-p5c19-intentional-expiry/cutover-records/` |
+| **`cv-infra-orchestrator:prod-5ae46d5`** (평면 ②' 릴리즈 각인) | `sha256:7fa08a866761752236ca9ba8edf47bf0c6eecc96daa66a0f4b28658a8177b77d` | 같은 커밋 (`CV_SOURCE_REVISION=… docker compose … up -d --build`, **14 s**) | G-88 그대로 — 러너 내용이 바뀌었든 아니든 **라벨을 옮기려면 이 이미지도 구워야** 게이트가 초록이 된다. `CV_ORCHESTRATOR_IMAGE` 를 `docker/.env` 에 명시해 compose 가 이 태그로 굽도록 고정했다(기본 `:local` 은 릴리즈 각인이 아니다) |
 | **`cv-infra-runner:p5c17`** (**G-74 스큐 창 폐쇄**) | `sha256:15f140d5b860bcd7d8fb6caa29b296b5887f64727b7707ab1acda1799162a786` | `8016803e4e5f7e4430d5c652a914af0fe7960f72` (`git archive` 컨텍스트 + `--build-arg`) | **5 s** — ⚠ apt 레이어 **캐시 히트**라 이 빌드는 apt 핀 가용성을 재확인하지 **않았다**(p5c16 의 2m10s 와 대비) · wheel **50파일 ↔ 소스 diff 공집합** · 이미지 안 `./python.sh -c "import isaacsim, cv_infra"` OK(pydantic 2.11.7 · numpy 1.26.0) · 게이트 **exit 0**(3평면) · `cv-infra run` 단독 경로 **exit 3 → exit 0**(같은 잡이 재빌드 전에는 `verdict=pass` 인데 exit 3, G-74) · 라이브 self-test pass · `docker/.env` 핀 갱신 + `up -d` · 증적 `~/cv-infra-p2-out/p5c17/t2/` |
 
 ### 게이트가 ③을 본다 (p5c13, Q1-B) — 그리고 **옛 이미지는 전부 미스탬프**다
