@@ -69,6 +69,25 @@ from cv_infra.contract.apiversion import API_VERSION
 Verdict = Literal["pass", "fail", "timeout", "error"]
 VERDICTS: tuple[str, ...] = ("pass", "fail", "timeout", "error")
 
+# Fixable example for a SUT image ref — a PLACEHOLDER SHAPE, never a real image
+# name, and the single definition of it (loader.py imports this one).
+#
+# It is not documentation: ``errors.py:_example_for`` renders ``examples=[...]``
+# VERBATIM into the friendly error a user gets when ``image_ref`` is missing
+# (NFR-INTAKE-001), so whatever stands here is what they will type next. Two
+# reasons, both measured on 2026-08-20, keep it synthetic:
+#   * a concrete name is advice to run THAT image, and no image is right for
+#     someone else's SUT. The example this replaced (``carter-sut:p2``) was
+#     deleted by the production cutover — ``RepoDigests: []``, not even
+#     re-fetchable (docs/evidence-anchors.md) — and kept being recommended.
+#   * the platform cannot guard a consumer image's lifetime: boundary rule 3
+#     means platform CI pulls nothing of the consumer's, so a real ref here has
+#     no mechanical anchor and dies silently (G-25). A shape cannot expire.
+# The shape is digest-pinned because that is the reproducibility rule (CLAUDE
+# §2-7) and because the live consumer ref proves the form runs end to end.
+# Pinned by tests/test_contract_errors_p3.py (a concrete tag fails that guard).
+EXAMPLE_IMAGE_REF = "ghcr.io/<org>/<image>@sha256:<64-hex-digest>"
+
 
 class _ForbidExtra(BaseModel):
     """Shared config: unknown keys are a loud contract violation, never dropped."""
@@ -177,10 +196,15 @@ class SutRef(_ForbidExtra):
     ``image_id`` optionally pins the EXACT image (image-as-artifact, FU-10):
     local tags carry no RepoDigest, so the docker Image Id is the pin. Optional
     — when given it must be a full ``sha256:`` id (loud, friendly reject
-    otherwise; example = the measured carter-sut:p2 Image Id).
+    otherwise). Its example is the Image Id measured for the first workstation
+    carter build, which the 2026-08-20 cutover deleted — kept as a shape sample
+    (a 64-hex id), NOT as a fetchable image (docs/evidence-anchors.md).
+
+    ``image_ref``'s example is a placeholder shape on purpose — see
+    ``EXAMPLE_IMAGE_REF`` above for why a real image name must not stand there.
     """
 
-    image_ref: str = Field(min_length=1, examples=["carter-sut:p2"])
+    image_ref: str = Field(min_length=1, examples=[EXAMPLE_IMAGE_REF])
     image_id: str | None = Field(
         default=None,
         pattern=r"^sha256:[0-9a-f]{64}$",
@@ -377,7 +401,7 @@ class VerificationRequest(_ForbidExtra):
             }
         ]
     )
-    sut: SutRef = Field(examples=[{"image_ref": "carter-sut:p2"}])
+    sut: SutRef = Field(examples=[{"image_ref": EXAMPLE_IMAGE_REF}])
     interface: Interface = Field(default_factory=Interface)
     acceptance_criteria: list[AcceptanceCriterion] = Field(
         min_length=1, examples=[[{"oracle": "reached_goal"}]]

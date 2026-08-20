@@ -18,7 +18,7 @@ from cv_infra.contract.errors import (
     from_validation_error,
     render_loc,
 )
-from cv_infra.contract.schema import Scenario, VerificationRequest
+from cv_infra.contract.schema import EXAMPLE_IMAGE_REF, Scenario, SutRef, VerificationRequest
 
 VERBATIM_KEYS = (
     "field_path",
@@ -166,3 +166,44 @@ def test_block_missing_nested_goal_carries_a_fixable_example():
     assert errors["goal"].got == "(missing)"
     assert errors["goal"].example.startswith("goal: {")
     assert "'yaw'" in errors["goal"].example
+
+
+def _names_a_runnable_image(example: str) -> bool:
+    """True when a rendered example hands the user a CONCRETE image name.
+
+    Placeholders carry ``<...>`` slots; a real ref (``carter-sut:p2``,
+    ``ghcr.io/org/img@sha256:ab..``) does not. Crude on purpose — the guard only
+    has to tell "shape" from "name" (karpathy: an assert, not a parser).
+    """
+    return "<" not in example
+
+
+def test_sut_image_examples_are_shapes_not_a_named_image():
+    """p5c20 pin — the example a user is TOLD to type must not name an image.
+
+    ``_example_for`` renders ``Field(examples=[...])`` verbatim into the friendly
+    error, so a concrete name is advice to run THAT image. On 2026-08-20 the
+    standing example ``carter-sut:p2`` was deleted by the production cutover
+    (``RepoDigests: []`` -> not even re-fetchable, docs/evidence-anchors.md) and
+    the platform cannot notice a consumer image dying (boundary rule 3: CI pulls
+    nothing of the consumer's). Shapes cannot expire; names can and did.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        SutRef.model_validate({})
+    (missing_ref,) = from_validation_error(exc_info.value, model=SutRef)
+    with pytest.raises(ValidationError) as exc_info:
+        VerificationRequest.model_validate({"apiVersion": "cv-infra/v1"})
+    missing_block = {
+        e.field_path: e for e in from_validation_error(exc_info.value, model=VerificationRequest)
+    }["sut"]
+
+    for err in (missing_ref, missing_block):
+        assert "image_ref" in err.example
+        assert not _names_a_runnable_image(err.example), err.example
+
+    # 비공허 대조군 (G-07): the predicate really discriminates — both the dead
+    # example this replaced and a live registry digest are rejected as NAMES.
+    assert _names_a_runnable_image("image_ref: carter-sut:p2")
+    assert _names_a_runnable_image("image_ref: ghcr.io/o/i@sha256:" + "d" * 64)
+    # ...and the shipped shape teaches the digest pin (CLAUDE §2-7).
+    assert "@sha256:" in EXAMPLE_IMAGE_REF

@@ -42,7 +42,7 @@ from pydantic import ValidationError
 
 from cv_infra.contract import errors as _errors
 from cv_infra.contract.errors import ContractError
-from cv_infra.contract.schema import VerificationRequest
+from cv_infra.contract.schema import EXAMPLE_IMAGE_REF, VerificationRequest
 from cv_infra.contract.version import resolve_api_version
 from cv_infra.oracles.base import load_oracle  # sanctioned edge (.importlinter ignore)
 
@@ -99,7 +99,7 @@ def load_request(
         raise ContractError(
             expected="a YAML mapping (scenario / sut / interface / acceptance_criteria)",
             got=repr(doc),
-            example="sut:\n  image_ref: carter-sut:p2",
+            example=f"sut:\n  image_ref: {EXAMPLE_IMAGE_REF}",
             doc_link=_DOC_LINK,
             source_path=source_path,
         )

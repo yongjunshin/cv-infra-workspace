@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 import cv_infra.contract.loader as loader_mod
 import cv_infra.contract.version as version_mod
@@ -85,7 +86,12 @@ def test_canonical_fixture_admits_with_bound_oracles():
     assert admitted.oracles == ("reached_goal", "no_collision")  # stage-5 binding proof
     assert admitted.warnings == ()
     assert admitted.source_path == str(FIXTURE)
-    assert admitted.request.sut.image_ref == "carter-sut:p2"
+    # The SUT ref is carried through UNMANGLED — compared against an independent
+    # plain-yaml read of the same file, never a retyped literal: the fixture is a
+    # COPY of the consumer document and its image ref moves when the consumer's
+    # does (it did on 2026-08-20, G-25/G-79). The 6-stage loader vs. yaml.safe_load
+    # are two different paths, so this is a pass-through assert, not a tautology.
+    assert admitted.request.sut.image_ref == yaml.safe_load(_fixture_text())["sut"]["image_ref"]
     assert admitted.request.scenario.timeout_s == 120
 
 
