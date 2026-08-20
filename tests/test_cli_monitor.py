@@ -71,6 +71,9 @@ def test_monitor_renders_the_pinned_projection_as_operator_table(monkeypatch, ca
     assert "queue_depth=0" in out and "running_k=0" in out and "over_launch_count=0" in out
     # The pin predates the budget field (p4c6 bbad1e4) -> absent scalar degrades (G-17).
     assert "concurrency_budget_k=n/a" in out
+    # ... and it predates resource_budget entirely (p5c18): absence is RENDERED,
+    # not omitted — the operator can tell "no budget held" from "build shows none".
+    assert "budget:    n/a  (no complete Resource Budget held)" in out
     assert "vram=n/a/n/a MiB" in out and "gpu_util=n/a%" in out
 
     lines = out.splitlines()
@@ -169,6 +172,120 @@ def test_monitor_shows_the_servers_concurrency_budget_k_verbatim(
     out = capsys.readouterr().out
     assert f"concurrency_budget_k={shown}" in out
     assert "running_k=5" in out
+
+
+# --------------------------------------------------------------------------- #
+# (1b) resources.resource_budget — the INPUTS k was computed from (p5c20 ④)
+# --------------------------------------------------------------------------- #
+# REQ-DEPLOY-012. p5c18 put the operator budget object on /monitor.json and the
+# HTML dashboard; the CLI axis (SSH/headless ops) was the one surface still showing
+# the derived cap without its inputs. Display-only, same as everything else here.
+
+
+_BUDGET = {"vram_per_instance_gb": 7.8125, "max_concurrent": 8, "scheduling_policy": "fifo"}
+
+
+def _render_with_budget(budget) -> str:
+    """Render the pinned projection with ``resources.resource_budget`` replaced."""
+    payload = json.loads(_MONITOR_SAMPLE_JSON)
+    payload["resources"]["resource_budget"] = budget
+    return monitor.render_monitor(payload)
+
+
+def test_monitor_shows_the_held_resource_budget_verbatim(monkeypatch, capsys):
+    """The three ``ResourceBudget`` values are COPIED from the server, not derived.
+
+    무장(비공허): the payload's ``concurrency_budget_k`` (4) deliberately DISAGREES
+    with the budget's ``max_concurrent`` (8) — exactly the real deployment shape
+    (VRAM caps k below the operator's request). A renderer that echoed k instead of
+    the held budget would print 4 here and be red.
+    """
+    payload = json.loads(_MONITOR_SAMPLE_JSON)
+    payload["resources"]["concurrency_budget_k"] = 4
+    payload["resources"]["resource_budget"] = _BUDGET
+
+    _wire_ok(monkeypatch, payload)
+    assert main(["monitor"]) == EXIT_PASS
+    out = capsys.readouterr().out
+    assert "concurrency_budget_k=4" in out  # the derived cap
+    assert "vram_per_instance_gb=7.8125" in out  # ... and the inputs it came from
+    assert "max_concurrent=8" in out
+    assert "scheduling_policy=fifo" in out
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        pytest.param(None, id="explicit-null"),
+        pytest.param("ABSENT", id="key-absent-pre-p5c18-server"),
+    ],
+)
+def test_absent_budget_is_rendered_as_absent_never_fabricated(budget):
+    """★ 부재를 그대로 렌더한다 (VRAM 미측정 배포 = ``null``, 구 서버 = 키 자체 없음).
+
+    Both land on the same honest line. The negative half matters as much as the
+    positive: no number appears, and the LINE still appears — a renderer that
+    dropped the line silently would leave the operator unable to distinguish
+    "platform holds no budget" from "this build does not show budgets".
+    """
+    payload = json.loads(_MONITOR_SAMPLE_JSON)
+    if budget == "ABSENT":
+        payload["resources"].pop("resource_budget", None)
+    else:
+        payload["resources"]["resource_budget"] = budget
+    out = monitor.render_monitor(payload)
+
+    line = next(ln for ln in out.splitlines() if ln.startswith("budget:"))
+    assert line == "budget:    n/a  (no complete Resource Budget held)"
+    for fabricated in ("vram_per_instance_gb=", "max_concurrent=", "scheduling_policy=", "0"):
+        assert fabricated not in line
+
+
+def test_partial_budget_degrades_only_the_missing_field():
+    """G-17 lenient parse, field-wise: a budget missing a sub-key shows ``n/a``
+    for that key alone — the present values still reach the operator."""
+    out = _render_with_budget({"max_concurrent": 8})
+    line = next(ln for ln in out.splitlines() if ln.startswith("budget:"))
+    assert "max_concurrent=8" in line
+    assert "vram_per_instance_gb=n/a" in line
+    assert "scheduling_policy=n/a" in line
+
+
+def test_budget_line_renders_every_field_the_m1_model_declares():
+    """★ 렌더러가 모델보다 뒤처지는 것을 막는 가드 — ④가 바로 그 결함이었다.
+
+    The rendered key set is compared against ``ResourceBudget.model_fields`` (M1
+    단일 정의, G-56) rather than a retyped list, so a field added to the budget
+    model turns THIS test red instead of shipping a renderer that quietly omits it
+    (which is exactly how ``resource_budget`` sat unrendered from p5c18 to p5c20).
+    """
+    from cv_infra.contract.schema import ResourceBudget
+
+    declared = set(ResourceBudget.model_fields)
+    live = ResourceBudget(**_BUDGET).model_dump(mode="json")
+    assert set(live) == declared  # 양성 대조: dump가 모델 필드를 다 낸다
+
+    line = next(
+        ln for ln in _render_with_budget(live).splitlines() if ln.startswith("budget:")
+    )
+    rendered = {cell.split("=", 1)[0] for cell in line.removeprefix("budget:").split()}
+    assert rendered == declared, f"budget line drifted from the M1 model: {rendered ^ declared}"
+
+
+def test_budget_line_is_operational_only_no_domain_detail():
+    """NEG-3 정렬 (운영뷰 ≠ 도메인 결과 뷰): the budget line reads ONLY budget keys.
+
+    The domain set is DERIVED from the M1 producer models — the same rule
+    tests/negative/test_monitor_no_domain_leak.py uses — so this cannot go stale.
+    """
+    from cv_infra.contract.schema import CriterionResult, Metrics, Scenario, SutRef
+
+    domain_names = set().union(
+        *(set(m.model_fields) for m in (CriterionResult, Metrics, Scenario, SutRef))
+    )
+    assert domain_names, "도메인 집합이 비었다 — 아래 단정이 공허하다"
+    line = next(ln for ln in _render_with_budget(_BUDGET).splitlines() if ln.startswith("budget:"))
+    assert not [name for name in domain_names if name in line], line
 
 
 # --------------------------------------------------------------------------- #
