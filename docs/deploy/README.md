@@ -460,9 +460,15 @@ curl -sS "http://127.0.0.1:${CV_PUBLISH_PORT:-8000}/monitor.json" \
 cvi monitor --api http://orchestrator:8000
 
 # 5) 외부 egress 감사를 무장한다 — 제어 평면을 새로 띄웠으면 **반드시 다시** (G-73)
-#    ⚠ 처음 하는 호스트라면 감사 사이드카 이미지를 먼저 굽는다. 이 이미지는 저장소에
-#      Dockerfile 로 존재하지 않고 2줄짜리 레시피가 scripts/netns_audit.sh 헤더에 있다
-#      (CV_NETNS_AUDIT_IMAGE 항목). 없이 부르면 docker 가 레지스트리를 찾다가 exit 125 다.
+#    ⚠ 처음 하는 호스트라면 감사 사이드카 이미지를 먼저 굽는다. 없이 부르면 docker 가
+#      레지스트리를 찾다가 exit 125 이고, 그 호스트의 평면은 **감사 없이** 돈다 —
+#      "external_packets=0" 이 아니라 "관측 없음"이다(둘을 같은 칸에 쓰지 마라, G-73 ③).
+docker build -f docker/netns_audit/Dockerfile -t cv-netns-audit:p5c8 docker/netns_audit
+#      태그는 scripts/netns_audit.sh 의 기본값 정의 줄(`CV_NETNS_AUDIT_IMAGE=...`)과 같아야
+#      한다 — 다른 태그로 구웠으면 그 이름을 CV_NETNS_AUDIT_IMAGE 로 넘겨라. 관례로 추측
+#      하지 말고 그 줄을 읽어라(G-86: 추측한 기본값이 실제로 두 번 거짓 보고를 냈다).
+#      ⚠ 이미 그 태그가 있는 호스트에서는 **다시 굽지 마라** — 무장된 평면이 지금 쓰는
+#      이미지다. 갱신이 필요하면 새 태그로 굽고 CV_NETNS_AUDIT_IMAGE 로 가리킨다(G-88).
 bash scripts/netns_audit.sh arm cv-infra-orchestrator
 #    arm 은 컨테이너 정체성(id + started_at)을 레코드 파일에 남긴다:
 #      ${CV_NETNS_AUDIT_RECORD_DIR:-/tmp}/cv-netns-audit.<chain>.<container>.arm  (+ .history)
