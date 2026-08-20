@@ -151,10 +151,35 @@ services:
       # does not make the cache read-only, it DISABLES it (G-34, measured p4c5).
       - "${CV_ISAAC_CACHE_ROOT}:${CV_ISAAC_CACHE_ROOT}:ro"
       - "${CV_ISAAC_CACHE_SCRATCH_ROOT}:${CV_ISAAC_CACHE_SCRATCH_ROOT}"
-      # If submitted requests reference host paths outside the roots above (e.g. an
-      # oracle plugin dir, or a CI runner workspace holding scenario YAML), add the
-      # same identical-path read-only bind for that root, e.g.:
-      #   - "/home/<operator>/actions-runner/_work:/home/<operator>/actions-runner/_work:ro"
+      # ---- EXTRA INPUT ROOT (optional) — the comment above used to stop here -----
+      # Submitted requests routinely reference host paths OUTSIDE every root above:
+      # a CI runner checks scenario YAML out into its own workspace, and the
+      # scenario's DIRECTORY is also the oracle plugin dir that the supervisor
+      # validates and bind-mounts into the runner (D-1). The control plane resolves
+      # those host paths against ITS OWN filesystem, so a path it cannot see is
+      # rejected as "does not exist" even though the file is right there on the host.
+      #
+      # This line used to be an EXAMPLE IN A COMMENT, and the repair lived only in a
+      # hand-typed `docker run -v ...` on the workstation. Measured cost of that
+      # (2026-08-20, p5c19 F-2): the very first consumer E2E after the control plane
+      # became a compose container (p5c14) failed with
+      #   ValueError: oracle_plugin_dir <runner _work>/scenarios does not exist
+      # 10 of 11 steps had already passed. The plane was healthy; it simply could not
+      # SEE the input. A fix that is not in this file is not deployed (G-43/G-71).
+      #
+      # UNSET = adds nothing. It then renders as an exact duplicate of the cache bind
+      # above and compose collapses the two into one entry — MEASURED on compose
+      # v2.39.2: `config` renders a single bind and `up` exits 0. Do NOT "simplify"
+      # this to an empty default `${VAR:-}`: that renders `::ro` and every compose
+      # subcommand dies with `invalid spec: ::ro: empty section between colons`
+      # (also measured, same day) — on every host that does not set the variable.
+      #
+      # EXPOSURE, stated plainly: setting this makes the WHOLE named tree readable by
+      # the control plane (`:ro`, never writable). Point it at the narrowest root that
+      # still contains the inputs you submit — a CI runner's `_work` root is the usual
+      # answer on a host that also hosts the runner, and nothing at all is the right
+      # answer on a host that does not.
+      - "${CV_CI_WORKSPACE_ROOT:-${CV_ISAAC_CACHE_ROOT}}:${CV_CI_WORKSPACE_ROOT:-${CV_ISAAC_CACHE_ROOT}}:ro"
 
     # The control plane needs NVML only (no render). On a host without the NVIDIA
     # container runtime this reservation makes `up` fail loudly — intended: this
