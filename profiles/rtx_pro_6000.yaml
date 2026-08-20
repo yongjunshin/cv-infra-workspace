@@ -33,5 +33,15 @@ match_name_pattern: RTX[ _-]?PRO[ _-]?6000
 # Per-instance VRAM in MiB -> emitted as CV_VRAM_PER_INSTANCE_MB, i.e. the NVML 2nd
 # guard input of k = min(max_concurrent, floor(availVRAM / this), render_cap)
 # (cv_infra/orchestrator/scheduler.py::compute_k, LOCKED §7.4).
+# ★ TWO LIMITS, STATED (do not silently inherit them):
+#   * the workload WAS valid (carter scenarios x4, repeats 2, k=1..8 — a MOVING robot, so
+#     G-85/G-80 do not bite here the way they bit rtx_4080.yaml), but the number is the
+#     ROUNDED top of a mean band (5947-6043 MiB), not the verbatim observed maximum that
+#     the 4080 profile's adoption rule requires. On this card it changes nothing
+#     operationally: floor(97192/6000) = floor(97192/6043) = 16, and this deployment runs
+#     CV_MAX_CONCURRENT=2. Re-measure with the 0.5 s per-PID method when a moving SUT is
+#     next available on this host and replace BOTH the number and its source line.
+#   * only method (B) (per-PID) was ever run here. Method (A) (GPU-wide peak minus idle),
+#     which is what catches the graphics context, has never been run on this card.
 vram_per_instance_mb: 6000
-vram_per_instance_source: implementation-plan/nfr-measurement-notes.md P4c5 (2026-07-15, QA passed) per-PID steady peak ~6.0 GiB, mean 5947-6043 MiB, flat over k=1..8; raw evidence on the workstation at ~/cv-infra-p2-out/p4c5/{T6,T6-resume}/; the same 6000 ran live as the NVML guard in the p5c10 k=8 leg
+vram_per_instance_source: implementation-plan/nfr-measurement-notes.md P4c5 (2026-07-15, QA passed) per-PID steady peak ~6.0 GiB, mean 5947-6043 MiB, flat over k=1..8; raw evidence WAS on the workstation at ~/cv-infra-p2-out/p4c5/{T6,T6-resume}/ — INTENTIONALLY EXPIRED 2026-08-20 (decision p5c19 D-1), file list + sha256 preserved in the meta repo evidence manifest; re-measure rather than cite the dead path; the same 6000 ran live as the NVML guard in the p5c10 k=8 leg

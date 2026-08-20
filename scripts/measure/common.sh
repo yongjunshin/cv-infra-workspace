@@ -31,10 +31,17 @@ source "$_CV_MEASURE_DIR/../workstation_setup/common.sh"
 # ---------------------------------------------------------------------------
 
 # The harness boots the RUNNER image (cv_infra wheel + Isaac), NOT the bare isaac-sim
-# base (CV_ISAAC_IMAGE from the sourced SoT). Wave 2 overrides with the freshly-built
-# runner image (image 5호) via CV_MEASURE_IMAGE. Default = the last known-good runner
-# tag verified end-to-end in T0 (fu16-probe); env-overridable, never floating.
-readonly CV_MEASURE_IMAGE="${CV_MEASURE_IMAGE:-cv-infra-runner:p2c5}"
+# base (CV_ISAAC_IMAGE from the sourced SoT). Overridable with the freshly-built runner
+# image via CV_MEASURE_IMAGE; env-overridable, never floating.
+#
+# The default USED to be `cv-infra-runner:p2c5` ("last known-good tag verified in T0").
+# That tag no longer exists on any host: the 2026-08-20 production cutover deleted all 15
+# pre-release runner tags by CEO decision (p5c19 D-3 neighbourhood — the runner tags were
+# experiment residue, not evidence). A default naming a deleted image is worse than no
+# default: every measure script would die at `docker run` with an unhelpful pull error.
+# The default is therefore the RELEASE image the production plane is pinned to.
+# When the release moves, this line moves with it (same discipline as docker/.env's pin).
+readonly CV_MEASURE_IMAGE="${CV_MEASURE_IMAGE:-cv-infra-runner:prod-5ae46d5}"
 
 # Scene ref used to WARM the asset closure. Joined to get_assets_root_path() at run
 # time by warm_scene.py — a measurement INPUT, never a product hardcode (R7). It MUST
