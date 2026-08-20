@@ -100,9 +100,39 @@ jobs:
     needs: lint
     if: ${{ vars.CV_SELFTEST_ENABLED == 'true' }}
     runs-on: [self-hosted, cv-infra-gpu]
-    # Job cap sits ABOVE the CLI's own --timeout below, so a wedged round-trip is
-    # ended by the CLI (honest exit 3 + message) rather than by a job cancellation.
-    timeout-minutes: 35
+    # TIMEOUT LAYERING (repaired p5c20 ⑥ — the previous comment asserted an
+    # invariant the numbers did not satisfy). Three clocks, innermost first:
+    #
+    #   1. `--timeout 1800` (CLI, 30m). Starts AFTER submit and covers QUEUE WAIT
+    #      + execution (the deadline in `batch._poll_until_terminal`), so the wait
+    #      for a busy GPU is inside the CLI's budget, not outside it. Exceeded =>
+    #      honest exit 3 naming the envelope.
+    #   2. this job's selftest STEP cap, 1 minute above (1) — see there. The CLI
+    #      therefore always ends a wedged round-trip itself; the step cap is a
+    #      backstop for a CLI that stops polling altogether.
+    #   3. this job cap, which must cover SETUP + (2). Setup is on the job clock
+    #      but NOT on the CLI's — which is exactly what `35` forgot: it compared
+    #      35 > 30 and ignored everything before the step started.
+    #      45 - 31 = 14m of setup budget.
+    #
+    # The two relations are ENFORCED, not just described:
+    # tests/test_gh_wiring_static.py::test_self_test_timeout_layering_* reads these
+    # numbers out of this file (and its twin proves the predicate rejects `35`).
+    #
+    # MEASURED, this tier (run 32342573510, 2026-08-20): setup = 7m46s from job
+    # start to the selftest step — `Set up job` 1m38s + checkout/uv ~2s + `uv sync
+    # --frozen` 6m05s. The 14m budget above is 1.8x that single observation; it is
+    # a BUDGET, not an NFR (CLAUDE §2-4). WHAT HAPPENED IN THAT RUN: the consumer
+    # E2E held both k=2 slots 07:10->07:43Z, the self-test envelope queued 27m21s,
+    # and the 35m job cap fired at 07:43:09Z — 47 SECONDS BEFORE that envelope
+    # completed successfully (env-3fe4916c5498, 07:43:56Z). Product healthy, gate
+    # red: precisely what this layering exists to prevent. Not a one-off — one
+    # operational plane at k=2 means consumer E2E and platform self-test compete
+    # for the same GPU by construction, so queue waits of this size are normal.
+    # NOT REPAIRED BY LOWERING `--timeout`: that would make the CLI abandon
+    # legitimately queued work sooner, and 1800 has no CI-tier measurement behind
+    # it (step comment below) — tightening it would be fabrication (§2-4).
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -129,7 +159,13 @@ jobs:
       # job, and under non-exclusive conditions, so neither number is written into
       # an NFR or used to tighten this cap. Replace 1800 with a cost measured from
       # THIS tier, in the same commit that records the measurement.
+      #
+      # Step cap = the CLI's own --timeout + 1m of grace (30m + 1m). This is the
+      # ONE comparison that makes the "the CLI ends it, not a cancellation"
+      # invariant true, and it is local: both numbers are on adjacent lines, so
+      # changing one without the other is caught by the static layering test.
       - name: cv-infra selftest (built-in stub round-trip)
+        timeout-minutes: 31
         env:
           CV_SELFTEST_SUT_IMAGE: ${{ vars.CV_SELFTEST_SUT_IMAGE }}
           CV_INFRA_API: ${{ vars.CV_INFRA_API }}
