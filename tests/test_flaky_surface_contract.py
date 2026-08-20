@@ -164,10 +164,11 @@ def test_matrix_columns_and_flaky_row_cells(tmp_path):
         "pass",
         "fail",
         "flaky",
+        "identity",  # p5c20 ⑦ 후속 — ADDED after flaky, ahead of the free-text cell
         "metrics",
     ]
-    # cells[:7] = the M-2 surface (the trailing metrics cell is M4's own contract,
-    # covered by tests/test_report_github_renderer.py — not re-pinned here).
+    # cells[:7] = the M-2 surface (the trailing identity/metrics cells are M4's own
+    # contract, covered by tests/test_report_github_renderer.py — not re-pinned here).
     assert _md_cells(body, "req-flaky")[:7] == [
         "req-flaky",
         "carter-sut:flaky",

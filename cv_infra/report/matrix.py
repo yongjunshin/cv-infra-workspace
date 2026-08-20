@@ -22,20 +22,23 @@ from collections import Counter
 from typing import Any
 
 from cv_infra.orchestrator.models import RequestRollup, Verdict
+from cv_infra.report.identity_display import identity_cell, was_abbreviated
 
 #: Text-render column order (matches the row dict shape below). ``identity_key``
 #: is APPENDED (p5c20 ⑦): the six preceding columns keep their meaning and order.
 _HEADERS = ("request_id", "verdict", "flakiness", "jobs", "pass", "fail", "identity_key")
 
-#: ``request_identity_key`` cell budget: ``sha256:`` + the first 12 of 64 hex.
 #: The full key is 71 chars — wider than the other six columns together — so the
-#: text table shows a prefix and SAYS SO (``_IDENTITY_LEGEND``); the untruncated
-#: value stays in the report JSON (``matrix[].request_identity_key``).
-_IDENTITY_CELL_CHARS = len("sha256:") + 12
-_TRUNCATION_MARK = "…"
+#: text table shows the shared abbreviated cell (``identity_display``, the ONE
+#: display rule both human surfaces use) and SAYS SO (``_IDENTITY_LEGEND``); the
+#: untruncated value stays in the report JSON (``matrix[].request_identity_key``),
+#: which ``cv-infra report --json`` prints verbatim.
 _IDENTITY_LEGEND = (
     "identity_key: abbreviated prefix (…) — full key: report JSON matrix[].request_identity_key"
 )
+
+#: Null idiom of this table (already used by the ``flakiness`` column).
+_ABSENT = "-"
 
 
 def build_matrix(rollups: list[RequestRollup]) -> dict[str, Any]:
@@ -86,27 +89,6 @@ def build_matrix(rollups: list[RequestRollup]) -> dict[str, Any]:
     }
 
 
-def _identity_cell(key: Any) -> str:
-    """Render one ``request_identity_key`` cell — truncated, never fabricated.
-
-    Present → the key's first ``_IDENTITY_CELL_CHARS`` chars + ``…``. Only a
-    SUFFIX is dropped, so what the terminal shows stays a literal PREFIX of the
-    stored key (``request_baselines.request_identity_key`` — the C-1 baseline PK
-    and therefore the axis every regression judgement is made on): it can be
-    pasted into a prefix lookup, and the untruncated value is one ``--json``
-    away. Absent (``None``, or a row carrying no such field at all — the
-    ``build_matrix`` preview rows are built from rollups and never see a request,
-    and a single-run producer may not carry the key yet) → the table's existing
-    null idiom ``-``. Absence renders as absence, never as an invented key.
-    """
-    if not key:
-        return "-"
-    text = str(key)
-    if len(text) <= _IDENTITY_CELL_CHARS:
-        return text
-    return text[:_IDENTITY_CELL_CHARS] + _TRUNCATION_MARK
-
-
 def render_text(matrix: dict[str, Any]) -> str:
     """Deterministic human-readable table for a ``build_matrix`` result.
 
@@ -116,7 +98,8 @@ def render_text(matrix: dict[str, Any]) -> str:
 
     ``identity_key`` reads the row's ``request_identity_key`` when the caller's
     rows carry it (the §3.4 report rows the CLI adapts do; the P4 preview rows
-    ``build_matrix`` emits do not) and renders it via ``_identity_cell``. The
+    ``build_matrix`` emits do not) and renders it via the shared
+    ``identity_display.identity_cell`` (same rule as the GitHub surfaces). The
     abbreviation legend is appended only when a cell was actually truncated —
     an unabbreviated table must not claim it abbreviated anything.
     """
@@ -133,7 +116,7 @@ def render_text(matrix: dict[str, Any]) -> str:
             str(row["jobs"]),
             str(row["counts"]["pass"]),
             str(row["counts"]["fail"]),
-            _identity_cell(row.get("request_identity_key")),
+            identity_cell(row.get("request_identity_key"), absent=_ABSENT),
         )
         for row in matrix["matrix"]
     ]
@@ -142,6 +125,6 @@ def render_text(matrix: dict[str, Any]) -> str:
     ]
     lines = [head, "  ".join(h.ljust(w) for h, w in zip(_HEADERS, widths)).rstrip()]
     lines += ["  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in rows]
-    if any(row[-1].endswith(_TRUNCATION_MARK) for row in rows):
+    if any(was_abbreviated(row[-1]) for row in rows):
         lines.append(_IDENTITY_LEGEND)
     return "\n".join(lines)
