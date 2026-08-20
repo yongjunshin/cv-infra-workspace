@@ -122,31 +122,80 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 # never builds is worse than an honest partial pin. (The closure-wide fix is an
 # archive snapshot service, not more pins; packages.ros.org has none — out of scope.)
 #
-# SOURCE OF THE VALUES (never invented — §2-4 / G-64): read out of the image that
-# is actually in service, cv-infra-runner:p5c15, on the workstation over SSH,
-# read-only, 2026-08-14 — same dpkg-query call the layer itself uses below:
-#   docker run --rm --entrypoint dpkg-query cv-infra-runner:p5c15 -W -f=... <pkgs>
-# Base-provided vs installed here (same day, same method, against the digest-pinned
+# SOURCE OF THE VALUES (never invented — §2-4 / G-64). These no longer share one
+# provenance, so they are listed per value rather than under one sentence (G-79: when
+# one value moves, the prose that described all of them stops being true):
+#
+#   * ca-certificates=20260601~24.04.1, gnupg=2.4.4-2ubuntu17.4, and the 5 ros-jazzy
+#     versions below — read out of the image then in service, cv-infra-runner:p5c15,
+#     on the workstation over SSH, read-only, 2026-08-14, with the same dpkg-query
+#     call this layer prints. ⚠ That image no longer exists (deleted 2026-08-20 in the
+#     production cutover — docs/evidence-anchors.md); the measurement stands, the
+#     path to re-run it does not. All 7 were RE-CONFIRMED as still served by their
+#     archives on 2026-08-21 (per-pin dry-run, p5c20 F-7).
+#
+#   * curl=8.5.0-2ubuntu10.12 — measured 2026-08-21 (p5c20 F-8) by ASKING THE ARCHIVE
+#     from this image's own stage-1 base, because the previous pin (8.5.0-2ubuntu10.11)
+#     had been WITHDRAWN and a --no-cache build failed on it ("E: Version
+#     '8.5.0-2ubuntu10.11' for 'curl' was not found"). Query, verbatim:
+#       docker run --rm --user 0 --entrypoint bash nvcr.io/nvidia/isaac-sim:5.1.0 -c \
+#         'apt-get update -qq && apt-cache policy curl'
+#       -> base: Ubuntu 24.04.2 LTS (noble); Candidate: 8.5.0-2ubuntu10.12, and that
+#          was the ONLY version in the table (.11 gone from noble-updates/-security).
+#     Verified by a --no-cache build of this file the same day (see the report).
+#
+# Base-provided vs installed here (2026-08-14, same method, against the digest-pinned
 # base): ca-certificates 20240203 and curl 8.5.0-2ubuntu10.6 ship IN the base and
 # are UPGRADED by this layer; gnupg is absent from the base and is NEW here.
 #
 # WHEN A PIN DISAPPEARS the build fails loudly (both installs print the re-pin
-# recipe). That is the intended §2-7 trade: a loud break beats silent drift. The
-# re-pin instrument is the dpkg-query manifest this layer still prints — keep it.
-# Re-pinning is: read the manifest/dpkg-query of the last good image, replace the
-# versions below, record the measurement in the report (G-24).
+# recipe). That is the intended §2-7 trade: a loud break beats silent drift.
+#
+# ★ RE-PINNING HAS TWO FAILURE MODES AND THEY NEED DIFFERENT INSTRUMENTS. Reaching
+# for the wrong one is not a slow path, it is a CIRCULAR one — measured 2026-08-21
+# (p5c20 F-7/F-8), which is why this block now spells both out:
+#
+#   (A) THE IMAGE IS STALE — you want the versions a known-good image was built
+#       with (e.g. reproducing an old build, or answering "what shipped?").
+#       INSTRUMENT: the last good image.
+#         docker run --rm --entrypoint dpkg-query <last-good-runner-image> -W \
+#           -f='${binary:Package}=${Version}\n' <the pkg names>
+#       (the dpkg-query manifest this layer prints is the same instrument — keep it)
+#
+#   (B) THE ARCHIVE WITHDREW THE VERSION — the build just failed with
+#       "E: Version 'X' for 'pkg' was not found". Ubuntu drops superseded versions
+#       out of noble-updates/-security on every security bump, so the version is
+#       simply GONE while the image that has it is fine.
+#       ⚠ INSTRUMENT (A) IS USELESS HERE AND LOOKS LIKE IT WORKS: the last good
+#       image dutifully reports the very version the archive just said does not
+#       exist — of course it does, it was alive when that image was built. Applying
+#       it re-pins the dead value and the next build fails identically.
+#       INSTRUMENT: ASK THE ARCHIVE, from this image's own base:
+#         docker run --rm --user 0 --entrypoint bash <base image> -c \
+#           'apt-get update -qq && apt-cache policy curl ca-certificates gnupg'
+#       Take the Candidate line. (docker/netns_audit/Dockerfile already said this;
+#       this file did not, and that gap cost a cycle.)
+#
+# Either way: replace the versions below and RECORD the measurement — what was
+# queried, from which base, on what date (G-24) — in the report and beside the pin.
 USER root
 RUN set -eu; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates=20260601~24.04.1 \
-        curl=8.5.0-2ubuntu10.11 \
+        curl=8.5.0-2ubuntu10.12 \
         gnupg=2.4.4-2ubuntu17.4 \
     || { echo "ERROR: a pinned ubuntu-archive version above is no longer in the index" \
-              "(superseded versions leave noble-updates/-security). RE-PIN: read the" \
-              "versions off the last good runner image with 'dpkg-query -W' and update" \
-              "the apt VERSION PINS block in docker/runner/Dockerfile (D-6, CLAUDE §2-7)."; \
+              "(superseded versions LEAVE noble-updates/-security on every security bump)." \
+              "RE-PIN by ASKING THE ARCHIVE what it serves now — NOT by reading the last" \
+              "good image, which still holds the version that just failed and would send" \
+              "you in a circle (measured 2026-08-21):" \
+              "  docker run --rm --user 0 --entrypoint bash <this image's base> -c" \
+              "    'apt-get update -qq && apt-cache policy ca-certificates curl gnupg'" \
+              "Take the Candidate line, update the apt VERSION PINS block in" \
+              "docker/runner/Dockerfile, record what/when/from-where (G-24), and re-verify" \
+              "with a --no-cache build (D-6, CLAUDE §2-7)."; \
          exit 1; }; \
     curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
          -o /usr/share/keyrings/ros-archive-keyring.gpg; \
