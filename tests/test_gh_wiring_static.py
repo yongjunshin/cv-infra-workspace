@@ -677,6 +677,66 @@ def test_self_test_tier_is_gated_and_bakes_no_image_ref():
     assert job["timeout-minutes"]  # a wedged GPU job never holds CI open forever
 
 
+# --- the self-test tier's TIMEOUT LAYERING (p5c20 ⑥) ------------------------- #
+# The job comment claims "a wedged round-trip is ended by the CLI (honest exit 3)
+# rather than by a job cancellation". Until p5c20 that was PROSE ONLY, and it was
+# FALSE: `timeout-minutes: 35` vs `--timeout 1800` (30m) compared two numbers on
+# different clocks — the job clock also carries setup, which the CLI's does not.
+# Run 32342573510 (2026-08-20) paid for it: setup 7m46s + a 27m21s queue wait hit
+# the 35m job cap at 07:43:09Z, 47 s BEFORE the envelope completed successfully.
+# The gate went red on a healthy product. So the relation is asserted here.
+
+#: Setup measured on THIS tier (run 32342573510): job start -> selftest step start
+#: = 7m46s (`Set up job` 1m38s + checkout/uv ~2s + `uv sync --frozen` 6m05s). One
+#: observation, used as a floor for the setup budget — not an NFR (CLAUDE §2-4).
+_MEASURED_SETUP_MINUTES = 7 + 46 / 60
+
+
+def _layering_holds(job_cap_min, step_cap_min, cli_timeout_s) -> bool:
+    """The two relations the comment promises, as one predicate.
+
+    (1) the CLI's own budget expires INSIDE its step  -> the CLI reports, not the
+        runner; (2) the job cap leaves the measured setup room ON TOP of that step
+        -> setup never eats the round-trip's budget (the p5c20 ⑥ defect).
+    """
+    if step_cap_min is None or job_cap_min is None:
+        return False
+    return (
+        step_cap_min * 60 > cli_timeout_s and job_cap_min - step_cap_min >= _MEASURED_SETUP_MINUTES
+    )
+
+
+def test_self_test_timeout_layering_lets_the_cli_end_a_wedged_round_trip():
+    """★ The invariant, read off the FILE instead of asserted in a comment."""
+    job = _load(_PLATFORM_CI)["jobs"]["selftest"]
+    step = next(s for s in job["steps"] if "cv-infra selftest" in str(s.get("run", "")))
+    match = re.search(r"--timeout\s+(\d+)", str(step["run"]))
+    assert match, "the selftest invocation carries no --timeout to layer against"
+    cli_timeout_s = int(match.group(1))
+
+    job_cap = job.get("timeout-minutes")
+    step_cap = step.get("timeout-minutes")
+    assert _layering_holds(job_cap, step_cap, cli_timeout_s), (
+        f"timeout layering broken: job={job_cap}m step={step_cap}m cli={cli_timeout_s}s "
+        f"(need step*60 > cli AND job - step >= {_MEASURED_SETUP_MINUTES:.2f}m of setup)"
+    )
+
+
+def test_the_layering_predicate_rejects_the_configuration_that_actually_failed():
+    """무장 실증 (G-35): the predicate above must be able to say NO.
+
+    The historical configuration — one job cap, no step cap — is fed back in; it
+    is rejected, and so is every near-miss (step cap at/below the CLI budget, job
+    cap without room for the measured setup). Without this the assertion above
+    could be satisfied by any pair of numbers.
+    """
+    assert not _layering_holds(35, None, 1800)  # ← the run that was cancelled
+    assert not _layering_holds(45, 30, 1800)  # step cap == CLI budget: a tie loses
+    assert not _layering_holds(45, 29, 1800)  # step cap below it: runner reports
+    assert not _layering_holds(35, 31, 1800)  # no room for the 7m46s setup
+    assert _layering_holds(45, 31, 1800)  # the shipped configuration
+
+
 def test_platform_ci_actions_are_sha_pinned():
     doc = _load(_PLATFORM_CI)
     uses = [u for job in doc["jobs"].values() for u in _uses(job["steps"])]

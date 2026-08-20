@@ -49,6 +49,35 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _render_budget(budget: Any) -> str:
+    """Render the held Resource Budget line (REQ-DEPLOY-012, p5c20 ④).
+
+    The budget k was computed FROM — the M1 ``ResourceBudget`` the server carries
+    verbatim on ``resources.resource_budget``. It is displayed, never derived: the
+    CLI has no way to reconstruct a budget from k and must not try.
+
+    ABSENCE IS RENDERED AS ABSENCE. ``null`` is a real deployment state (no VRAM
+    figure configured => no complete budget exists; also a store-only projection,
+    and any pre-p5c18 server that has no such key at all). All three land on the
+    same honest ``n/a`` — never a fabricated number and never a silent omission of
+    the line, so an operator can tell "the platform holds no budget" apart from
+    "this build does not show budgets". Individual missing sub-keys degrade to
+    ``n/a`` on their own by the same lenient rule as every other field here (G-17).
+
+    Operational view only (NEG-3): a VRAM/concurrency/scheduling budget is
+    infrastructure, exactly like ``concurrency_budget_k`` next to which the HTML
+    dashboard prints it — no domain field is read here.
+    """
+    if not isinstance(budget, dict):
+        return f"budget:    {_NA}  (no complete Resource Budget held)"
+    return (
+        "budget:    "
+        f"vram_per_instance_gb={_fmt(budget.get('vram_per_instance_gb'))}  "
+        f"max_concurrent={_fmt(budget.get('max_concurrent'))}  "
+        f"scheduling_policy={_fmt(budget.get('scheduling_policy'))}"
+    )
+
+
 def _render_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     """Minimal fixed-width table (no dependency): aligned header + rows -> lines."""
     widths = [len(h) for h in headers]
@@ -92,7 +121,10 @@ def render_monitor(record: dict[str, Any]) -> str:
     category / runner exit code / infra_error. Counts are surfaced verbatim — the
     server already aggregated them (M6 §3.3), this only lays them out.
     ``concurrency_budget_k`` sits next to ``running_k`` (same order as the HTML
-    dashboard) so the operator can judge ``running_k > k`` inside one surface.
+    dashboard) so the operator can judge ``running_k > k`` inside one surface, and
+    the ``budget:`` line under it shows the Resource Budget that k was computed
+    FROM (p5c20 ④ — the JSON/HTML surfaces already carried it; only this renderer
+    was missing, so an SSH operator saw the derived cap without its inputs).
     """
     health = record.get("health") or {}
     resources = record.get("resources") or {}
@@ -116,6 +148,7 @@ def render_monitor(record: dict[str, Any]) -> str:
             f"{_fmt(resources.get('vram_total_mib'))} MiB  "
             f"gpu_util={_fmt(resources.get('gpu_util_pct'))}%"
         ),
+        _render_budget(resources.get("resource_budget")),
         "",
     ]
 

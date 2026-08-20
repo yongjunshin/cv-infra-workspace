@@ -469,6 +469,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     wiring contract #2, decision 2026-07-11) for the read-only runner mount
     (contract #3). MVP-only criteria leave the kwarg unpassed — the pinned
     kw-only default ``None`` (no mount, no env) applies.
+
+    ``request_identity_key`` (p5c20 ③) rides UNCONDITIONALLY: this entrypoint
+    always holds an ADMITTED request, so the key is always derivable and the
+    honest-absence branch (``run_job``'s ``None`` default) belongs to callers
+    that have no request at all. Both entrypoints — ``run`` and the REST
+    envelope — therefore emit the same key for the same request document.
     """
     scenario_path = Path(args.scenario)
     job_id = args.job_id or _default_job_id(scenario_path)
@@ -534,6 +540,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # kw-only default None (no mount, no env), mirroring runner_env above.
     if any(isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria):
         kwargs["oracle_plugin_dir"] = str(scenario_path.parent.resolve())
+    # p5c20 ③ (DoD-P2-06 ① / REQ-REPORT-002): the single-run entrypoint hands the
+    # runner the SAME request identity key the envelope/REST entrypoint does, so a
+    # ``result.json`` produced by ``cv-infra run`` names WHICH request produced it
+    # instead of reporting ``identity_key=none`` (the p5c18 T3 defect, one half of
+    # which stayed open on this path). The key is M4's 단일 정의 IMPORTED (G-56) and
+    # fed the SAME input M3 feeds it (``VerificationRequest`` wire dump) — deriving
+    # it here from the JOB_SPEC would mint *a different key wearing the same name*
+    # (p5c18 T4's mutation: well-formed, per-request distinct, and wrong).
+    from cv_infra.report.regression import identity_key
+
+    kwargs["request_identity_key"] = identity_key(
+        admitted.request.model_dump(mode="json", by_alias=True)
+    )
     outcome = run_job(job_spec, out_dir, args.runner_image, job_spec["sut_image_ref"], **kwargs)
     return _exit_from_outcome(outcome)
 
