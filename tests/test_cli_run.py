@@ -752,9 +752,10 @@ def _envelope_identity_keys(document: dict, tmp_path: Path) -> tuple[set, set]:
 def _cli_identity_key(monkeypatch, scenario: Path, out_dir: Path) -> str:
     stub = ConsentRecordingSupervisor("pass")
     _install_supervisor(monkeypatch, stub)
-    assert main(
-        ["run", str(scenario), "--runner-image", RUNNER_IMAGE, "--out-dir", str(out_dir)]
-    ) == EXIT_PASS
+    assert (
+        main(["run", str(scenario), "--runner-image", RUNNER_IMAGE, "--out-dir", str(out_dir)])
+        == EXIT_PASS
+    )
     (kwargs,) = stub.kwargs_calls
     return kwargs["request_identity_key"]
 
@@ -782,9 +783,7 @@ def test_run_hands_the_seam_the_same_key_the_envelope_path_does(
     assert report_keys == {cli_key}  # (b) 리포트 평면도 같은 키
 
 
-def test_run_key_discriminates_requests_and_is_not_an_identifier_in_disguise(
-    monkeypatch, tmp_path
-):
+def test_run_key_discriminates_requests_and_is_not_an_identifier_in_disguise(monkeypatch, tmp_path):
     """비공허 대조: a constant (or the job id spelled differently) would pass the
     equality above. Two materially different scenarios must get two keys, and the
     key must not merely echo the job/scenario identifiers the CLI already had."""

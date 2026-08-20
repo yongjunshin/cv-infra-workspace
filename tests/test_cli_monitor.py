@@ -265,9 +265,7 @@ def test_budget_line_renders_every_field_the_m1_model_declares():
     live = ResourceBudget(**_BUDGET).model_dump(mode="json")
     assert set(live) == declared  # 양성 대조: dump가 모델 필드를 다 낸다
 
-    line = next(
-        ln for ln in _render_with_budget(live).splitlines() if ln.startswith("budget:")
-    )
+    line = next(ln for ln in _render_with_budget(live).splitlines() if ln.startswith("budget:"))
     rendered = {cell.split("=", 1)[0] for cell in line.removeprefix("budget:").split()}
     assert rendered == declared, f"budget line drifted from the M1 model: {rendered ^ declared}"
 

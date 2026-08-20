@@ -36,6 +36,13 @@
 #
 # PINS (§2-7): every `uses:` is an immutable commit SHA (trailing comment = the
 # semver tag). No floating/mutable tag ref (moving major or branch). Bump = new SHA.
+# p5c20 ⑤: the three stock actions moved to their first `runs.using: node24` major
+# (download-artifact v7 / github-script v8 / upload-artifact v6) — Node 20 is EOL and
+# the runner was force-executing these on Node 24 already. THE INPUTS/SECRETS CONTRACT
+# BELOW IS UNCHANGED (consumers call this by `@v1`); only the pins moved. NOTE: those
+# majors declare a MINIMUM ACTIONS RUNNER of 2.327.1 — the self-hosted GPU runner pin
+# (scripts/workstation_setup/common.sh CV_GH_RUNNER_VERSION=2.335.1) clears it. Keep
+# that floor in mind when bumping the runner DOWN or registering a new box.
 
 name: cv-infra-verify
 
@@ -95,7 +102,7 @@ jobs:
     steps:
       # Scenario declarations arrive as an artifact (NO PR-head checkout — R10).
       - name: Download scenario inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
         with:
           name: ${{ inputs.scenarios_artifact }}
 
@@ -155,7 +162,7 @@ jobs:
       # Checks/Comments API client (github-script) — no API reimplemented.
       - name: Publish Check Run and sticky comment
         if: always() && steps.verify.outputs.have_report == 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
         with:
           script: |
             const fs = require('fs');
@@ -204,7 +211,7 @@ jobs:
       # downloads from the PR). if-no-files-found=warn: an empty stage never fails.
       - name: Upload verification artifacts
         if: always() && steps.verify.outputs.have_report == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: cv-infra-verification-results
           path: |
