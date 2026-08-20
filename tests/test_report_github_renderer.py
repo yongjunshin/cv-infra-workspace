@@ -413,3 +413,154 @@ def test_matrix_row_echoes_rollup_verdict_verbatim(tmp_path):
     assert "| req-0 |" in body
     row_line = next(line for line in body.splitlines() if line.startswith("| req-0 |"))
     assert "| pass |" in row_line
+
+
+# --------------------------------------------------------------------------- #
+# (7) request_identity_key on the publish surfaces (p5c20 ⑦ 후속)
+# --------------------------------------------------------------------------- #
+# REQ-REPORT-002/003 + NFR-REPORT-001 식별성 on the surface people actually read:
+# the PR. The key IS the C-1 baseline PK, so "baseline 부재 2건" must say WHICH
+# identity was not matched and a regressed row must say which identity was
+# matched. Measured before this change: `request_identity_key` appeared ZERO
+# times in github.py — the matrix showed 8 columns without it and the regression
+# section named only the request/SUT/date. Two display forms, deliberately:
+# ABBREVIATED in the table (scannability, identical rule to the CLI table) and
+# FULL in the regression section (a PR reader's only other copy of the key is
+# inside the artifact zip — unlike the CLI reader, who has ``--json``).
+
+#: The three human surfaces that share ``_render_body`` — asserted SEPARATELY so a
+#: surface silently losing the column cannot hide behind the other two.
+_HUMAN_SURFACES = [
+    pytest.param(github.render_sticky_comment, id="sticky-comment"),
+    pytest.param(github.render_step_summary, id="step-summary"),
+    pytest.param(
+        lambda report: github.render_check_run(report)["output"]["summary"], id="check-run"
+    ),
+]
+
+
+def _md_row_cells(body: str, lead: str) -> list[str]:
+    """Cells of the markdown matrix row whose first column is ``lead``."""
+    line = next((ln for ln in body.splitlines() if ln.startswith(f"| {lead} |")), None)
+    assert line is not None, f"no matrix row for {lead!r} in:\n{body}"
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _two_identity_report(tmp_path) -> dict:
+    """Two requests with DIFFERENT identities (differing scenario seed) — a constant
+    or request_id-derived cell cannot pass. Neither has a baseline (both absent)."""
+    inputs = [
+        RequestReportInput(
+            request=_request(),
+            rollup=_rollup("req-0", Verdict.PASS, [Verdict.PASS]),
+            results=[_result("req-0:0", "pass")],
+        ),
+        RequestReportInput(
+            request=_request(scenario={**_BASE_REQUEST["scenario"], "seed": 7}),
+            rollup=_rollup("req-1", Verdict.PASS, [Verdict.PASS]),
+            results=[_result("req-1:0", "pass")],
+        ),
+    ]
+    return _build(inputs, tmp_path)
+
+
+def _regressed_report(tmp_path) -> dict:
+    """A row that REGRESSED against a seeded baseline (only the SUT moved)."""
+    request = _request(sut={"image_ref": "carter-sut:new"})
+    inputs = [
+        RequestReportInput(
+            request=request,
+            rollup=_rollup("req-0", Verdict.FAIL, [Verdict.FAIL]),
+            results=[_result("req-0:0", "fail")],
+        )
+    ]
+    with Store(tmp_path / "cv.sqlite3") as store:
+        update_baseline(
+            store,
+            request_identity_key=identity_key(request),
+            sut_ref="carter-sut:old",
+            verdict="pass",
+            established_at="2026-07-10T00:00:00+00:00",
+        )
+        return build_report(
+            inputs, store, envelope_id="env-1", trigger_source="ci-cd", generated_at=_AT
+        )
+
+
+@pytest.mark.parametrize("render", _HUMAN_SURFACES)
+def test_every_surface_matrix_carries_the_identity_cell(tmp_path, render):
+    report = _two_identity_report(tmp_path)
+    keys = {row["request_id"]: row["request_identity_key"] for row in report["matrix"]}
+    assert keys["req-0"] != keys["req-1"]  # premise: two REAL, different keys
+    body = render(report)
+    assert "| flaky | identity | metrics |" in body  # column exists, metrics stays last
+    cell_0, cell_1 = _md_row_cells(body, "req-0")[7], _md_row_cells(body, "req-1")[7]
+    assert cell_0 != "n/a" and cell_1 != "n/a"  # ...and carries VALUES
+    assert cell_0 != cell_1  # ...per row (a constant cell cannot pass)
+    # abbreviated, but a literal PREFIX of the real key (only a suffix was dropped)
+    assert cell_0.endswith("…") and keys["req-0"].startswith(cell_0.removesuffix("…"))
+    assert cell_1.endswith("…") and keys["req-1"].startswith(cell_1.removesuffix("…"))
+    assert "축약" in body  # the truncation is DECLARED, not silent
+
+
+@pytest.mark.parametrize("render", _HUMAN_SURFACES)
+def test_every_surface_names_the_identity_the_regression_was_judged_on(tmp_path, render):
+    report = _regressed_report(tmp_path)
+    row = report["matrix"][0]
+    assert row["regression"]["status"] == "regressed"  # premise
+    body = render(report)
+    # FULL key (not the abbreviation) on the same line as the verbatim detail, so
+    # "왜 이게 회귀지" is answerable — and copy-pasteable into a baseline lookup.
+    line = next(ln for ln in body.splitlines() if row["regression"]["detail"] in ln)
+    assert f"identity `{row['request_identity_key']}`" in line
+    assert len(row["request_identity_key"]) == 71  # the whole thing, not a prefix
+
+
+@pytest.mark.parametrize("render", _HUMAN_SURFACES)
+def test_every_surface_names_the_identities_with_no_baseline(tmp_path, render):
+    """The exact question the first live E2E raised: *"baseline 부재 2건 — 어느
+    키에 대한 부재인가"*. Every skipped row is named with its FULL key, and the
+    enumeration cannot disagree with the count above it."""
+    report = _two_identity_report(tmp_path)
+    assert report["baseline_summary"]["absent"] == 2  # premise: both rows skipped
+    body = render(report)
+    assert "baseline 부재 2건" in body
+    named = [ln for ln in body.splitlines() if ln.startswith("  - ") and "identity `sha256:" in ln]
+    assert len(named) == report["baseline_summary"]["absent"]
+    for row in report["matrix"]:
+        assert f"  - {row['request_id']} — identity `{row['request_identity_key']}`" in body
+
+
+def test_absent_identity_renders_n_a_on_both_surfaces_and_drops_the_legend(tmp_path):
+    """§2-4 honesty, paired with the value case (G-35): a row whose producer carried
+    NO key renders the markdown null idiom in the table AND in the regression line,
+    while its sibling that HAS a key still renders the value. Nothing was
+    abbreviated for the missing row, and a table with NO abbreviation at all must
+    not carry the abbreviation note."""
+    report = _two_identity_report(tmp_path)
+    report["matrix"][1]["request_identity_key"] = None
+    body = github.render_step_summary(report)
+    assert _md_row_cells(body, "req-1")[7] == "n/a"  # absence is rendered as absence
+    assert _md_row_cells(body, "req-0")[7].startswith("sha256:")  # value case survives
+    assert "  - req-1 — identity n/a" in body  # ...and in the regression enumeration
+    assert f"  - req-0 — identity `{report['matrix'][0]['request_identity_key']}`" in body
+
+    # every key gone -> no cell was abbreviated -> the note must disappear
+    report["matrix"][0]["request_identity_key"] = None
+    stripped = github.render_step_summary(report)
+    assert "축약" not in stripped
+    assert _md_row_cells(stripped, "req-0")[7] == "n/a"
+
+
+def test_table_abbreviation_uses_the_same_rule_as_the_cli_table(tmp_path):
+    """One display rule, two surfaces (G-56): the markdown cell is the SHARED
+    ``identity_display.identity_cell`` output, not a second truncation that could
+    drift from the CLI's."""
+    from cv_infra.report.identity_display import identity_cell as shared_cell
+
+    report = _two_identity_report(tmp_path)
+    body = github.render_step_summary(report)
+    for row in report["matrix"]:
+        expected = shared_cell(row["request_identity_key"], absent="n/a")
+        assert _md_row_cells(body, row["request_id"])[7] == expected
+        assert expected != "n/a"  # the comparison is not vacuous

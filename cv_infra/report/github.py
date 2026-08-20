@@ -5,9 +5,12 @@ else: a Check Run payload, a sticky PR-comment markdown, a step-summary markdown
 and an artifact upload manifest. The actual GitHub API calls / uploads are the M8
 Action plane's job (LOCKED §7.14) — this module holds NO GitHub token, opens NO
 socket, touches NO network (M4-09 이식성 negative): a developer can produce every
-surface from a report JSON standalone. Consequently it imports ONLY the stdlib and
-``cv_infra.cli.exit_codes`` (itself a stdlib-only leaf, so the import drags no
-orchestrator/fastapi/network graph — the property M4-09 rests on).
+surface from a report JSON standalone. Consequently it imports ONLY the stdlib and two
+stdlib-only leaves — ``cv_infra.cli.exit_codes`` (M8 exit table) and
+``cv_infra.report.identity_display`` (the shared ``request_identity_key`` display
+rule) — so the import drags no orchestrator/fastapi/network graph (the property
+M4-09 rests on; ``report/matrix.py`` deliberately is NOT imported here because it
+pulls the M3 orchestrator models).
 
 The exit -> Check conclusion table lives in ONE place — ``cv_infra.cli.exit_codes``,
 the M8 single source (LOCKED §7.9 / D-I) — and is IMPORTED, never re-declared here:
@@ -37,6 +40,7 @@ from cv_infra.cli.exit_codes import (
     INFRA_INCOMPLETE_MESSAGE,
     exit_code_for_report_outcome,
 )
+from cv_infra.report.identity_display import ABBREVIATED_HEX, identity_cell, was_abbreviated
 
 #: Hidden HTML comment anchoring the sticky PR comment for in-place upsert (P5-14).
 #: MUST appear in every rendered sticky comment; the Action finds+updates the
@@ -171,16 +175,39 @@ def _header(report: dict[str, Any]) -> str:
 
 
 def _matrix_section(report: dict[str, Any]) -> str:
+    """The per-request table. ``identity`` (p5c20 ⑦ 후속) is INSERTED before the
+    free-text ``metrics`` cell — the seven preceding columns keep their meaning,
+    order and position (the M-2 flaky surface), and the variable-length cell stays
+    rightmost so the table still scans. The cell is the SHARED abbreviation
+    (``identity_display`` — identical rule to the CLI table); unlike the CLI, whose
+    reader can reach the full key with ``--json``, a PR reader only has the
+    artifact, so the FULL key is rendered in the regression section below for the
+    rows that need identifying (부재·회귀). The note is emitted only when a cell was
+    actually abbreviated."""
     rows = report.get("matrix") or []
     header = "### Pass/Fail matrix"
     if not rows:
         return f"{header}\n\n_(집계된 요청 없음)_"
     table = [
-        "| request | sut | verdict | repeats | pass | fail | flaky | metrics |",
-        "|---|---|---|---|---|---|---|---|",
+        "| request | sut | verdict | repeats | pass | fail | flaky | identity | metrics |",
+        "|---|---|---|---|---|---|---|---|---|",
         *(_matrix_row(row) for row in rows),
     ]
+    if any(was_abbreviated(_identity_key_cell(row)) for row in rows):
+        table += [
+            "",
+            f"_identity = `request_identity_key` 축약(앞 {ABBREVIATED_HEX} hex + `…`, "
+            "보이는 값은 실제 키의 접두사) — 전체 키는 아래 회귀 절(부재·회귀 행)과 "
+            "artifact 의 report JSON `matrix[].request_identity_key`._",
+        ]
     return f"{header}\n\n" + "\n".join(table)
+
+
+def _identity_key_cell(row: dict[str, Any]) -> str:
+    """Abbreviated ``request_identity_key`` cell for one matrix row — the report
+    row's value verbatim (never re-derived: ``regression.identity_key`` is the one
+    definition), with this surface's own null idiom when the row carries no key."""
+    return identity_cell(row.get("request_identity_key"), absent=_NA)
 
 
 def _matrix_row(row: dict[str, Any]) -> str:
@@ -195,6 +222,7 @@ def _matrix_row(row: dict[str, Any]) -> str:
         verdicts.count("pass"),
         verdicts.count("fail"),
         "yes" if rollup.get("flaky") else "no",
+        _identity_key_cell(row),
         _metrics_cell(row.get("metrics")),
     )
     return "| " + " | ".join(_md_cell(cell) for cell in cells) + " |"
@@ -217,7 +245,14 @@ def _regression_section(report: dict[str, Any]) -> str:
 
     Absent baseline = skip(정상), never read as a failing result (REQ-REPORT-004); a
     regressed row surfaces the report's ``regression.detail`` VERBATIM (재도출 금지,
-    NFR-REPORT-001 식별성 — which request vs which SUT/date)."""
+    NFR-REPORT-001 식별성 — which request vs which SUT/date).
+
+    p5c20 ⑦ 후속: each listed row also carries its FULL ``request_identity_key`` —
+    the axis the judgement was made on (C-1 ``request_baselines`` PK). Without it
+    *"baseline 부재 2건"* cannot be traced to WHICH identity was not matched, and
+    *"왜 이게 회귀지"* cannot be answered from the PR. Full (not abbreviated) here
+    because a PR reader's only other copy is inside the artifact zip; the value is
+    the row's, never re-derived."""
     bsum = report.get("baseline_summary") or {}
     absent = bsum.get("absent", 0)
     regressed = bsum.get("regressed", 0)
@@ -228,17 +263,39 @@ def _regression_section(report: dict[str, Any]) -> str:
         lines.append(
             f"- baseline 부재 {absent}건 — 회귀 판정 skip(정상: 최초 실행/신규 SUT, 실패 아님)"
         )
+        lines += [
+            f"  - {_md_cell(row.get('request_id', _NA))} — identity {_identity_ref(row)}"
+            for row in _rows_with_status(report, "no-baseline")
+        ]
     if regressed:
         lines.append(f"- 회귀 {regressed}건:")
-        for row in report.get("matrix") or []:
+        for row in _rows_with_status(report, "regressed"):
             reg = row.get("regression") or {}
-            if reg.get("status") == "regressed":
-                lines.append(f"  - {reg.get('detail')}")
+            lines.append(f"  - {reg.get('detail')} — identity {_identity_ref(row)}")
     if improved:
         lines.append(f"- 개선 {improved}건 (baseline 대비 fail→pass)")
     if not lines:
         lines.append("- baseline 대비 회귀 없음")
     return f"{header}\n\n" + "\n".join(lines)
+
+
+def _rows_with_status(report: dict[str, Any], status: str) -> list[dict[str, Any]]:
+    """Matrix rows whose regression judgement is ``status`` — the SAME rows the
+    ``baseline_summary`` counters counted (aggregate keys both off
+    ``regression.status``), so the enumerated lines can never disagree with the
+    count above them."""
+    return [
+        row
+        for row in report.get("matrix") or []
+        if ((row.get("regression") or {}).get("status")) == status
+    ]
+
+
+def _identity_ref(row: dict[str, Any]) -> str:
+    """FULL ``request_identity_key`` of one row, copy-pasteable (backticked), or the
+    honest null idiom when the row carries none — never a fabricated key (§2-4)."""
+    key = row.get("request_identity_key")
+    return f"`{_md_cell(key)}`" if key else _NA
 
 
 def _artifact_section(report: dict[str, Any]) -> str:
