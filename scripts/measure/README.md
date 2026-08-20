@@ -108,7 +108,7 @@ resulting split into any script.
 ## Evidence layout
 
 ```
-$CV_MEASURE_OUT_ROOT/<run-name>/
+$CV_MEASURE_OUT_ROOT/<run-name>/          # default: ~/cv-infra-prod/measure  (see below)
   host/ (baseline) or ./ (observe)
     SUMMARY.txt                       derived: exit, wall, per-PID VRAM peak/steady/median, RX
     vram_compute_apps_samples.csv     RAW per-PID VRAM time series (preserved)
@@ -138,6 +138,9 @@ CV_EULA_CONSENT=yes bash scripts/measure/isaac_baseline_run.sh baseline-01 60
 
 `CV_MEASURE_IMAGE` (runner image · Wave-2 override), `CV_MEASURE_SCENE_REL` (closure to
 warm — match the scenario under test), `CV_ISAAC_CACHE_ROOT` (host-absolute cache root),
-`CV_MEASURE_OUT_ROOT` (evidence root), `CV_MEASURE_NET`, `CV_MEASURE_SHM_SIZE`,
+`CV_MEASURE_OUT_ROOT` (evidence root — **default `~/cv-infra-prod/measure`**, defined once in
+`common.sh`; it moved off `~/cv-infra-p2-out` on 2026-08-21 because that prefix was
+**intentionally expired** by decision D-1 and a default that recreates an expired tree
+un-expires it — see `docs/evidence-anchors.md`), `CV_MEASURE_NET`, `CV_MEASURE_SHM_SIZE`,
 `CV_MEASURE_TIMEOUT_S`, `CV_OBSERVE_WAIT_S`, `CV_STEADY_K` / `CV_STEADY_EPS` /
 `CV_SAMPLE_INTERVAL_S` (steady-state judgement window — **not** a measurement target).

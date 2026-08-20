@@ -34,7 +34,7 @@ CONDITION="${2:-unlabeled}"   # cold-fresh | warm-all | cold-assets-warm-shaders
 require_cmd docker
 require_cmd nvidia-smi
 
-OUT_ROOT="${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}"
+OUT_ROOT="$CV_MEASURE_OUT_ROOT"   # default + rationale: scripts/measure/common.sh
 RUN_DIR="$OUT_ROOT/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 

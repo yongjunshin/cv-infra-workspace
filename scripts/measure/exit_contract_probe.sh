@@ -43,7 +43,7 @@
 #   bash exit_contract_probe.sh events '30m'
 #
 # Evidence (G-24): every arm writes container log + observed code under
-#   ${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}/<run-name>/ , plus SUMMARY.tsv.
+#   $CV_MEASURE_OUT_ROOT/<run-name>/ , plus SUMMARY.tsv  (root: scripts/measure/common.sh).
 # Quote the paths in the report; a code without its log is an unverified claim.
 #
 # Exit: 0 = every contract arm matched · 2 = usage · 3 = a mismatch, or an arm
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd docker
-OUT_DIR="${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}/$RUN_NAME"
+OUT_DIR="$CV_MEASURE_OUT_ROOT/$RUN_NAME"   # default + rationale: scripts/measure/common.sh
 mkdir -p "$OUT_DIR"
 
 # The JOB_SPEC both boot arms use. `scenario.scene` is a deliberately UNKNOWN name:

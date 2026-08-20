@@ -49,6 +49,25 @@ readonly CV_MEASURE_IMAGE="${CV_MEASURE_IMAGE:-cv-infra-runner:prod-5ae46d5}"
 # Default = the P2 canonical carter warehouse nav scene (T0 asset root).
 readonly CV_MEASURE_SCENE_REL="${CV_MEASURE_SCENE_REL:-/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd}"
 
+# Evidence root for every measure script (G-24 anchors are written under it).
+#
+# THE DEFAULT MOVED 2026-08-21 (p5c20 F-7), and the reason matters: it used to be
+# `$HOME/cv-infra-p2-out`, which is one of the two prefixes CEO decision D-1 deliberately
+# EXPIRED on 2026-08-20 (docs/evidence-anchors.md). A default that recreates an expired
+# tree quietly UN-EXPIRES it: the directory reappears, and the next reader cites what is
+# inside it as if the manifest still described it. Expiry has to survive the next run of
+# the tooling, or it was never an expiry.
+# The value now lives under the operating root this host actually uses
+# (~/cv-infra-prod/**, the one anchor class evidence-anchors.md lists as still valid).
+#
+# It is DEFINED ONCE, here, on purpose: four sibling scripts used to repeat the literal
+# `${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}` in five places, so moving it meant
+# finding all five — and missing one leaves a script silently writing to the dead path
+# (G-56: one definition, imported; a duplicated default is a future divergence).
+# Override per run with CV_MEASURE_OUT_ROOT=<abs path>; host-absolute, never relative
+# (these paths are handed to the docker daemon — R-mount).
+readonly CV_MEASURE_OUT_ROOT="${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-prod/measure}"
+
 # Dedicated non-host bridge network for the single-instance baseline / warm boot (R8;
 # host networking is forbidden project-wide). Per-job observe watches the supervisor's
 # own cvj-* network instead (it does not create one).
