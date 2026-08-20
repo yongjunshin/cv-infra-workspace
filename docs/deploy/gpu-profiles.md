@@ -1,5 +1,9 @@
 # 적응형 GPU 프로파일 — 다른 GPU 호스트에 배포하기 (C-2 매뉴얼)
 
+> ⚠ 이 문서가 인용하는 워크스테이션 증적 경로(`~/cv-infra-p2-out/**`·`~/cv-infra-ci/**`)는
+> 2026-08-20 **의도적으로 만료**됐다(측정 사실은 유효 · 재현 불가). 구분과 매니페스트 소재 =
+> [`docs/evidence-anchors.md`](evidence-anchors.md).
+
 > **범위**: C-2 배포 매뉴얼(`docs/deploy/`)의 두 번째 절. **GPU 적응 한 건**만 다룬다
 > (`scripts/detect_gpu.sh` + `profiles/*`). 프로비저닝 전체·트러블슈팅은 여전히
 > `scripts/workstation_setup/README.md`, 평면 스큐는 `plane-sync.md`.

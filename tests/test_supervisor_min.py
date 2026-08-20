@@ -7,6 +7,10 @@ teardown on every path incl. exceptions (REQ-EXEC-015 결), and operator runner_
 pass-through (no consent literal anywhere — decision 2026-07-03).
 """
 
+# ⚠ 이 파일이 인용하는 워크스테이션 증적 경로(`~/cv-infra-p2-out/**`·`~/cv-infra-ci/**`)는
+# 2026-08-20 **의도적으로 만료**됐다 — 측정이 일어난 사실은 유효하고, 재현은 불가하다.
+# 목록·sha256 매니페스트의 소재와 그 구분은 docs/evidence-anchors.md 를 보라.
+
 from __future__ import annotations
 
 import json
