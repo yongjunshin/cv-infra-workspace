@@ -44,3 +44,12 @@ SQLite store 스키마·테이블별 행수. 전송 후 **양쪽 바이트 동�
 ## 아직 유효한 앵커
 - GitHub Actions artifact retention **2026-10-20 / 2026-11-01** — 만료 예정. 그때 이 문서에 추가.
 - 운영 평면 `~/cv-infra-prod/**`(etri6000) — 2026-08-20 신설, 만료 예약 없음.
+  - `~/cv-infra-prod/{store,out,cache-warm,cache-scratch}` — 운영 평면이 쓰는 것(`docker/.env`).
+  - `~/cv-infra-prod/measure` — **측정 하네스의 증거 루트**(`CV_MEASURE_OUT_ROOT` 기본값,
+    정의는 `scripts/measure/common.sh` 한 곳). 2026-08-21 에 여기로 옮겼다.
+
+> ★ **만료는 도구가 다시 돌아도 살아남아야 한다.** 옮기기 전 `scripts/measure/*` 의 기본
+> 출력 루트가 **`~/cv-infra-p2-out`**(위에서 만료시킨 바로 그 접두사)이었다. 즉 측정 스크립트를
+> 한 번만 돌리면 그 디렉토리가 **다시 생기고**, 다음 사람은 *"있네"* 하며 그 안의 것을 증적으로
+> 인용한다 — 매니페스트가 서술하는 대상이 아닌데도. **삭제로 만료를 집행했으면, 그 경로를
+> 되만드는 기본값도 함께 옮겨야 한다.** (QA p5c19 §③ 발견 · 수리 p5c20 F-7.)

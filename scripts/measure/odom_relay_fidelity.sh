@@ -65,7 +65,7 @@ done
 [[ -d "$BAG_DIR" ]] || { err "no such bag dir: $BAG_DIR"; exit "$EXIT_USAGE"; }
 require_cmd docker
 
-OUT_DIR="${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}/$RUN_NAME"
+OUT_DIR="$CV_MEASURE_OUT_ROOT/$RUN_NAME"   # default + rationale: scripts/measure/common.sh
 mkdir -p "$OUT_DIR"
 INFO="$OUT_DIR/$(basename "$BAG_DIR").bag-info.txt"
 

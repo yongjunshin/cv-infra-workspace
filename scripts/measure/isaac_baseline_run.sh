@@ -44,7 +44,7 @@ require_cmd nvidia-smi
 
 IMG="$CV_MEASURE_IMAGE"
 SMOKE_DIR="$SCRIPT_DIR/../isaac_smoke"
-OUT_ROOT="${CV_MEASURE_OUT_ROOT:-$HOME/cv-infra-p2-out}"
+OUT_ROOT="$CV_MEASURE_OUT_ROOT"   # default + rationale: scripts/measure/common.sh
 RUN_DIR="$OUT_ROOT/$RUN_NAME"
 CNAME="cv-measure-$RUN_NAME"
 mkdir -p "$RUN_DIR/host"
