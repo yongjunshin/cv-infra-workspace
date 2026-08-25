@@ -40,8 +40,15 @@ bash vram_sampler.sh "$E/arm_b/vram_0.5s.csv" "$E/arm_b/crosscheck" 0.5 &  SAMPL
 ACCEPT_EULA=Y PRIVACY_CONSENT=Y bash arm_b.sh "$E"
 kill $SAMPLER
 
-python3 analyze.py "$E" > "$E/tables.md"
+# 표 4개 (같은 표본을 여러 번 잰 런들을 --run 으로 매트릭스에 넣는다)
+python3 analyze.py "$E" --run A2="$E/pass2":a --run B2="$E/pass2":b > "$E/tables.md"
 ```
+
+⚠ **측정 중에는 push 하지 마라.** 이 저장소의 `ci.yml` 은 `on: push` 이고 tier-2
+(`selftest`)가 **같은 GPU 호스트의 self-hosted 러너**에서 돈다. p6c1 실측에서 exp 브랜치
+push 3회가 각각 self-test 잡을 이 카드 위에 올렸고, 그중 하나가 Arm A 1번 잡의 창을
+침범했다(측정: 같은 순간 Isaac PID 2개). `analyze.py` 는 창마다 외부 테넌트를 이름으로
+찍어 주며, 오염된 행은 평균에 넣지 않는다.
 
 ## 지키는 것
 
