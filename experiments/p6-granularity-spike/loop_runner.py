@@ -365,7 +365,14 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
         watch.begin("bootstrap")
         bootstrap = bootstrap_bridge_env(base_config.ros_distro, base_config.rmw)
         _log(f"bridge bootstrap: {bootstrap}")
-        reexec_for_bridge_lib(bootstrap)
+        # MEASURED HERE (p6c1, first Arm B attempt — runner exited 2 in 2.4 s): the
+        # production boot glue re-execs the interpreter with a HARDCODED entrypoint,
+        # ``[sys.executable, "-m", "cv_infra.runner.main"]``. A second entrypoint —
+        # which is exactly what "1 job, n repeats" needs — is therefore replaced by
+        # main.py mid-boot and dies on the JOB_SPEC main.py expects. The parameter
+        # exists (``argv``), so the fix is to pass our own; the finding is that the
+        # runner image today assumes ONE process = ONE entrypoint = ONE job.
+        reexec_for_bridge_lib(bootstrap, argv=[sys.executable, "-m", "p6spike.loop_runner"])
         observe("cache probe", emit_cache_probe)
         watch.end("bootstrap")
 
