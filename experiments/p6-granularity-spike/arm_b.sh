@@ -98,6 +98,24 @@ docker run -d --name "$SUT_CT" \
   "$SUT_IMAGE" >/dev/null
 log "SUT container started (blackbox: no command/entrypoint override, no GPU)"
 
+# WALL-CLOCK RUNAWAY WATCHDOG. Arm B's mission budget is SIM-time only (D-F), and the
+# thing this arm does that production never does — restarting the timeline — is exactly
+# what could stall /clock and make that budget unreachable. M3 owns this clock for a
+# normal job (job_timeout_s); here the script owns it.
+: "${CV_SPIKE_WALL_CAP_S:=5400}"
+WATCHDOG_FIRED=no
+deadline=$(( $(date +%s) + CV_SPIKE_WALL_CAP_S ))
+while :; do
+  status="$(docker inspect -f '{{.State.Status}}' "$RUNNER_CT" 2>/dev/null || echo gone)"
+  [[ "$status" == "running" ]] || break
+  if (( $(date +%s) > deadline )); then
+    WATCHDOG_FIRED=yes
+    log "WALL-CLOCK CAP ${CV_SPIKE_WALL_CAP_S}s EXCEEDED — stopping the runner (graceful)"
+    docker stop -t 30 "$RUNNER_CT" >/dev/null || true
+    break
+  fi
+  sleep 2
+done
 set +e
 RUNNER_EXIT="$(docker wait "$RUNNER_CT")"
 set -e
@@ -115,6 +133,7 @@ log "runner exited: code=$RUNNER_EXIT wall=$(elapsed "$T_START" "$T_END")s"
   echo "t0_epoch=$T_START"
   echo "t1_epoch=$T_END"
   echo "runner_exit_code=$RUNNER_EXIT"
+  echo "wall_watchdog_fired=$WATCHDOG_FIRED"
   echo "finished=$(date -Is)"
 } > "$EVID/arm_b_summary.txt"
 cat "$EVID/arm_b_summary.txt"

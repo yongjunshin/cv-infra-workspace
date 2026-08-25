@@ -133,7 +133,7 @@ def _worst(codes: list[int]) -> int:
 # --------------------------------------------------------------------------- #
 # SUT realign (ROS-only, blackbox-safe) — the "1순위" of the cycle plan.
 # --------------------------------------------------------------------------- #
-def realign_sut(adapter, pose: dict | None, sim_time_s: float, step_and_spin) -> dict:
+class SutRealigner:
     """Reset the SUT's nav state between iterations WITHOUT touching the SUT.
 
     (a) re-seed AMCL with the pose the sim just teleported the robot to
@@ -141,55 +141,89 @@ def realign_sut(adapter, pose: dict | None, sim_time_s: float, step_and_spin) ->
     (b) clear both costmaps so occupancy from the previous mission cannot decide this
         one.
 
-    Returns an observation dict (what was actually done) — a realign that silently did
-    nothing must not read as a realign (G-26).
+    The publisher/clients are created ONCE and kept: a publisher created and used in the
+    same instant has not been DISCOVERED by the subscriber yet, so the message would go
+    nowhere and the realign would read as done while doing nothing (G-26). ``realign``
+    therefore also waits for a matched subscription, bounded, and reports what it saw.
     """
-    node = adapter._node  # spike: the adapter exposes no node accessor
-    observed: dict = {"initialpose_published": False, "costmaps_cleared": [], "missing": []}
-    if node is None:
-        observed["missing"].append("rclpy node (adapter not wired)")
-        return observed
 
-    from geometry_msgs.msg import PoseWithCovarianceStamped  # noqa: PLC0415
-    from nav2_msgs.srv import ClearEntireCostmap  # noqa: PLC0415
+    def __init__(self, adapter) -> None:
+        self.adapter = adapter
+        self.node = adapter._node  # spike: the adapter exposes no node accessor
+        self._pub = None
+        self._clients: dict = {}
 
-    if pose is not None:
-        pub = node.create_publisher(PoseWithCovarianceStamped, INITIALPOSE_TOPIC, 10)
-        msg = PoseWithCovarianceStamped()
-        msg.header.frame_id = "map"
-        msg.header.stamp.sec = int(sim_time_s)
-        msg.header.stamp.nanosec = int((sim_time_s - int(sim_time_s)) * 1e9)
-        msg.pose.pose.position.x = float(pose["x"])
-        msg.pose.pose.position.y = float(pose["y"])
+    def _publisher(self):
+        if self._pub is None:
+            from geometry_msgs.msg import PoseWithCovarianceStamped  # noqa: PLC0415
+
+            self._pub = self.node.create_publisher(PoseWithCovarianceStamped, INITIALPOSE_TOPIC, 10)
+        return self._pub
+
+    def _client(self, service: str):
+        if service not in self._clients:
+            from nav2_msgs.srv import ClearEntireCostmap  # noqa: PLC0415
+
+            self._clients[service] = self.node.create_client(ClearEntireCostmap, service)
+        return self._clients[service]
+
+    def realign(self, pose: dict | None, sim_time_s: float) -> dict:
+        from geometry_msgs.msg import PoseWithCovarianceStamped  # noqa: PLC0415
+        from nav2_msgs.srv import ClearEntireCostmap  # noqa: PLC0415
+
         from cv_infra.runner.adapter.ros2 import quat_z_w_from_yaw  # noqa: PLC0415
 
-        qz, qw = quat_z_w_from_yaw(float(pose["yaw"]))
-        msg.pose.pose.orientation.z = qz
-        msg.pose.pose.orientation.w = qw
-        # AMCL's default initial-pose covariance (x/y 0.25, yaw 0.0685) — the values
-        # nav2 itself ships as ``initial_pose`` defaults.
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.06853891945200942
-        for _ in range(5):  # latched-less topic: publish a few times while spinning
-            pub.publish(msg)
-            step_and_spin()
-        observed["initialpose_published"] = True
-        node.destroy_publisher(pub)
+        step = self.adapter._step_and_spin
+        observed: dict = {
+            "initialpose_subscribers": None,
+            "initialpose_published": 0,
+            "costmaps_cleared": [],
+            "missing": [],
+        }
+        if self.node is None:
+            observed["missing"].append("rclpy node (adapter not wired)")
+            return observed
 
-    for service in COSTMAP_CLEAR_SERVICES:
-        client = node.create_client(ClearEntireCostmap, service)
-        if not client.wait_for_service(timeout_sec=2.0):
-            observed["missing"].append(service)
-            node.destroy_client(client)
-            continue
-        future = client.call_async(ClearEntireCostmap.Request())
-        deadline = time.monotonic() + 5.0
-        while not future.done() and time.monotonic() < deadline:
-            step_and_spin()
-        observed["costmaps_cleared" if future.done() else "missing"].append(service)
-        node.destroy_client(client)
-    return observed
+        if pose is not None:
+            pub = self._publisher()
+            deadline = time.monotonic() + 10.0
+            while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
+                step()
+            observed["initialpose_subscribers"] = pub.get_subscription_count()
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = "map"
+            msg.header.stamp.sec = int(sim_time_s)
+            msg.header.stamp.nanosec = int((sim_time_s - int(sim_time_s)) * 1e9)
+            msg.pose.pose.position.x = float(pose["x"])
+            msg.pose.pose.position.y = float(pose["y"])
+            qz, qw = quat_z_w_from_yaw(float(pose["yaw"]))
+            msg.pose.pose.orientation.z = qz
+            msg.pose.pose.orientation.w = qw
+            # AMCL's default initial-pose covariance (x/y 0.25, yaw 0.0685) — the values
+            # nav2 itself ships as ``initial_pose`` defaults.
+            msg.pose.covariance[0] = 0.25
+            msg.pose.covariance[7] = 0.25
+            msg.pose.covariance[35] = 0.06853891945200942
+            for _ in range(30):  # ~0.5 sim-seconds of repeats (volatile topic)
+                pub.publish(msg)
+                step()
+            observed["initialpose_published"] = 30
+
+        for service in COSTMAP_CLEAR_SERVICES:
+            client = self._client(service)
+            if not client.service_is_ready():
+                ready_deadline = time.monotonic() + 5.0
+                while not client.service_is_ready() and time.monotonic() < ready_deadline:
+                    step()
+            if not client.service_is_ready():
+                observed["missing"].append(service)
+                continue
+            future = client.call_async(ClearEntireCostmap.Request())
+            deadline = time.monotonic() + 10.0
+            while not future.done() and time.monotonic() < deadline:
+                step()
+            observed["costmaps_cleared" if future.done() else "missing"].append(service)
+        return observed
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +403,9 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
         video = _LoopVideoRecorder()
         video.open_render_product()
         sim.on_step.append(video.capture_frame)
+        # ONE realigner for the whole process (its publisher/clients must OUTLIVE an
+        # iteration to be discovered — see SutRealigner).
+        realigner = SutRealigner(adapter)
 
         for position, (index, job_id, request, _cfg, criteria, oracles) in enumerate(parsed):
             first = position == 0
@@ -396,7 +433,21 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
                 if request.scenario.initial_pose is None
                 else request.scenario.initial_pose.model_dump()
             )
-            realign = realign_sut(adapter, pose, adapter.sim_time_s, adapter._step_and_spin)
+            # Pump first: ``world.reset()`` restarts the timeline, so the adapter's
+            # cached ``sim_time_s`` still holds the PREVIOUS iteration's (larger) value
+            # until the first post-reset /clock arrives. Realigning or arming the
+            # mission budget on that stale value would stamp AMCL in the future and
+            # give drive_mission a deadline the restarted clock can never reach.
+            sim_before = adapter.sim_time_s
+            if not first:
+                pump_deadline = time.monotonic() + 60.0
+                for _ in range(600):
+                    adapter._step_and_spin()
+                    if adapter.sim_time_s < sim_before or time.monotonic() > pump_deadline:
+                        break
+            record["sim_time_before_reset_s"] = sim_before
+            record["sim_time_after_reset_s"] = adapter.sim_time_s
+            realign = realigner.realign(pose, adapter.sim_time_s)
             settle_until = adapter.sim_time_s + settle_s
             settle_deadline = time.monotonic() + 60.0
             while adapter.sim_time_s < settle_until and time.monotonic() < settle_deadline:
