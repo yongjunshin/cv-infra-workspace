@@ -500,7 +500,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
         video = LoopVideoRecorder()
         video.open_render_product()
         sim.on_step.append(video.capture_frame)
-        realigner = SutRealigner(adapter.node, adapter.step_and_spin)
+        realigner = SutRealigner(adapter.node, adapter.step_and_spin, lambda: adapter.sim_time_s)
         summary.doc["boot"]["total_s"] = round(
             sum(v for k, v in summary.doc["boot"].items() if k.endswith("_s")), 4
         )
@@ -549,7 +549,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
 
             iter_watch.begin("realign")
             sim_time_start_s = adapter.sim_time_s
-            realign = realigner.realign(pose, sim_time_start_s)
+            realign = realigner.realign(pose)
             print(f"[cv-runner] sut realign: {realign}", flush=True)
             settle_until = adapter.sim_time_s + settle_s
             settle_deadline = time.monotonic() + SETTLE_WALL_BUDGET_S

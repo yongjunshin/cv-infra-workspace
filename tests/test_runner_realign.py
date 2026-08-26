@@ -10,6 +10,9 @@ Two surfaces, both of which fail SILENTLY in production if they are wrong:
   only evidence that this step happened (NEG-6 counts it n/n), so the keys are
   pinned, "not attempted" is kept distinct from "nobody listened", and every wait
   is proven bounded (a blackbox that never answers must not hang the carrier).
+  Since p6c3 T3 the BURST's stamps are pinned too: they are what AMCL corrects
+  the seed by, and a shared stamp measured 1/12 samples starting their mission
+  where the sim had actually put the robot.
 
 The ROS message/service TYPES are injected as fakes — the production default is
 the bundled-Jazzy import, which is what the workstation exercises.
@@ -115,10 +118,33 @@ class _FakeNode:
         return self.clients.setdefault(service, _FakeClient())
 
 
+class _FakeSimClock:
+    """A /clock that advances ONLY when the realigner pumps the sim.
+
+    That coupling is the point: the burst steps between messages, so a stamp read
+    per publish comes out different every time and a stamp read once cannot. It
+    starts at 99.75 s so the 0.5 s burst crosses a whole second.
+    """
+
+    def __init__(self, steps: list, start: float = 99.75, dt: float = 1.0 / 60.0) -> None:
+        self.steps = steps
+        self.t = start
+        self.dt = dt
+
+    def step(self) -> None:
+        self.steps.append(1)
+        self.t += self.dt
+
+    def now(self) -> float:
+        return self.t
+
+
 def _realigner(node, steps: list) -> SutRealigner:
+    clock = _FakeSimClock(steps)
     return SutRealigner(
         node,
-        lambda: steps.append(1),
+        clock.step,
+        clock.now,
         pose_msg_type=_pose_msg_type,
         clear_srv_type=_FakeClearSrv,
     )
@@ -174,7 +200,7 @@ def test_apply_initialpose_fields_writes_every_field_onto_the_message():
 def test_realign_publishes_the_burst_and_clears_both_costmaps():
     steps: list = []
     node = _FakeNode(pub=_FakePub(subscribers=2))
-    observed = _realigner(node, steps).realign(POSE, 4.0)
+    observed = _realigner(node, steps).realign(POSE)
 
     assert observed["initialpose_subscribers"] == 2
     assert observed["initialpose_published"] == REALIGN_PUBLISH_COUNT
@@ -187,13 +213,35 @@ def test_realign_publishes_the_burst_and_clears_both_costmaps():
     assert node.created_publishers == [(_pose_msg_type, INITIALPOSE_TOPIC, 10)]
 
 
+def test_realign_restamps_every_message_with_the_clock_as_it_advances():
+    """Each message of the burst carries the sim time it was SENT at (p6c3 T3).
+
+    nav2's ``initialPoseReceived`` corrects the incoming pose by the odometry
+    motion between ``header.stamp`` and now, so ONE stamp shared by 30 messages
+    folds the teleport discontinuity into messages 2..N and walks the belief back:
+    measured 1/12 samples began their mission within 0.5 m of where the sim had
+    put the robot, 12/12 once each publish re-read the clock. The fake clock
+    crosses a whole second inside the burst, so a stamp that only ever moves in
+    the nanosec field would show up here too.
+    """
+    steps: list = []
+    node = _FakeNode(pub=_FakePub(subscribers=1))
+    _realigner(node, steps).realign(POSE)
+
+    stamps = [(m.header.stamp.sec, m.header.stamp.nanosec) for m in node.pub.published]
+    assert len(stamps) == REALIGN_PUBLISH_COUNT
+    assert stamps == sorted(stamps)  # monotonic ...
+    assert len(set(stamps)) == REALIGN_PUBLISH_COUNT  # ... and STRICTLY so: no shared stamp
+    assert (stamps[0][0], stamps[-1][0]) == (99, 100)  # the burst crossed a second
+
+
 def test_realign_always_returns_the_same_keys():
     """Pinned BOTH ways: a key that appears only when it is interesting is a key
     nobody can count, and NEG-6 counts this dict n/n."""
     node = _FakeNode()
-    observed = _realigner(node, []).realign(POSE, 1.0)
+    observed = _realigner(node, []).realign(POSE)
     assert tuple(observed) == REALIGN_OBSERVATION_KEYS
-    without_pose = _realigner(_FakeNode(), []).realign(None, 1.0)
+    without_pose = _realigner(_FakeNode(), []).realign(None)
     assert tuple(without_pose) == REALIGN_OBSERVATION_KEYS
 
 
@@ -202,7 +250,7 @@ def test_realign_without_a_declared_pose_does_not_invent_one():
     AMCL with a pose we do not know would be an invention. Costmaps still clear
     (stale occupancy is stale either way)."""
     node = _FakeNode()
-    observed = _realigner(node, []).realign(None, 9.0)
+    observed = _realigner(node, []).realign(None)
     assert observed["initialpose_subscribers"] is None  # "not attempted"
     assert observed["initialpose_published"] == 0
     assert node.created_publishers == []
@@ -218,7 +266,7 @@ def test_realign_reports_zero_subscribers_instead_of_claiming_success(monkeypatc
     """
     monkeypatch.setattr(realign_mod, "DISCOVERY_TIMEOUT_S", 0.0)
     steps: list = []
-    observed = _realigner(_FakeNode(pub=_FakePub(subscribers=0)), steps).realign(POSE, 1.0)
+    observed = _realigner(_FakeNode(pub=_FakePub(subscribers=0)), steps).realign(POSE)
     assert observed["initialpose_subscribers"] == 0
     assert observed["initialpose_published"] == REALIGN_PUBLISH_COUNT  # honest: it did publish
 
@@ -228,14 +276,14 @@ def test_realign_discovery_wait_is_bounded_and_pumps_the_sim(monkeypatch):
     how a hung blackbox becomes a reported observation instead of a hung carrier."""
     monkeypatch.setattr(realign_mod, "DISCOVERY_TIMEOUT_S", 0.0)
     steps: list = []
-    _realigner(_FakeNode(pub=_FakePub(subscribers=0)), steps).realign(POSE, 1.0)
+    _realigner(_FakeNode(pub=_FakePub(subscribers=0)), steps).realign(POSE)
     assert len(steps) == REALIGN_PUBLISH_COUNT  # burst only: the discovery loop never spun
 
 
 def test_realign_waits_for_the_subscription_before_publishing():
     steps: list = []
     pub = _FakePub(subscribers=[0, 0, 0, 1])  # discovered on the 4th poll
-    observed = _realigner(_FakeNode(pub=pub), steps).realign(POSE, 1.0)
+    observed = _realigner(_FakeNode(pub=pub), steps).realign(POSE)
     assert observed["initialpose_subscribers"] == 1
     assert len(steps) == 3 + REALIGN_PUBLISH_COUNT  # 3 discovery steps + the burst
 
@@ -244,7 +292,7 @@ def test_realign_records_a_service_that_never_becomes_ready(monkeypatch):
     monkeypatch.setattr(realign_mod, "SERVICE_READY_TIMEOUT_S", 0.0)
     clients = {COSTMAP_CLEAR_SERVICES[0]: _FakeClient(ready=False)}
     node = _FakeNode(clients=clients)
-    observed = _realigner(node, []).realign(POSE, 1.0)
+    observed = _realigner(node, []).realign(POSE)
     assert observed["missing"] == [COSTMAP_CLEAR_SERVICES[0]]
     assert observed["costmaps_cleared"] == [COSTMAP_CLEAR_SERVICES[1]]
     assert clients[COSTMAP_CLEAR_SERVICES[0]].calls == []  # never called
@@ -253,13 +301,13 @@ def test_realign_records_a_service_that_never_becomes_ready(monkeypatch):
 def test_realign_records_a_service_call_that_never_answers(monkeypatch):
     monkeypatch.setattr(realign_mod, "SERVICE_CALL_TIMEOUT_S", 0.0)
     clients = {s: _FakeClient(done_after=10) for s in COSTMAP_CLEAR_SERVICES}
-    observed = _realigner(_FakeNode(clients=clients), []).realign(None, 1.0)
+    observed = _realigner(_FakeNode(clients=clients), []).realign(None)
     assert observed["costmaps_cleared"] == []
     assert observed["missing"] == list(COSTMAP_CLEAR_SERVICES)
 
 
 def test_realign_without_a_wired_node_reports_it_instead_of_crashing():
-    observed = _realigner(None, []).realign(POSE, 1.0)
+    observed = _realigner(None, []).realign(POSE)
     assert observed["missing"] == ["rclpy node (adapter not wired)"]
     assert observed["initialpose_published"] == 0
 
@@ -270,8 +318,8 @@ def test_publisher_and_clients_outlive_an_iteration():
     every sample would make every realign a no-op that reads as done."""
     node = _FakeNode()
     realigner = _realigner(node, [])
-    realigner.realign(POSE, 1.0)
-    realigner.realign(POSE, 2.0)
+    realigner.realign(POSE)
+    realigner.realign(POSE)
     assert len(node.created_publishers) == 1
     assert [service for _type, service in node.created_clients] == list(COSTMAP_CLEAR_SERVICES)
 

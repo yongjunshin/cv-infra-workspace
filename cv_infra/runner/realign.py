@@ -24,6 +24,12 @@ subscriber yet, so the message goes nowhere and the realign reads as done while
 doing nothing (G-26). ``realign`` therefore waits — BOUNDED — for a matched
 subscription and REPORTS what it saw; the observation dict is the batch summary's
 evidence that this step actually happened, so its keys are a contract.
+
+The clock, by contrast, is read LIVE: every message of the burst is stamped with
+the sim time it is published at, never with one time taken before the burst (see
+``REALIGN_PUBLISH_COUNT`` for the measurement that says why). That is why the
+sim-time source is an injected CALLABLE — a float parameter is exactly how the
+stale-stamp bug was expressible.
 """
 
 from __future__ import annotations
@@ -43,9 +49,16 @@ COSTMAP_CLEAR_SERVICES = (
 
 #: ``/initialpose`` is a VOLATILE-durability topic: a late-joining or busy AMCL
 #: can miss a single message and there is no re-delivery. Publishing a burst
-#: (~0.5 sim-seconds at 60 Hz, one sim step between messages) is the cheap,
-#: idempotent way to make the seed land — AMCL treats each message as the same
-#: absolute reset, so N of them are not N different beliefs.
+#: (~0.5 sim-seconds at 60 Hz, one sim step between messages) is the cheap way to
+#: make the seed land — but ONLY if every message carries its own stamp. nav2's
+#: ``initialPoseReceived`` does not take the pose literally: it corrects it by the
+#: odometry motion between ``header.stamp`` and now, so a burst sharing one stamp
+#: taken right after a teleport folds that discontinuity into messages 2..N and
+#: walks AMCL's belief back to where the robot used to be. Measured (p6c3 T3, the
+#: same 12 samples, single-component control arm): one stamp -> belief within
+#: 0.5 m at mission start **1/12**, verdict 3 pass / 9 fail, 31 planner failures
+#: and 7 bt aborts in the SUT's own log; stamped per publish -> **12/12**,
+#: 12 pass, 0 / 0.
 REALIGN_PUBLISH_COUNT = 30
 
 #: Wall bounds. Every wait here PUMPS the sim (the /clock source), so these are
@@ -86,7 +99,8 @@ def initialpose_fields(pose: dict, sim_time_s: float) -> dict:
 
     * the STAMP is sim-time split into (sec, nanosec) — D-F: the SUT runs on
       ``use_sim_time``, so a wall-clock stamp would be decades in its future and
-      TF would drop the pose;
+      TF would drop the pose. The time is a PARAMETER (this function stays pure);
+      the caller re-reads the clock for every message of the burst;
     * the ORIENTATION is planar (+Z only), the same convention
       ``initial_pose_world_transform`` writes into the sim, so the SUT is told
       exactly where the sim just put the robot.
@@ -131,10 +145,12 @@ class SutRealigner:
     """Re-seed the SUT's nav state between samples WITHOUT touching the SUT.
 
     Constructed ONCE per carrier and reused across iterations — see the module
-    docstring on discovery. Both collaborators are injected rather than reached
-    for: ``node`` is the adapter's public ``node`` property (one DDS participant
-    per runner) and ``step`` is its public ``step_and_spin`` (waiting without
-    stepping would stall the /clock this very SUT is waiting on).
+    docstring on discovery. All three collaborators are injected rather than
+    reached for: ``node`` is the adapter's public ``node`` property (one DDS
+    participant per runner), ``step`` is its public ``step_and_spin`` (waiting
+    without stepping would stall the /clock this very SUT is waiting on), and
+    ``sim_time`` reads its public ``sim_time_s`` — a zero-arg callable, so the
+    burst reads the clock as it advances instead of being handed a snapshot.
 
     The two ROS TYPES are injectable, defaulting to the bundled-Jazzy imports.
     That default IS the production path; the parameters exist so the observation
@@ -146,12 +162,14 @@ class SutRealigner:
         self,
         node: object,
         step,
+        sim_time,
         *,
         pose_msg_type=None,
         clear_srv_type=None,
     ) -> None:
         self.node = node
         self.step = step
+        self.sim_time = sim_time
         self._pose_msg_type = pose_msg_type
         self._clear_srv_type = clear_srv_type
         self._pub = None
@@ -185,7 +203,7 @@ class SutRealigner:
         return self._clients[service]
 
     # ----------------------------------------------------------------------- #
-    def realign(self, pose: dict | None, sim_time_s: float) -> dict:
+    def realign(self, pose: dict | None) -> dict:
         """Seed AMCL at ``pose`` and clear both costmaps; return what was OBSERVED.
 
         Never raises for a SUT that does not answer: a service that stays unready
@@ -216,11 +234,15 @@ class SutRealigner:
             while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
                 self.step()
             observed["initialpose_subscribers"] = pub.get_subscription_count()
-            msg = apply_initialpose_fields(
-                self._pose_type()(), initialpose_fields(pose, sim_time_s)
-            )
             for _ in range(REALIGN_PUBLISH_COUNT):
-                pub.publish(msg)
+                # Built fresh per message: the stamp must be the clock NOW, and a
+                # burst is a burst of SEPARATE claims about the same pose, not one
+                # message sent N times (see REALIGN_PUBLISH_COUNT).
+                pub.publish(
+                    apply_initialpose_fields(
+                        self._pose_type()(), initialpose_fields(pose, self.sim_time())
+                    )
+                )
                 self.step()
             observed["initialpose_published"] = REALIGN_PUBLISH_COUNT
 
