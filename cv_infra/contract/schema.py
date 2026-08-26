@@ -96,14 +96,115 @@ class _ForbidExtra(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Randomizable scalars (p6 랜덤 표기 — implementation-plan/p6-implementation-plan.md
+# §0-1/§2). A consumer submits ONE document and the platform derives N samples
+# from it (contract/derive.py). The notation is INLINE on the field that varies:
+#
+#     x: -6.0                  # static, exactly as before
+#     x: {uniform: [-6.5, -5.5]}
+#     x: {choice: [-6.0, 5.0]}
+#
+# WHY INLINE and not a parallel "randomized request" model tree: a parallel tree
+# drifts from this one silently (G-25) and forks every consumer of the request
+# wire (identity projection, the JOB_SPEC twins, the runner's re-validation).
+#
+# BYTES-UNCHANGED PROPERTY (what makes the union safe to add to a live contract):
+# a static document validates into the plain ``float`` branch and dumps as a
+# plain float, so every pre-p6 request keeps its exact wire bytes AND its
+# ``request_identity_key`` (pinned: tests/test_report_regression.py
+# ::CANONICAL_FIXTURE_KEY). Derivation happens at the job_spec producers, never
+# here — this module only says what may be written.
+# --------------------------------------------------------------------------- #
+
+#: Distribution list elements must be FINITE: an ``inf``/``nan`` bound would ride
+#: the identity projection into canonical JSON (``Infinity``/``NaN`` — which no
+#: other JSON reader accepts) and no draw from it names a pose. The STATIC branch
+#: stays a plain ``float`` on purpose: tightening THAT is a separate contract
+#: change with its own compatibility story, and this cycle must not move a byte
+#: of a static document.
+_FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+
+
+class Uniform(_ForbidExtra):
+    """Continuous uniform draw over the closed interval ``[lo, hi]``.
+
+    ``lo == hi`` is LEGAL (degenerate = "this exact value, said in the random
+    notation"): pinning one axis while another sweeps must not force a consumer
+    to rewrite the field's SHAPE. ``lo > hi`` is rejected loudly — that is a
+    typo, not a convention for a descending range.
+    """
+
+    uniform: list[_FiniteFloat] = Field(min_length=2, max_length=2, examples=[[-6.5, -5.5]])
+
+    @model_validator(mode="after")
+    def _bounds_are_ordered(self) -> Uniform:
+        low, high = self.uniform
+        if low > high:
+            raise ValueError(
+                f"uniform bounds must be [lo, hi] with lo <= hi (got [{low}, {high}]) — "
+                f"write 'uniform: [{high}, {low}]'"
+            )
+        return self
+
+
+class Choice(_ForbidExtra):
+    """Uniform draw from an explicit value list, used VERBATIM (never rounded).
+
+    A single element is legal for the same reason ``lo == hi`` is. The values
+    are the consumer's own literals, so the platform reproduces them exactly —
+    only ``uniform`` draws are rounded (derive.UNIFORM_DECIMALS).
+    """
+
+    choice: list[_FiniteFloat] = Field(min_length=1, examples=[[-6.0, 5.0]])
+
+
+def _randomizable_tag(value: Any) -> str:
+    """Discriminate a randomizable scalar: plain number vs distribution mapping.
+
+    A mapping's SOLE key IS the tag, so an unknown vocabulary word fails with
+    pydantic's ``union_tag_invalid``, which names what the consumer wrote and
+    lists the accepted words (measured: ``Input tag 'gaussian' found using
+    _randomizable_tag() does not match any of the expected tags: 'static',
+    'uniform', 'choice'``). A mapping with 0 or 2+ keys gets the same loud
+    treatment — silently picking one key is the ``goal_tolerance_m``
+    silent-ignore pattern (G-25).
+    """
+    if isinstance(value, Mapping):
+        return "+".join(sorted(str(key) for key in value)) or "(no keys)"
+    if isinstance(value, Uniform):
+        return "uniform"
+    if isinstance(value, Choice):
+        return "choice"
+    return "static"
+
+
+#: A scalar a consumer may randomize. Same ``Discriminator(callable)`` idiom as
+#: ``AcceptanceCriterion`` below (one union style in this contract, not two).
+RandomizableFloat = Annotated[
+    (
+        Annotated[float, Tag("static")]
+        | Annotated[Uniform, Tag("uniform")]
+        | Annotated[Choice, Tag("choice")]
+    ),
+    Discriminator(_randomizable_tag),
+]
+
+
+# --------------------------------------------------------------------------- #
 # Request side (REQ-INTAKE-001/002/006)
 # --------------------------------------------------------------------------- #
 class Goal(_ForbidExtra):
-    """Navigation goal pose (REQ-EXEC-004). Coordinates are expressed in ``frame``."""
+    """Navigation goal pose (REQ-EXEC-004). Coordinates are expressed in ``frame``.
 
-    x: float = Field(examples=[-6.0])
-    y: float = Field(examples=[5.0])
-    yaw: float = Field(examples=[1.5708])
+    All three components are ``RandomizableFloat`` (p6 §0-1) — ``yaw`` included:
+    it is an axis of the same goal, and a consumer sweeping approach headings is
+    the same request shape as one sweeping positions. ``frame`` is not: it names
+    a coordinate system, and "a random frame" has no meaning.
+    """
+
+    x: RandomizableFloat = Field(examples=[-6.0])
+    y: RandomizableFloat = Field(examples=[5.0])
+    yaw: RandomizableFloat = Field(examples=[1.5708])
     frame: str = "map"
 
 
@@ -135,12 +236,14 @@ class InitialPose(_ForbidExtra):
 
     All three components are REQUIRED inside the block: "spawn here, facing
     this way" then has exactly one meaning, and required->optional stays
-    backwards compatible if partial overrides ever earn their demand.
+    backwards compatible if partial overrides ever earn their demand. Each may
+    be randomized (``RandomizableFloat``, p6 §0-1) — a spawn window around the
+    SUT's localization init is the motivating case.
     """
 
-    x: float = Field(examples=[-6.0])
-    y: float = Field(examples=[-1.0])
-    yaw: float = Field(examples=[3.1416])
+    x: RandomizableFloat = Field(examples=[-6.0])
+    y: RandomizableFloat = Field(examples=[-1.0])
+    yaw: RandomizableFloat = Field(examples=[3.1416])
 
 
 class DebugObstacle(_ForbidExtra):
@@ -153,13 +256,42 @@ class DebugObstacle(_ForbidExtra):
     ``None`` on a dimension means "runner default applies" — the default
     VALUES stay runner-owned (M2), the shape is M1's (ReachedGoalParams
     pattern).
+
+    ``x``/``y`` are randomizable (p6 §0-1) — "put the box somewhere on the
+    path" is the FAIL-injection sweep this block exists for. The DIMENSIONS are
+    not: they are optional (``None`` = runner default), and a distribution
+    inside an optional-with-a-default field would need a third state to mean
+    "unspecified" (module-header convention). No demand, so no shape.
     """
 
-    x: float = Field(examples=[-6.0])
-    y: float = Field(examples=[2.0])
+    x: RandomizableFloat = Field(examples=[-6.0])
+    y: RandomizableFloat = Field(examples=[2.0])
     height: float | None = Field(default=None, gt=0, examples=[0.15])
     width: float | None = Field(default=None, gt=0, examples=[1.2])
     depth: float | None = Field(default=None, gt=0, examples=[0.4])
+
+
+class DerivationMeta(_ForbidExtra):
+    """PLATFORM stamp on a materialized sample (derive.materialize_request).
+
+    ``version`` freezes the derivation rule (seeding, draw order, rounding) so a
+    stored sample can say which rule produced it; ``index`` is the sample's
+    ``repeat_index``. A CONSUMER may not submit this block — the loader rejects
+    a submitted one: a stamp the consumer typed claims provenance the platform
+    never gave (G-79 — the string that describes a state must be produced by
+    whoever owns that state). Hence no ``examples=`` here either: an example is
+    rendered into the friendly error as "type this next" (errors._example_for),
+    and nobody should type this.
+
+    It lives inside ``Scenario`` rather than at the top level so it rides the
+    JOB_SPEC twins unchanged, passes the runner's ``extra="forbid"``
+    re-validation, and — optional and ``None`` on every submitted document —
+    prunes out of the identity projection (report/regression.py), leaving every
+    pre-p6 ``request_identity_key`` exactly where it is.
+    """
+
+    version: str = Field(min_length=1)
+    index: int = Field(ge=0)
 
 
 class Scenario(_ForbidExtra):
@@ -187,6 +319,14 @@ class Scenario(_ForbidExtra):
             "which is the behaviour every pre-p5c11 scenario got."
         ),
         examples=[{"x": -6.0, "y": -1.0, "yaw": 3.1416}],
+    )
+    derivation: DerivationMeta | None = Field(
+        default=None,
+        description=(
+            "Platform-stamped sample provenance (derive.materialize_request). "
+            "MUST be absent in a submitted document — the loader rejects one that "
+            "carries it; the platform writes it when it materializes a sample."
+        ),
     )
 
 
@@ -216,7 +356,9 @@ class ExecutionSettings(_ForbidExtra):
     """Execution knobs (M1 §3.2). All optional — the canonical scenario omits it.
 
     ``repeats`` is the 2-axis fan-out input (M3 ``fanout.py`` — single
-    definition, blueprint §8). ``fixed_dt`` expresses the determinism dt lock
+    definition, blueprint §8); with the p6 random notation it doubles as the
+    SAMPLE COUNT (repeats=5 = 5 samples of the declared distributions — B-U
+    semantics, CEO 2026-08-26). ``fixed_dt`` expresses the determinism dt lock
     (LOCKED §7-6; the Phase-2 runner steps at 1/60 — enforcement is M2's).
     ``seed`` / mission ``timeout_s`` live in ``Scenario`` (canonical fixture),
     NOT here — one home per field.
@@ -224,6 +366,20 @@ class ExecutionSettings(_ForbidExtra):
 
     repeats: int = Field(default=1, ge=1, examples=[3])
     fixed_dt: float | None = Field(default=None, gt=0, examples=[0.016667])
+    min_pass_ratio: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        examples=[0.8],
+        description=(
+            "Fraction of the request's samples that must pass for the rolled-up "
+            "verdict to be pass (0 < r <= 1). None = today's any-fail rule, "
+            "byte-identical. SHAPE ONLY this cycle — the rollup consumes it in "
+            "p6c4 (M3), and like repeats it stays OFF the JOB_SPEC wire: it is a "
+            "request-level judgement policy, and a runner told about it would be "
+            "told something false about the single sample it holds."
+        ),
+    )
 
 
 # --- acceptance criteria ("criteria are also input", REQ-INTAKE-007) -------- #

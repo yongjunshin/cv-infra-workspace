@@ -158,8 +158,16 @@ def _example_for(model: Any, loc: Iterable[Any]) -> str:
     field named by ``loc``, from the schema's ``Field(examples=[...])``.
 
     Walks ``model_fields`` down the loc path (skipping list indices via the
-    element annotation). Returns "" when the path cannot be resolved (e.g.
-    across an ambiguous union) — the error stays friendly without an example.
+    element annotation). Returns "" when a NAMED field cannot be resolved — the
+    error stays friendly without an example.
+
+    A discriminated union appends its BRANCH TAG to the loc after the field name
+    (``goal.x.static`` for a non-numeric ``x`` under ``RandomizableFloat``, p6c3).
+    That segment names no field, so the walk STOPS there and exemplifies the
+    deepest field it did resolve — otherwise every wrong-typed randomizable
+    scalar would lose its example, which is the one thing the friendly error
+    exists to give (NFR-INTAKE-001). Reaching a mapping of fields that simply
+    lacks the key still returns "" (an unknown key has no example to give).
     """
     current = model
     field = None
@@ -175,7 +183,9 @@ def _example_for(model: Any, loc: Iterable[Any]) -> str:
         if fields is None and field is not None:
             current = _unwrap_annotation(field.annotation, index_step=False)
             fields = getattr(current, "model_fields", None)
-        if not isinstance(fields, Mapping) or part not in fields:
+        if not isinstance(fields, Mapping):
+            break  # union branch tag (see the docstring) — keep the last field
+        if part not in fields:
             return ""
         field = fields[part]
         name = str(part)

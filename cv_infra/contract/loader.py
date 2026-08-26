@@ -7,6 +7,7 @@ any failing stage rejects BEFORE the execution plane ever sees the input):
     (2) apiVersion resolve           -> unknown/absent = reject / deprecated = warn
     (3) pydantic model_validate      -> schema error  = friendly reject
     (4) self-containedness           -> missing triad = reject   (REQ-INTAKE-006)
+        + no platform stamp          -> submitted derivation = reject
     (5) oracle load + bind           -> load failure  = reject   (REQ-INTAKE-007/008;
                                         scenario dir on sys.path while binding — D-1)
     (6) admit marking                -> AdmittedRequest           (REQ-INTAKE-009)
@@ -127,6 +128,7 @@ def load_request(
 
     # (4) self-containedness (REQ-INTAKE-006) — explicit gate re-assertion --- #
     _check_self_contained(request, source_path)
+    _reject_platform_stamp(request, source_path)
 
     # (5) oracle load + bind (REQ-INTAKE-007/008) ---------------------------- #
     # D-1(a) submission plane (decision 2026-07-11 §D-1 wiring item 1):
@@ -220,6 +222,35 @@ def _check_self_contained(request: VerificationRequest, source_path: str | None)
                 doc_link=_DOC_LINK,
                 source_path=source_path,
             )
+
+
+def _reject_platform_stamp(request: VerificationRequest, source_path: str | None) -> None:
+    """A submitted ``scenario.derivation`` is a lie — reject it (p6 §0-2).
+
+    The block records WHICH derivation rule produced a sample and WHICH sample
+    it is (``derive.materialize_request`` writes it). A consumer cannot know
+    either: whatever they typed would ride the execution plane and the stored
+    result as provenance the platform never gave (G-79 — the owner of a state
+    is the only honest producer of the string that describes it). Rejecting at
+    admit keeps it out of the execution plane entirely (NFR-INTAKE-003), which
+    is why this sits with the stage-4 gate and not in the schema: the SHAPE is
+    legal (the platform stamps it), the SUBMISSION is not.
+    """
+    if request.scenario.derivation is not None:
+        raise ContractError(
+            field_path="scenario.derivation",
+            expected=(
+                "no 'derivation' block in a submitted document — the platform stamps "
+                "sample provenance when it materializes a sample"
+            ),
+            got=repr(request.scenario.derivation.model_dump()),
+            example=(
+                "delete the 'derivation:' block; to randomize a value declare it inline, "
+                "e.g. goal:\n    x: {uniform: [-6.5, -5.5]}"
+            ),
+            doc_link=_DOC_LINK,
+            source_path=source_path,
+        )
 
 
 def _relocated(

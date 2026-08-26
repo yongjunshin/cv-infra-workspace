@@ -278,10 +278,21 @@ def test_resource_budget_shape_and_bounds():
         # (no frame — the runner applies it to a stage prim, REQ-EXEC-002).
         (InitialPose, {"x", "y", "yaw"}),
         # debug_obstacle = the D-2' addition (2026-07-10) on the Phase-2 set;
-        # initial_pose = the D-2 addition (CEO 2026-08-04, landed p5c11).
+        # initial_pose = the D-2 addition (CEO 2026-08-04, landed p5c11);
+        # derivation = the p6c3 platform stamp (optional/None on every submitted
+        # document, so the identity keys behind it do not move — D-5).
         (
             Scenario,
-            {"scene", "robot", "goal", "seed", "timeout_s", "debug_obstacle", "initial_pose"},
+            {
+                "scene",
+                "robot",
+                "goal",
+                "seed",
+                "timeout_s",
+                "debug_obstacle",
+                "initial_pose",
+                "derivation",
+            },
         ),
     ],
 )
