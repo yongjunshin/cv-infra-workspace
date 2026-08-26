@@ -180,6 +180,68 @@ def test_collision_filter_skips_non_chassis_pairs_articulation_aggregation():
 
 
 # --------------------------------------------------------------------------- #
+# p6 §0-5: an UNMATERIALIZED distribution must never reach the execution plane.
+# --------------------------------------------------------------------------- #
+def _randomizable_spec(**scenario_overrides) -> dict:
+    scenario = {
+        "scene": "omniverse://assets/warehouse.usd",
+        "robot": "omniverse://assets/nova_carter_ros.usd",
+        "goal": {"x": 3.0, "y": -1.5, "yaw": 0.0},
+        "seed": 7,
+        "timeout_s": 120.0,
+    }
+    scenario.update(scenario_overrides)
+    return {
+        "job_id": "job-0001",
+        "scenario": scenario,
+        "sut_image_ref": "carter-sut:p2",
+        "interface": {"type": "ros2", "adapter_config": {}},
+        "acceptance_criteria": [{"oracle": "reached_goal"}],
+    }
+
+
+def test_parse_request_accepts_a_materialized_sample():
+    """Positive control: a CONCRETE sample — stamp included — still parses.
+
+    The runner must accept ``scenario.derivation`` (the platform stamps it when
+    it materializes a sample); it is the LOADER that rejects a submitted one.
+    """
+    spec = _randomizable_spec(derivation={"version": "cv-derive/1", "index": 3})
+    request, _config = main.parse_request(spec)
+    assert request.scenario.goal.x == 3.0
+    assert request.scenario.derivation.index == 3
+
+
+@pytest.mark.parametrize(
+    ("block", "field", "value"),
+    [
+        ("goal", "x", {"uniform": [-6.5, -5.5]}),
+        ("goal", "yaw", {"choice": [0.0, 1.57]}),
+        ("initial_pose", "y", {"uniform": [0.0, 1.0]}),
+        ("debug_obstacle", "x", {"choice": [1.0]}),
+    ],
+)
+def test_parse_request_rejects_a_leaked_distribution(block, field, value):
+    """The union extension means ``extra="forbid"`` no longer stops a
+    distribution from reaching the runner — this check is what does.
+
+    Drawing the sample HERE would fork the provenance: the result would carry
+    values that no ``derivation`` stamp explains and no identity key predicts.
+    It is a platform bug, so it is bad input -> exit 2, never a pose.
+    """
+    scenario_block = (
+        {"x": 1.0, "y": 0.5} if block == "debug_obstacle" else {"x": 1.0, "y": 0.5, "yaw": 0.0}
+    )
+    scenario_block[field] = value
+    spec = _randomizable_spec(**{block: scenario_block})
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    message = str(excinfo.value)
+    assert f"scenario.{block}.{field}" in message  # names the field to materialize
+    assert "materialize" in message
+
+
+# --------------------------------------------------------------------------- #
 # MVP oracles (REQ-EXEC-011).
 # --------------------------------------------------------------------------- #
 def _record(samples=None, events=None):

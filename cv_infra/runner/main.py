@@ -35,6 +35,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from cv_infra.contract.adapter_schema import Ros2AdapterConfig
+from cv_infra.contract.derive import distribution_fields
 from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.schema import VerificationRequest
 from cv_infra.oracles.base import ENTRY_POINT_GROUP, load_oracle
@@ -210,6 +211,21 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
         raise BadJobSpec(f"JOB_SPEC is not a canonical VerificationRequest: {friendly}") from exc
     if request.interface.type != "ros2":
         raise BadJobSpec(f"unsupported interface.type {request.interface.type!r} (MVP: ros2 only)")
+    # p6 §0-5: the randomizable fields are a UNION (float | Uniform | Choice), so
+    # ``extra="forbid"`` no longer stops ``{uniform: [...]}`` from reaching the
+    # execution plane — this check is what does. A distribution here means the
+    # platform dispatched an UNMATERIALIZED document, and drawing the sample in
+    # the runner would fork the provenance: the result would carry values no
+    # ``derivation`` stamp explains and no identity key predicts. The paths come
+    # from the contract's own definition, so the message names exactly the fields
+    # that must be materialized (contract.derive.materialize_request).
+    leaked = distribution_fields(request.scenario)
+    if leaked:
+        raise BadJobSpec(
+            f"JOB_SPEC still declares a distribution at {list(leaked)} — the runner "
+            "executes CONCRETE samples only; the platform materializes them at "
+            "dispatch (contract.derive.materialize_request stamps scenario.derivation)"
+        )
     # The schema already parsed adapter_config into the typed M1 model — no
     # second from_dict pass (single validation, single definition).
     return request, request.interface.adapter_config
