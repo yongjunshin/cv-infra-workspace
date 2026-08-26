@@ -8,9 +8,11 @@ IS the M1 wire invariant, the summary heartbeat, the carrier exit mapping, and t
 re-exec argv — the one that made the first C-2 attempt die in 2.4 s by silently
 re-execing into the SINGLE-job entrypoint.
 
-Two structural guards close the loop on the parts a unit test cannot run:
-``restage`` must not contain the hard-reset spelling it replaced, and ``run`` must
-not close a vendor object on its terminal path (G-62).
+Three structural guards close the loop on the parts a unit test cannot run:
+``restage`` must not contain the hard-reset spelling it replaced, ``run`` must not
+close a vendor object on its terminal path (G-62), and the telemetry accumulator
+must be swapped where the mission starts — not before the restage that teleports
+the robot (measured p6c3 T3 §4).
 """
 
 import ast
@@ -536,6 +538,12 @@ def test_spawn_and_move_share_one_obstacle_position_home():
         assert "debug_obstacle_position" in called, f"{method} places the box on its own"
 
 
+def _batch_run_function() -> ast.FunctionDef:
+    """``batch.run``'s AST — the GPU loop no unit test can execute."""
+    tree = ast.parse(Path(batch.__file__).read_text(encoding="utf-8"))
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+
+
 def test_batch_run_closes_no_vendor_object_on_its_terminal_path():
     """Same G-62 invariant ``main.run`` carries: a vendor ``close()`` ends the
     process with status 0 and erases the carrier's exit code."""
@@ -549,6 +557,42 @@ def test_batch_run_closes_no_vendor_object_on_its_terminal_path():
         and node.func.attr == "close"
     ]
     assert not closes, f"batch.run calls {closes} (G-62)"
+
+
+def test_telemetry_accumulator_is_swapped_at_mission_start_not_at_restage():
+    """WHERE the record is replaced decides what the sample's first GT sample is.
+
+    ``World.reset(soft=True)`` "will do one step internally regardless" (vendor
+    docstring), and ``repose_robot`` runs AFTER that reset — so a record swapped
+    before the restage collects its first GT pose at the PREVIOUS sample's pose.
+    Measured (p6c3 T3 §4, 12 samples): all 11 teleported samples reported
+    ``time_to_goal_s = 0.0`` (the previous sample ended near the goal, so
+    ``reached_goal`` read t=0 as arrived) and ``path_len_m`` carried the teleport
+    distance (i=3: 12.564 m, of which 6.354 m was the jump). The swap therefore
+    belongs where ``main.run`` attaches the sampler: after readiness, at mission
+    start. Guarded on the AST rather than the text so comments cannot fake it.
+    """
+    run = _batch_run_function()
+    swaps = [
+        node.lineno
+        for node in ast.walk(run)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "sampler.record"
+        and ast.unparse(node.value) == "TelemetryRecord()"
+    ]
+    assert len(swaps) == 1, f"the sample boundary must be exactly ONE swap, found {swaps}"
+    called: dict[str, list[int]] = {}
+    for node in ast.walk(run):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            called.setdefault(node.func.attr, []).append(node.lineno)
+    (restage,) = called["restage"]
+    (realign,) = called["realign"]
+    (readiness,) = called["await_ready"]
+    (mission,) = called["drive_mission"]
+    assert restage < realign < readiness < swaps[0] < mission, (
+        f"record swap at line {swaps[0]} is not between readiness ({readiness}) "
+        f"and the mission ({mission})"
+    )
 
 
 def test_batch_module_entrypoint_delivers_the_code_with_hard_exit():

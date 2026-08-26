@@ -16,9 +16,9 @@ Sequence — boot ONCE, then per sample i:
     admit every spec (0 GPU seconds) -> bridge bootstrap -> SimulationApp ->
     ros2 bridge -> scene/robot/telemetry (sample 0's staging) -> adapter wire ->
     render product
-      | i: cycle telemetry accumulator -> re-pin seed -> restage (obstacle move,
-      |    soft reset, repose) -> sim_config line -> SUT realign + settle ->
-      |    readiness -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
+      | i: re-pin seed -> restage (obstacle move, soft reset, repose) ->
+      |    sim_config line -> SUT realign + settle -> readiness -> cycle telemetry
+      |    accumulator -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
       |    -> batch_summary.json (atomic flush = the carrier's heartbeat)
 
 Exit contract (CARRIER level — the sample verdicts live in their own result.json):
@@ -534,12 +534,6 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
             )
 
             iter_watch.begin("restage")
-            # The accumulator is REPLACED, not the binding: a soft restage never
-            # destroys the physics simulation view, so the sampler stays bound for
-            # the carrier's life (measured p6c2: 60 iterations, bind() 0 extra
-            # times, GT poses collected throughout). The physics callback reads
-            # the attribute every step, so swapping it is the whole "new sample".
-            sampler.record = TelemetryRecord()
             sim.config.seed = request.scenario.seed
             sim.pin_determinism_seeds()
             if position:  # sample 0's world is the one load_scene just staged
@@ -605,6 +599,18 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
                 return EXIT_PLATFORM
 
             plan = plan_artifacts(out_dir)
+            # The accumulator is REPLACED, not the binding: a soft restage never
+            # destroys the physics simulation view, so the sampler stays bound for
+            # the carrier's life (measured p6c2: 60 iterations, bind() 0 extra
+            # times). The physics callback reads the attribute every step, so
+            # swapping it IS the sample boundary — and it belongs HERE, where
+            # ``main.run`` attaches (step 6), not at the top of the iteration:
+            # ``World.reset(soft=True)`` "will do one step internally regardless"
+            # (vendor docstring), so a record swapped before the restage takes its
+            # FIRST GT sample at the previous sample's pose. Measured (p6c3 T3
+            # §4): 11/11 teleported samples reported time_to_goal_s = 0.0 and a
+            # path_len_m inflated by the teleport distance (i=3: +6.354 m).
+            sampler.record = TelemetryRecord()
             iter_watch.begin("record_start")
             rosbag = _start_quiet(RosbagRecorder(plan, base_config))
             video.begin_iteration(plan.video_mp4)
