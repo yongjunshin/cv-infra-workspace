@@ -122,6 +122,7 @@ from typing import Any, get_args
 
 from fastapi import FastAPI, HTTPException, Request
 
+from cv_infra.contract.derive import materialize_request
 from cv_infra.contract.errors import ContractError
 from cv_infra.contract.loader import AdmittedRequest, load_request
 from cv_infra.contract.schema import RequestEnvelope, ResourceBudget
@@ -386,8 +387,11 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
     ``execution_settings`` (decision 2026-08-04 D-8): the knobs the RUNNER can
     act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
     each fanned-out job IS one repeat, so shipping it would tell the runner
-    something false about the job it holds (one home per field). The subtree is
-    dumped mechanically (``exclude={"repeats"}`` + ``exclude_none``) so a future
+    something false about the job it holds (one home per field). ``min_pass_ratio``
+    is excluded for the same reason (p6 §0-14): it judges the REQUEST's samples
+    as a set, which is not a fact about the one sample the runner holds. The
+    subtree is dumped mechanically (``exclude={"repeats", "min_pass_ratio"}`` +
+    ``exclude_none``) so a future
     M1 knob rides without an allowlist to drift (G-25), and it is OMITTED when
     nothing survives that filter — an undeclared ``fixed_dt`` leaves the frozen
     key set byte-identical. Nesting (not flattening like ``sut_image_ref``) is
@@ -411,7 +415,9 @@ def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
             criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
         ],
     }
-    runner_knobs = request.execution_settings.model_dump(exclude_none=True, exclude={"repeats"})
+    runner_knobs = request.execution_settings.model_dump(
+        exclude_none=True, exclude={"repeats", "min_pass_ratio"}
+    )
     if runner_knobs:
         spec["execution_settings"] = runner_knobs
     return spec
@@ -618,7 +624,14 @@ def create_app(
             # p4c4 glue (T1 §7-1 (a)): the ADMITTED model materializes into the
             # canonical per-job JOB_SPEC riding (and persisting with) the job —
             # the production runner seam (RunJobRunner) drives run_job off it.
-            job.job_spec = _job_spec_for(admitted_of[job.request_id].request, job_key(job))
+            # p6c3: the request is first materialized for THIS job's sample index
+            # (derive.materialize_request) — a static document is returned
+            # unchanged (same object), so this line is byte-identical for every
+            # pre-p6 request; a randomized one yields sample `repeat_index`.
+            job.job_spec = _job_spec_for(
+                materialize_request(admitted_of[job.request_id].request, job.repeat_index),
+                job_key(job),
+            )
             # p5c18 T4: the request identity key rides the job to the runner env, so the
             # job plane's own artifacts can name the request that produced them.
             job.request_identity_key = identity_of[job.request_id]

@@ -327,8 +327,10 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
     act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
     each fanned-out job IS one repeat (this CLI path runs exactly one), so
     shipping it would tell the runner something false about the job it holds.
-    The subtree is dumped mechanically (``exclude={"repeats"}`` +
-    ``exclude_none``) so a future M1 knob rides without an allowlist to drift,
+    ``min_pass_ratio`` is excluded for the same reason (p6 §0-14) — it judges the
+    request's samples as a set, not the one sample the runner holds.
+    The subtree is dumped mechanically (``exclude={"repeats", "min_pass_ratio"}``
+    + ``exclude_none``) so a future M1 knob rides without an allowlist to drift,
     and it is OMITTED when nothing survives that filter — an undeclared
     ``fixed_dt`` leaves the frozen key set byte-identical. It nests (rather than
     flattening like ``sut_image_ref``) because the runner re-validates the spec
@@ -344,7 +346,9 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
             criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
         ],
     }
-    runner_knobs = request.execution_settings.model_dump(exclude_none=True, exclude={"repeats"})
+    runner_knobs = request.execution_settings.model_dump(
+        exclude_none=True, exclude={"repeats", "min_pass_ratio"}
+    )
     if runner_knobs:
         spec["execution_settings"] = runner_knobs
     return spec
@@ -498,7 +502,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     # Canonical JOB_SPEC from the ADMITTED model (G-17: the model, not prose,
     # is SoT) — wire shape frozen at the Phase-2 seam (_job_spec_from_request).
-    job_spec = _job_spec_from_request(admitted.request, job_id)
+    # p6c3: `cv-infra run` executes exactly one job, so it runs SAMPLE 0 of a
+    # randomized document (a preview of what the fan-out's first sample will be —
+    # same seed, same index, same bytes). A static document is returned unchanged.
+    from cv_infra.contract.derive import materialize_request
+
+    job_spec = _job_spec_from_request(materialize_request(admitted.request, 0), job_id)
 
     out_dir = Path(args.out_dir)
     try:

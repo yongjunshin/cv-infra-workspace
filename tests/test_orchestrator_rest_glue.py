@@ -204,6 +204,114 @@ def test_admitted_spec_rides_fanned_out_jobs_and_persists(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# (a2) p6c3 랜덤성: 구체화(materialization)의 교차평면 동일성 + parity 입력 성장 (G-59)
+# --------------------------------------------------------------------------- #
+
+
+def _randomized_doc() -> dict:
+    """캐노니컬 요청 + 3축 분포 + p6 실행 노브 — parity 가드의 입력을 계약 성장에 맞춰
+    키운다(G-59 ③: optional 필드를 더하면 그것을 선언하는 입력을 함께 넣어라)."""
+    doc = _request_doc()
+    doc["scenario"]["goal"] = {
+        "x": {"choice": [-6.0, 5.0]},
+        "y": 5.0,
+        "yaw": {"uniform": [0.0, 3.14]},
+    }
+    doc["scenario"]["initial_pose"] = {"x": {"uniform": [-6.5, -5.5]}, "y": -1.0, "yaw": 3.1416}
+    doc["execution_settings"] = {"repeats": 3, "fixed_dt": 0.02, "min_pass_ratio": 0.8}
+    return doc
+
+
+def test_job_spec_twins_stay_equal_on_the_p6_inputs():
+    """쌍둥이 parity를 p6 입력으로 재무장: **구체화된 표본**(분포가 이미 값이 된 문서)과
+    **min_pass_ratio를 선언한 execution_settings**를 둘 다 밟는다.
+
+    비공허 실증(G-59 ②): 한쪽 쌍둥이의 exclude에서 ``min_pass_ratio``만 빼면 이 단정이
+    red가 된다 — 아래 두 번째 블록이 그 값이 **어느 쪽 wire에도 없다**는 것을 함께 걸기
+    때문에, 두 복제본을 같이 고쳐도 통과하지 못한다.
+    """
+    from cv_infra.contract.derive import materialize_request
+
+    request = _admit(_randomized_doc()).request
+    for index in range(3):
+        sample = materialize_request(request, index)
+        assert _job_spec_for(sample, "jid-1") == m8_job_spec_from_request(sample, "jid-1")
+
+    spec = _job_spec_for(materialize_request(request, 0), "jid-1")
+    # 러너가 작동시킬 수 있는 노브만 실린다: fixed_dt는 타고, repeats/min_pass_ratio는 안 탄다.
+    assert spec["execution_settings"] == {"fixed_dt": 0.02}
+    assert request.execution_settings.min_pass_ratio == 0.8  # 모델에는 남아 있다 (p6c4가 읽는다)
+
+
+def test_materialization_is_identical_on_the_rest_and_cli_planes(tmp_path):
+    """분포 문서 1건이 **REST fan-out 경로**와 **CLI 경로**에서 인덱스별로 같은 JOB_SPEC
+    바이트를 낸다 — 그리고 그 값은 derive 자신이 산출한 값과 같다.
+
+    두 진입점은 서로를 import 하지 않으므로(레이어 방향: M8이 M3을 감싼다) 이 동일성은
+    "같은 파생기를 같은 인덱스로 부른다"는 계약에만 의존한다. REST 쪽은 재구현이 아니라
+    **실제 submit 경로**를 태워서(create_app + fan-out + job_spec 승차) 잡에 실제로 올라탄
+    스펙을 회수한다.
+    """
+    from cv_infra.contract.derive import materialize_request
+
+    class SpecRecordingRunner:
+        def __init__(self) -> None:
+            self.specs: dict[str, dict | None] = {}
+
+        def run(self, job: Job) -> JobResult:
+            self.specs[job_key(job)] = copy.deepcopy(job.job_spec)
+            return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+    doc = _randomized_doc()
+    runner = SpecRecordingRunner()
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, runner, k=2)
+        with TestClient(app) as client:
+            response = client.post("/envelopes", json={"requests": [doc]})
+            assert response.status_code == 202, response.text
+            envelope_id = response.json()["envelope_id"]
+            deadline = time.monotonic() + 10.0
+            body = client.get(f"/envelopes/{envelope_id}").json()
+            while body["status"] != "completed":
+                assert time.monotonic() < deadline, "envelope did not complete in time"
+                time.sleep(0.02)
+                body = client.get(f"/envelopes/{envelope_id}").json()
+
+    assert len(runner.specs) == 3  # repeats=3 = 표본 3개 (B-U)
+    request = _admit(doc).request
+    for key, spec in runner.specs.items():
+        repeat_index = int(key.rsplit(":", 1)[1])
+        # ① 잡의 repeat_index == 그 잡이 들고 있는 표본의 인덱스 (와이어 불변식)
+        assert spec["scenario"]["derivation"] == {"version": "cv-derive/1", "index": repeat_index}
+        # ② CLI 평면이 같은 인덱스로 만든 스펙과 바이트 동일
+        cli_spec = m8_job_spec_from_request(materialize_request(request, repeat_index), key)
+        assert json.dumps(spec, sort_keys=True) == json.dumps(cli_spec, sort_keys=True)
+        # ③ 값 자체가 derive 산출과 같다 (양쪽이 같이 틀렸을 가능성을 닫는다)
+        derived = materialize_request(request, repeat_index).scenario
+        assert spec["scenario"]["goal"]["x"] == derived.goal.x
+        assert spec["scenario"]["initial_pose"]["x"] == derived.initial_pose.x
+        # ④ 분포 표기는 실행 평면으로 새지 않는다 (§0-5 러너 거부의 반대편 끝)
+        assert "uniform" not in json.dumps(spec) and "choice" not in json.dumps(spec)
+
+    # 표본 3개가 서로 다른 문서다 (핀이 "전부 같은 상수"로도 통과하지 않는다는 대조).
+    goals = {spec["scenario"]["goal"]["yaw"] for spec in runner.specs.values()}
+    assert len(goals) == 3
+
+
+def test_a_materialized_spec_is_accepted_by_the_real_runner_seam():
+    """착지의 반대편 끝: 구체화된 스펙을 러너의 REAL ``parse_request``가 복원한다 —
+    ``derivation`` 스탬프가 러너의 ``extra="forbid"`` 재검증을 통과한다는 실증(이것이
+    스탬프를 Scenario 안에 둔 이유다)."""
+    from cv_infra.contract.derive import materialize_request
+    from cv_infra.runner.main import parse_request
+
+    sample = materialize_request(_admit(_randomized_doc()).request, 2)
+    restored, _adapter = parse_request(_job_spec_for(sample, "jid-1"))
+    assert restored.scenario.derivation.index == 2
+    assert restored.scenario.goal.x == sample.scenario.goal.x
+
+
+# --------------------------------------------------------------------------- #
 # (b) RunJobRunner: outcome fold + frozen-seam hand-off + watchdog declaration
 # --------------------------------------------------------------------------- #
 

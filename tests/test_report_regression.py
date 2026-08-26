@@ -263,6 +263,83 @@ def test_empty_list_is_kept_not_treated_as_absent():
 
 
 # --------------------------------------------------------------------------- #
+# (1c) p6 randomness (p6c3) — a request that DECLARES distributions has its own
+# key, and the axis that decides which samples get drawn is INSIDE it.
+# --------------------------------------------------------------------------- #
+
+# Same request as ``_BASE_REQUEST`` with two axes randomized + a spawn window.
+_DISTRIBUTION_SCENARIO: dict[str, Any] = {
+    "scene": "nova_carter_warehouse",
+    "robot": "nova_carter",
+    "goal": {"x": {"choice": [-6.0, 5.0]}, "y": 5.0, "yaw": {"uniform": [0.0, 3.1416]}},
+    "seed": 42,
+    "timeout_s": 120,
+    "initial_pose": {"x": {"uniform": [-6.5, -5.5]}, "y": -1.0, "yaw": 3.1416},
+}
+
+# The key a randomized request carries. Measured 2026-08-26 (p6c3 T1) — the
+# sibling of CANONICAL_FIXTURE_KEY for the p6 wire: it exists so that the
+# baseline of a randomized request cannot be silently invalidated by a change to
+# the notation's SERIALIZATION (the distribution rides the key verbatim), the
+# way the canonical pin protects static requests.
+DISTRIBUTION_FIXTURE_KEY = "sha256:cc66d90e256cd60ba6e3deff92d92182f7c9780ab864ade5abd0b7d05628ae85"
+
+
+def test_distribution_request_key_is_pinned():
+    assert identity_key(_dump(scenario=_DISTRIBUTION_SCENARIO)) == DISTRIBUTION_FIXTURE_KEY
+
+
+def test_seed_moves_a_randomized_requests_key_but_repeats_still_does_not():
+    """The two halves of "what identifies a randomized request".
+
+    seed IS in the key: with distributions declared, the seed decides WHICH
+    samples get drawn, so two seeds are two different verification requests and
+    must not share a baseline. repeats is still NOT: it decides HOW MANY samples
+    are drawn — the rolled-up verdict already collapses them (header block).
+    """
+    other_seed = {**_DISTRIBUTION_SCENARIO, "seed": 43}
+    assert identity_key(_dump(scenario=other_seed)) != DISTRIBUTION_FIXTURE_KEY
+    for repeats in (1, 5, 60):
+        assert (
+            identity_key(
+                _dump(scenario=_DISTRIBUTION_SCENARIO, execution_settings={"repeats": repeats})
+            )
+            == DISTRIBUTION_FIXTURE_KEY
+        )
+
+
+def test_min_pass_ratio_is_part_of_request_identity():
+    """Unlike repeats, min_pass_ratio says WHAT COUNTS AS PASS — a judgement
+    policy, i.e. part of what is being verified (p6 design §0-14). Absent it is
+    null and prunes away, so no existing key moved when the field landed."""
+    assert (
+        identity_key(_dump(scenario=_DISTRIBUTION_SCENARIO, execution_settings={"repeats": 5}))
+        == DISTRIBUTION_FIXTURE_KEY
+    )
+    with_ratio = _dump(
+        scenario=_DISTRIBUTION_SCENARIO, execution_settings={"repeats": 5, "min_pass_ratio": 0.8}
+    )
+    assert identity_key(with_ratio) != DISTRIBUTION_FIXTURE_KEY
+
+
+def test_the_key_belongs_to_the_submitted_document_not_to_a_derived_sample():
+    """Why the producers derive the key from the ADMITTED request and never from
+    the materialized sample (orchestrator/api.py, cli/main.py): each sample has
+    different drawn values and its own derivation stamp, so keying on a sample
+    would give one request N baselines that never match again."""
+    from cv_infra.contract.derive import materialize_request
+
+    request = VerificationRequest.model_validate(
+        {**_BASE_REQUEST, "scenario": _DISTRIBUTION_SCENARIO}
+    )
+    keys = {
+        identity_key(materialize_request(request, i).model_dump(mode="json", by_alias=True))
+        for i in range(3)
+    }
+    assert len(keys) == 3 and DISTRIBUTION_FIXTURE_KEY not in keys
+
+
+# --------------------------------------------------------------------------- #
 # (2) regression 3-phase — REQ-REPORT-003/004, NFR-REPORT-001/002
 # --------------------------------------------------------------------------- #
 
