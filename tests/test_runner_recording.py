@@ -194,5 +194,74 @@ def test_video_recorder_capture_before_start_is_noop(tmp_path):
     assert recorder.stride == 6  # 60 sim fps -> 10 video fps default
 
 
+class _FakeWriter:
+    """A cv2.VideoWriter-shaped stand-in (the only per-sample allocation)."""
+
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+def _loop_recorder(monkeypatch, writers: list):
+    recorder = recording.LoopVideoRecorder()
+    monkeypatch.setattr(recorder, "_open_writer", lambda path: writers.pop(0))
+    return recorder
+
+
+def test_loop_recorder_shares_the_single_job_frame_policy():
+    """Camera/resolution/fps/stride are IMPORTED, not restated (G-25): two
+    recorders of the same mission must not produce two different videos."""
+    recorder = recording.LoopVideoRecorder()
+    assert recorder.camera_path == recording.DEFAULT_CAMERA_PATH
+    assert recorder.resolution == recording.DEFAULT_RESOLUTION
+    assert recorder.video_fps == recording.DEFAULT_VIDEO_FPS
+    assert recorder.stride == recording.capture_stride(60.0, recording.DEFAULT_VIDEO_FPS)
+
+
+def test_loop_recorder_returns_none_when_the_sample_captured_no_frames(tmp_path, monkeypatch):
+    """A 0-frame mp4 is unplayable, so the artifact field must say "no video"
+    rather than point at one (P2-02: recording degrades loudly, never silently)."""
+    writer = _FakeWriter()
+    recorder = _loop_recorder(monkeypatch, [writer])
+    recorder.begin_iteration(tmp_path / "results" / "0" / "recording.mp4")
+    assert recorder.end_iteration() is None
+    assert writer.released is True  # the writer is closed either way
+
+
+def test_loop_recorder_returns_the_path_when_frames_were_written(tmp_path, monkeypatch):
+    target = tmp_path / "results" / "1" / "recording.mp4"
+    recorder = _loop_recorder(monkeypatch, [_FakeWriter()])
+    recorder.begin_iteration(target)
+    recorder.last_frame_count = 42  # what capture_frame does on GPU
+    assert recorder.end_iteration() == target
+    assert target.parent.is_dir()  # the sample's out-dir was created
+
+
+def test_loop_recorder_cycles_only_the_writer_between_samples(tmp_path, monkeypatch):
+    """The render product is created ONCE per carrier (a per-sample one would
+    re-add the VRAM growth term p6c2 removed); only the writer is cycled."""
+    first, second = _FakeWriter(), _FakeWriter()
+    recorder = _loop_recorder(monkeypatch, [first, second])
+    recorder.begin_iteration(tmp_path / "0.mp4")
+    recorder.last_frame_count = 5
+    recorder.end_iteration()
+    recorder.begin_iteration(tmp_path / "1.mp4")
+    assert recorder.last_frame_count == 0  # counters reset per sample
+    assert first.released and not second.released
+    assert recorder._annotator is None  # never re-created by begin_iteration
+
+
+def test_loop_recorder_capture_between_samples_is_a_noop(tmp_path):
+    """The hook stays registered on SimRuntime for the carrier's whole life, so
+    frames produced by a restage/realign belong to no sample and are dropped."""
+    recorder = recording.LoopVideoRecorder()
+    recorder.capture_frame()  # no writer -> silently skips
+    recorder.abort()
+    recorder.abort()  # idempotent
+    assert recorder.end_iteration() is None
+
+
 def test_recorder_unavailable_is_runtime_error():
     assert issubclass(recording.RecorderUnavailable, RuntimeError)

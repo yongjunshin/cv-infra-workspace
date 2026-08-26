@@ -223,6 +223,106 @@ class RosbagRecorder:
             self._log_file = None
 
 
+class LoopVideoRecorder:
+    """One render product for the CARRIER, one mp4 per SAMPLE (p6 batch loop).
+
+    ``VideoRecorder`` creates its render product in ``start()``; a batch carrier
+    calling that n times would add a VRAM growth term per sample — the exact term
+    the p6c2 measurement worked to eliminate — and it would also re-pay the
+    replicator attach on every iteration. So the render product/annotator are
+    created ONCE (``open_render_product``) and only the cv2 writer is cycled
+    (``begin_iteration`` / ``end_iteration``).
+
+    Everything else is IMPORTED from this module, not restated: camera path,
+    resolution, fps and the capture stride are the same policy the single-job
+    recorder applies, so the two never drift into producing different videos of
+    the same mission (G-25).
+
+    ``end_iteration`` returns None when the sample produced NO frames rather than
+    a path to an unplayable 0-frame file — the artifact field then honestly says
+    "no video" (P2-02: recording degrades loudly, it never poisons a verdict).
+    """
+
+    def __init__(
+        self,
+        camera_path: str = DEFAULT_CAMERA_PATH,
+        resolution: tuple[int, int] = DEFAULT_RESOLUTION,
+        sim_fps: float = 60.0,
+        video_fps: float = DEFAULT_VIDEO_FPS,
+    ) -> None:
+        self.camera_path = camera_path
+        self.resolution = resolution
+        self.stride = capture_stride(sim_fps, video_fps)
+        self.video_fps = video_fps
+        self.last_frame_count = 0
+        self._annotator = None
+        self._writer = None
+        self._path: Path | None = None
+        self._step_count = 0
+
+    def open_render_product(self) -> None:  # pragma: no cover - GPU path (W2)
+        """Create the ONE render product + rgb annotator for the whole carrier."""
+        import omni.replicator.core as rep  # noqa: PLC0415
+
+        render_product = rep.create.render_product(self.camera_path, self.resolution)
+        self._annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+        self._annotator.attach(render_product)
+
+    def _open_writer(self, path: Path):  # pragma: no cover - GPU path (bundled cv2)
+        """The cv2 writer for one sample — the only per-iteration allocation."""
+        import cv2  # noqa: PLC0415 (bundled, measured 4.11.0)
+
+        return cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), self.video_fps, self.resolution
+        )
+
+    def begin_iteration(self, path: str | Path) -> None:
+        """Start sample i's mp4 (counters reset; the render product is untouched)."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._path = target
+        self._step_count = 0
+        self.last_frame_count = 0
+        self._writer = self._open_writer(target)
+
+    def capture_frame(self) -> None:  # pragma: no cover - GPU path (W2)
+        """Step listener: encode every Nth rendered frame (RGBA -> BGR).
+
+        Between samples ``self._writer`` is None, so the hook can stay registered
+        on ``SimRuntime.on_step`` for the carrier's whole life — the frames a
+        restage/realign produces simply belong to no sample and are dropped.
+        """
+        if self._writer is None:
+            return
+        self._step_count += 1
+        if self._step_count % self.stride:
+            return
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp)
+
+        data = self._annotator.get_data()
+        if data is None or getattr(data, "size", 0) == 0:
+            return  # renderer warm-up: no frame yet
+        frame = np.asarray(data)
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            return
+        self._writer.write(np.ascontiguousarray(frame[:, :, 2::-1]))
+        self.last_frame_count += 1
+
+    def end_iteration(self) -> Path | None:
+        """Close sample i's mp4; the path, or None when nothing was captured."""
+        if self._writer is None:
+            return None
+        self._writer.release()
+        self._writer = None
+        return self._path if self.last_frame_count else None
+
+    def abort(self) -> None:
+        """Failure-path cleanup (idempotent): release the writer without raising."""
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+
+
 class VideoRecorder:
     """Off-screen render product -> mp4 via bundled cv2 (CPU encode, D-O).
 
