@@ -150,6 +150,23 @@ def test_reexec_honors_explicit_argv():
     ]
 
 
+def test_reexec_carries_the_batch_entrypoint_when_the_carrier_boots():
+    """p6c1 measured the cost of NOT passing argv: the batch carrier re-exec'd
+    into ``cv_infra.runner.main``, which then died on the JOB_SPEC it expects
+    (exit 2 in 2.4 s). The carrier owns its argv; the default stays main's."""
+    import sys
+
+    from cv_infra.runner import batch
+
+    calls: list = []
+    ros_bridge.reexec_for_bridge_lib(
+        _bootstrap(prepended=True),
+        argv=batch.reexec_argv(),
+        execv=lambda path, args: calls.append((path, args)),
+    )
+    assert calls == [(sys.executable, [sys.executable, "-m", "cv_infra.runner.batch"])]
+
+
 # --------------------------------------------------------------------------- #
 # R4 texture streaming budget cap (sim_runtime boot glue, p4c4 T2).
 # --------------------------------------------------------------------------- #
