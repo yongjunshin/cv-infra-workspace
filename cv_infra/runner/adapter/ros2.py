@@ -201,6 +201,19 @@ class Ros2Adapter(SimAdapter):
         """
         return self._readiness_phase
 
+    @property
+    def node(self):
+        """The wired rclpy node, or None before ``wire`` (public seam, p6c3).
+
+        Exposed so collaborators that need ROS knowledge this adapter does not
+        own — the nav2-specific ``runner.realign`` above all — can create their
+        own publishers/clients on the SAME node without reaching into a private
+        attribute (the p6 spike did ``adapter._node`` and said so in a comment).
+        One node per runner process stays the rule: a second node would be a
+        second DDS participant in the job's domain.
+        """
+        return self._node
+
     # ------------------------------------------------------------------ #
     # SimAdapter interface — ROS bodies (bundled rclpy; T3 proves on GPU).
     # ------------------------------------------------------------------ #
@@ -381,6 +394,17 @@ class Ros2Adapter(SimAdapter):
     # ------------------------------------------------------------------ #
     # ROS-body helpers (bundled rclpy; not CPU-reachable).
     # ------------------------------------------------------------------ #
+    def step_and_spin(self) -> None:
+        """Public alias of ``_step_and_spin`` — the pump every waiter must use.
+
+        Any loop that waits on the SUT (readiness, mission, and since p6c3 the
+        realign/settle steps in ``runner.batch``) has to keep the sim stepping
+        while it waits, because the sim IS the /clock source (G-19): a plain
+        sleep would wait forever on a clock it just stopped feeding. The
+        internal spelling stays for this class's own call sites.
+        """
+        self._step_and_spin()
+
     def _step_and_spin(self) -> None:
         """One sim step (the /clock source) + a BOUNDED batch of rclpy callbacks.
 

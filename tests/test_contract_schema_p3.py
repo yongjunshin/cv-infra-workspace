@@ -186,15 +186,24 @@ def test_scenario_debug_obstacle_is_optional_and_rejects_unknown_keys():
 
 
 def test_debug_obstacle_keys_match_the_runner_read_set():
-    # G-25-style mechanical bind: the contract's known keys == the keys
-    # ``SimRuntime.spawn_debug_obstacle`` actually reads (``spec["k"]`` /
-    # ``spec.get("k", ...)`` call sites) — never a hand-kept list.
+    # G-25-style mechanical bind: the contract's known keys == the keys the
+    # runner actually reads (``spec["k"]`` / ``spec.get("k", ...)`` call sites)
+    # when it places the obstacle — never a hand-kept list.
+    #
+    # p6c3: the read set is spread over TWO functions on purpose. The x/y/height
+    # -> world-position arithmetic became one pure home (``debug_obstacle_position``)
+    # because the batch loop MOVES the existing prim instead of respawning it, and
+    # a moved box and a spawned box must land in the same place by construction.
+    # Both are the same module's obstacle-placement surface, so the guard takes
+    # their union rather than a single function's source.
     import inspect
     import re
 
-    from cv_infra.runner.sim_runtime import SimRuntime
+    from cv_infra.runner.sim_runtime import SimRuntime, debug_obstacle_position
 
-    src = inspect.getsource(SimRuntime.spawn_debug_obstacle)
+    src = inspect.getsource(SimRuntime.spawn_debug_obstacle) + inspect.getsource(
+        debug_obstacle_position
+    )
     reads = set(re.findall(r"""spec(?:\.get\(|\[)\s*["'](\w+)["']""", src))
     assert reads, "read-set extraction went empty (positive control, G-07)"
     assert set(DebugObstacle.model_fields) == reads

@@ -314,6 +314,38 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# P2-04 debug obstacle placement — ONE home for the prim path + defaults.
+# --------------------------------------------------------------------------- #
+#: Stage path of the runner-authored debug obstacle. It is a CONSTANT because two
+#: call sites must name the same prim: ``spawn_debug_obstacle`` (once, pre-reset)
+#: and ``move_debug_obstacle`` (every batch iteration). A drift between them would
+#: not fail — it would silently author a SECOND box, and every ``FixedCuboid()``
+#: on a fresh path also defines two material prims nothing removes (measured
+#: p6c2 §2.1: 2 -> 48 material prims over 24 delete+respawn iterations).
+DEBUG_OBSTACLE_PRIM = "/World/cv_debug_obstacle"
+
+#: Runner-owned dimension defaults (M1 schema None = "the runner default
+#: applies"). The LOW default height keeps the box below the 2D-lidar scan plane,
+#: so it stays invisible to the blackbox nav's costmaps and deterministically
+#: meets the chassis.
+DEBUG_OBSTACLE_DEFAULT_HEIGHT = 0.15
+DEBUG_OBSTACLE_DEFAULT_WIDTH = 1.2
+DEBUG_OBSTACLE_DEFAULT_DEPTH = 0.4
+
+
+def debug_obstacle_position(spec: dict) -> tuple[float, float, float]:
+    """Declared ``{x, y[, height]}`` -> the world position that CENTRES the box.
+
+    Spawn and move share this one function on purpose: the ``z = height/2``
+    centring and the height default are what put the cuboid on the floor, so a
+    moved box and a respawned box must land in the same place by construction
+    (G-25 — the spike carried a second copy of this arithmetic). Pure, CPU-tested.
+    """
+    height = float(spec.get("height", DEBUG_OBSTACLE_DEFAULT_HEIGHT))
+    return float(spec["x"]), float(spec["y"]), height / 2.0
+
+
+# --------------------------------------------------------------------------- #
 # REQ-EXEC-002: the DECLARED spawn pose (scenario.initial_pose) — CPU-testable.
 # --------------------------------------------------------------------------- #
 def resolve_initial_pose_target(pose: dict | None, robot_prim_path: str | None) -> str | None:
@@ -357,6 +389,33 @@ def initial_pose_world_transform(
     return position, (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
 
 
+# --------------------------------------------------------------------------- #
+# p6 batch loop: the iteration boundary's own evidence line — CPU-testable.
+# --------------------------------------------------------------------------- #
+#: Verbatim grep marker (G-26 prove-it-ran gate, pinned by CPU test + NEG-6): a
+#: repose that silently did nothing and a repose that never ran read the same in
+#: a log, and the batch loop's whole correctness rests on sample i+1 starting
+#: where it declared it would.
+REPOSE_LOG_MARKER = "repose_applied="
+
+
+def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz) -> str:
+    """One structured line per repose — what was DECLARED and what was WRITTEN.
+
+    Both sides are printed because they are different objects: the declared block
+    is planar (x/y/yaw) and the written position carries the asset's own z. The
+    trailing note names what this repose does NOT touch, so a W1 reading of
+    "the robot is in the right place but the wheels are spinning" has the code's
+    own statement of scope next to it.
+    """
+    return (
+        f"[cv-runner] {REPOSE_LOG_MARKER}{prim_path} declared={declared} "
+        f"position={position} orientation_wxyz={orientation_wxyz} "
+        "(z from the scene asset; lin/ang + joint velocities zeroed, "
+        "joint POSITIONS untouched)"
+    )
+
+
 class SimRuntime:
     """Wraps the SimulationApp / World lifecycle. Isaac bodies are deferred-import."""
 
@@ -377,6 +436,11 @@ class SimRuntime:
         # instrumentation (behavior identical; the runner works untraced).
         self.trace = trace
         self._first_step_traced = False
+        # p6 batch loop: the SingleArticulation wrapper ``repose_robot`` writes
+        # through, created once and kept — building it per iteration would re-run
+        # the physics-view handshake n times for no gain (and the wrapper is only
+        # valid while the timeline plays, which soft restaging never interrupts).
+        self._articulation = None
 
     def _phase_begin(self, phase: str, **fields) -> None:
         if self.trace is not None:
@@ -460,6 +524,21 @@ class SimRuntime:
             print(f"[cv-runner] WARNING: sim_config {'; '.join(notes)}", flush=True)
         return line
 
+    def pin_determinism_seeds(self) -> None:  # pragma: no cover - GPU path (numpy)
+        """Pin the PRNG streams for the sample about to run (REQ-EXEC-003).
+
+        ONE home for the pins (G-25): ``load_scene`` calls it BEFORE the World is
+        constructed (seed before physics init), and the batch loop calls it again
+        at every iteration boundary — sample i+1 must not inherit sample i's
+        already-advanced stream, which is the opposite of an independent run.
+        numpy is legal here (post-SimulationApp, D-C) and is why this body is off
+        the CPU path: the bundled interpreter has it, a CPU host need not.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed & 0xFFFFFFFF)
+
     def load_scene(self, identity_key: str | None = None) -> None:  # pragma: no cover - GPU
         """open_stage(sample scene) + locate pre-wired robot; pin dt/seed; reset.
 
@@ -513,11 +592,8 @@ class SimRuntime:
         # lands in first_render_frame.
         self._phase_begin(PHASE_ROBOT_SPAWN)
         # Determinism pins (REQ-EXEC-003, LOCKED §6): seed before physics init;
-        # fixed dt on the World. numpy is legal here (post-SimulationApp, D-C).
-        random.seed(self.config.seed)
-        import numpy as np  # noqa: PLC0415
-
-        np.random.seed(self.config.seed & 0xFFFFFFFF)
+        # fixed dt on the World.
+        self.pin_determinism_seeds()
         self.world = World(
             physics_dt=self.config.physics_dt,
             rendering_dt=self.config.rendering_dt,
@@ -626,22 +702,146 @@ class SimRuntime:
         Runner-side scene mutation. The spec travels via the M1 known-key field
         ``scenario.debug_obstacle {x, y, height, width, depth}`` (D-2' — an
         obstacle is WORLD state, not a judging criterion; supersedes the P2
-        criteria-params ride-along). Dimension defaults below stay RUNNER-owned
-        (schema None = "runner default applies"). A LOW box (default 0.15 m,
-        below the 2D-lidar scan plane) stays invisible to the blackbox nav's
-        costmaps, so it deterministically meets the chassis. Called as a
-        pre-reset hook so the physics parse includes the collider.
+        criteria-params ride-along). Dimension defaults stay RUNNER-owned (the
+        ``DEBUG_OBSTACLE_DEFAULT_*`` constants; schema None = "runner default
+        applies"). A LOW box stays below the 2D-lidar scan plane and is therefore
+        invisible to the blackbox nav's costmaps, so it deterministically meets
+        the chassis. Called as a pre-reset hook so the physics parse includes the
+        collider — ONCE per process: the batch loop RE-POSITIONS this prim
+        (``move_debug_obstacle``) instead of respawning it.
         """
         import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
         from isaacsim.core.api.objects import FixedCuboid  # noqa: PLC0415
 
-        height = float(spec.get("height", 0.15))
+        height = float(spec.get("height", DEBUG_OBSTACLE_DEFAULT_HEIGHT))
         FixedCuboid(
-            prim_path="/World/cv_debug_obstacle",
-            name="cv_debug_obstacle",
-            position=np.array([float(spec["x"]), float(spec["y"]), height / 2.0]),
-            scale=np.array([float(spec.get("width", 1.2)), float(spec.get("depth", 0.4)), height]),
+            prim_path=DEBUG_OBSTACLE_PRIM,
+            name=DEBUG_OBSTACLE_PRIM.rsplit("/", 1)[-1],
+            position=np.array(debug_obstacle_position(spec)),
+            scale=np.array(
+                [
+                    float(spec.get("width", DEBUG_OBSTACLE_DEFAULT_WIDTH)),
+                    float(spec.get("depth", DEBUG_OBSTACLE_DEFAULT_DEPTH)),
+                    height,
+                ]
+            ),
         )
+
+    def move_debug_obstacle(self, spec: dict) -> None:  # pragma: no cover - GPU path (W2)
+        """Relocate the EXISTING debug-obstacle prim to this sample's position.
+
+        The batch loop's obstacle seam. Delete+respawn is FORBIDDEN here, and this
+        is why: measured in the installed 5.1.0 source
+        (``isaacsim/core/api/objects/cuboid.py``), every ``FixedCuboid()`` on a
+        fresh prim path also defines a NEW ``/World/Looks/visual_material_NN`` and
+        a NEW ``/World/Physics_Materials/physics_material_NN`` via
+        ``find_unique_string_name``, and nothing removes them (p6c2 §2.1 measured
+        2 -> 48 material prims over 24 delete+respawn iterations). Moving performs
+        zero prim churn: no orphans, no re-cook, no new material.
+
+        do-not-reinvent: the write goes through ``SingleXFormPrim``, the same
+        Isaac world-pose wrapper the declared initial pose uses.
+
+        A MISSING prim is a loud ``RuntimeError``, never a shrug: this runs only
+        when the sample DECLARES an obstacle, so "nothing to move" means the
+        pre-reset spawn hook never ran and the sample would silently be judged on
+        an obstacle-free world — exactly the FAIL-injection that must not vanish.
+        """
+        import omni.usd  # noqa: PLC0415 (legal post-SimulationApp)
+        from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+
+        stage = omni.usd.get_context().get_stage()
+        if not stage.GetPrimAtPath(DEBUG_OBSTACLE_PRIM).IsValid():
+            raise RuntimeError(
+                f"debug obstacle prim {DEBUG_OBSTACLE_PRIM!r} is not on the stage — this "
+                "sample declares scenario.debug_obstacle, so the pre-reset spawn hook must "
+                "have run once at scene load (a missing box would silently turn a "
+                "FAIL-injection sample into an obstacle-free one)"
+            )
+        position = debug_obstacle_position(spec)
+        SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=position)
+        print(f"[cv-runner] debug obstacle moved: {DEBUG_OBSTACLE_PRIM} -> {position}", flush=True)
+
+    def repose_robot(self, pose: dict) -> None:  # pragma: no cover - GPU path (W1 proves)
+        """Put the PLAYING robot back at a declared pose (batch iteration step 3).
+
+        ``apply_initial_pose`` cannot be reused: its stage-level xform write only
+        sticks BEFORE play (its own docstring says so), and the batch loop never
+        stops the timeline. The post-play equivalent is the articulation view, and
+        do-not-reinvent these are all existing 5.1.0 calls
+        (``SingleArticulation.set_world_pose`` = "teleport the prim pose
+        immediately" / ``set_linear_velocity`` / ``set_angular_velocity`` /
+        ``set_joint_velocities``). The planar-to-world math is the SAME
+        ``initial_pose_world_transform`` the pre-play path uses, so the two
+        spellings of "put the robot at the declared pose" agree by construction.
+
+        Velocities are zeroed because a teleport does not zero them: carrying
+        sample i's momentum into sample i+1 is a hidden coupling between samples,
+        and it would surface as unexplained variance in exactly the comparison
+        this platform exists to make.
+
+        SURFACED ASSUMPTION (v1 — W1 measures it): joint POSITIONS are left alone.
+        The MVP robot is a differential-drive base whose joint positions are wheel
+        angles, physically irrelevant to where a mission starts. If W1's settling
+        gate says otherwise, ``set_joint_positions`` is the one-line addition; the
+        log line says out loud that this run did not touch them.
+        """
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
+
+        # Same "declared but no known robot prim" rejection the pre-play path
+        # raises — ONE definition of that branch (CPU-tested there).
+        target = resolve_initial_pose_target(pose, self.robot_prim_path)
+        if self._articulation is None:
+            self._articulation = SingleArticulation(target)
+            self._articulation.initialize()
+        robot = self._articulation
+        current_position, _ = robot.get_world_pose()
+        position, orientation = initial_pose_world_transform(pose, current_position)
+        robot.set_world_pose(position=np.array(position), orientation=np.array(orientation))
+        robot.set_linear_velocity(np.zeros(3))
+        robot.set_angular_velocity(np.zeros(3))
+        dof = robot.num_dof
+        if dof:
+            robot.set_joint_velocities(np.zeros(dof))
+        print(repose_log_line(target, pose, position, orientation), flush=True)
+
+    def restage(
+        self, pose: dict | None = None, obstacle: dict | None = None
+    ) -> None:  # pragma: no cover - GPU path (W1/W2 prove)
+        """Bring the world to the NEXT sample's start state (p6 batch iteration seam).
+
+        NOT ``load_scene``: that re-opens the stage, and avoiding that cost is the
+        entire reason the batch carrier exists. The three steps and THEIR ORDER
+        are the contract:
+
+        1. **obstacle move FIRST** — it is an authored (kinematic) prim, so the new
+           transform must be on the stage before the reset publishes the start
+           state to physics.
+        2. **``world.reset(soft=True)``** — the SDK's own path that skips
+           ``stop()``/``play()`` (``isaacsim/core/api/world/world.py``: ``if not
+           soft: self.stop()``), so the physics simulation views are never
+           destroyed and re-created. Measured (p6c2): this is the ONLY intervention
+           that flattens the per-iteration VRAM slope (+4.96 -> +0.00 MiB/iteration,
+           flat to n=60); it also shortens the iteration by ~0.9 s and removes the
+           ``/clock`` rewind entirely (23/23 rewinds -> 0) because the timeline
+           never stops. Every post-hoc cleanup measured INEFFECTIVE (§5).
+        3. **repose LAST** — soft reset restores the articulation's DEFAULT state,
+           so a pose written before it would simply be overwritten. ``pose=None``
+           needs no step at all: that default restore IS the declared answer (and
+           is what every scenario declaring no initial_pose expects).
+
+        The hard-reset fallback (stop/author/reset + an ``n`` cap) is a CONTRACT
+        RESERVATION, not code: it is pre-approved for the case W1's gate fails, and
+        writing it now would ship a branch nobody has measured.
+        """
+        if self.world is None:
+            raise RuntimeError("load_scene() must run before restage() (M2 §3.2 order)")
+        if obstacle is not None:
+            self.move_debug_obstacle(obstacle)
+        self.world.reset(soft=True)
+        if pose is not None:
+            self.repose_robot(pose)
 
     def step(self, render: bool = True) -> None:
         """One fixed-dt step (render=True: Nova Carter RTX lidar needs off-screen render).
