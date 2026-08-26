@@ -520,6 +520,22 @@ def test_restage_keeps_the_soft_reset_and_its_two_neighbours():
     assert [ast.unparse(k) for k in reset_call[0].keywords] == ["soft=True"]
 
 
+def test_spawn_and_move_share_one_obstacle_position_home():
+    """The moved box and the spawned box must land in the same place BY CONSTRUCTION.
+
+    The batch loop MOVES the prim the first sample spawned, so the two placements
+    are the same physical claim written twice — the p6 spike carried the ``z =
+    height/2`` centring in two copies. Both call sites must go through the one
+    pure home; the read-set guard in test_contract_schema_p3 sees their UNION and
+    would therefore NOT notice one of them re-inlining the arithmetic (measured:
+    that mutation stays green).
+    """
+    source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
+    for method in ("spawn_debug_obstacle", "move_debug_obstacle"):
+        called = _called_names(_method(source, "SimRuntime", method))
+        assert "debug_obstacle_position" in called, f"{method} places the box on its own"
+
+
 def test_batch_run_closes_no_vendor_object_on_its_terminal_path():
     """Same G-62 invariant ``main.run`` carries: a vendor ``close()`` ends the
     process with status 0 and erases the carrier's exit code."""

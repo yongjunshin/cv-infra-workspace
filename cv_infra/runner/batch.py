@@ -53,7 +53,12 @@ from cv_infra.contract.job_batch import (
     JOB_SPEC_BATCH_ENV,
     JobSpecBatch,
 )
-from cv_infra.runner.evaluate import VERDICT_ERROR, read_field
+from cv_infra.runner.evaluate import (
+    VERDICT_ERROR,
+    EvaluationEngine,
+    build_result_dict,
+    read_field,
+)
 from cv_infra.runner.main import (
     EXIT_PASS,
     EXIT_PLATFORM,
@@ -382,7 +387,6 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
         install_readonly_error_counter,
         observe,
     )
-    from cv_infra.runner.evaluate import EvaluationEngine, build_result_dict  # noqa: PLC0415
     from cv_infra.runner.realign import SutRealigner  # noqa: PLC0415
     from cv_infra.runner.recording import (  # noqa: PLC0415
         LoopVideoRecorder,
@@ -578,7 +582,8 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
                 # the remaining samples would all measure the same dead thing.
                 item["sim_time_end_s"] = adapter.sim_time_s
                 item["verdict"] = VERDICT_ERROR
-                item["timings_s"] = iter_watch.spans | {"iteration": iter_watch.end("iteration")}
+                iter_watch.end("iteration")
+                item["timings_s"] = dict(iter_watch.spans)
                 write_result(
                     build_result_dict(
                         parsed.job_id, VERDICT_ERROR, [], {}, request_identity_key=identity_key
@@ -673,7 +678,8 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 prov
                 contact_events=len(telemetry.contact_events),
                 sim_time_end_s=previous_sim_time_s,
             )
-            item["timings_s"] = iter_watch.spans | {"iteration": iter_watch.end("iteration")}
+            iter_watch.end("iteration")
+            item["timings_s"] = dict(iter_watch.spans)
             summary.add_iteration(item)
             print(f"[cv-runner] sample {index} verdict={verdict} metrics={metrics}", flush=True)
             current = None
