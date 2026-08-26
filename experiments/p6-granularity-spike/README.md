@@ -58,3 +58,45 @@ push 3회가 각각 self-test 잡을 이 카드 위에 올렸고, 그중 하나�
 * 동의는 **운영자 입력**이다(NEG-2). 스크립트는 값을 기본값으로 갖지 않고, 호스트
   동의 **레코드**를 `scripts/consent/check_consent.sh` 로 먼저 확인한다.
 * 삭제는 이 스파이크가 만든 트리만, 전체 이름 지정으로(`discard_tree`). prune 없음.
+
+---
+
+## p6c2 — VRAM 미리셋 원인 규명 (같은 하네스의 2차 사용)
+
+p6c1 이 남긴 미해결 ①(반복당 per-PID VRAM 단조 증가, n=8 내 미포화)을 **성분 분해**로
+좁히고, 설치된 Isaac Sim 5.1.0 의 **기존** 리셋·청소 API 로 해소한다. 결정(C-2 채택)은
+이미 났으므로 이것은 채택 심사가 아니라 **채택된 구조의 비효율 해소**다.
+
+### 추가 파일
+
+| 파일 | 하는 일 |
+|---|---|
+| `arm_b2.sh` | 변형 1개 실행 = 샘플 순환 n개 + 토글 + **자기 소유 VRAM 샘플러** |
+| `vram_slope.py` | 변형별 반복당 VRAM 기울기(반복수·**sim-초** 양쪽 정규화) + 반복별 상세 |
+
+### 토글 (전부 기본 OFF = p6c1 동작 그대로)
+
+```
+CV_SPIKE_ABLATE   obstacle_move | no_obstacle | no_sensors | no_video | no_bag
+                  no_mission | no_realign | no_restage        (Phase 1 절제)
+CV_SPIKE_CLEANUP  orphan_materials | gc | mesh_cache          (Phase 2 표적 청소)
+```
+
+`no_*` 중 다수는 **진단용**이다(그 변형은 측정 대상 자체를 바꾼다) — 프로덕션 후보는
+`obstacle_move` 와 `CV_SPIKE_CLEANUP` 쪽뿐이다.
+
+### 실행
+
+```bash
+cd ~/cv-infra-exp-p6spike/experiments/p6-granularity-spike
+E=~/cv-infra-p6c1-evidence            # p6c2/ 하위에 변형별로 쌓인다
+
+CV_SPIKE_N=24 ACCEPT_EULA=Y PRIVACY_CONSENT=Y bash arm_b2.sh base
+CV_SPIKE_N=24 CV_SPIKE_ABLATE=obstacle_move ACCEPT_EULA=Y PRIVACY_CONSENT=Y \
+  bash arm_b2.sh obstacle_move
+…
+python3 vram_slope.py "$E" --csv "$E/p6c2/rows.csv" > "$E/p6c2/slopes.md"
+```
+
+⚠ 위의 "측정 중 push 금지"(G-101)는 p6c2 에도 그대로 적용된다 — 코드는 **측정 창을 열기
+전에** 전부 push 하고, 창이 닫힐 때까지 push 하지 않는다.

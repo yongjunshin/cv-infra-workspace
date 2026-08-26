@@ -29,6 +29,12 @@ Env (all required unless marked):
   RESULT_OUT       output root; iteration i writes <root>/results/<i>/
   ACCEPT_EULA      operator consent (the production boot guard, unchanged)
   CV_SPIKE_REALIGN_SETTLE_S   (optional, default 3.0) sim-seconds to settle after realign
+  CV_SPIKE_ABLATE  (optional, p6c2) comma set of COMPONENT TOGGLES — see ABLATIONS
+  CV_SPIKE_CLEANUP (optional, p6c2) comma set of TARGETED CLEANUPS — see CLEANUPS
+
+p6c2 addition: both env sets default to EMPTY, i.e. the loop below is byte-for-byte
+the p6c1 behaviour unless a toggle is named. Every toggle is a measurement arm, not
+a proposal; the ones that survive Phase 2 are named in the report.
 """
 
 from __future__ import annotations
@@ -61,6 +67,53 @@ from cv_infra.runner.sim_runtime import EulaNotAcceptedError, resolve_initial_po
 SPECS_ENV = "CV_SPIKE_SPECS"
 SETTLE_ENV = "CV_SPIKE_REALIGN_SETTLE_S"
 DEFAULT_REALIGN_SETTLE_S = 3.0
+
+# --------------------------------------------------------------------------- #
+# p6c2 — ablation toggles (Phase 1) and targeted cleanups (Phase 2).
+# --------------------------------------------------------------------------- #
+ABLATE_ENV = "CV_SPIKE_ABLATE"
+CLEANUP_ENV = "CV_SPIKE_CLEANUP"
+
+#: Phase-1 component toggles. Each REMOVES one thing the p6c1 loop does per
+#: iteration, so the VRAM slope of (base - variant) attributes the growth to that
+#: component. Diagnostic arms are marked: they change what the run MEASURES and are
+#: never candidates for production.
+ABLATIONS = {
+    "obstacle_move": "re-stage the debug obstacle by MOVING the existing prim "
+    "instead of RemovePrim + FixedCuboid(); also a Phase-2 candidate",
+    "no_obstacle": "skip the debug obstacle entirely (diagnostic)",
+    "no_sensors": "skip the per-iteration enable_declared_sensors() call",
+    "no_video": "skip the mp4 writer cycle (diagnostic)",
+    "no_bag": "skip the rosbag2 session (diagnostic)",
+    "no_mission": "skip drive_mission — re-initialise only (diagnostic)",
+    "no_realign": "skip the SUT /initialpose + costmap realign (diagnostic)",
+    "no_restage": "skip stop/author/reset entirely — keep driving the SAME world "
+    "and telemetry binding to the next goal (diagnostic)",
+}
+
+#: Phase-2 targeted cleanups. All are EXISTING Isaac 5.1.0 / stdlib calls invoked at
+#: the iteration boundary — no cleanup framework, no re-implementation.
+CLEANUPS = {
+    "orphan_materials": "delete the /World/Looks/visual_material* and "
+    "/World/Physics_Materials/physics_material* prims that each FixedCuboid() "
+    "construction creates and nothing removes (isaacsim.core.utils.prims.delete_prim)",
+    "gc": "gc.collect() at the iteration boundary (the SDK's own idiom in "
+    "World.clear_instance / SimulationContext.clear_all_callbacks)",
+    "mesh_cache": "omni.physx cooking interface release_local_mesh_cache()",
+}
+
+
+def _flag_set(environ: dict, key: str, known: dict) -> frozenset:
+    """Parse a comma-separated toggle env; an unknown name is LOUD, never ignored."""
+    raw = (environ.get(key) or "").strip()
+    if not raw:
+        return frozenset()
+    names = {part.strip() for part in raw.split(",") if part.strip()}
+    unknown = sorted(names - set(known))
+    if unknown:
+        raise BadJobSpec(f"{key}: unknown toggle(s) {unknown} — known: {sorted(known)}")
+    return frozenset(names)
+
 
 #: nav2 services used to drop stale occupancy between iterations (blackbox-safe: they
 #: are the SUT's own published interfaces — nothing inside the SUT is modified).
@@ -229,7 +282,50 @@ class SutRealigner:
 # --------------------------------------------------------------------------- #
 # Per-iteration world staging.
 # --------------------------------------------------------------------------- #
-def stage_world(sim, request, sensor_topics, chassis_path, excluded_paths, first: bool):
+def _obstacle_world_xy(spec: dict) -> tuple[float, float, float]:
+    """The world position ``SimRuntime.spawn_debug_obstacle`` would place — reused.
+
+    The height default (0.15 m) and the ``z = height/2`` centring are the PRODUCTION
+    module's, read from it rather than restated, so a "move" and a "respawn" put the
+    cuboid in the same place by construction (the whole point of the arm).
+    """
+    height = float(spec.get("height", 0.15))
+    return float(spec["x"]), float(spec["y"]), height / 2.0
+
+
+def move_debug_obstacle(spec: dict) -> bool:  # pragma: no cover - GPU path
+    """p6c2 A1: relocate the EXISTING cuboid prim; True if it was there to move.
+
+    MEASURED in the 5.1.0 source (isaacsim/core/api/objects/cuboid.py): every
+    ``FixedCuboid()`` on a fresh prim path also defines a NEW
+    ``/World/Looks/visual_material_NN`` (VisualCuboid) and a NEW
+    ``/World/Physics_Materials/physics_material_NN`` (FixedCuboid), via
+    ``find_unique_string_name``. The p6c1 loop removes only ``/World/cv_debug_obstacle``,
+    so a delete+respawn cycle leaves TWO orphan material prims behind per iteration.
+    Moving the prim performs zero prim churn — no orphans, no re-cook, no new material.
+
+    do-not-reinvent: the move goes through ``SingleXFormPrim``, the same Isaac
+    world-pose wrapper production uses for the robot's declared initial pose.
+    """
+    import omni.usd  # noqa: PLC0415
+    from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+
+    stage = omni.usd.get_context().get_stage()
+    if not stage.GetPrimAtPath(DEBUG_OBSTACLE_PRIM).IsValid():
+        return False
+    SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=_obstacle_world_xy(spec))
+    return True
+
+
+def stage_world(  # noqa: PLR0913 - spike: one staging routine, explicitly parameterised
+    sim,
+    request,
+    sensor_topics,
+    chassis_path,
+    excluded_paths,
+    first: bool,
+    ablate: frozenset = frozenset(),
+):
     """Bring the world to iteration i's start state; return the fresh telemetry sampler.
 
     ``first`` reuses ``SimRuntime.load_scene``'s own pre-reset hook sequence (identical
@@ -253,6 +349,8 @@ def stage_world(sim, request, sensor_topics, chassis_path, excluded_paths, first
         if request.scenario.debug_obstacle is None
         else request.scenario.debug_obstacle.model_dump(exclude_none=True)
     )
+    if "no_obstacle" in ablate:
+        obstacle = None
 
     if first:
         sim.pre_reset = [sampler.bind]
@@ -276,18 +374,64 @@ def stage_world(sim, request, sensor_topics, chassis_path, excluded_paths, first
 
     sim.world.stop()  # back to the authored (pre-play) stage state
     stage = omni.usd.get_context().get_stage()
-    if stage.GetPrimAtPath(DEBUG_OBSTACLE_PRIM).IsValid():
+    moved = False
+    if obstacle is not None and "obstacle_move" in ablate:
+        moved = move_debug_obstacle(obstacle)
+    if not moved and stage.GetPrimAtPath(DEBUG_OBSTACLE_PRIM).IsValid():
         stage.RemovePrim(DEBUG_OBSTACLE_PRIM)
     target = resolve_initial_pose_target(pose, sim.robot_prim_path)
     if target is not None:
         sim.apply_initial_pose(target)
     sampler.bind(sim.world)
-    if obstacle is not None:
+    if obstacle is not None and not moved:
         sim.spawn_debug_obstacle(obstacle)
-    if sensor_topics:
+    if sensor_topics and "no_sensors" not in ablate:
         sim.enable_declared_sensors(sensor_topics)
     sim.world.reset()
     return sampler
+
+
+#: Prim roots the SDK's own cuboid constructors auto-populate (measured, see
+#: ``move_debug_obstacle``). Deleting an ORPHAN under these is the p6c2 targeted
+#: cleanup; the prims the SCENE ASSET ships under the same roots are protected by the
+#: baseline snapshot taken right after boot (only paths that appear LATER are ours).
+MATERIAL_ROOTS = ("/World/Looks", "/World/Physics_Materials")
+
+
+def material_prim_paths() -> set:  # pragma: no cover - GPU path
+    """Current material prim paths under the two SDK-owned roots."""
+    import omni.usd  # noqa: PLC0415
+
+    stage = omni.usd.get_context().get_stage()
+    found = set()
+    for root in MATERIAL_ROOTS:
+        prim = stage.GetPrimAtPath(root)
+        if not prim.IsValid():
+            continue
+        found.update(str(child.GetPath()) for child in prim.GetChildren())
+    return found
+
+
+def run_cleanups(cleanup: frozenset, baseline: set) -> dict:  # pragma: no cover - GPU
+    """Iteration-boundary cleanup: EXISTING SDK calls only, a few lines each."""
+    done: dict = {}
+    if "orphan_materials" in cleanup:
+        from isaacsim.core.utils.prims import delete_prim  # noqa: PLC0415
+
+        orphans = sorted(material_prim_paths() - baseline)
+        for path in orphans:
+            delete_prim(path)  # = omni.usd.commands.DeletePrimsCommand([path]).do()
+        done["orphan_materials_deleted"] = len(orphans)
+    if "mesh_cache" in cleanup:
+        from omni.physx import get_physx_cooking_interface  # noqa: PLC0415
+
+        get_physx_cooking_interface().release_local_mesh_cache()
+        done["mesh_cache_released"] = True
+    if "gc" in cleanup:
+        import gc  # noqa: PLC0415
+
+        done["gc_collected"] = gc.collect()
+    return done
 
 
 def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear sequence
@@ -316,6 +460,10 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
     out_root = resolve_out_root(env)
     specs = load_specs(env)
     settle_s = float(environ.get(SETTLE_ENV) or DEFAULT_REALIGN_SETTLE_S)
+    ablate = _flag_set(environ, ABLATE_ENV, ABLATIONS)
+    cleanup = _flag_set(environ, CLEANUP_ENV, CLEANUPS)
+    if ablate or cleanup:
+        _log(f"p6c2 arms: ablate={sorted(ablate) or '-'} cleanup={sorted(cleanup) or '-'}")
 
     # Pre-boot validation of EVERY spec (main.run does this for its one job): a bad
     # spec must cost 0 GPU seconds, and in this arm a spec 8 failing after 7 missions
@@ -344,6 +492,8 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
         "arm": "B",
         "started_at": time.time(),
         "n": len(parsed),
+        "ablate": sorted(ablate),
+        "cleanup": sorted(cleanup),
         "boot": {},
         "iterations": [],
     }
@@ -392,7 +542,13 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
 
         watch.begin("scene_load")
         sampler = stage_world(
-            sim, parsed[0][2], sensor_topics, chassis_path, excluded_paths, first=True
+            sim,
+            parsed[0][2],
+            sensor_topics,
+            chassis_path,
+            excluded_paths,
+            first=True,
+            ablate=ablate,
         )
         timings["boot"]["scene_load_and_spawn_s"] = round(watch.end("scene_load"), 4)
 
@@ -408,11 +564,18 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
         # ONE render product for the whole process (creating a new one per iteration
         # would be a VRAM growth term the spike would then have to explain away).
         video = _LoopVideoRecorder()
-        video.open_render_product()
-        sim.on_step.append(video.capture_frame)
+        if "no_video" not in ablate:
+            video.open_render_product()
+            sim.on_step.append(video.capture_frame)
         # ONE realigner for the whole process (its publisher/clients must OUTLIVE an
         # iteration to be discovered — see SutRealigner).
         realigner = SutRealigner(adapter)
+        # p6c2: the material prims the SCENE ASSET ships, snapshotted once. Anything
+        # that appears under those roots LATER was created by this loop (measured:
+        # every FixedCuboid() defines one visual + one physics material), so the
+        # cleanup arm can delete only its own orphans and never the asset's.
+        material_baseline = material_prim_paths()
+        _log(f"material baseline: {len(material_baseline)} prim(s) under {MATERIAL_ROOTS}")
 
         for position, (index, job_id, request, _cfg, criteria, oracles) in enumerate(parsed):
             first = position == 0
@@ -421,17 +584,38 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             iter_watch = _Stopwatch()
             iter_watch.begin("iteration")
             record: dict = {"index": index, "job_id": job_id, "first": first}
+            # Wall-clock marks: the 0.5 s per-PID VRAM sampler runs OUTSIDE the
+            # container, so attributing a MiB step to a phase needs the phase's own
+            # epoch boundaries in this file (p6c2 — otherwise "which phase grew" is
+            # unanswerable without a second instrument).
+            record["epoch"] = {"iteration_begin": time.time()}
             _log(f"=== iteration {index}/{len(parsed)} job_id={job_id} ===")
 
             iter_watch.begin("restage")
-            if not first:
+            if not first and "no_restage" not in ablate:
                 sampler.detach()
                 sampler = stage_world(
-                    sim, request, sensor_topics, chassis_path, excluded_paths, first=False
+                    sim,
+                    request,
+                    sensor_topics,
+                    chassis_path,
+                    excluded_paths,
+                    first=False,
+                    ablate=ablate,
                 )
-            if not first:
                 sim.emit_sim_config(None)  # DoD-P2-06 ① line, per iteration
-            sampler.attach(sim.world)
+                sampler.attach(sim.world)
+            elif first:
+                sampler.attach(sim.world)
+            else:
+                # no_restage (diagnostic): the world keeps running and the telemetry
+                # binding survives, so only the ACCUMULATOR is cycled — replacing
+                # ``record`` is enough because the physics callback reads the
+                # attribute on every step (it does not close over the list).
+                from cv_infra.runner.telemetry import TelemetryRecord  # noqa: PLC0415
+
+                sampler.record = TelemetryRecord()
+            record["epoch"]["restage_end"] = time.time()
             iter_watch.end("restage")
 
             iter_watch.begin("sut_realign")
@@ -446,7 +630,7 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             # mission budget on that stale value would stamp AMCL in the future and
             # give drive_mission a deadline the restarted clock can never reach.
             sim_before = adapter.sim_time_s
-            if not first:
+            if not first and "no_restage" not in ablate:
                 pump_deadline = time.monotonic() + 60.0
                 for _ in range(600):
                     adapter._step_and_spin()
@@ -454,11 +638,15 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
                         break
             record["sim_time_before_reset_s"] = sim_before
             record["sim_time_after_reset_s"] = adapter.sim_time_s
-            realign = realigner.realign(pose, adapter.sim_time_s)
+            if "no_realign" in ablate:
+                realign = {"skipped": "no_realign ablation"}
+            else:
+                realign = realigner.realign(pose, adapter.sim_time_s)
             settle_until = adapter.sim_time_s + settle_s
             settle_deadline = time.monotonic() + 60.0
             while adapter.sim_time_s < settle_until and time.monotonic() < settle_deadline:
                 adapter._step_and_spin()
+            record["epoch"]["realign_end"] = time.time()
             iter_watch.end("sut_realign")
             record["sut_realign"] = realign
             _log(f"sut realign: {realign}")
@@ -473,24 +661,26 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             plan = plan_artifacts(iter_dir)
             rosbag = None
             iter_watch.begin("record_start")
-            if ready:
+            if ready and "no_bag" not in ablate:
                 rosbag = RosbagRecorder(plan, base_config)
                 try:
                     rosbag.start()
                 except Exception as exc:  # loud, non-fatal (P2-02 stance)
                     print(f"[cv-spike] recorder unavailable: {exc}", file=sys.stderr, flush=True)
                     rosbag = None
+            if ready and "no_video" not in ablate:
                 video.begin_iteration(plan.video_mp4)
             iter_watch.end("record_start")
 
             iter_watch.begin("mission")
-            if ready:
+            if ready and "no_mission" not in ablate:
                 outcome = adapter.drive_mission(
                     request.scenario.goal, timeout_s=request.scenario.timeout_s
                 )
             else:
                 outcome = None
             iter_watch.end("mission")
+            record["epoch"]["mission_end"] = time.time()
             record["mission_status"] = None if outcome is None else outcome.status
             record["mission_sim_time_s"] = None if outcome is None else outcome.sim_time_elapsed_s
             _log(f"mission outcome: {outcome}")
@@ -506,7 +696,8 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             iter_watch.end("record_stop")
 
             iter_watch.begin("evaluate")
-            sampler.detach()
+            if "no_restage" not in ablate:
+                sampler.detach()
             telemetry = sampler.record
             goal = read_field(criteria, "goal_position")
             tolerance = resolve_position_tolerance(criteria)
@@ -553,7 +744,17 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
                 record["final_orientation_wxyz"] = list(last.orientation_wxyz)
                 record["first_position"] = list(telemetry.gt_pose_samples[0].position)
             record["video_frames"] = video.last_frame_count
+
+            # p6c2 targeted cleanup, at the ITERATION BOUNDARY (after the result is on
+            # disk, before the next re-stage) — the only place a per-iteration leak can
+            # be returned without touching a live mission.
+            iter_watch.begin("cleanup")
+            record["cleanup"] = run_cleanups(cleanup, material_baseline) if cleanup else {}
+            iter_watch.end("cleanup")
+            record["material_prims"] = len(material_prim_paths())
+
             iter_watch.end("iteration")
+            record["epoch"]["iteration_end"] = time.time()
             record["timings_s"] = iter_watch.spans
             record["sim_time_at_end_s"] = adapter.sim_time_s
             record["clock_count_at_end"] = adapter.clock_count
