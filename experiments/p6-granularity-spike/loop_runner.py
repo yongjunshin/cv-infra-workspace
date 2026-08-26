@@ -89,6 +89,9 @@ ABLATIONS = {
     "no_realign": "skip the SUT /initialpose + costmap realign (diagnostic)",
     "no_restage": "skip stop/author/reset entirely — keep driving the SAME world "
     "and telemetry binding to the next goal (diagnostic)",
+    "soft_reset": "re-stage with World.reset(soft=True) — the SDK's own path that "
+    "does NOT stop/replay the timeline, so the physics simulation views are never "
+    "destroyed and re-created; PRODUCTION CANDIDATE (see report)",
 }
 
 #: Phase-2 targeted cleanups. All are EXISTING Isaac 5.1.0 / stdlib calls invoked at
@@ -315,6 +318,34 @@ def move_debug_obstacle(spec: dict) -> bool:  # pragma: no cover - GPU path
         return False
     SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=_obstacle_world_xy(spec))
     return True
+
+
+def soft_restage(sim, request) -> None:  # pragma: no cover - GPU path
+    """p6c2 A5: bring the world to the next start state WITHOUT stopping the timeline.
+
+    MEASURED (p6c2 Phase 1): the whole per-iteration VRAM growth lives in the
+    ``world.stop() ... world.reset()`` cycle — an arm that skips it (``no_restage``)
+    is FLAT while every arm that keeps it leaks ~5 MiB/iteration regardless of what
+    is authored in between (obstacle on/off, sensors on/off) or how much is driven.
+    ``World.reset(soft=True)`` is the SDK's own path that skips ``stop()``/``play()``
+    (isaacsim/core/api/world/world.py: ``if not soft: self.stop()``), so the physics
+    simulation views ``SimulationManager._on_stop`` destroys and
+    ``_create_simulation_view`` re-creates on every play are never cycled.
+
+    DIAGNOSTIC SCOPE, stated: this arm answers "does avoiding stop/play remove the
+    growth". It does NOT restore the robot to a declared spawn pose — the stage-level
+    xform write production uses (``SimRuntime.apply_initial_pose``) only sticks
+    pre-play. Repositioning a PLAYING articulation is a separate piece of work and is
+    named as such in the report, not faked here.
+    """
+    obstacle = (
+        None
+        if request.scenario.debug_obstacle is None
+        else request.scenario.debug_obstacle.model_dump(exclude_none=True)
+    )
+    if obstacle is not None:
+        move_debug_obstacle(obstacle)
+    sim.world.reset(soft=True)
 
 
 def stage_world(  # noqa: PLR0913 - spike: one staging routine, explicitly parameterised
@@ -592,7 +623,8 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             _log(f"=== iteration {index}/{len(parsed)} job_id={job_id} ===")
 
             iter_watch.begin("restage")
-            if not first and "no_restage" not in ablate:
+            keeps_binding = bool(ablate & {"no_restage", "soft_reset"})
+            if not first and not keeps_binding:
                 sampler.detach()
                 sampler = stage_world(
                     sim,
@@ -608,12 +640,14 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             elif first:
                 sampler.attach(sim.world)
             else:
-                # no_restage (diagnostic): the world keeps running and the telemetry
-                # binding survives, so only the ACCUMULATOR is cycled — replacing
-                # ``record`` is enough because the physics callback reads the
-                # attribute on every step (it does not close over the list).
+                # no_restage / soft_reset: the timeline keeps running and the
+                # telemetry binding survives, so only the ACCUMULATOR is cycled —
+                # replacing ``record`` is enough because the physics callback reads
+                # the attribute on every step (it does not close over the list).
                 from cv_infra.runner.telemetry import TelemetryRecord  # noqa: PLC0415
 
+                if "soft_reset" in ablate:
+                    soft_restage(sim, request)
                 sampler.record = TelemetryRecord()
             record["epoch"]["restage_end"] = time.time()
             iter_watch.end("restage")
@@ -630,7 +664,7 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             # mission budget on that stale value would stamp AMCL in the future and
             # give drive_mission a deadline the restarted clock can never reach.
             sim_before = adapter.sim_time_s
-            if not first and "no_restage" not in ablate:
+            if not first and not keeps_binding:
                 pump_deadline = time.monotonic() + 60.0
                 for _ in range(600):
                     adapter._step_and_spin()
@@ -696,7 +730,7 @@ def run(env: dict | None = None) -> int:  # noqa: PLR0915 - spike: one linear se
             iter_watch.end("record_stop")
 
             iter_watch.begin("evaluate")
-            if "no_restage" not in ablate:
+            if not keeps_binding:
                 sampler.detach()
             telemetry = sampler.record
             goal = read_field(criteria, "goal_position")
