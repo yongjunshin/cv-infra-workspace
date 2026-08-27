@@ -10,7 +10,7 @@ cv-infra의 버전은 **서로 독립인 3축**으로 관리된다(M8 §3.6 / �
 
 | 축 | 현행 값 | 정본(source of truth) |
 |---|---|---|
-| ① Action 태그 (`@vN`) | `@v1` 대상 표면 저작(p5c3) · 릴리즈 태그 발행 대기(p5c4+) | `cv-infra-workspace` 릴리즈 태그. 태그 대상 표면(reusable workflow `.github/workflows/verify.yml` · composite `actions/verify`)이 p5c3에 저작됐다 — `@v1` 릴리즈 발행은 첫 실 트리거·이식성 증명(p5c4+) 후. 표면이 랜딩됐으므로 바인딩 테스트가 이 행의 갱신을 강제한다(발행 시 태그로 교체) |
+| ① Action 태그 (`@vN`) | `v1.1.0` (별칭 `@v1` → `v1.1.0`, 2026-08-27 이동) | `cv-infra-workspace` 릴리즈 태그 — **정본은 태그 자신**(`git rev-parse '<태그>^{commit}'`), 대장은 `docs/releases.md`. 소비자는 `uses: …@v1`(별칭, v1.x 최신을 따라감) 또는 불변 핀 `@v1.1.0`으로 소비한다. 발행 이력: `v1.0.0`(⛔ 결함) → `v1.0.1` → **`v1.1.0`** |
 | ② CLI/패키지 버전 | `0.0.0` | `cv_infra/__init__.py`의 `__version__` — `pyproject.toml` `[tool.hatch.version]`이 여기에 위임하는 단일 정본 |
 | ③ 계약 `apiVersion` | `cv-infra/v1` | `cv_infra/contract/apiversion.py`의 `API_VERSION`; 수용/유예 테이블 = `cv_infra/contract/version.py`의 `SUPPORTED` / `DEPRECATED` |
 
@@ -25,7 +25,7 @@ cv-infra의 버전은 **서로 독립인 3축**으로 관리된다(M8 §3.6 / �
 
 | Action 태그 | CLI/패키지 | 수용 `apiVersion` | deprecated(warn) | 그 외 apiVersion |
 |---|---|---|---|---|
-| `@v1` 저작·발행 대기(p5c3) | `0.0.0` | `cv-infra/v1` | 없음 | reject — exit 2 + 친절 에러 + 마이그레이션 포인터 |
+| `@v1` → `v1.1.0` | `0.0.0` | `cv-infra/v1` | 없음 | reject — exit 2 + 친절 에러 + 마이그레이션 포인터 |
 
 - 수용/warn/reject 의미론 = 3-state resolver(`cv_infra/contract/version.py`,
   NFR-INTAKE-002): 지원·현행 → accept / 지원·deprecated → accept + WARNING
@@ -37,10 +37,12 @@ cv-infra의 버전은 **서로 독립인 3축**으로 관리된다(M8 §3.6 / �
 
 어느 축이든 움직이면 이 문서를 갱신한다(바인딩 테스트가 값 불일치를 잡는다):
 
-1. **Action 태그 발행/이동** — Phase 5 최초 `@v1` 발행 시 ① 축 값을 태그로
-   교체하고 호환 표에 행을 추가한다. 태그 이동은 **YAML 평면만** 갱신하므로
-   런타임 평면(러너 venv + serve 컨테이너) 동기화가 필수다 — 절차·스큐 게이트는
-   `docs/deploy/plane-sync.md`(G-43) 참조.
+1. **Action 태그 발행/이동** — 태그를 발행하거나 `@vN` 별칭을 옮기면 ① 축 값과
+   호환 표의 Action 태그 칸을 그 태그로 갱신한다(최초 발행 = `v1.0.0`, 2026-08-20).
+   태그 이동은 **YAML 평면만** 갱신하므로 런타임 평면(러너 venv + serve 컨테이너)
+   동기화가 필수다 — 절차·스큐 게이트는 `docs/deploy/plane-sync.md`(G-43) 참조.
+   ⚠ 이 문서는 **축 값만** 옮긴다. 릴리즈별 내용·결함·정정은 `docs/releases.md`가
+   정본이고, 두 문서가 갈리면 **태그 실peel이 이긴다**(2026-08-27 실사례).
 2. **패키지 릴리즈** — `__version__` 범프 시 ② 축 값과 호환 표를 갱신한다.
 3. **`apiVersion` 이동** — 새 버전이 `SUPPORTED`에 들어오거나 기존 버전이
    `DEPRECATED`로 이동하면(그 시점에 sunset·마이그레이션 링크가 코드에
