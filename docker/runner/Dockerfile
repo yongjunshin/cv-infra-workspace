@@ -134,15 +134,25 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 #     path to re-run it does not. All 7 were RE-CONFIRMED as still served by their
 #     archives on 2026-08-21 (per-pin dry-run, p5c20 F-7).
 #
-#   * curl=8.5.0-2ubuntu10.12 — measured 2026-08-21 (p5c20 F-8) by ASKING THE ARCHIVE
-#     from this image's own stage-1 base, because the previous pin (8.5.0-2ubuntu10.11)
-#     had been WITHDRAWN and a --no-cache build failed on it ("E: Version
-#     '8.5.0-2ubuntu10.11' for 'curl' was not found"). Query, verbatim:
-#       docker run --rm --user 0 --entrypoint bash nvcr.io/nvidia/isaac-sim:5.1.0 -c \
-#         'apt-get update -qq && apt-cache policy curl'
-#       -> base: Ubuntu 24.04.2 LTS (noble); Candidate: 8.5.0-2ubuntu10.12, and that
-#          was the ONLY version in the table (.11 gone from noble-updates/-security).
+#   * curl=8.5.0-2ubuntu10.13 — measured 2026-08-27 (p6c5) by ASKING THE ARCHIVE from
+#     this image's own stage-2 base, because the previous pin (8.5.0-2ubuntu10.12) had
+#     been WITHDRAWN and the release-gate --no-cache build failed on it ("E: Version
+#     '8.5.0-2ubuntu10.12' for 'curl' was not found"). Query, verbatim:
+#       docker run --rm --user 0 --entrypoint bash \
+#         nvcr.io/nvidia/isaac-sim@sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54 \
+#         -c 'apt-get update -qq && apt-cache policy ca-certificates curl gnupg'
+#       -> base: Ubuntu 24.04.2 LTS (noble); curl Candidate: 8.5.0-2ubuntu10.13 (served
+#          by noble-updates AND noble-security). The table holds only .13, the noble
+#          release 8.5.0-2ubuntu10, and the installed 8.5.0-2ubuntu10.6 — .12 is GONE,
+#          exactly as .11 was. The same query re-confirmed the other two ubuntu pins on
+#          this date: ca-certificates=20260601~24.04.1 and gnupg=2.4.4-2ubuntu17.4.
 #     Verified by a --no-cache build of this file the same day (see the report).
+#     ⚠ THIS ONE PIN ROTS FASTER THAN WE RELEASE: .11 was dead by 2026-08-21, .12 by
+#     2026-08-27 — SIX DAYS. Expect the pre-release --no-cache gate (G-99 ①) to go red
+#     on curl most cycles; that is the gate working, and the fix is this recipe, not a
+#     new investigation. (A standing fix would be an archive snapshot service —
+#     snapshot.ubuntu.com does exist for Ubuntu, unlike packages.ros.org; not adopted
+#     here, see WHAT IS PINNED above. Decide it deliberately, not mid-release.)
 #
 # Base-provided vs installed here (2026-08-14, same method, against the digest-pinned
 # base): ca-certificates 20240203 and curl 8.5.0-2ubuntu10.6 ship IN the base and
@@ -184,7 +194,7 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates=20260601~24.04.1 \
-        curl=8.5.0-2ubuntu10.12 \
+        curl=8.5.0-2ubuntu10.13 \
         gnupg=2.4.4-2ubuntu17.4 \
     || { echo "ERROR: a pinned ubuntu-archive version above is no longer in the index" \
               "(superseded versions LEAVE noble-updates/-security on every security bump)." \
