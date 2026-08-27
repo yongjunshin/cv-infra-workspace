@@ -762,7 +762,7 @@ class SimRuntime:
         SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=position)
         print(f"[cv-runner] debug obstacle moved: {DEBUG_OBSTACLE_PRIM} -> {position}", flush=True)
 
-    def repose_robot(self, pose: dict) -> None:  # pragma: no cover - GPU path (W1 proves)
+    def repose_robot(self, pose: dict) -> None:  # pragma: no cover - GPU path (W1 measured)
         """Put the PLAYING robot back at a declared pose (batch iteration step 3).
 
         ``apply_initial_pose`` cannot be reused: its stage-level xform write only
@@ -808,7 +808,7 @@ class SimRuntime:
 
     def restage(
         self, pose: dict | None = None, obstacle: dict | None = None
-    ) -> None:  # pragma: no cover - GPU path (W1/W2 prove)
+    ) -> None:  # pragma: no cover - GPU path (W1/W2/W3 measured)
         """Bring the world to the NEXT sample's start state (p6 batch iteration seam).
 
         NOT ``load_scene``: that re-opens the stage, and avoiding that cost is the

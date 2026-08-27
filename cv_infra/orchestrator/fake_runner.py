@@ -19,7 +19,7 @@ from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 
 
 class Runner(Protocol):
-    """Seam the supervisor drives per job (1잡=1러너=1결과; REQ-ORCH-007).
+    """Seam the supervisor drives per job (표본 슬롯당 결과 1개; REQ-ORCH-007).
 
     Phase 0 pins a synchronous `run(job) -> JobResult` placeholder signature. The real supervisor
     offloads blocking Docker SDK calls off the asyncio event loop (loop.run_in_executor / polling

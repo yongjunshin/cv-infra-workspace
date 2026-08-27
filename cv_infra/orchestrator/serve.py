@@ -109,10 +109,10 @@ OUTER_WALLCLOCK_ENV = "CV_OUTER_WALLCLOCK_S"
 RUNNER_SHM_SIZE_ENV = "CV_RUNNER_SHM_SIZE"
 #: p6 batch (carrier) watchdog coefficients — the three inputs of
 #: ``supervisor.batch_timeout_s`` (설계 §0-12). Unset = the module defaults, whose MEASURED
-#: anchors (W2 n=8) and revision plan (W3) live on those constants. Operator knobs rather than
-#: hardcodes for the usual reason: the value that matters is a live batch wall nobody has
-#: measured through M3 yet (CLAUDE §2-4), and a site with slower storage must be able to
-#: widen it without a rebuild.
+#: anchors (W2 n=8, revised with W3 n=60 through-M3) live on those constants. Operator knobs
+#: rather than hardcodes because a site with slower storage, a heavier scenario or a larger n
+#: must be able to widen the budget without a rebuild — the measured wall/sim ratio band
+#: (1.4666~1.6292) is scenario-dependent, and 2.0 clears its worst case by only 1.23x.
 BATCH_WALL_FACTOR_ENV = "CV_BATCH_WALL_FACTOR"
 BATCH_ITER_OVERHEAD_ENV = "CV_BATCH_ITER_OVERHEAD_S"
 BATCH_BOOT_ALLOWANCE_ENV = "CV_BATCH_BOOT_ALLOWANCE_S"

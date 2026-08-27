@@ -356,9 +356,9 @@ def reexec_argv() -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# The carrier loop (M2 §3.2 order, boot-once) — Isaac-deferred; W1/W2 prove it.
+# The carrier loop (M2 §3.2 order, boot-once) — Isaac-deferred; W1/W2/W3 measured it.
 # --------------------------------------------------------------------------- #
-def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2 proves)
+def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 measured)
     """Boot once, run every admitted sample in series, write one result each.
 
     Every seam this touches is the SAME one ``main.run`` uses (SimRuntime,

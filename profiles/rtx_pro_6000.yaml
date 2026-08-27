@@ -43,5 +43,32 @@ match_name_pattern: RTX[ _-]?PRO[ _-]?6000
 #     next available on this host and replace BOTH the number and its source line.
 #   * only method (B) (per-PID) was ever run here. Method (A) (GPU-wide peak minus idle),
 #     which is what catches the graphics context, has never been run on this card.
+#
+# ★ BATCH-FORM MEASUREMENT (2026-08-27, W3 = p6c4 T2) — BOTH limits above are now retired,
+# and the ADOPTED VALUE BELOW IS DELIBERATELY LEFT AT 6000 (p6c5 T4 scope: annex only).
+# What was run: ONE p6 batch carrier (설계 §0-7) on this card — 60 samples of one random
+# request through M3 `run_batch`, 3819 s wall, per-PID sampling every 0.5 s (6867 app ticks
+# / 6955 GPU ticks), a MOVING nova_carter_warehouse mission per sample (not `selftest` —
+# G-80). Applying `profiles/rtx_4080.yaml`'s adoption rule (the LARGER of the two methods,
+# no rounding, no margin):
+#   (A) GPU-wide peak 6006 MiB - idle baseline (median 35 over the 30 ticks before the
+#       carrier; min 35 / max 53)                                      = 5971 MiB   <- larger
+#   (B) per-PID `--query-compute-apps` peak                            = 5927 MiB
+#   steady-state only (excluding the i=0 boot peak): A 5883 / B 5840.
+# So the rule's value on THIS evidence is 5971 MiB, and method (A) has now run here (and
+# WON, by +44 MiB — the graphics context per-PID omits is real on this card too).
+# WHY THE FILE STILL SAYS 6000: this file's own rule is "replace BOTH the number and its
+# source line, never one without the other", and that swap is a value change, not an annex —
+# it is left to the PM/CEO (p6c5 T4 changed no adopted value anywhere). Operationally the
+# difference is nil and errs SAFE: 6000 > 5971 budgets slightly MORE per instance, and
+# floor(97192 / 5971) = floor(97192 / 6000) = 16 while this deployment runs
+# CV_MAX_CONCURRENT=2, so k does not move either way.
+# LIMITS OF THE 5971 FIGURE (state them, do not silently inherit them): measured at k=1
+# (no concurrent carrier); ONE scenario family, so it is an observed maximum, not a proven
+# bound; per CARRIER, and the observation that it does not grow with n rests on a single
+# +64 MiB step at sample 19 (W3 §3.1) — a longer batch could show another step.
+# Evidence: `~/cv-infra-p6c1-evidence/p6c4/w3/vram_0.5s.csv` + `w3/crosscheck/` (114 full
+# process-table + `pmon` captures) + `w3/ANALYSIS.txt`; report
+# `agent-comms/reports/runner-2026-08-27-p6c4-t2-gpu-w3.md` §3 게이트 5 / §5.2.
 vram_per_instance_mb: 6000
 vram_per_instance_source: implementation-plan/nfr-measurement-notes.md P4c5 (2026-07-15, QA passed) per-PID steady peak ~6.0 GiB, mean 5947-6043 MiB, flat over k=1..8; raw evidence WAS on the workstation at ~/cv-infra-p2-out/p4c5/{T6,T6-resume}/ — INTENTIONALLY EXPIRED 2026-08-20 (decision p5c19 D-1), file list + sha256 preserved in the meta repo evidence manifest; re-measure rather than cite the dead path; the same 6000 ran live as the NVML guard in the p5c10 k=8 leg

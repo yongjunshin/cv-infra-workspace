@@ -174,7 +174,7 @@ BATCH_RESULTS_DIRNAME = "results"
 BATCH_RUNNER_ENTRYPOINT = "./python.sh"
 BATCH_RUNNER_COMMAND: tuple[str, ...] = ("-m", "cv_infra.runner.batch")
 
-# --- batch (carrier) watchdog defaults — 실측-후-기입 앵커 (§2-4, W3 후 개정 예고) ---------
+# --- batch (carrier) watchdog defaults — 실측-후-기입 앵커 (§2-4, W3 실측 반영 2026-08-27) ---
 #
 # The carrier's inner watchdog is ``batch_timeout_s()`` below, NOT a constant: a carrier that
 # boots once and then runs n missions has a budget that GROWS with n, and a fixed 1800 s would
@@ -188,15 +188,23 @@ BATCH_RUNNER_COMMAND: tuple[str, ...] = ("-m", "cv_infra.runner.batch")
 #     and the COLD Isaac boot anchor the readiness default already carries (~67.5 s). 300 s is
 #     ~12x the measured warm boot / ~4.4x the cold anchor.
 #   * wall factor 2.0 — the scenario's ``timeout_s`` is a SIM-time budget (M1 §3.2), so it must
-#     be converted to wall-clock. The wall/sim ratio carried into this task from the W2 numbers
-#     is 1.46~1.55 (NOT re-derived by this team — the W2 report's per-iteration table publishes
-#     mission WALL only, so this coefficient is inherited, not measured here). 2.0 leaves ~30%
-#     headroom over the top of that band.
+#     be converted to wall-clock. MEASURED wall/sim ratio 1.4666~1.6292 (mean 1.5797): W3
+#     (p6c4 T2, n=60 through-M3) — the 9 TIMEOUT samples spend exactly ``timeout_s``=120 sim
+#     seconds in the mission, so their ``mission_wall / 120`` IS the ratio with no assumption
+#     in it; the all-sample approximation (mission_wall / (sim span - 3.0 s settle)) lands in
+#     the same band, 1.4294~1.6513. 2.0 leaves 1.23x over the worst observed — the THINNEST
+#     of these three margins, so this is the coefficient to re-check first when the scenario
+#     mix changes. (SUPERSEDES the inherited band 1.46~1.55, which the p6c4 T1 task carried
+#     from W2 without re-deriving it: it UNDERSTATED the measured worst case.)
 #   * per-iteration overhead 60 s — MEASURED per-sample fixed cost 5.684~5.801 s (W2 §5.2,
 #     restage+realign+readiness+record+evaluate), against the p6c1 anchor 7.26~7.28 s: the
-#     band the task pins is 5.7~7.3 s. 60 s is ~8~10x it.
+#     band the task pins is 5.7~7.3 s. 60 s is ~8~10x it. (W3 n=60 re-measures 5.6818~6.5161,
+#     same band; the +0.58 s drift from sample 19 on is the realign settle loop, W3 §5.1.)
 #
-# W3 (n=60 through-M3) measures the real batch wall and these get REVISED there (p6c4 T4).
+# W3 REVISION (p6c4 T2/T4): the three VALUES stay — measured margins 11.48x / 1.23x / 6.64x,
+# watchdog misfires 0 in a 60-sample healthy run (budget 18300 s vs measured wall 3772.6 s,
+# 4.85x headroom). What changed is this block's EVIDENCE, above. Raw: W3 report §5.1 +
+# ``~/cv-infra-p6c1-evidence/p6c4/w3/{batch_summary.json,GATE3.txt,ANALYSIS.txt}``.
 DEFAULT_BATCH_BOOT_ALLOWANCE_S = 300.0
 DEFAULT_BATCH_WALL_FACTOR = 2.0
 DEFAULT_BATCH_ITER_OVERHEAD_S = 60.0
@@ -2294,7 +2302,8 @@ def reconcile_at_restart(
     1. **label sweep** (when a docker client is given): stop/remove every
        container labeled ``LABEL_JOB_ID`` and remove every so-labeled per-job
        network — teardown precedes any re-queue so a reconciled job can never
-       run twice concurrently (1잡=1러너=1결과 불변식).
+       run twice concurrently (한 잡이 동시에 두 러너에 실리지 않는다 — p6 이후에도
+       성립: 운반체가 공유되는 것은 컨테이너이지 잡이 아니다).
     2. **domain-id clear**: release every liveness row (stale by step 1) so
        fresh allocations never collide with ghosts (M3 §3.6 D-O).
     3. **RUNNING-orphan re-label** (task 2026-07-13 ① 시맨틱): a job persisted
