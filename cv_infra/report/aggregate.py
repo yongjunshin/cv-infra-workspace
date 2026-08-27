@@ -130,6 +130,11 @@ def build_report(
                     "flaky": bool(rollup.flakiness),
                     "verdict": core_row["verdict"],
                 },
+                # p6 §0-14: the request's DECLARED judgement policy (None = the frozen
+                # any-fail rule). A ROW-level sibling of ``rollup`` — never inside it,
+                # because ``rollup`` mirrors M3's frozen ``RequestRollup`` shape and the
+                # ratio is not a field of it (it is an input the caller applied).
+                "min_pass_ratio": _declared_min_pass_ratio(inp.request),
                 "flakiness": core_row["flakiness"],
                 "metrics": _metrics(inp.results, current_verdict),
                 "regression": {
@@ -185,6 +190,28 @@ def _sut_ref(request: dict[str, Any]) -> str | None:
     if image_ref and image_id:
         return f"{image_ref}@{image_id}"
     return image_ref
+
+
+def _declared_min_pass_ratio(request: dict[str, Any]) -> float | None:
+    """The request's declared ``execution_settings.min_pass_ratio`` (p6 §0-14), or None.
+
+    Read off the SAME captured M1 wire dump the caller read it from when it rolled
+    up (``api._min_pass_ratio`` -> ``roll_up(min_pass_ratio=...)``), so the row can
+    only ever say what was actually applied to the verdict it displays. The
+    normalization rule is DUPLICATED from ``api._min_pass_ratio`` rather than
+    imported (importing ``orchestrator.api`` here would be circular — api imports
+    this module — and would drag fastapi into the renderer's graph, M4-09); the
+    duplicate is held to its source by
+    ``tests/test_report_distribution_surface.py::test_row_ratio_agrees_with_the_rollup_caller``
+    (G-25 복제본 + repo-내부 기계적 가드).
+    """
+    settings = request.get("execution_settings")
+    if not isinstance(settings, dict):
+        return None
+    ratio = settings.get("min_pass_ratio")
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        return None
+    return float(ratio)
 
 
 def _scenario_label(request: dict[str, Any]) -> str | None:

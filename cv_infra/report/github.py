@@ -211,7 +211,38 @@ def _matrix_section(report: dict[str, Any]) -> str:
             "보이는 값은 실제 키의 접두사) — 전체 키는 아래 회귀 절(부재·회귀 행)과 "
             "artifact 의 report JSON `matrix[].request_identity_key`._",
         ]
+    table += _min_pass_ratio_note(rows)
     return f"{header}\n\n" + "\n".join(table)
+
+
+def _min_pass_ratio_note(rows: list[dict[str, Any]]) -> list[str]:
+    """The ONE human-surface line saying a row judged itself by a declared
+    ``min_pass_ratio`` instead of the frozen any-fail rule (p6 §0-14).
+
+    Without it the table is honest but unreadable in the one case that matters: a
+    row showing ``verdict=pass`` NEXT TO ``fail 19`` looks like a bug unless the
+    reader is told the request declared a threshold. Rendered right under the rows
+    it explains (no new column — the nine columns keep their meaning, order and
+    width) and only for the rows that actually declared one; a report where nobody
+    declared a ratio renders BYTE-IDENTICALLY to before this note existed
+    (``[]`` -> nothing appended; pinned in tests/test_report_distribution_surface.py).
+
+    The value is the row's verbatim (``aggregate._declared_min_pass_ratio``
+    normalized it off the same wire dump the rollup caller read) — never re-derived
+    from the counts, which would invent a threshold the request never declared."""
+    declared = [row for row in rows if row.get("min_pass_ratio") is not None]
+    if not declared:
+        return []
+    listed = " · ".join(
+        f"{_md_cell(row.get('request_id', _NA))}: "
+        f"pass ratio ≥ {_md_cell(row['min_pass_ratio'])} declared"
+        for row in declared
+    )
+    return [
+        "",
+        f"_{listed} (`min_pass_ratio`) — 해당 행의 `verdict` 는 any-fail 이 아니라 선언된 이 "
+        "임계로 판정됨(표본 분포는 위 `pass`/`fail` 열 그대로)._",
+    ]
 
 
 def _identity_key_cell(row: dict[str, Any]) -> str:
