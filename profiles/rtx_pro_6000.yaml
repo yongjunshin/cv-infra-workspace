@@ -70,5 +70,8 @@ match_name_pattern: RTX[ _-]?PRO[ _-]?6000
 # Evidence: `~/cv-infra-p6c1-evidence/p6c4/w3/vram_0.5s.csv` + `w3/crosscheck/` (114 full
 # process-table + `pmon` captures) + `w3/ANALYSIS.txt`; report
 # `agent-comms/reports/runner-2026-08-27-p6c4-t2-gpu-w3.md` §3 게이트 5 / §5.2.
+# 결정(2026-08-27, p6c5 PM/게이트#3): 채택값 6000 유지 — 규칙(larger-of)이 현재 증적에 주는 값은
+# 단일형 5994~6010(p6c1)·배치형 5971(W3 n=60)로 갈라져 있고, 값+_source 동시 교체는 배포 팀의
+# 정식 재측정 태스크로 이연한다(그때까지 이 갈림은 침묵이 아니라 여기 명시로 존재한다). k 불변.
 vram_per_instance_mb: 6000
 vram_per_instance_source: implementation-plan/nfr-measurement-notes.md P4c5 (2026-07-15, QA passed) per-PID steady peak ~6.0 GiB, mean 5947-6043 MiB, flat over k=1..8; raw evidence WAS on the workstation at ~/cv-infra-p2-out/p4c5/{T6,T6-resume}/ — INTENTIONALLY EXPIRED 2026-08-20 (decision p5c19 D-1), file list + sha256 preserved in the meta repo evidence manifest; re-measure rather than cite the dead path; the same 6000 ran live as the NVML guard in the p5c10 k=8 leg
