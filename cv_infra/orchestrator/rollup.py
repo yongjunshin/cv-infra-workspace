@@ -10,6 +10,14 @@ Rollup verdict policy (구현 확정, task 2026-07-13 / M3 §3.7 deferral resolv
 (conservative CI gate; a flaky failure must block, not average out), all-PASS
 passes. Flakiness (REQ-ORCH-013) is surfaced SEPARATELY in the same rollup,
 never folded into the verdict.
+
+p6 §0-14 adds ONE opt-in relaxation of that policy: ``min_pass_ratio`` (M1
+``ExecutionSettings``, 0 < r <= 1) — the fraction of the request's samples that
+must pass. ``None`` (the default, and every pre-p6 request) is the any-fail rule
+BYTE-IDENTICAL. It changes the verdict COMPUTATION only: ``RequestRollup``'s
+shape, the verdict-less (infra) exclusion and ``flakiness`` are untouched, so an
+errored/timed-out sample is still no judgement at all rather than a cheap "fail"
+the ratio could average away (P5-13 stays exit-3 territory).
 """
 
 from __future__ import annotations
@@ -19,7 +27,9 @@ from collections import Counter
 from cv_infra.orchestrator.models import JobResult, RequestRollup, Verdict
 
 
-def roll_up(request_id: str, results: list[JobResult]) -> RequestRollup:
+def roll_up(
+    request_id: str, results: list[JobResult], *, min_pass_ratio: float | None = None
+) -> RequestRollup:
     """Roll up repeated-job results for ``request_id`` into a ``RequestRollup``.
 
     Orders the results by ``repeat_index`` FIRST (canonical order invariant),
@@ -33,11 +43,16 @@ def roll_up(request_id: str, results: list[JobResult]) -> RequestRollup:
       caller passes in (``record.results`` is supervisor完료 순서, non-deterministic
       at k>1). ``verdict``/``flakiness`` are order-independent — this sort is a
       pure canonicalisation of the list-order field, no domain-result change.
-    * ``verdict`` — any-fail=fail (module docstring). All repeats verdict-less
+    * ``verdict`` — any-fail=fail (module docstring), or the ``min_pass_ratio``
+      threshold when the request declared one. All repeats verdict-less
       leaves ``verdict=None``: an infra outcome, not a domain judgement —
       exit-code 3 territory (M8 매핑), never mapped to pass/fail here.
     * ``flakiness`` — repeat-disagreement metric (see ``_flakiness``), surfaced
       separately from the verdict.
+
+    ``min_pass_ratio`` (p6 §0-14) is the request's own judgement policy, read by
+    the CALLER off the request wire dump (``api._min_pass_ratio``) — this module
+    never reaches for a document. None = the frozen any-fail rule.
     """
     ordered = sorted(results, key=lambda r: r.job.repeat_index)
     verdicts = [r.verdict for r in ordered if r.verdict is not None]
@@ -45,15 +60,27 @@ def roll_up(request_id: str, results: list[JobResult]) -> RequestRollup:
         request_id=request_id,
         verdicts=verdicts,
         flakiness=_flakiness(verdicts),
-        verdict=_verdict(verdicts),
+        verdict=_verdict(verdicts, min_pass_ratio),
     )
 
 
-def _verdict(verdicts: list[Verdict]) -> Verdict | None:
-    """Any-fail=fail rollup verdict; None when no repeat produced a verdict."""
+def _verdict(verdicts: list[Verdict], min_pass_ratio: float | None = None) -> Verdict | None:
+    """Rollup verdict; None when no repeat produced a verdict.
+
+    Default (``min_pass_ratio is None``) = any-fail=fail, byte-identical to the
+    frozen policy. With a ratio: PASS iff ``pass_count / len(verdicts) >= r``.
+    The DENOMINATOR is the surviving verdicts, not ``repeats`` — verdict-less
+    (errored/timed-out) samples were already excluded above, and counting them as
+    failures would let infra noise masquerade as a SUT judgement (P5-13); an
+    envelope carrying such samples still folds to errored/exit-3 upstream,
+    independently of this ratio.
+    """
     if not verdicts:
         return None
-    return Verdict.FAIL if Verdict.FAIL in verdicts else Verdict.PASS
+    if min_pass_ratio is None:
+        return Verdict.FAIL if Verdict.FAIL in verdicts else Verdict.PASS
+    passed = sum(1 for verdict in verdicts if verdict is Verdict.PASS)
+    return Verdict.PASS if passed / len(verdicts) >= min_pass_ratio else Verdict.FAIL
 
 
 def _flakiness(verdicts: list[Verdict]) -> float | None:

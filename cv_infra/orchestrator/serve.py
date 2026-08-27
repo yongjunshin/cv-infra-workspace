@@ -79,10 +79,13 @@ from cv_infra.orchestrator.store import Store
 from cv_infra.orchestrator.supervisor import (
     CACHE_ROOT_ENV,
     CACHE_SCRATCH_ROOT_ENV,
+    DEFAULT_BATCH_BOOT_ALLOWANCE_S,
+    DEFAULT_BATCH_ITER_OVERHEAD_S,
+    DEFAULT_BATCH_WALL_FACTOR,
     DEFAULT_OUTER_WALLCLOCK_S,
     DEFAULT_RUNNER_SHM_SIZE,
+    BatchRunJobRunner,
     RestartReconciliation,
-    RunJobRunner,
     reconcile_at_restart,
 )
 
@@ -104,6 +107,15 @@ OUTER_WALLCLOCK_ENV = "CV_OUTER_WALLCLOCK_S"
 #: operator knob rather than a hardcode because the value that matters is a LIVE peak
 #: usage nobody has measured on the production spawn yet (CLAUDE §2-4).
 RUNNER_SHM_SIZE_ENV = "CV_RUNNER_SHM_SIZE"
+#: p6 batch (carrier) watchdog coefficients — the three inputs of
+#: ``supervisor.batch_timeout_s`` (설계 §0-12). Unset = the module defaults, whose MEASURED
+#: anchors (W2 n=8) and revision plan (W3) live on those constants. Operator knobs rather than
+#: hardcodes for the usual reason: the value that matters is a live batch wall nobody has
+#: measured through M3 yet (CLAUDE §2-4), and a site with slower storage must be able to
+#: widen it without a rebuild.
+BATCH_WALL_FACTOR_ENV = "CV_BATCH_WALL_FACTOR"
+BATCH_ITER_OVERHEAD_ENV = "CV_BATCH_ITER_OVERHEAD_S"
+BATCH_BOOT_ALLOWANCE_ENV = "CV_BATCH_BOOT_ALLOWANCE_S"
 
 _REQUIRED_ENVS = (STORE_PATH_ENV, OUT_DIR_ENV, RUNNER_IMAGE_ENV, MAX_CONCURRENT_ENV)
 
@@ -133,6 +145,9 @@ class ServeConfig:
     port: int
     outer_wallclock_s: float  # outer wall-clock cap over pull(s)+mission (default on unset)
     runner_shm_size: str | int  # runner /dev/shm size (R-shm; default on unset)
+    batch_wall_factor: float  # p6 carrier watchdog: sim-seconds -> wall-clock factor
+    batch_iter_overhead_s: float  # p6 carrier watchdog: per-sample fixed cost allowance
+    batch_boot_allowance_s: float  # p6 carrier watchdog: once-per-carrier boot allowance
 
     @property
     def resource_budget(self) -> ResourceBudget | None:
@@ -201,6 +216,9 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
         )
     port = _number(environ, BIND_PORT_ENV, int)
     outer_wallclock_s = _number(environ, OUTER_WALLCLOCK_ENV, float)
+    batch_wall_factor = _number(environ, BATCH_WALL_FACTOR_ENV, float)
+    batch_iter_overhead_s = _number(environ, BATCH_ITER_OVERHEAD_ENV, float)
+    batch_boot_allowance_s = _number(environ, BATCH_BOOT_ALLOWANCE_ENV, float)
     return ServeConfig(
         store_path=required[STORE_PATH_ENV],
         out_dir=required[OUT_DIR_ENV],
@@ -217,6 +235,19 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
             outer_wallclock_s if outer_wallclock_s is not None else DEFAULT_OUTER_WALLCLOCK_S
         ),
         runner_shm_size=_get(environ, RUNNER_SHM_SIZE_ENV) or DEFAULT_RUNNER_SHM_SIZE,
+        batch_wall_factor=(
+            batch_wall_factor if batch_wall_factor is not None else DEFAULT_BATCH_WALL_FACTOR
+        ),
+        batch_iter_overhead_s=(
+            batch_iter_overhead_s
+            if batch_iter_overhead_s is not None
+            else DEFAULT_BATCH_ITER_OVERHEAD_S
+        ),
+        batch_boot_allowance_s=(
+            batch_boot_allowance_s
+            if batch_boot_allowance_s is not None
+            else DEFAULT_BATCH_BOOT_ALLOWANCE_S
+        ),
     )
 
 
@@ -226,6 +257,7 @@ def build_app(
     docker_client: Any = None,
     vram_gauge: VramGauge | None = None,
     run_job_fn: Callable[..., Any] | None = None,
+    run_batch_fn: Callable[..., Any] | None = None,
     start_sampler: bool = False,
 ) -> FastAPI:
     """Compose the production app: store -> reconcile (R14) -> budget -> k -> runner -> api.
@@ -254,7 +286,10 @@ def build_app(
         # No VRAM figure was set -> no complete budget object exists; the
         # authoritative cap alone bounds k (LOCKED §7.4), never a fabricated one.
         k = compute_k(config.max_concurrent)
-    runner = RunJobRunner(
+    # p6 §0-10: the production seam declares the batch CAPABILITY, so a request whose
+    # samples are waiting together rides ONE container pair. The single-job path is
+    # unchanged and still taken for every group of one (설계 §0-10 2요소 트리거).
+    runner = BatchRunJobRunner(
         out_dir=config.out_dir,
         runner_image=config.runner_image,
         docker_client=docker_client,
@@ -263,6 +298,10 @@ def build_app(
         cache_scratch_root=config.cache_scratch_root,
         shm_size=config.runner_shm_size,  # R-shm (p5c15)
         run_job_fn=run_job_fn,
+        run_batch_fn=run_batch_fn,
+        batch_wall_factor=config.batch_wall_factor,
+        batch_iter_overhead_s=config.batch_iter_overhead_s,
+        batch_boot_allowance_s=config.batch_boot_allowance_s,
     )
     # p5c7 T2 (D-2): wire the OUTER wall-clock cap — the only bound spanning the image pull.
     # It rides create_app -> ParallelSupervisor, whose strict coherence gate refuses an
@@ -328,6 +367,11 @@ def _log_serve_config(
             "job_timeout_s": inner_watchdog_s,  # inner container watchdog (run_job / RunJobRunner)
             "outer_wallclock_s": outer_wallclock_s,  # outer cap over pull(s)+mission (p5c7 T2)
             "runner_shm_size": config.runner_shm_size,  # runner /dev/shm (R-shm, p5c15)
+            # p6 §0-12: the carrier watchdog coefficients (the inner batch budget is
+            # DERIVED per carrier from these + the specs it carries, never a constant).
+            "batch_wall_factor": config.batch_wall_factor,
+            "batch_iter_overhead_s": config.batch_iter_overhead_s,
+            "batch_boot_allowance_s": config.batch_boot_allowance_s,
             "reconciliation": {
                 "containers_removed": recon.containers_removed,
                 "networks_removed": recon.networks_removed,

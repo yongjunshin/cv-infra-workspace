@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from cv_infra.contract.job_batch import JOB_SPEC_BATCH_ENV, JobSpecBatch
 from cv_infra.orchestrator.allocator import (
     LABEL_JOB_ID,
     LABEL_ROS_DOMAIN_ID,
@@ -153,6 +154,52 @@ _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immed
 # placeholder, not an NFR claim — run_job docstring): run_job's signature and
 # the production ``RunJobRunner`` share this ONE constant (이중 정의 금지).
 DEFAULT_JOB_TIMEOUT_S = 1800.0
+
+# --- p6 batch CARRIER seam (설계 정본 §0-10/§0-12) ------------------------------------------
+#
+# Container-side path of the batch WRAPPER document (sibling of ``JOB_SPEC_MOUNT``; the env
+# NAME itself is M1's ``contract.job_batch.JOB_SPEC_BATCH_ENV``, imported above — one
+# definition). ``RESULT_OUT`` is the same mount as the single-job seam, but for a carrier it
+# is the out-dir ROOT: the samples land under ``<root>/results/<i>/``.
+JOB_SPEC_BATCH_MOUNT = "/cv/job_spec_batch.json"
+
+# SOURCE OF TRUTH (G-25 anchor): ``cv_infra.runner.batch.BATCH_RESULTS_DIRNAME`` /
+# ``cv_infra.runner.batch.BATCH_MODULE`` / docker/runner/Dockerfile's ENTRYPOINT. The values
+# are COPIED (not imported) on purpose — the control plane must not import the data plane's
+# module tree (the runner is a black box behind a container boundary, and an M2 module-level
+# import added later would break `import cv_infra.orchestrator.supervisor` on the control-plane
+# host). Drift is caught MECHANICALLY, not by prose: tests/test_supervisor_batch.py pins each
+# literal against its source of truth (and the Dockerfile's ENTRYPOINT is read from the file).
+BATCH_RESULTS_DIRNAME = "results"
+BATCH_RUNNER_ENTRYPOINT = "./python.sh"
+BATCH_RUNNER_COMMAND: tuple[str, ...] = ("-m", "cv_infra.runner.batch")
+
+# --- batch (carrier) watchdog defaults — 실측-후-기입 앵커 (§2-4, W3 후 개정 예고) ---------
+#
+# The carrier's inner watchdog is ``batch_timeout_s()`` below, NOT a constant: a carrier that
+# boots once and then runs n missions has a budget that GROWS with n, and a fixed 1800 s would
+# false-kill a healthy n>=6 batch. The three coefficients are CONSERVATIVE defaults derived
+# from measured anchors (p6c3 T3 report §5 — W2 n=8 on the production-shaped image), each
+# roughly an order of magnitude above what was observed, because a watchdog that fires early
+# destroys evidence while one that fires late only wastes wall-clock:
+#
+#   * boot allowance 300 s — MEASURED t_boot 24.914 s (W2 §5.1: simulation_app_init 13.2989 +
+#     scene_load 10.5517 + ros_bridge_ready 0.7594 + adapter_wire 0.2987 + bootstrap 0.0053),
+#     and the COLD Isaac boot anchor the readiness default already carries (~67.5 s). 300 s is
+#     ~12x the measured warm boot / ~4.4x the cold anchor.
+#   * wall factor 2.0 — the scenario's ``timeout_s`` is a SIM-time budget (M1 §3.2), so it must
+#     be converted to wall-clock. The wall/sim ratio carried into this task from the W2 numbers
+#     is 1.46~1.55 (NOT re-derived by this team — the W2 report's per-iteration table publishes
+#     mission WALL only, so this coefficient is inherited, not measured here). 2.0 leaves ~30%
+#     headroom over the top of that band.
+#   * per-iteration overhead 60 s — MEASURED per-sample fixed cost 5.684~5.801 s (W2 §5.2,
+#     restage+realign+readiness+record+evaluate), against the p6c1 anchor 7.26~7.28 s: the
+#     band the task pins is 5.7~7.3 s. 60 s is ~8~10x it.
+#
+# W3 (n=60 through-M3) measures the real batch wall and these get REVISED there (p6c4 T4).
+DEFAULT_BATCH_BOOT_ALLOWANCE_S = 300.0
+DEFAULT_BATCH_WALL_FACTOR = 2.0
+DEFAULT_BATCH_ITER_OVERHEAD_S = 60.0
 
 # --- runner /dev/shm (LOCKED risk R-shm, M5 §8 / §3.3 D-O) --------------------------------
 #
@@ -988,6 +1035,415 @@ def run_job(
         _discard_scratch(scratch_dir)  # D-B: per-job scratch dies with the job (stateless)
 
 
+# --------------------------------------------------------------------------- #
+# p6 batch carrier: ONE container pair, n samples of ONE request (설계 §0-10).
+# Layered ON TOP of the frozen single-job seam above — every docker-facing step
+# (image gate, readiness gate, supervision loop, teardown, scratch discard) is
+# the SAME helper ``run_job`` drives, so the two entry points cannot drift into
+# two different definitions of "a supervised container pair".
+# --------------------------------------------------------------------------- #
+
+
+def batch_timeout_s(
+    job_specs: list[dict[str, Any]],
+    *,
+    boot_allowance_s: float = DEFAULT_BATCH_BOOT_ALLOWANCE_S,
+    wall_factor: float = DEFAULT_BATCH_WALL_FACTOR,
+    iter_overhead_s: float = DEFAULT_BATCH_ITER_OVERHEAD_S,
+) -> float:
+    """The carrier's inner wall-clock watchdog budget (설계 §0-12) — the ONE formula.
+
+    ``max(boot_allowance + Σᵢ(timeout_sᵢ × wall_factor + iter_overhead), DEFAULT_JOB_TIMEOUT_S)``
+
+    Pure arithmetic, no docker, no clock — so the number a carrier is judged against is
+    unit-testable and has exactly one home (the ``ParallelSupervisor``'s per-vehicle OUTER
+    cap is derived from this same call, never from a second formula). The floor keeps a
+    2-sample carrier from being judged more harshly than a single job would be.
+
+    ``scenario.timeout_s`` is a SIM-time budget (M1 §3.2); ``wall_factor`` converts it to
+    wall-clock (see the constants' measured derivation). A spec that declares none raises
+    LOUD: inventing a watchdog budget is exactly what CLAUDE §2-4 forbids, and the caller
+    (``BatchRunJobRunner``) runs inside the supervisor's crash boundary, so the loudness
+    lands as a named FAILED attempt rather than a silent wrong deadline.
+    """
+    total = float(boot_allowance_s)
+    for index, spec in enumerate(job_specs):
+        total += _mission_budget_s(spec, index) * wall_factor + iter_overhead_s
+    return max(total, DEFAULT_JOB_TIMEOUT_S)
+
+
+def _mission_budget_s(spec: dict[str, Any], index: int) -> float:
+    """``scenario.timeout_s`` of one spec (sim-seconds), loud when absent/invalid."""
+    scenario = spec.get("scenario")
+    budget = scenario.get("timeout_s") if isinstance(scenario, dict) else None
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        raise ValueError(
+            f"batch spec {index} declares no positive scenario.timeout_s (got {budget!r})"
+            " — the carrier watchdog is derived from the mission budgets it carries;"
+            " refusing to invent one (CLAUDE §2-4)"
+        )
+    return float(budget)
+
+
+def run_batch(
+    job_specs: list[dict[str, Any]],
+    out_dir: Path,
+    runner_image: str,
+    sut_image: str,
+    docker_client: Any = None,
+    *,
+    batch_id: str,
+    batch_timeout_s: float,
+    runner_env: dict[str, str] | None = None,
+    cache_root: str | os.PathLike[str] | None = None,
+    cache_scratch_root: str | os.PathLike[str] | None = None,
+    oracle_plugin_dir: str | None = None,
+    runner_gpus: bool = True,
+    readiness_probe: ReadinessProbe | None = None,
+    readiness_timeout_s: float = 120.0,
+    pull_stall_timeout_s: float = DEFAULT_PULL_STALL_TIMEOUT_S,
+    sut_restart_limit: int = 1,
+    poll_interval_s: float = 1.0,
+    ros_domain_id: int | None = None,
+    shm_size: str | int | None = DEFAULT_RUNNER_SHM_SIZE,
+    request_identity_key: str | None = None,
+    on_iteration_result: Callable[[int, JobOutcome], None] | None = None,
+) -> list[JobOutcome]:
+    """Run n samples of ONE request in ONE container pair; return n ``JobOutcome``s.
+
+    The p6 CARRIER seam (CEO decision 2026-08-26, 설계 §0-10): the SAMPLE stays the logical
+    job (one ``JobOutcome`` -> one ``JobResult`` -> one store row, M3/M4 unchanged) and the
+    container carries n of them, so the ~25 s Isaac boot + stage open + DDS wiring are paid
+    ONCE. The five positional parameters mirror ``run_job``'s frozen pin, with the spec
+    replaced by the spec LIST; ``batch_id`` (= the request id) is the carrier's identity and
+    names its network / domain id / scratch / labels / host dir — i.e. the store schema does
+    NOT grow a "batch" column (설계 §0-10: 묶음 컬럼 기각).
+
+    Wire (M1 ``contract.job_batch``, M2 ``runner.batch``): the wrapper document
+    ``{specs, request_id}`` is written to the job dir, bind-mounted READ-ONLY at
+    ``JOB_SPEC_BATCH_MOUNT`` and announced via ``JOB_SPEC_BATCH``; ``RESULT_OUT`` is the
+    out-dir ROOT and sample i's result lands at ``results/<i>/result.json``. The runner image
+    ENTRYPOINT is the SINGLE-job entrypoint, so the batch entry point is reached by a command
+    override (``BATCH_RUNNER_ENTRYPOINT`` + ``BATCH_RUNNER_COMMAND``) — an image that predates
+    batching then fails loudly with "No module named cv_infra.runner.batch" instead of
+    half-running the request (설계 §0-7).
+
+    FAILURE FOLD (P5-13, 12행 표): this function NEVER raises after the first docker resource
+    exists and NEVER returns fewer than ``len(job_specs)`` outcomes. Every slot is charged
+    separately:
+
+    * a slot with its one ``result.json`` keeps it — **a completed sample's verdict survives
+      a carrier that dies later** (M2 flushes each result before the next sample starts);
+    * a slot with 0 results is charged the carrier's reason: the watchdog marker when the
+      carrier was killed by the watchdog (-> TIMEOUT classification), else a named infra
+      error (-> FAILED). ``runner_exit_code`` is the CARRIER's exit code on every row, which
+      is what makes exit 2 (bad spec) read as *contract* and exit 3 as *infra* on the
+      operational view;
+    * a slot with 2+ results is charged the collection violation itself (REQ-EXEC-013 재독해:
+      the invariant is per SAMPLE SLOT now, not per container).
+
+    Pre-resource guards (< 2 specs, missing/duplicate ``job_id``, disagreeing
+    ``sut_image_ref``) raise BEFORE any docker resource, exactly like ``run_job``'s
+    ``job_id`` check — the caller runs inside the supervisor's crash boundary.
+
+    ``on_iteration_result`` is a RESERVED seam (v1 always None, never called): live
+    per-sample state transitions are the ``batch_summary.json`` flush's job to feed, and
+    wiring them before there is a consumer would be a store write from an executor thread
+    (설계 §0-11 — 그룹 헤드만 RUNNING).
+    """
+    if len(job_specs) < 2:
+        raise ValueError(
+            f"run_batch needs at least 2 job specs, got {len(job_specs)} — a 1-sample carrier"
+            " is exactly what the frozen run_job seam already is (설계 §0-10 트리거 = 대기"
+            " 형제 그룹 크기 > 1)"
+        )
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError("run_batch requires a non-empty batch_id (the carrier's identity)")
+    job_ids: list[str] = []
+    first_seen: dict[str, int] = {}
+    for index, spec in enumerate(job_specs):
+        job_id = spec.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError(f"batch spec {index} must carry a non-empty job_id (seam contract)")
+        first = first_seen.setdefault(job_id, index)
+        if first != index:
+            raise ValueError(
+                f"batch spec {index}: job_id {job_id!r} is already used by spec {first} —"
+                " each sample names its own JobResult/store row"
+            )
+        job_ids.append(job_id)
+    sut_refs = {spec.get("sut_image_ref") for spec in job_specs}
+    if len(sut_refs) != 1:
+        raise ValueError(
+            f"batch specs disagree on sut_image_ref ({sorted(map(repr, sut_refs))}) — ONE"
+            " carrier wires ONE SUT, so every sample of the batch must name the same image"
+        )
+    if sut_restart_limit < 0:
+        raise ValueError(f"sut_restart_limit must be >= 0, got {sut_restart_limit}")
+    # Same seat as run_job: a bad cache/plugin path fails loud BEFORE any resource.
+    cache_volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, batch_id)
+    plugin_dir = _resolve_oracle_plugin_dir(oracle_plugin_dir)
+
+    client = docker_client
+    if client is None:
+        import docker  # noqa: PLC0415
+
+        client = docker.from_env()
+
+    net_name = network_name_for(batch_id)  # carrier key = request id (설계 §0-10)
+    job_dir = Path(out_dir) / net_name
+    result_dir = job_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.chmod(0o777)  # runner is non-root (uid 1234) — same idiom as run_job
+    batch_path = job_dir / "job_spec_batch.json"
+    # M1 owns the wrapper SHAPE (G-56 import, never a re-declared dict): validating it here
+    # means a malformed carrier document is a producer-side error, not an exit-2 GPU round trip.
+    wrapper = JobSpecBatch(specs=list(job_specs), request_id=batch_id)
+    batch_path.write_text(
+        json.dumps(wrapper.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    domain_id = ros_domain_id if ros_domain_id is not None else allocate_ros_domain_id(batch_id)
+    labels = {LABEL_JOB_ID: batch_id, LABEL_ROS_DOMAIN_ID: str(domain_id)}
+    network: Any = None
+    runner_ct: Any = None
+    sut_ct: Any = None
+    vehicle_exit: int | None = None
+    carrier_error: str | None = None
+    try:
+        _ensure_image_present(
+            client,
+            runner_image,
+            kind="runner",
+            stall_timeout_s=pull_stall_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        _ensure_image_present(
+            client,
+            sut_image,
+            kind="sut",
+            stall_timeout_s=pull_stall_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        network = client.networks.create(net_name, driver="bridge", labels=labels)
+
+        environment = dict(runner_env or {})
+        environment.update(
+            {
+                JOB_SPEC_BATCH_ENV: JOB_SPEC_BATCH_MOUNT,
+                "RESULT_OUT": RESULT_OUT_MOUNT,  # the batch out-dir ROOT (results/<i>/ under it)
+                "ROS_DOMAIN_ID": str(domain_id),
+            }
+        )
+        if plugin_dir is not None:
+            environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
+        if request_identity_key is not None:
+            environment[REQUEST_IDENTITY_KEY_ENV] = request_identity_key
+        # FU-14 scenario-derived ROS env off spec 0 — the carrier wires the ROS side ONCE and
+        # M2's ``admit_specs`` refuses a batch whose specs disagree on the adapter config.
+        interface = job_specs[0].get("interface")
+        adapter_config = interface.get("adapter_config") if isinstance(interface, dict) else None
+        if isinstance(adapter_config, dict):
+            for cfg_key, env_key in (("ros_distro", "ROS_DISTRO"), ("rmw", "RMW_IMPLEMENTATION")):
+                if cfg_key in adapter_config:
+                    environment[env_key] = str(adapter_config[cfg_key])
+        runner_extra: dict[str, Any] = {}
+        if shm_size is not None:
+            runner_extra["shm_size"] = shm_size
+        if runner_gpus:
+            from docker.types import DeviceRequest  # noqa: PLC0415
+
+            runner_extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+        volumes = {
+            **cache_volumes,
+            **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
+            str(batch_path): {"bind": JOB_SPEC_BATCH_MOUNT, "mode": "ro"},
+            str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
+        }
+        _log_runner_mounts(batch_id, volumes, shm_size=shm_size)
+        runner_ct = client.containers.run(
+            runner_image,
+            detach=True,
+            name=f"{net_name}-runner",
+            network=net_name,
+            labels=labels,
+            environment=environment,
+            volumes=volumes,
+            # The image ENTRYPOINT is the single-job entry point (M5 owns the Dockerfile,
+            # unchanged by p6) — the carrier is reached by overriding it (설계 §0-7).
+            entrypoint=BATCH_RUNNER_ENTRYPOINT,
+            command=list(BATCH_RUNNER_COMMAND),
+            **runner_extra,
+        )
+
+        probe = readiness_probe if readiness_probe is not None else default_readiness_probe
+        gate = _gate_runner_ready(runner_ct, probe, readiness_timeout_s, poll_interval_s)
+        if gate == _GATE_EXITED:
+            vehicle_exit = _exit_code(runner_ct)
+        elif gate == _GATE_TIMEOUT:
+            carrier_error = f"runner readiness gate timed out after {readiness_timeout_s}s"
+        else:
+            sut_ct = client.containers.run(
+                sut_image,
+                detach=True,
+                name=f"{net_name}-sut",
+                network=net_name,
+                labels=labels,
+                environment={"ROS_DOMAIN_ID": str(domain_id)},
+            )
+            vehicle_exit, carrier_error = _supervise_until_runner_exit(
+                runner_ct,
+                sut_ct,
+                job_timeout_s=batch_timeout_s,
+                sut_restart_limit=sut_restart_limit,
+                poll_interval_s=poll_interval_s,
+            )
+        # ALWAYS collect — unlike run_job, an infra reason does not skip collection: the
+        # samples that finished before the carrier died already have their results on disk
+        # and retracting them would be a lie (P5-13).
+        return _fold_batch_outcomes(result_dir, job_ids, vehicle_exit, carrier_error)
+    except Exception as exc:  # infra boundary: salvage whatever landed, never raise
+        reason = carrier_error or f"{type(exc).__name__}: {exc}"
+        try:
+            return _fold_batch_outcomes(result_dir, job_ids, vehicle_exit, reason)
+        except Exception as salvage_exc:  # the salvage read itself failed — still no raise
+            return [
+                JobOutcome(
+                    job_id,
+                    None,
+                    vehicle_exit,
+                    f"{reason}; batch result salvage also failed:"
+                    f" {type(salvage_exc).__name__}: {salvage_exc}",
+                )
+                for job_id in job_ids
+            ]
+    finally:
+        _teardown((sut_ct, runner_ct), network)
+        _discard_scratch(scratch_dir)
+
+
+def _fold_batch_outcomes(
+    result_dir: Path,
+    job_ids: list[str],
+    vehicle_exit: int | None,
+    carrier_error: str | None,
+) -> list[JobOutcome]:
+    """Per-SLOT fold of one carrier's disk state + terminal reason (P5-13, 12행 표).
+
+    The slot INDEX is the array position (the wire invariant ``specs[i] <-> results/<i> <->
+    repeat_index i``); the ``job_id`` declared inside a recovered ``result.json`` is
+    cross-checked against it and a mismatch fails THAT slot — silently re-mapping a sample's
+    result onto another sample's row is the one error mode nothing downstream could detect.
+    """
+    collected = _collect_batch_results(result_dir, len(job_ids))
+    timed_out = carrier_error is not None and carrier_error.startswith(JOB_TIMEOUT_MARKER)
+    why = carrier_error if carrier_error is not None else f"carrier exited {vehicle_exit}"
+    outcomes: list[JobOutcome] = []
+    for index, (job_id, slot) in enumerate(zip(job_ids, collected, strict=True)):
+        if slot.path is not None:
+            declared = _declared_job_id(slot.path)
+            if declared is not None and declared != job_id:
+                outcomes.append(
+                    JobOutcome(
+                        job_id,
+                        None,
+                        vehicle_exit,
+                        f"slot {index}: result.json declares job_id {declared!r}, but this slot"
+                        f" is {job_id!r} — refusing to re-map a sample's result silently",
+                    )
+                )
+                continue
+            # The verdict of a COMPLETED sample survives a carrier that died later.
+            outcomes.append(JobOutcome(job_id, slot.path, vehicle_exit, None))
+            continue
+        if slot.found:  # 2+ — this slot is DAMAGED, not missing (say which, not "never ran")
+            outcomes.append(JobOutcome(job_id, None, vehicle_exit, slot.error))
+            continue
+        if timed_out:
+            detail = (carrier_error or "").removeprefix(JOB_TIMEOUT_MARKER).strip()
+            outcomes.append(
+                JobOutcome(
+                    job_id,
+                    None,
+                    vehicle_exit,
+                    f"{JOB_TIMEOUT_MARKER} vehicle timeout ({detail}) before slot {index}"
+                    " produced a result",
+                )
+            )
+            continue
+        outcomes.append(
+            JobOutcome(
+                job_id,
+                None,
+                vehicle_exit,
+                f"slot {index}: iteration never produced a result ({why})",
+            )
+        )
+    return outcomes
+
+
+@dataclass(frozen=True)
+class _SlotCollection:
+    """What one sample slot's directory actually holds (``found`` = result.json count)."""
+
+    index: int
+    path: Path | None
+    found: int
+    error: str | None
+
+
+def _collect_batch_results(result_dir: Path, n: int) -> list[_SlotCollection]:
+    """Enforce the exactly-one-result invariant PER SAMPLE SLOT (REQ-EXEC-013 재독해).
+
+    The requirement's unit was the container while 1 job = 1 container; under the p6 carrier
+    the unit is the SAMPLE SLOT — ``<result_dir>/results/<i>/`` must hold exactly one
+    ``result.json``. 0 and 2+ are both recorded (never guessed at), and the message names the
+    slot so the failure is traceable to one sample rather than to "the batch".
+    """
+    slots: list[_SlotCollection] = []
+    for index in range(n):
+        slot_dir = Path(result_dir) / BATCH_RESULTS_DIRNAME / str(index)
+        found = sorted(slot_dir.rglob("result.json"))
+        if len(found) == 1:
+            slots.append(_SlotCollection(index, found[0], 1, None))
+        elif not found:
+            slots.append(
+                _SlotCollection(
+                    index,
+                    None,
+                    0,
+                    f"slot {index}: no result.json under {slot_dir}"
+                    " (REQ-EXEC-013 재독해: 표본 슬롯당 정확히 1개)",
+                )
+            )
+        else:
+            slots.append(
+                _SlotCollection(
+                    index,
+                    None,
+                    len(found),
+                    f"slot {index}: expected exactly 1 result.json under {slot_dir},"
+                    f" found {len(found)} (REQ-EXEC-013 재독해)",
+                )
+            )
+    return slots
+
+
+def _declared_job_id(result_path: Path) -> str | None:
+    """The ``job_id`` a recovered result.json names (None when unreadable/absent).
+
+    Deliberately soft: an unreadable result is already classified FAILED by ``_classify``, so
+    a second read must not invent a second failure mode — this only feeds the cross-check.
+    """
+    try:
+        payload = json.loads(Path(result_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    declared = payload.get("job_id") if isinstance(payload, dict) else None
+    return declared if isinstance(declared, str) else None
+
+
 def _log_runner_mounts(
     job_id: str, volumes: dict[str, dict[str, str]], *, shm_size: str | int | None = None
 ) -> None:
@@ -1125,15 +1581,38 @@ def _teardown(containers: tuple[Any, ...], network: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class _Flight:
+    """One in-flight CARRIER: the jobs it carries + the key its resources were taken under.
+
+    ``release_key`` is what the slot token / domain id / observation events are keyed on —
+    ``store.job_key`` for a legacy single-job flight, the REQUEST id for a p6 batch carrier
+    (설계 §0-10: the carrier's identity is the request, and the store schema does not grow a
+    batch column). Keeping BOTH shapes in one record is what lets the completion path stay a
+    SINGLE code path regardless of how many samples rode the container.
+    """
+
+    jobs: list[Job]
+    release_key: str
+
+
 class ParallelSupervisor:
     """k-parallel asyncio supervision — REQ-ORCH-006/007/009/010, NFR-ORCH-003.
 
-    Generalizes the single-runner seam: one asyncio task per admitted job
-    (잡↔러너 1:1, REQ-ORCH-007), driving the injected synchronous ``Runner``
-    seam. The real per-job callable is ``run_job`` (blocking Docker SDK), so
-    every attempt is offloaded to the default thread pool via
+    Generalizes the single-runner seam: one asyncio task per admitted CARRIER, driving the
+    injected synchronous ``Runner`` seam. The real per-job callable is ``run_job`` (blocking
+    Docker SDK), so every attempt is offloaded to the default thread pool via
     ``loop.run_in_executor`` (M3 §3.5 R-DS — the event loop is never blocked
     and the k supervision tasks stay concurrent); CPU tests inject fakes.
+
+    * **batch carriers** (p6, 설계 §0-10): admission takes a whole waiting sibling group
+      (``JobQueue.pop_group``) when TWO conditions hold — the group has more than one job AND
+      the runner seam declares the ``run_batch`` capability (duck-typed, so every existing
+      CPU test whose fake has no such method keeps the byte-identical single-job path). A
+      group of one is the frozen single-job path in all cases. The slot token is taken ONCE
+      per carrier (slot = container pair, not sample) and the ``ROS_DOMAIN_ID`` is allocated
+      ONCE under the request id, then stamped onto every job of the group — one carrier, one
+      network, one domain (LOCKED §7.5 불변).
 
     * **admission**: fill free slots from the ``JobQueue`` through the
       ``SlotAccountant`` gate — a closed gate means the launch never happens
@@ -1164,9 +1643,10 @@ class ParallelSupervisor:
       ``infra_error`` are written back onto the ``Job``, so the queue's existing
       persist (REQ-ORCH-011) carries them into SQLite and onto the status API.
 
-    ``events`` is the observation log — ``("start"|"end", job_key)`` in
+    ``events`` is the observation log — ``("start"|"end", release_key)`` in
     wall-clock order — that makes slot re-assignment / cap invariants
-    unit-assertable (DoD-P4-03/04 CPU 선행).
+    unit-assertable (DoD-P4-03/04 CPU 선행). One event pair per CARRIER: a batch
+    carrier logs its request id, a single job logs its ``job_key`` (unchanged).
     """
 
     def __init__(
@@ -1206,7 +1686,7 @@ class ParallelSupervisor:
         """
         loop = asyncio.get_running_loop()
         results: list[JobResult] = []
-        in_flight: dict[asyncio.Task[JobResult], Job] = {}
+        in_flight: dict[asyncio.Task[list[JobResult]], _Flight] = {}
         while self._queue.pending() or in_flight:
             self._admit(loop, in_flight)
             if not in_flight:
@@ -1218,77 +1698,177 @@ class ParallelSupervisor:
                 )
             done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                job = in_flight.pop(task)
-                key = job_key(job)
+                flight = in_flight.pop(task)
                 # Reclaim BEFORE the retry decision: the freed slot/domain id is
                 # available to the next admission wave immediately (REQ-ORCH-006).
+                # ONE slot + ONE domain id per CARRIER, whatever it carried.
                 self._slots.release()
                 if self._allocator is not None:
-                    self._allocator.release(key)
-                self.events.append(("end", key))
-                result = task.result()  # _run_one never raises (crash boundary inside)
-                # p4c5 실패 관측성: the attempt's diagnostics ride onto the job so
-                # ``record_outcome``'s persist (REQ-ORCH-011) writes them with the
-                # state — one write path, no new store call site. Last-attempt
-                # semantics: a clean retry resets them to None.
-                job.runner_exit_code = result.runner_exit_code
-                job.infra_error = result.infra_error
-                if not self._queue.record_outcome(job, result.state):
-                    results.append(result)
+                    self._allocator.release(flight.release_key)
+                self.events.append(("end", flight.release_key))
+                # _run_one/_run_group never raise (crash boundary inside) and always
+                # return one JobResult per carried job — a single completion path.
+                for result in task.result():
+                    job = result.job
+                    # p4c5 실패 관측성: the attempt's diagnostics ride onto the job so
+                    # ``record_outcome``'s persist (REQ-ORCH-011) writes them with the
+                    # state — one write path, no new store call site. Last-attempt
+                    # semantics: a clean retry resets them to None.
+                    job.runner_exit_code = result.runner_exit_code
+                    job.infra_error = result.infra_error
+                    if job.state is JobState.QUEUED:
+                        # A batch carrier marks only its HEAD running (설계 §0-11 —
+                        # running_k must stay the CARRIER count, and an executor thread
+                        # must never write the store). Its siblings take the QUEUED ->
+                        # RUNNING -> terminal transitions here, on the loop thread.
+                        self._queue.mark_running(job)
+                    if not self._queue.record_outcome(job, result.state):
+                        results.append(result)
         return results
 
     def _admit(self, loop: asyncio.AbstractEventLoop, in_flight: dict) -> None:
-        """Admission gate: fill free slots up to k from the queue (REQ-ORCH-006)."""
-        while self._queue.pending() and self._slots.try_acquire():
-            job = self._queue.pop_next()
-            assert job is not None  # pending() > 0 above
-            key = job_key(job)
-            self._queue.mark_running(job)
-            if self._allocator is not None:
-                # p4c6 §7-1: the allocated id RIDES the job to run_job (the single
-                # source for the concurrent-job domain set) — run_job no longer
-                # re-derives a colliding pure-hash id. Re-set on every admission
-                # (a retry re-allocates); None when no allocator (fallback path).
-                job.ros_domain_id = self._allocator.allocate(key)
-            self.events.append(("start", key))
-            in_flight[loop.create_task(self._run_one(loop, job))] = job
+        """Admission gate: fill free slots up to k from the queue (REQ-ORCH-006).
 
-    async def _run_one(self, loop: asyncio.AbstractEventLoop, job: Job) -> JobResult:
+        One slot token = one CARRIER. When the runner seam declares the ``run_batch``
+        capability the whole waiting sibling group is admitted together (p6 §0-10); a group
+        of ONE is the frozen single-job path (same events, same allocations, same task).
+        """
+        capable = getattr(self._runner, "run_batch", None) is not None
+        while self._queue.pending() and self._slots.try_acquire():
+            if capable:
+                group = self._queue.pop_group()
+            else:
+                job = self._queue.pop_next()
+                assert job is not None  # pending() > 0 above
+                group = [job]
+            assert group  # pending() > 0 above
+            if len(group) == 1:
+                job = group[0]
+                key = job_key(job)
+                self._queue.mark_running(job)
+                if self._allocator is not None:
+                    # p4c6 §7-1: the allocated id RIDES the job to run_job (the single
+                    # source for the concurrent-job domain set) — run_job no longer
+                    # re-derives a colliding pure-hash id. Re-set on every admission
+                    # (a retry re-allocates); None when no allocator (fallback path).
+                    job.ros_domain_id = self._allocator.allocate(key)
+                self.events.append(("start", key))
+                in_flight[loop.create_task(self._run_one(loop, job))] = _Flight([job], key)
+                continue
+            # Batch carrier: the REQUEST is the resource key (one network, one domain id,
+            # one host dir), and only the group HEAD goes RUNNING so ``running_k`` keeps
+            # meaning "live carriers" instead of reading as over-launch (설계 §0-11).
+            key = group[0].request_id
+            self._queue.mark_running(group[0])
+            domain_id = None if self._allocator is None else self._allocator.allocate(key)
+            for job in group:
+                job.ros_domain_id = domain_id
+            self.events.append(("start", key))
+            in_flight[loop.create_task(self._run_group(loop, group))] = _Flight(group, key)
+
+    async def _run_one(self, loop: asyncio.AbstractEventLoop, job: Job) -> list[JobResult]:
         """One attempt: offload the blocking Runner seam; classify the outcome.
 
         Both boundaries below now carry their REASON (p4c5, T1.5 §8-2): a
         swallowed crash-boundary message left a bare ``failed`` in the store with
-        nothing to trace. The classification itself is unchanged.
+        nothing to trace. The classification itself is unchanged. Returns a ONE-element
+        list so the completion loop has a single shape for both carrier kinds (p6).
         """
         try:
             attempt = loop.run_in_executor(None, self._runner.run, job)
             if self._job_timeout_s is None:
-                return await attempt
-            return await asyncio.wait_for(attempt, timeout=self._job_timeout_s)
+                return [await attempt]
+            return [await asyncio.wait_for(attempt, timeout=self._job_timeout_s)]
         except TimeoutError:
             # py3.11: asyncio.TimeoutError IS this builtin. The executor thread
             # may still be draining — the real seam's own watchdog kills the
             # container (run_job); classification is all the state machine needs.
-            return JobResult(
-                job=job,
-                state=JobState.TIMEOUT,
-                verdict=None,
-                infra_error=_reason(
-                    f"{JOB_TIMEOUT_MARKER} supervisor watchdog fired after"
-                    f" {self._job_timeout_s}s (the runner seam's own watchdog kills"
-                    " the container)"
-                ),
-            )
+            return [
+                JobResult(
+                    job=job,
+                    state=JobState.TIMEOUT,
+                    verdict=None,
+                    infra_error=_reason(
+                        f"{JOB_TIMEOUT_MARKER} supervisor watchdog fired after"
+                        f" {self._job_timeout_s}s (the runner seam's own watchdog kills"
+                        " the container)"
+                    ),
+                )
+            ]
         except Exception as exc:
             # Runner crash boundary: this attempt failed; other jobs unaffected.
             # The exception MESSAGE is the only trace of why (the seam raised
             # instead of returning an outcome) — preserve it, bounded.
-            return JobResult(
-                job=job,
-                state=JobState.FAILED,
-                verdict=None,
-                infra_error=_reason(f"runner seam crashed: {type(exc).__name__}: {exc}"),
-            )
+            return [
+                JobResult(
+                    job=job,
+                    state=JobState.FAILED,
+                    verdict=None,
+                    infra_error=_reason(f"runner seam crashed: {type(exc).__name__}: {exc}"),
+                )
+            ]
+
+    async def _run_group(self, loop: asyncio.AbstractEventLoop, jobs: list[Job]) -> list[JobResult]:
+        """One CARRIER attempt: offload ``runner.run_batch``; classify n outcomes (p6).
+
+        Same two boundaries as ``_run_one``, applied to the whole group: the outer watchdog
+        classifies EVERY sample TIMEOUT (the carrier is one container — a fired outer cap
+        says nothing about which sample was in flight, and the samples that DID finish are
+        recovered by the seam's own per-slot fold, not by this classification), and a raising
+        seam fails every sample of that carrier with the exception message.
+        """
+        outer_s = self._group_timeout_s(jobs)
+        try:
+            attempt = loop.run_in_executor(None, self._runner.run_batch, jobs)
+            if outer_s is None:
+                return await attempt
+            return await asyncio.wait_for(attempt, timeout=outer_s)
+        except TimeoutError:
+            return [
+                JobResult(
+                    job=job,
+                    state=JobState.TIMEOUT,
+                    verdict=None,
+                    infra_error=_reason(
+                        f"{JOB_TIMEOUT_MARKER} supervisor watchdog fired after {outer_s}s"
+                        f" for the {len(jobs)}-sample carrier (the runner seam's own"
+                        " watchdog kills the container)"
+                    ),
+                )
+                for job in jobs
+            ]
+        except Exception as exc:
+            return [
+                JobResult(
+                    job=job,
+                    state=JobState.FAILED,
+                    verdict=None,
+                    infra_error=_reason(f"runner seam crashed: {type(exc).__name__}: {exc}"),
+                )
+                for job in jobs
+            ]
+
+    def _group_timeout_s(self, jobs: list[Job]) -> float | None:
+        """The PER-VEHICLE outer cap: ``configured_outer - inner_single + inner_batch``.
+
+        The configured outer cap (``CV_OUTER_WALLCLOCK_S``) is a job-shaped number: worst
+        legitimate image crawl + ONE mission budget. A carrier's inner watchdog grows with n
+        (``batch_timeout_s``), so a fixed outer would fire FIRST on any sizeable batch — the
+        exact dual-watchdog inversion the coherence gate exists to prevent (p4c1 후속 ②). The
+        difference between the seam's batch and single inner watchdogs is therefore added,
+        which preserves the configured pull headroom while tracking the batch's own budget.
+
+        Both inner numbers are DUCK-TYPED (``job_timeout_s`` attribute /
+        ``batch_job_timeout_s(jobs)`` method): a seam that declares neither is simply not
+        scaled, and no outer cap at all (None) stays no ``wait_for`` at all.
+        """
+        if self._job_timeout_s is None:
+            return None
+        inner_single = getattr(self._runner, "job_timeout_s", None)
+        inner_batch_fn = getattr(self._runner, "batch_job_timeout_s", None)
+        if inner_single is None or inner_batch_fn is None:
+            return self._job_timeout_s
+        return self._job_timeout_s + (inner_batch_fn(jobs) - inner_single)
 
 
 # --------------------------------------------------------------------------- #
@@ -1407,7 +1987,112 @@ class RunJobRunner:
         return _job_result_of(job, outcome)
 
 
-def _read_result_doc(result_path: Path | None) -> dict[str, Any] | None:
+class BatchRunJobRunner(RunJobRunner):
+    """``RunJobRunner`` + the p6 CARRIER capability (설계 §0-10) — the production seam.
+
+    Adds exactly two duck-typed members on top of the frozen single-job wrapper, which is
+    what the ``ParallelSupervisor`` gates on:
+
+    * ``run_batch(jobs)`` — n sibling jobs of ONE request -> one container pair ->
+      n ``JobResult``s. Every knob (out dir, images, cache roots, consent env, shm, gpus,
+      readiness probe, docker client) is the SAME construction-time value the single-job path
+      uses: one wrapper, one configuration, so the two paths cannot be configured differently.
+    * ``batch_job_timeout_s(jobs)`` — the carrier's inner watchdog, delegated to the ONE
+      formula (``batch_timeout_s``). The supervisor reads it to scale its per-vehicle outer
+      cap; the same value is what ``run_batch`` is actually run with (이중 정의 금지).
+
+    The class exists (rather than these landing on ``RunJobRunner``) precisely so the
+    capability is a CHOICE at composition time: every CPU test that injects the plain wrapper
+    — and every deployment that wants the pre-p6 one-container-per-sample behavior — keeps the
+    byte-identical single-job path, because ``getattr(runner, "run_batch", None)`` is None.
+
+    ``run_batch_fn`` mirrors ``run_job_fn`` (G-20 주입식 fake, never a module stub); the three
+    ``batch_*`` coefficients mirror the module defaults and exist so an operator (serve.py's
+    ``CV_BATCH_*``) can retune the watchdog without a rebuild.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_batch_fn: Callable[..., list[JobOutcome]] | None = None,
+        batch_boot_allowance_s: float = DEFAULT_BATCH_BOOT_ALLOWANCE_S,
+        batch_wall_factor: float = DEFAULT_BATCH_WALL_FACTOR,
+        batch_iter_overhead_s: float = DEFAULT_BATCH_ITER_OVERHEAD_S,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.batch_boot_allowance_s = batch_boot_allowance_s  # public: serve-config log
+        self.batch_wall_factor = batch_wall_factor
+        self.batch_iter_overhead_s = batch_iter_overhead_s
+        self._run_batch = run_batch_fn if run_batch_fn is not None else run_batch
+
+    def batch_job_timeout_s(self, jobs: list[Job]) -> float:
+        """This carrier's inner watchdog (the ONE formula, with THIS wrapper's coefficients)."""
+        return batch_timeout_s(
+            [spec for spec, _ in self._ordered_specs(jobs)],
+            boot_allowance_s=self.batch_boot_allowance_s,
+            wall_factor=self.batch_wall_factor,
+            iter_overhead_s=self.batch_iter_overhead_s,
+        )
+
+    def run_batch(self, jobs: list[Job]) -> list[JobResult]:
+        """n sibling jobs -> ONE carrier -> n ``JobResult``s (repeat_index order)."""
+        ordered = self._ordered_specs(jobs)
+        specs = [spec for spec, _ in ordered]
+        batch_id = ordered[0][1].request_id
+        outcomes = self._run_batch(
+            specs,
+            self._out_dir,
+            self._runner_image,
+            specs[0]["sut_image_ref"],
+            self._docker_client,
+            batch_id=batch_id,
+            batch_timeout_s=self.batch_job_timeout_s(jobs),
+            runner_env=self._runner_env,
+            cache_root=self._cache_root,
+            cache_scratch_root=self._cache_scratch_root,
+            # Request-level data denormalized onto every job — the group shares a request, so
+            # the head's anchor/key ARE the carrier's (they are set from the same source).
+            oracle_plugin_dir=ordered[0][1].oracle_plugin_dir,
+            runner_gpus=self._runner_gpus,
+            readiness_probe=self._readiness_probe,
+            ros_domain_id=ordered[0][1].ros_domain_id,
+            shm_size=self.shm_size,
+            request_identity_key=ordered[0][1].request_identity_key,
+        )
+        # 설계 §0-13: the carrier's RESULT_OUT host root is the job dir's ``result/`` — the
+        # results live one level deeper (results/<i>/), so the default "parent of result.json"
+        # rule would nest the artifact paths twice.
+        host_root = Path(self._out_dir) / network_name_for(batch_id) / "result"
+        return [
+            _job_result_of(job, outcome, host_root)
+            for (_, job), outcome in zip(ordered, outcomes, strict=True)
+        ]
+
+    def _ordered_specs(self, jobs: list[Job]) -> list[tuple[dict[str, Any], Job]]:
+        """(spec, job) pairs in ``repeat_index`` order — the wire's array order.
+
+        ``specs[i] <-> results/<i> <-> repeat_index i`` is the batch wire invariant
+        (``contract.job_batch``), so the array position is not a convenience: it IS the
+        sample index the carrier renders its out-dir from. A spec-less job raises loud for
+        the same reason ``run`` does (G-26 — a silent no-op run is worse than a failure).
+        """
+        ordered = sorted(jobs, key=lambda job: job.repeat_index)
+        pairs: list[tuple[dict[str, Any], Job]] = []
+        for job in ordered:
+            if not job.job_spec:
+                raise ValueError(
+                    f"job {job_key(job)} carries no job_spec — the REST submit path must"
+                    " materialize the admitted request onto every fanned-out job"
+                    " (api._job_spec_for); refusing a silent no-op run (G-26)"
+                )
+            pairs.append((job.job_spec, job))
+        return pairs
+
+
+def _read_result_doc(
+    result_path: Path | None, result_out_host_root: Path | None = None
+) -> dict[str, Any] | None:
     """Read the runner-emitted result.json for ADDITIVE capture (p5c3 — honest absence).
 
     The report row consumes each repeat's declared ``metrics`` map + ``artifacts``
@@ -1430,10 +2115,16 @@ def _read_result_doc(result_path: Path | None) -> dict[str, Any] | None:
         return None
     # (c) T2: the runner writes mcap/mp4 as CONTAINER-frame paths (under RESULT_OUT =
     # RESULT_OUT_MOUNT); rewrite them to host-resolvable absolute paths so T1's uploader
-    # can stage them, consistent with ``result_json`` (already a host path). The RESULT_OUT
-    # dir is the parent of this result.json on the host (M2 ``resolve_result_path``:
-    # result.json lives directly under RESULT_OUT), which is the host side of the bind.
-    return _hostify_artifact_paths(payload, Path(result_path).parent)
+    # can stage them, consistent with ``result_json`` (already a host path). The host side of
+    # the RESULT_OUT bind DEFAULTS to the parent of this result.json, which is exactly right
+    # for the single-job seam (M2 ``resolve_result_path``: result.json lives directly under
+    # RESULT_OUT) — and exactly WRONG for a batch carrier, where the file is at
+    # ``<root>/results/<i>/result.json`` while its artifacts declare ``/cv/out/results/<i>/…``:
+    # mapping those against the PARENT nests the relative part a second time
+    # (``…/results/<i>/results/<i>/…`` — 설계 §0-13 발견 버그). A caller that knows the real
+    # RESULT_OUT root passes it; None keeps the frozen parent behavior byte-identical.
+    root = Path(result_path).parent if result_out_host_root is None else Path(result_out_host_root)
+    return _hostify_artifact_paths(payload, root)
 
 
 def _hostify_artifact_paths(doc: dict[str, Any], result_out_host_root: Path) -> dict[str, Any]:
@@ -1477,7 +2168,9 @@ def _container_to_host_path(container_path: str, result_out_host_root: Path) -> 
     return str(result_out_host_root.joinpath(*rel.parts))
 
 
-def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
+def _job_result_of(
+    job: Job, outcome: JobOutcome, result_out_host_root: Path | None = None
+) -> JobResult:
     """Fold one ``JobOutcome`` into the control-plane ``JobResult`` (p4c4 glue).
 
     The state/verdict classification is ``_classify`` below — UNCHANGED. What
@@ -1496,6 +2189,11 @@ def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
     absent/unreadable result is honest ``None`` (회귀 0). The doc is read a SECOND time here
     (``_classify`` reads it for the verdict) to keep ``_classify`` frozen — a terminal-fold,
     once-per-job read of a tiny file.
+
+    ``result_out_host_root`` (p6, 설계 §0-13) is the host side of the runner's ``RESULT_OUT``
+    bind, used ONLY to rewrite the doc's container-frame artifact paths. None (the default =
+    every pre-p6 caller) keeps the frozen "parent of result.json" behavior byte-identical; the
+    batch carrier passes its out-dir ROOT because its results sit one level deeper.
     """
     state, verdict = _classify(outcome)
     return JobResult(
@@ -1504,7 +2202,7 @@ def _job_result_of(job: Job, outcome: JobOutcome) -> JobResult:
         verdict=verdict,
         runner_exit_code=outcome.runner_exit_code,
         infra_error=_reason(outcome.infra_error),
-        result_doc=_read_result_doc(outcome.result_path),
+        result_doc=_read_result_doc(outcome.result_path, result_out_host_root),
         result_json_path=str(outcome.result_path) if outcome.result_path is not None else None,
     )
 

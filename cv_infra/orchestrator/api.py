@@ -456,6 +456,27 @@ def _result_wire(result: JobResult) -> dict[str, Any]:
     return wire
 
 
+def _min_pass_ratio(request_dump: dict[str, Any]) -> float | None:
+    """The request's own rollup judgement policy, off its M1 wire dump (p6 §0-14).
+
+    ``execution_settings.min_pass_ratio`` — read from the SAME captured dump the
+    report assembly consumes (전달-not-재도출: the admitted models are gone by
+    completion time), so the live status read and the persisted report apply the
+    same policy to the same request by construction. Absent / null / non-numeric
+    -> None = the frozen any-fail rule (``rollup.roll_up``), never a guessed
+    threshold. Like ``repeats`` it is deliberately OFF the JOB_SPEC wire
+    (``_job_spec_for``): it judges the request's samples as a SET, which is not a
+    fact about the one sample a runner holds.
+    """
+    settings = request_dump.get("execution_settings")
+    if not isinstance(settings, dict):
+        return None
+    ratio = settings.get("min_pass_ratio")
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        return None
+    return float(ratio)
+
+
 def _report_inputs(record: _EnvelopeRecord) -> list[RequestReportInput]:
     """Assemble the per-request report inputs from the terminal record (전달-not-재도출).
 
@@ -473,7 +494,9 @@ def _report_inputs(record: _EnvelopeRecord) -> list[RequestReportInput]:
         inputs.append(
             RequestReportInput(
                 request=record.request_dumps[rid],
-                rollup=roll_up(rid, repeats),
+                rollup=roll_up(
+                    rid, repeats, min_pass_ratio=_min_pass_ratio(record.request_dumps[rid])
+                ),
                 results=[_result_wire(r) for r in repeats],
             )
         )
@@ -715,7 +738,11 @@ def create_app(
                 status_code=500, detail=f"envelope supervision crashed: {record.error}"
             )
         rollups = [
-            roll_up(rid, [r for r in record.results if r.job.request_id == rid])
+            roll_up(
+                rid,
+                [r for r in record.results if r.job.request_id == rid],
+                min_pass_ratio=_min_pass_ratio(record.request_dumps[rid]),
+            )
             for rid in record.request_ids
         ]
         return _status_body(

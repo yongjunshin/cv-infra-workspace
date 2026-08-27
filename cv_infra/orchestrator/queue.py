@@ -124,6 +124,39 @@ class JobQueue:
         (admission gate) transitions it via ``mark_running`` once a slot is held."""
         return self._queue.popleft() if self._queue else None
 
+    def pop_group(self) -> list[Job]:
+        """Remove and return the head job PLUS every waiting SIBLING of it (p6 §0-10).
+
+        A sibling = a waiting job of the SAME ``request_id``. The p6 execution
+        granularity is "1 container = n samples of ONE request" (CEO decision
+        2026-08-26), so the admission gate needs the head's whole waiting family in
+        one hand-off; the returned list is sorted by ``repeat_index`` because the
+        batch wire pins ``specs[i] <-> results/<i> <-> repeat_index i``
+        (``contract.job_batch``) and the array position IS the sample index.
+
+        FIFO is preserved AT THE CARRIER GRANULARITY, which is the honest
+        statement: the head is still the oldest waiting job, and the jobs that are
+        NOT its siblings keep their relative order untouched (they are drained and
+        re-appended in order). A sibling that was queued behind a stranger does
+        overtake that stranger — that is the point of a carrier (it rides the boot
+        the head already pays for), not an accident. Returns ``[]`` on an empty
+        queue (same "nothing to admit" answer as ``pop_next() is None``).
+
+        Transitions are the CALLER's (same contract as ``pop_next``): this only
+        moves jobs out of the waiting deque, it never persists anything.
+        """
+        head = self.pop_next()
+        if head is None:
+            return []
+        group = [head]
+        remaining: deque[Job] = deque()
+        while self._queue:
+            job = self._queue.popleft()
+            (group if job.request_id == head.request_id else remaining).append(job)
+        self._queue = remaining
+        group.sort(key=lambda job: job.repeat_index)
+        return group
+
     def mark_running(self, job: Job) -> None:
         """QUEUED -> RUNNING (admission), persisted."""
         job.state = transition(job.state, JobState.RUNNING)
