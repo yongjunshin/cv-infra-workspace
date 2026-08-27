@@ -8,6 +8,9 @@ NFR-DEPLOY-004; 게이트 DoD-P5-06; 결정 2026-07-03-p1-eula-runtime-consent).
    -> ``test_runner_entrypoint_refuses_without_consent_with_exit_3``
    -> ``test_cpu_substitute_runs_the_image_entrypoint``   (등가 앵커)
    -> ``test_consent_released_run_gets_past_the_gate``    (G-35 반대편/착지)
+   -> ``test_batch_entrypoint_refuses_without_consent_with_exit_3``  (p6 운반체)
+   -> ``test_carrier_entrypoint_is_the_module_m3_overrides_the_image_with`` (등가 앵커)
+   -> ``test_both_entrypoints_refuse_through_the_ONE_guard``
 2. "``grep -rn "ACCEPT_EULA=Y" docker/ cv_infra/ scripts/ docs/`` -> 하드코딩 박힘 0"
    -> ``test_no_acceptance_literal_is_baked_into_the_gate_dirs``
    -> ``test_no_acceptance_value_injection_in_any_syntax``  (G-21 전 구문형)
@@ -36,6 +39,15 @@ NFR-DEPLOY-004; 게이트 DoD-P5-06; 결정 2026-07-03-p1-eula-runtime-consent).
   exit-3 전파는 GPU 사이클 실측 몫이다(본 파일은 프로세스 exit 코드까지).
   (``docker/compose.yaml``·``docker/.env.example``·``docker/orchestrator/Dockerfile``은
   전부 아래 ``_GATE_DIRS`` 스캔 범위 안이다 — 리터럴을 심으면 red, 실측 확인.)
+
+**★ p6 확장 — Isaac을 부팅하는 진입점이 둘이 됐다** (p6c5 T4, 설계 정본 §0-7).
+운반체(``cv_infra.runner.batch``)는 이미지의 ENTRYPOINT가 아니라 **M3의 command
+override**로 실행된다(``supervisor.BATCH_RUNNER_ENTRYPOINT``/``BATCH_RUNNER_COMMAND``).
+즉 *"이미지가 동의를 굽지 않는다"* 만으로는 부족하고, **그 두 번째 진입점도 같은 게이트를
+지나는지**를 봐야 한다 — 안 그러면 배포된 배치 경로가 스캔·거부 단정 어느 쪽에도 걸리지
+않는다(p5c10 (b) CI 평면 미스캔과 정확히 같은 형태의 구멍). 그래서 ⓐ 스캔이
+``cv_infra/runner/batch.py``를 **실제로 읽는지** 앵커하고 ⓑ 그 모듈을 진짜 프로세스로
+띄워 exit 3을 받고 ⓒ 두 진입점의 거부 **메시지가 같은 한 가드에서 나왔음**을 단정한다.
 * 3항의 "동의(identity+timestamp) **기록**"은 **p5c10-T4에 제품으로 생겼다**
   (``scripts/consent/{accept_eula,check_consent}.sh`` — ``eula_accepted`` +
   ``eula_operator_identity`` + ``eula_consented_at``를 0600 JSON으로 기록하고, 부재·
@@ -136,6 +148,9 @@ import pytest
 import yaml
 
 from cv_infra.cli.exit_codes import EXIT_INFRA
+from cv_infra.contract.job_batch import JOB_SPEC_BATCH_ENV
+from cv_infra.orchestrator.supervisor import BATCH_RUNNER_COMMAND, BATCH_RUNNER_ENTRYPOINT
+from cv_infra.runner.batch import BATCH_MODULE
 from cv_infra.runner.main import EXIT_PLATFORM
 from cv_infra.runner.sim_runtime import EulaNotAcceptedError, SimRuntime, eula_boot_guard
 
@@ -146,6 +161,11 @@ _DOCKERFILE = _REPO_ROOT / "docker" / "runner" / "Dockerfile"
 #: The runner module the runner image's ENTRYPOINT executes (등가 앵커 — the
 #: Dockerfile equality is asserted, never assumed).
 _RUNNER_MODULE = "cv_infra.runner.main"
+
+#: The p6 carrier module M3 runs by OVERRIDING that ENTRYPOINT (설계 §0-7). Both
+#: entry points boot Isaac, so both are NEG-2's business; the override equality is
+#: asserted below, never assumed.
+_BATCH_ENTRYPOINT_FILE = "cv_infra/runner/batch.py"
 
 #: Consent env keys (NAMES are the cross-team wire; VALUES are operator input).
 _CONSENT_KEY = "ACCEPT_EULA"
@@ -727,3 +747,95 @@ def test_consent_released_run_gets_past_the_gate(tmp_path):
     assert result_path.exists()  # 미션이 시작됐으므로 정규 result가 남는다
     assert code == EXIT_PLATFORM  # Isaac 부재는 플랫폼 실패 — 여전히 3
     assert _OPAQUE_CONSENT not in stderr  # 동의 값은 어떤 로그에도 타지 않는다 (G-21)
+
+
+# --------------------------------------------------------------------------- #
+# 1항 p6 확장 — 두 번째 진입점(운반체)도 같은 한 게이트를 지난다
+# --------------------------------------------------------------------------- #
+
+
+def _run_batch_entrypoint(tmp_path) -> tuple[int, str, Path]:
+    """운반체를 REAL 프로세스로 띄운다(동의 없음) — (exit, stderr, out_root).
+
+    와이어만 러너와 다르다: ``JOB_SPEC_BATCH``는 래퍼 문서의 **파일 경로**이고
+    ``RESULT_OUT``은 결과 **디렉토리**(``results/<i>/``의 루트)다.
+    """
+    out_root = tmp_path / "batch-out"
+    out_root.mkdir(parents=True, exist_ok=True)
+    wrapper = tmp_path / "job_spec_batch.json"
+    wrapper.write_text(
+        json.dumps({"specs": [json.loads(_job_spec("neg2-batch-0"))], "request_id": "neg2-batch"}),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", BATCH_MODULE],
+        cwd=str(_REPO_ROOT),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(tmp_path),
+            JOB_SPEC_BATCH_ENV: str(wrapper),
+            "RESULT_OUT": str(out_root),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return completed.returncode, completed.stderr, out_root
+
+
+def test_scan_covers_the_batch_entrypoint_file():
+    """스캔 목록 확장(p6c5 T4): 게이트 스캔이 **운반체 진입점 파일을 실제로 읽는다**.
+
+    ``_GATE_DIRS``의 ``cv_infra/``가 이미 이 파일을 포함하지만, "포함할 것이다"와
+    "읽었다"는 다른 명제다(p5c8 함정의 형태) — 파일이 옮겨지거나 스캔이 좁아지면
+    배포된 배치 경로가 조용히 스캔 밖으로 나간다. 여기서는 **부재 = red**다.
+    """
+    scanned = {path.relative_to(_REPO_ROOT).as_posix() for path in _scan_files()}
+    assert _BATCH_ENTRYPOINT_FILE in scanned, "NEG-2 스캔이 운반체 진입점을 안 읽는다"
+    assert BATCH_MODULE == _BATCH_ENTRYPOINT_FILE.removesuffix(".py").replace("/", ".")
+
+
+def test_carrier_entrypoint_is_the_module_m3_overrides_the_image_with():
+    """등가 앵커(운반체판): 아래 subprocess가 띄우는 모듈 = M3가 이미지에 덮어씌우는 그것.
+
+    러너 이미지의 ENTRYPOINT는 여전히 단일잡 진입점이고, 배치는 M3가 command를
+    **override**해서 실행한다. 그 override가 다른 모듈을 가리키게 되면 이 파일이 검사한
+    프로세스는 배포가 실제로 띄우는 프로세스가 아니게 된다 — 그 순간 red.
+    """
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    entrypoint = next(line for line in dockerfile.splitlines() if line.startswith("ENTRYPOINT"))
+    interpreter = json.loads(entrypoint[len("ENTRYPOINT") :].strip())[0]
+    assert BATCH_RUNNER_ENTRYPOINT == interpreter  # 같은 번들 인터프리터
+    assert list(BATCH_RUNNER_COMMAND) == ["-m", BATCH_MODULE]
+
+
+def test_batch_entrypoint_refuses_without_consent_with_exit_3(tmp_path):
+    """동의 미기록 -> 운반체도 부트 거부 + exit 3 (표본 결과 0개)."""
+    code, stderr, out_root = _run_batch_entrypoint(tmp_path)
+
+    assert code == EXIT_PLATFORM == EXIT_INFRA == 3
+    assert "EULA" in stderr and "refused" in stderr, stderr
+    assert "NEG-2" in stderr, stderr
+    assert list(out_root.rglob("result.json")) == [], "거부된 운반체가 표본 결과를 남겼다"
+    assert "Traceback" not in stderr  # 친절 에러 경로 (NFR-INTAKE-001 정신)
+
+
+def test_both_entrypoints_refuse_through_the_ONE_guard(tmp_path):
+    """두 진입점의 거부가 **같은 한 가드**에서 나왔다 — 두 번째 동의 판정은 없다.
+
+    두 층으로 본다. ⓐ 어느 진입점 모듈도 동의 키를 텍스트로 알지 못한다(자기 판정을
+    할 수 없다; 유일한 판정자는 ``sim_runtime.eula_boot_guard``) ⓑ 두 프로세스의 거부
+    줄이 **바이트 단위로 같다** — 복제된 두 번째 게이트라면 문면이 갈라진다(G-25).
+    """
+    for module in (_RUNNER_MODULE, BATCH_MODULE):
+        source = Path(_REPO_ROOT, *module.split(".")).with_suffix(".py").read_text(encoding="utf-8")
+        assert _CONSENT_KEY not in source, f"{module}이 동의 키를 스스로 읽는다"
+        assert "eula_boot_guard" not in source  # 가드는 SimRuntime.boot 안에서만 불린다
+
+    _, runner_stderr, _ = _run_entrypoint(tmp_path / "single", consent=False)
+    _, batch_stderr, _ = _run_batch_entrypoint(tmp_path / "carrier")
+    refusals = [
+        next(line for line in stderr.splitlines() if "EULA" in line)
+        for stderr in (runner_stderr, batch_stderr)
+    ]
+    assert refusals[0] == refusals[1], refusals
