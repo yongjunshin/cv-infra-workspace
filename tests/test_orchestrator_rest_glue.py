@@ -59,12 +59,15 @@ from cv_infra.orchestrator.store import Store, job_key
 from cv_infra.orchestrator.supervisor import (
     _REASON_MAX_CHARS,  # NEG 가드: 사유 문자열 상한 (테스트가 상수를 재타이핑하지 않게)
     _TRUNCATION_SUFFIX,
+    BATCH_RESULTS_DIRNAME,
     DEFAULT_JOB_TIMEOUT_S,
     DEFAULT_OUTER_WALLCLOCK_S,
     JOB_TIMEOUT_MARKER,
     JobOutcome,
     ParallelSupervisor,
     RunJobRunner,
+    batch_timeout_s,
+    network_name_for,
 )
 from tests.test_supervisor_min import FakeClient, run_min
 
@@ -1019,6 +1022,49 @@ def _scripted_run_job(behaviors: dict[str, str], calls: dict[str, dict]):
     return fake_run_job
 
 
+def _scripted_run_batch(behaviors: dict[str, str], calls: dict[str, dict]):
+    """Injected fake of the ``run_batch`` CARRIER contract (G-20), sibling of
+    ``_scripted_run_job``: records the ONE hand-off per request, then writes each sample's
+    result WHERE THE REAL CARRIER WRITES IT (``<job dir>/result/results/<i>/result.json``,
+    the ``specs[i] <-> results/<i>`` wire invariant) so the wrapper's per-slot fold and
+    verdict extraction run for real."""
+
+    def fake_run_batch(
+        job_specs,
+        out_dir,
+        runner_image,
+        sut_image,
+        docker_client=None,
+        *,
+        batch_id,
+        batch_timeout_s,
+        **kwargs,
+    ):
+        calls[batch_id] = {
+            "job_specs": copy.deepcopy(job_specs),
+            "runner_image": runner_image,
+            "sut_image": sut_image,
+            "batch_timeout_s": batch_timeout_s,
+            **kwargs,
+        }
+        result_root = Path(out_dir) / network_name_for(batch_id) / "result"
+        outcomes = []
+        for index, spec in enumerate(job_specs):
+            job_id = spec["job_id"]
+            suffix = job_id.rsplit("/", 1)[-1].split(":")[0]
+            verdict = {"pass": "pass", "fail": "fail"}[behaviors.get(suffix, "pass")]
+            slot = result_root / BATCH_RESULTS_DIRNAME / str(index)
+            slot.mkdir(parents=True, exist_ok=True)
+            result_path = slot / "result.json"
+            result_path.write_text(
+                json.dumps({"job_id": job_id, "verdict": verdict}), encoding="utf-8"
+            )
+            outcomes.append(JobOutcome(job_id, result_path, 0, None))
+        return outcomes
+
+    return fake_run_batch
+
+
 _E2E_ORACLE_MODULE = "p4c4_glue_e2e_oracle"
 
 _E2E_ORACLE_SRC = """\
@@ -1047,9 +1093,17 @@ def _custom_scenario_text() -> str:
 
 def test_e2e_submit_wait_drives_fake_run_job_to_pass_with_anchors(monkeypatch, tmp_path, capsys):
     """The full glue seam: REAL load_envelope -> wire v2 -> env-built production
-    app (serve.build_app) -> fan-out -> k-parallel RunJobRunner -> fake run_job
-    -> rollup -> terminal exit 0. Asserts the spec/anchor/timeout hand-offs the
-    fake recorded AND the store's restart-safe copy."""
+    app (serve.build_app) -> fan-out -> k-parallel BatchRunJobRunner -> fake
+    run_batch / run_job -> rollup -> terminal exit 0. Asserts the spec/anchor/timeout
+    hand-offs the fakes recorded AND the store's restart-safe copy.
+
+    ★ p6c4 재핀 (설계 §0-10): this pin used to read "one ``run_job`` call per repeat".
+    That is exactly what p6 changes — the production seam now declares the batch
+    capability, so r0 (``repeats: 2``) rides ONE carrier (one ``run_batch`` call carrying
+    2 specs in ``repeat_index`` array order) while r1 (one sample) stays on the frozen
+    single-job seam. The FAN-OUT is unchanged: 3 samples, 3 specs, 3 store rows, 3 report
+    repeats — only the number of CONTAINERS changed, which is the whole point of the
+    remodel. The dispatch split below IS the documentation of that intent."""
     envelope = _write_envelope_tree(
         tmp_path,
         {"plain.yaml": _CANONICAL_TEXT, "custom.yaml": _custom_scenario_text()},
@@ -1063,8 +1117,13 @@ def test_e2e_submit_wait_drives_fake_run_job_to_pass_with_anchors(monkeypatch, t
         _E2E_ORACLE_SRC, encoding="utf-8"
     )
     calls: dict[str, dict] = {}
+    batch_calls: dict[str, dict] = {}
     config = _serve_config(tmp_path, CV_MAX_CONCURRENT="2")
-    app = serve.build_app(config, run_job_fn=_scripted_run_job({}, calls))
+    app = serve.build_app(
+        config,
+        run_job_fn=_scripted_run_job({}, calls),
+        run_batch_fn=_scripted_run_batch({}, batch_calls),
+    )
     _wire_batch(monkeypatch, ProcessBoundaryTransport(app, _E2E_ORACLE_MODULE))
     try:
         rc = main(["submit", str(envelope), "--wait"])
@@ -1077,15 +1136,37 @@ def test_e2e_submit_wait_drives_fake_run_job_to_pass_with_anchors(monkeypatch, t
     assert envelope_id.startswith("env-")
     assert "report_outcome=pass" in out_lines[-1]
 
-    # Fan-out N×r reached the runner seam: 2 (repeats override) + 1 jobs.
-    assert sorted(calls) == [
+    # Fan-out N×r reached the runner seam: 2 (repeats override) + 1 jobs — but through
+    # TWO carriers, not three (p6 재핀): r0's two samples share one, r1 runs alone.
+    r0_batch = f"{envelope_id}/r0"
+    assert sorted(batch_calls) == [r0_batch]
+    assert [spec["job_id"] for spec in batch_calls[r0_batch]["job_specs"]] == [
+        f"{envelope_id}/r0:0",
+        f"{envelope_id}/r0:1",
+    ]  # 배열 순서 = repeat_index (specs[i] <-> results/<i> 불변식)
+    assert sorted(calls) == [f"{envelope_id}/r1:0"]  # 그룹 1 = 동결된 단일잡 경로
+    # The carrier watchdog is DERIVED from the specs it carries (never a constant), and it
+    # is strictly greater than a single job's — that is why the outer cap has to scale too.
+    assert batch_calls[r0_batch]["batch_timeout_s"] == batch_timeout_s(
+        batch_calls[r0_batch]["job_specs"]
+    )
+    assert batch_calls[r0_batch]["batch_timeout_s"] >= DEFAULT_JOB_TIMEOUT_S
+
+    # Per-SAMPLE hand-offs, whichever carrier carried them (the fan-out is what is
+    # unchanged: 3 samples, 3 specs, 3 store rows).
+    handoffs = {job_id: (call, call["job_spec"]) for job_id, call in calls.items()}
+    handoffs.update(
+        (spec["job_id"], (call, spec))
+        for call in batch_calls.values()
+        for spec in call["job_specs"]
+    )
+    assert sorted(handoffs) == [
         f"{envelope_id}/r0:0",
         f"{envelope_id}/r0:1",
         f"{envelope_id}/r1:0",
     ]
     anchor = str((tmp_path / "scenarios").resolve())
-    for job_id, call in calls.items():
-        spec = call["job_spec"]
+    for job_id, (call, spec) in handoffs.items():
         assert set(spec) == {
             "job_id",
             "scenario",
@@ -1096,7 +1177,8 @@ def test_e2e_submit_wait_drives_fake_run_job_to_pass_with_anchors(monkeypatch, t
         assert spec["job_id"] == job_id
         assert call["sut_image"] == spec["sut_image_ref"] == _CANONICAL_DOC["sut"]["image_ref"]
         assert call["runner_image"] == "runner:test"
-        assert call["job_timeout_s"] == DEFAULT_JOB_TIMEOUT_S  # wrapper 단일 소스
+        if "job_timeout_s" in call:
+            assert call["job_timeout_s"] == DEFAULT_JOB_TIMEOUT_S  # wrapper 단일 소스
         # D-1 anchor 전달 단정: on the batch path the M8 CLI anchors EVERY
         # request with its scenario's parent dir (test_cli_batch E2E pins
         # ``[anchor, anchor]``), so all jobs hand run_job the REAL dir — the
@@ -1116,7 +1198,7 @@ def test_e2e_submit_wait_drives_fake_run_job_to_pass_with_anchors(monkeypatch, t
     # 재기동 대비: the specs the seam ran are ALSO the persisted ones.
     with Store(config.store_path) as reopened:
         persisted = {job_key(j): j.job_spec for j in reopened.load_jobs()}
-        assert persisted == {job_id: call["job_spec"] for job_id, call in calls.items()}
+        assert persisted == {job_id: spec for job_id, (_, spec) in handoffs.items()}
 
 
 def test_e2e_mixed_outcomes_with_a_crash_runner_stay_isolated(monkeypatch, tmp_path, capsys):
