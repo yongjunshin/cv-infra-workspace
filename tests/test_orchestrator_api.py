@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 
 from cv_infra.orchestrator.api import create_app, report_outcome_of
 from cv_infra.orchestrator.fake_runner import FakeRunner
-from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
+from cv_infra.orchestrator.models import Job, JobResult, JobState, RequestRollup, Verdict
 from cv_infra.orchestrator.store import Store
 
 # Canonical M1-valid request document (the platform copy of the consumer
@@ -196,13 +196,34 @@ def test_flaky_repeats_surface_flakiness_separately(tmp_path):
 
 
 def test_report_outcome_of_priority_unit():
+    """errored (JOB plane) > fail (REQUEST plane) > pass.
+
+    ★ p6c4 T1b: the FAIL level moved from the raw job verdicts to the request ROLLUP, so the
+    envelope outcome and the report matrix (which consumes that same rollup) can no longer
+    disagree about one envelope. The errored level deliberately stayed on the JOB plane — a
+    verdict-less sample is infra and no request-level policy may average it away (P5-13).
+    """
+
     def result(verdict: Verdict | None) -> JobResult:
         state = JobState.COMPLETED if verdict is not None else JobState.FAILED
         return JobResult(job=Job("r", 0), state=state, verdict=verdict)
 
-    assert report_outcome_of([result(Verdict.PASS)]) == "pass"
-    assert report_outcome_of([result(Verdict.PASS), result(Verdict.FAIL)]) == "fail"
-    assert report_outcome_of([result(Verdict.FAIL), result(None)]) == "errored"
+    def rollup(verdict: Verdict | None) -> RequestRollup:
+        return RequestRollup(request_id="r", verdict=verdict)
+
+    assert report_outcome_of([result(Verdict.PASS)], [rollup(Verdict.PASS)]) == "pass"
+    passing_and_failing = [result(Verdict.PASS), result(Verdict.FAIL)]
+    assert report_outcome_of(passing_and_failing, [rollup(Verdict.FAIL)]) == "fail"
+    # errored outranks BOTH, whatever the rollup decided.
+    assert report_outcome_of([result(Verdict.FAIL), result(None)], [rollup(Verdict.FAIL)]) == (
+        "errored"
+    )
+    assert report_outcome_of([result(Verdict.PASS), result(None)], [rollup(Verdict.PASS)]) == (
+        "errored"
+    )
+    # T1b 비공허 대조: the SAME job verdicts fold to pass when the request's own policy
+    # (min_pass_ratio) accepted that mix — which is precisely what used to be impossible.
+    assert report_outcome_of(passing_and_failing, [rollup(Verdict.PASS)]) == "pass"
 
 
 # --------------------------------------------------------------------------- #

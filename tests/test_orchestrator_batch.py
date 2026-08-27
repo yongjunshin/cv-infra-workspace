@@ -30,8 +30,14 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from cv_infra.cli.exit_codes import (
+    EXIT_FAIL,
+    EXIT_INFRA,
+    EXIT_PASS,
+    exit_code_for_report_outcome,
+)
 from cv_infra.orchestrator.allocator import DomainIdAllocator
-from cv_infra.orchestrator.api import _min_pass_ratio, create_app
+from cv_infra.orchestrator.api import _min_pass_ratio, create_app, report_outcome_of
 from cv_infra.orchestrator.fake_runner import FakeBatchRunner, FakeRunner
 from cv_infra.orchestrator.fanout import fan_out
 from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
@@ -669,14 +675,10 @@ def test_min_pass_ratio_reaches_the_live_and_persisted_rollup(tmp_path):
         assert rollup["flakiness"] == 1 / 5  # the instability is still surfaced, separately
         assert report["matrix"][0]["rollup"]["verdict"] == "pass"
         assert store.load_rollup(f"{envelope_id}/r0").verdict is Verdict.PASS
-        # SCOPE BOUNDARY, pinned deliberately (설계 §2 "요청 레벨 exit 는 기존
-        # rollup->report_outcome 경로 무변경"): ``report_outcome_of`` folds the per-JOB
-        # verdicts directly and never consults a rollup, so the ENVELOPE outcome (and the
-        # M8 exit code keyed off it) still reads the one failing sample as a fail. Whether a
-        # request-level threshold should also relax the envelope gate is a POLICY question
-        # this cycle did not answer — pinned here so the answer is a deliberate change, not
-        # a surprise (report 미해결 항목).
-        assert body["report_outcome"] == "fail"
+        # ★ p6c4 T1b: the ENVELOPE outcome now reads the same rollup the matrix row does, so
+        # the PR Check and the process exit cannot disagree about this envelope.
+        assert body["report_outcome"] == "pass"
+        assert exit_code_for_report_outcome(body["report_outcome"]) == EXIT_PASS
 
 
 def test_without_the_ratio_the_same_run_is_a_fail(tmp_path):
@@ -696,3 +698,144 @@ def test_without_the_ratio_the_same_run_is_a_fail(tmp_path):
             body = _wait_completed(client, _submit(client, [doc]))
     assert body["rollups"][0]["verdict"] == "fail"
     assert body["report_outcome"] == "fail"
+    assert exit_code_for_report_outcome(body["report_outcome"]) == EXIT_FAIL
+
+
+# --------------------------------------------------------------------------- #
+# (h) p6c4 T1b: the ENVELOPE outcome is folded off the REQUEST plane
+#
+# THE DEFECT (found while pinning §g, PM 판정 = 실결함): a request that MET its
+# ``min_pass_ratio`` rolled up to PASS and the M4 report matrix — which consumes that
+# rollup — published pass, while ``report_outcome_of`` folded the raw JobResult verdicts
+# and published fail. One envelope, two answers: a green PR Check next to exit 1.
+# --------------------------------------------------------------------------- #
+
+
+class _ScriptedByIndex:
+    """Per-sample scripted seam: ``{repeat_index: verdict}``; None = a verdict-less (infra) job."""
+
+    def __init__(self, script: dict[int, Verdict | None]) -> None:
+        self._script = script
+
+    def run(self, job: Job) -> JobResult:
+        verdict = self._script.get(job.repeat_index, Verdict.PASS)
+        state = JobState.COMPLETED if verdict is not None else JobState.FAILED
+        return JobResult(job=job, state=state, verdict=verdict)
+
+
+def _envelope_outcome(tmp_path, doc: dict, script: dict[int, Verdict | None]) -> tuple[dict, dict]:
+    """Submit ONE request end to end; return (status body, report) from the live surfaces."""
+    with Store(tmp_path / "cv.sqlite3") as store:
+        app = create_app(store, _ScriptedByIndex(script), k=2)
+        with TestClient(app) as client:
+            envelope_id = _submit(client, [doc])
+            body = _wait_completed(client, envelope_id)
+            report = client.get(f"/envelopes/{envelope_id}/report").json()
+    return body, report
+
+
+def _doc(**settings) -> dict:
+    doc = copy.deepcopy(_CANONICAL_DOC)
+    doc["execution_settings"] = settings
+    return doc
+
+
+@pytest.mark.parametrize(
+    ("case", "settings", "script", "outcome", "exit_code"),
+    [
+        # ratio MET: the Check (matrix row, off the rollup) and the exit (off report_outcome)
+        # now say the same thing — that agreement IS the repair.
+        (
+            "ratio-met-is-pass",
+            {"repeats": 5, "min_pass_ratio": 0.8},
+            {0: Verdict.FAIL},
+            "pass",
+            EXIT_PASS,
+        ),
+        # ratio MISSED: still a domain failure, exit 1.
+        (
+            "ratio-missed-is-fail",
+            {"repeats": 5, "min_pass_ratio": 0.8},
+            {0: Verdict.FAIL, 1: Verdict.FAIL},
+            "fail",
+            EXIT_FAIL,
+        ),
+        # an INFRA sample outranks the ratio entirely (P5-13): a verdict-less sample is not a
+        # cheap 'fail' the threshold can average away — errored, exit 3, "our problem".
+        (
+            "infra-sample-outranks-the-ratio",
+            {"repeats": 5, "min_pass_ratio": 0.8},
+            {0: None},
+            "errored",
+            EXIT_INFRA,
+        ),
+        # ...even when every JUDGED sample passed.
+        (
+            "infra-sample-with-all-passes",
+            {"repeats": 3, "min_pass_ratio": 1.0},
+            {2: None},
+            "errored",
+            EXIT_INFRA,
+        ),
+        # no ratio declared = the frozen any-fail behavior, unchanged.
+        ("no-ratio-any-fail", {"repeats": 5}, {0: Verdict.FAIL}, "fail", EXIT_FAIL),
+        ("no-ratio-all-pass", {"repeats": 5}, {}, "pass", EXIT_PASS),
+    ],
+)
+def test_envelope_outcome_agrees_with_the_report_matrix(
+    tmp_path, case, settings, script, outcome, exit_code
+):
+    body, report = _envelope_outcome(tmp_path, _doc(**settings), script)
+    assert body["report_outcome"] == outcome, case
+    assert exit_code_for_report_outcome(body["report_outcome"]) == exit_code, case
+    # ★ the invariant this repair exists for: the two planes answer the same envelope the
+    # same way. (matrix rollup verdict is None for an all-infra request — hence the `or`.)
+    matrix_verdict = report["matrix"][0]["rollup"]["verdict"]
+    assert matrix_verdict == body["rollups"][0]["verdict"]
+    if outcome != "errored":
+        assert matrix_verdict == outcome
+
+
+def _legacy_job_plane_fold(results: list[JobResult]) -> str:
+    """The PRE-T1b rule, written out here verbatim.
+
+    The equivalence below is checked against this frozen TEXT, not against whatever the
+    production function currently does — otherwise it would be comparing a thing to itself.
+    """
+    if any(r.verdict is None for r in results):
+        return "errored"
+    if any(r.verdict is Verdict.FAIL for r in results):
+        return "fail"
+    return "pass"
+
+
+@pytest.mark.parametrize(
+    ("case", "mix"),
+    [
+        ("all-pass", {"a": [_P, _P], "b": [_P]}),
+        ("one-fail", {"a": [_P, _F], "b": [_P]}),
+        ("all-fail", {"a": [_F, _F], "b": [_F]}),
+        ("fail-in-the-second-request", {"a": [_P, _P], "b": [_F]}),
+        ("infra-sample", {"a": [_P, None], "b": [_P]}),
+        ("infra-and-fail", {"a": [_F, None], "b": [_P]}),
+        ("single-request-single-sample", {"a": [_P]}),
+    ],
+)
+def test_rollup_fold_equals_the_job_fold_without_a_ratio(case, mix):
+    """동치 핀: for a request that declares NO threshold, moving the FAIL level from the job
+    plane to the request plane changes NOTHING — the rollup's any-fail rule IS "some sample
+    failed". Every pre-p6 envelope therefore folds byte-identically."""
+    results: list[JobResult] = []
+    rollups = []
+    for request_id, verdicts in mix.items():
+        request_results = [
+            JobResult(
+                job=Job(request_id, index),
+                state=JobState.COMPLETED if verdict is not None else JobState.FAILED,
+                verdict=verdict,
+            )
+            for index, verdict in enumerate(verdicts)
+        ]
+        results.extend(request_results)
+        rollups.append(roll_up(request_id, request_results))  # no min_pass_ratio
+    assert report_outcome_of(results, rollups) == _legacy_job_plane_fold(results), case

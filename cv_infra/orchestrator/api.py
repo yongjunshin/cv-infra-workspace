@@ -167,16 +167,37 @@ _TRIGGER_SOURCES: tuple[str, ...] = get_args(
 )
 
 
-def report_outcome_of(results: list[JobResult]) -> str:
-    """Fold terminal job results into the envelope ``report_outcome`` literal.
+def report_outcome_of(results: list[JobResult], rollups: list[RequestRollup]) -> str:
+    """Fold one envelope's terminal state into its ``report_outcome`` literal.
 
-    errored 우선 (M3 §7 / blueprint §9): a verdict-less terminal job is an
-    infra outcome (exit-3 territory downstream) and outranks FAIL, which
-    outranks PASS — infra noise must never masquerade as a domain judgement.
+    Priority (M3 §7 / blueprint §9), and WHICH plane each level is read from:
+
+    1. **errored** — any terminal job that produced no verdict at all. Read off the
+       ``JobResult``s, i.e. still the JOB plane: a verdict-less sample is an infra outcome
+       (exit-3 territory downstream, P5-13) and no request-level policy may average it
+       away — ``roll_up`` deliberately drops it from ``verdicts`` rather than counting it
+       as a failure, so asking the rollup about it would be asking the wrong object.
+    2. **fail** — any request whose ROLLUP verdict is FAIL. This level is read off the
+       REQUEST plane (p6c4 T1b 수리): the rollup is where the request's judgement policy
+       lives (any-fail by default, ``min_pass_ratio`` when declared), and folding raw job
+       verdicts here made a ratio-satisfying request read ``fail`` on the envelope/CLI exit
+       while the report matrix — which consumes the same rollup — said ``pass``. One
+       envelope must not answer the PR Check and the process exit differently.
+    3. **pass** — everything else.
+
+    For a request that declares NO ``min_pass_ratio`` the two planes are EQUIVALENT (the
+    rollup's any-fail rule is exactly "some sample failed"), so every pre-p6 envelope folds
+    byte-identically; that equivalence is pinned, not assumed
+    (``test_orchestrator_batch.py::test_rollup_fold_equals_the_job_fold_without_a_ratio``).
+
+    ``rollups`` is REQUIRED rather than optional-with-fallback on purpose: a default would
+    be a SECOND fail policy living in this function, and the whole defect being repaired was
+    two planes disagreeing about one envelope. Both callers already hold the rollups they
+    persist/serve, and they pass those very instances (computed once — no re-aggregation).
     """
     if any(r.verdict is None for r in results):
         return REPORT_OUTCOME_ERRORED
-    if any(r.verdict is Verdict.FAIL for r in results):
+    if any(rollup.verdict is Verdict.FAIL for rollup in rollups):
         return REPORT_OUTCOME_FAIL
     return REPORT_OUTCOME_PASS
 
@@ -577,10 +598,13 @@ def create_app(
                 key_metrics=row["metrics"],
                 established_at=report["generated_at"],
             )
-        for inp in inputs:  # ④ rollups + outcome (unchanged job-level fold)
+        for inp in inputs:  # ④ rollups + outcome
             store.upsert_rollup(inp.rollup)
+        # The SAME rollup instances that were just persisted (and that the report matrix
+        # above already carries) decide the envelope outcome — one aggregation, one answer.
         store.complete_envelope(
-            record.envelope_id, report_outcome=report_outcome_of(record.results)
+            record.envelope_id,
+            report_outcome=report_outcome_of(record.results, [inp.rollup for inp in inputs]),
         )
 
     async def _drive(record: _EnvelopeRecord, supervisor: ParallelSupervisor) -> None:
@@ -750,7 +774,8 @@ def create_app(
             status="completed" if record.done else "running",
             jobs=record.jobs,
             rollups=rollups,
-            report_outcome=report_outcome_of(record.results) if record.done else None,
+            # Same instances the response body carries (no second aggregation).
+            report_outcome=report_outcome_of(record.results, rollups) if record.done else None,
         )
 
     @app.get("/envelopes/{envelope_id}/report")
