@@ -10,7 +10,7 @@ cv-infra의 버전은 **서로 독립인 3축**으로 관리된다(M8 §3.6 / �
 
 | 축 | 현행 값 | 정본(source of truth) |
 |---|---|---|
-| ① Action 태그 (`@vN`) | `v1.1.0` (별칭 `@v1` → `v1.1.0`, 2026-08-27 이동) | `cv-infra-workspace` 릴리즈 태그 — **정본은 태그 자신**(`git rev-parse '<태그>^{commit}'`), 대장은 `docs/releases.md`. 소비자는 `uses: …@v1`(별칭, v1.x 최신을 따라감) 또는 불변 핀 `@v1.1.0`으로 소비한다. 발행 이력: `v1.0.0`(⛔ 결함) → `v1.0.1` → **`v1.1.0`** |
+| ① Action 태그 (`@vN`) | `v1.2.0` (별칭 `@v1` → `v1.2.0`, 2026-08-28 이동) | `cv-infra-workspace` 릴리즈 태그 — **정본은 태그 자신**(`git rev-parse '<태그>^{commit}'`), 대장은 `docs/releases.md`. 소비자는 `uses: …@v1`(별칭, v1.x 최신을 따라감) 또는 불변 핀 `@v1.2.0`으로 소비한다. 발행 이력: `v1.0.0`(⛔ 결함) → `v1.0.1` → `v1.1.0` → **`v1.2.0`** |
 | ② CLI/패키지 버전 | `0.0.0` | `cv_infra/__init__.py`의 `__version__` — `pyproject.toml` `[tool.hatch.version]`이 여기에 위임하는 단일 정본 |
 | ③ 계약 `apiVersion` | `cv-infra/v1` | `cv_infra/contract/apiversion.py`의 `API_VERSION`; 수용/유예 테이블 = `cv_infra/contract/version.py`의 `SUPPORTED` / `DEPRECATED` |
 
@@ -25,7 +25,7 @@ cv-infra의 버전은 **서로 독립인 3축**으로 관리된다(M8 §3.6 / �
 
 | Action 태그 | CLI/패키지 | 수용 `apiVersion` | deprecated(warn) | 그 외 apiVersion |
 |---|---|---|---|---|
-| `@v1` → `v1.1.0` | `0.0.0` | `cv-infra/v1` | 없음 | reject — exit 2 + 친절 에러 + 마이그레이션 포인터 |
+| `@v1` → `v1.2.0` | `0.0.0` | `cv-infra/v1` | 없음 | reject — exit 2 + 친절 에러 + 마이그레이션 포인터 |
 
 - 수용/warn/reject 의미론 = 3-state resolver(`cv_infra/contract/version.py`,
   NFR-INTAKE-002): 지원·현행 → accept / 지원·deprecated → accept + WARNING
