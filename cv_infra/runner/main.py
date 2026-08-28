@@ -35,7 +35,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from cv_infra.contract.adapter_schema import Ros2AdapterConfig
-from cv_infra.contract.derive import distribution_fields
+from cv_infra.contract.derive import unmaterialized_fields
 from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.schema import VerificationRequest
 from cv_infra.oracles.base import ENTRY_POINT_GROUP, load_oracle
@@ -50,7 +50,12 @@ from cv_infra.runner.evaluate import (
     build_result_dict,
     read_field,
 )
-from cv_infra.runner.sim_runtime import EulaNotAcceptedError, SimConfig
+from cv_infra.runner.sim_runtime import (
+    EulaNotAcceptedError,
+    SimConfig,
+    obstacle_pool_plan,
+    resolve_obstacle_asset,
+)
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -219,13 +224,31 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
     # ``derivation`` stamp explains and no identity key predicts. The paths come
     # from the contract's own definition, so the message names exactly the fields
     # that must be materialized (contract.derive.materialize_request).
-    leaked = distribution_fields(request.scenario)
+    #
+    # p7 widens the window from "still a distribution" to "still unmaterialized"
+    # (``unmaterialized_fields``): an obstacle group with ``count: 3`` carries no
+    # distribution at all, and the runner would place ONE box where the document
+    # asked for three and judge the sample as if that were the world (G-25's
+    # silent-ignore, with the verdict attached).
+    leaked = unmaterialized_fields(request.scenario)
     if leaked:
         raise BadJobSpec(
-            f"JOB_SPEC still declares a distribution at {list(leaked)} — the runner "
-            "executes CONCRETE samples only; the platform materializes them at "
-            "dispatch (contract.derive.materialize_request stamps scenario.derivation)"
+            f"JOB_SPEC still carries unmaterialized field(s) at {list(leaked)} — the "
+            "runner executes CONCRETE samples only (a distribution must be DRAWN, an "
+            "obstacle group EXPANDED to one entry per instance); the platform "
+            "materializes them at dispatch (contract.derive.materialize_request stamps "
+            "scenario.derivation)"
         )
+    # An asset designator the runner cannot resolve is bad input as well, and HERE
+    # is the last moment it costs 0 GPU seconds: past this point the job (or the
+    # whole batch) pays the Isaac boot and an unknown name resurfaces as a 404 at
+    # reference time, mid-boot. Named by group index — the handle a consumer, and
+    # M3, actually has on one declaration.
+    for group, obstacle in enumerate(request.scenario.obstacles or ()):
+        try:
+            resolve_obstacle_asset(obstacle.asset)
+        except ValueError as exc:
+            raise BadJobSpec(f"scenario.obstacles[{group}]: {exc}") from exc
     # The schema already parsed adapter_config into the typed M1 model — no
     # second from_dict pass (single validation, single definition).
     return request, request.interface.adapter_config
@@ -255,6 +278,25 @@ def criteria_view(request: VerificationRequest) -> dict:
             params = params.model_dump(exclude_none=True)
         view.update(params)
     return view
+
+
+def obstacle_specs(request: VerificationRequest) -> list[dict]:
+    """M1 ``scenario.obstacles`` -> plain dicts, the hand-off shape the sim layer takes.
+
+    No contract model crosses into ``sim_runtime`` (that layer imports no
+    contract), so the typed groups are dumped HERE — once, for both entrypoints,
+    which is what keeps "what the carrier places" and "what a single job places"
+    from becoming two shapes. ``exclude_none`` for the same reason
+    ``debug_obstacle`` uses it: an unset dimension must ARRIVE absent so the
+    runner's own default applies instead of ``float(None)``.
+
+    Absent -> ``[]``. The contract spells "no obstacles" as ``None`` (a ``[]``
+    default rides the identity projection verbatim and MOVES every stored
+    request's key — M1 measured it), while the sim layer wants a list; this is
+    the one line that absorbs the difference, and the one line that changes if
+    the contract ever renames the field.
+    """
+    return [group.model_dump(exclude_none=True) for group in request.scenario.obstacles or []]
 
 
 def sim_config_for(request: VerificationRequest) -> SimConfig:
@@ -438,6 +480,15 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # (before any Isaac import/boot).
     request, adapter_config = parse_request(spec)
     criteria = criteria_view(request)
+    # p7: the pool is PLANNED here, pre-boot, for the same reason the batch plans
+    # it in admission — an over-cap pool must cost 0 GPU seconds and read as bad
+    # input (exit 2), not as a platform failure after the boot is paid. The plan
+    # is pure; the pre-reset hooks below only execute it.
+    obstacles = obstacle_specs(request)
+    try:
+        obstacle_pool = obstacle_pool_plan([obstacles])
+    except ValueError as exc:
+        raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
     # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
     # engine composes uniformly via the M1 loader — still PRE-sim, so a load
     # failure (defence-in-depth; admit already rejected it once) is
@@ -496,6 +547,14 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         if request.scenario.debug_obstacle is not None:  # D-2': obstacle = WORLD state
             obstacle = request.scenario.debug_obstacle.model_dump(exclude_none=True)
             sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(obstacle))
+        # p7: the same TWO hooks the carrier registers, in the same order. For one
+        # sample the pool IS the declared list and nothing parks — going through
+        # ``spawn_obstacle_pool`` + ``apply_obstacle_set`` anyway keeps the two
+        # entrypoints from drifting into two definitions of "placed" (and the log
+        # line a reviewer greps is then the same line in both).
+        if obstacle_pool:
+            sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(obstacle_pool))
+            sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(obstacles))
         # FU-17: declared-sensor render products must be enabled PRE-play
         # (BEFORE world.reset() — mid-play toggling is a measured no-op), so
         # this rides the same pre_reset seam as the telemetry bind.

@@ -21,6 +21,7 @@ are the seams filled in cycles 2-4.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
@@ -346,6 +347,331 @@ def debug_obstacle_position(spec: dict) -> tuple[float, float, float]:
 
 
 # --------------------------------------------------------------------------- #
+# Planar +Z rotation — ONE home for the quaternion the runner writes INTO the sim.
+# --------------------------------------------------------------------------- #
+def yaw_to_quat_wxyz(yaw: float) -> tuple[float, float, float, float]:
+    """Planar +Z rotation as an Isaac ``(w, x, y, z)`` quaternion (pure, stdlib).
+
+    ONE home for the half-angle formula on the SIM-facing side: the declared
+    initial pose (pre-play and repose) wrote it, and the p7 obstacle set would
+    have made it a second copy. The ROS spelling
+    (``adapter/ros2.quat_z_w_from_yaw``, ``(z, w)`` order) deliberately stays
+    where it is — that one is SUT-facing surface in ROS message field order, so
+    folding the two would trade a real duplicate for a confusing one.
+    """
+    half = float(yaw) / 2.0
+    return (math.cos(half), 0.0, 0.0, math.sin(half))
+
+
+# --------------------------------------------------------------------------- #
+# p7 obstacle sets: asset resolution -> pool -> placement (pure, CPU-testable).
+# --------------------------------------------------------------------------- #
+#: The literal that means "the runner's own FixedCuboid", not an asset at all.
+#: M1 spells the same word for its dimensions validator
+#: (``contract.schema.BUILTIN_BOX_ASSET``); this layer imports no contract, so a
+#: CPU test holds the two equal (the BATCH_RUNNER_COMMAND <-> Dockerfile precedent).
+BOX_ASSET_REF = "box"
+
+
+@dataclass(frozen=True)
+class ObstacleAsset:
+    """One resolvable obstacle prop: the USD to reference plus how it sits on the floor.
+
+    Mirrors ``SceneAsset``: ``usd_path`` is relative to the Isaac assets root
+    (``is_direct_usd_ref`` decides whether the root prefix applies — ONE
+    definition of that branch, shared with the scene path).
+
+    ``z_offset`` is the asset-origin correction MEASURED per asset (W0 gate ⓐ):
+    0.0 means the prop's own origin sits on its footprint, which is the Isaac
+    prop convention but NOT a promise — the same W0 sweep measured
+    ``table.usd`` at ``bbox_min_z = -1.0398`` (a live counterexample; it is
+    therefore not in the registry). An asset whose offset has never been
+    measured does not belong here: a guessed offset either floats the prop or
+    sinks it through the floor, and both read as "the obstacle did nothing".
+    """
+
+    usd_path: str
+    z_offset: float = 0.0
+
+
+#: The v1 curated registry. Every row is W0-MEASURED (p7c1 gate ⓐ/ⓑ; raw evidence
+#: ``etri6000:~/cv-infra-p7c1-evidence/w0/`` + its ``tables.md``), and the three
+#: rows are the set CEO ruling ② adopted
+#: (``agent-comms/decisions/2026-08-28-p7c1-obstacle-gate1-rulings.md``).
+#: Admission rule (CLAUDE §2-4 measured-then-written, G-25): a name enters this
+#: table only after its bbox/z_offset, collider candidate and dynamic-physics
+#: census were measured on the live 5.1.0 asset root — never typed from memory,
+#: because a remembered path resolves to a 404 at reference time, i.e. a boot
+#: failure at sample 0 after the batch already paid the Isaac boot (G-28).
+OBSTACLE_ASSETS: dict[str, ObstacleAsset] = {
+    # _source W0 ⓐ/ⓑ: 0.600 x 0.599 x 0.877 m, bbox_min_z ~ 0 -> z_offset 0.0,
+    # collider C3, RigidBodyAPI 0.
+    "chair": ObstacleAsset(usd_path="/Isaac/Environments/Office/Props/SM_Chair.usd"),
+    # _source W0 ⓐ/ⓑ: 0.800 x 2.800 x 0.750 m, bbox_min_z ~ 0 -> z_offset 0.0,
+    # collider C3, RigidBodyAPI 0.
+    "desk": ObstacleAsset(usd_path="/Isaac/Environments/Office/Props/SM_SecretaryDeskA.usd"),
+    # _source W0 ⓐ/ⓑ: 1.214 x 3.495 x 2.155 m, z_offset 0.001907 (the only non-zero
+    # one of the three), collider C3, RigidBodyAPI 0. It stands in for the CEO's
+    # "car": the 5.1.0 asset root ships no passenger-car visual asset at all
+    # (ruling ①, 5,529 non-thumbnail usd enumerated).
+    "forklift": ObstacleAsset(usd_path="/Isaac/Props/Forklift/forklift.usd", z_offset=0.001907),
+}
+
+
+def resolve_obstacle_asset(asset_ref: str) -> ObstacleAsset | None:
+    """Map an obstacle asset designator to the USD to reference — ``"box"`` -> None.
+
+    ``None`` is the runner's built-in ``FixedCuboid`` body (the same one the
+    legacy debug obstacle uses), and that is why the sentinel is None rather than
+    an ``ObstacleAsset(usd_path="")``: ``asset is None`` is the ONE branch that
+    tells "author a cuboid" from "reference a prop", and an empty path would be a
+    landmine the moment it is joined onto the assets root. A registry NAME
+    resolves through ``OBSTACLE_ASSETS``; a ``.usd/.usda/.usdz`` ref passes
+    through with no registry knowledge (same grammar as ``resolve_scene``); an
+    unknown NAME is bad input -> loud ValueError listing the registry
+    (REQ-INTAKE-005).
+    """
+    if asset_ref == BOX_ASSET_REF:
+        return None
+    if asset_ref in OBSTACLE_ASSETS:
+        return OBSTACLE_ASSETS[asset_ref]
+    if asset_ref.endswith((".usd", ".usda", ".usdz")):
+        return ObstacleAsset(usd_path=asset_ref)
+    raise ValueError(
+        f"unknown obstacle asset {asset_ref!r} — known assets: {sorted(OBSTACLE_ASSETS)} "
+        f"(or {BOX_ASSET_REF!r} for the built-in cuboid, or a direct "
+        ".usd/.usda/.usdz reference)"
+    )
+
+
+#: Root scope of the runner-authored obstacle POOL. One flat namespace under one
+#: scope, so "how many obstacle prims exist?" is a single subtree count and the
+#: parking check has exactly one place to look. Also the path a consumer names in
+#: ``collision_excluded_paths`` when it wants obstacle contacts off the verdict.
+OBSTACLE_POOL_ROOT = "/World/cv_obstacles"
+
+#: Parking pose of an UNUSED pool member. DEPTH, not distance: a 2D-lidar ray is
+#: horizontal, so a prim 50 m under the floor cannot be hit by one at ANY range,
+#: while a far-XY park stays in the scan PLANE and leans on a max-range the runner
+#: does not own. W0 gate ⓓ measured the parked column's contribution to /scan at
+#: 8.70e-05 m against a 0.0657 m self-consistency noise floor, and 0/12 parked
+#: contacts.
+OBSTACLE_PARK_Z = -50.0
+#: Vertical pitch between parked members: the parked set must be a COUNTABLE
+#: column, not n prims stacked at one point.
+OBSTACLE_PARK_PITCH = 5.0
+
+#: Fail-loud cap on the TOTAL pool (all buckets). Not a measurement (CLAUDE §2-4):
+#: the CEO's stated worst case is chair 1 + desk 0..5 + forklift 2 = 8 prims, and
+#: 32 is 4x that. Its job is to turn "a template expanded to 500 obstacles per
+#: sample" into a pre-boot rejection (exit 2, 0 GPU seconds) instead of an OOM
+#: after the boot is paid. Raising it is backwards compatible.
+OBSTACLE_POOL_MAX = 32
+
+
+def obstacle_pool_key(spec: dict) -> tuple[str, tuple[float, float, float] | None]:
+    """The pool BUCKET one declared obstacle belongs to (pure, CPU-tested).
+
+    * box   -> ``("box", (width, depth, height))`` with the runner defaults
+      resolved. The dimensions are CONSTRUCTION-time on a ``FixedCuboid``, so each
+      distinct size is its own bucket — re-scaling a cooked collider mid-play is
+      an authoring op the soft reset does not republish to physics.
+    * asset -> ``(asset_ref, None)`` VERBATIM (registry name or direct ref). Not
+      the RESOLVED path: two aliases for one asset then cost two prims, which is
+      wasteful but not wrong, whereas keying on the resolution would move the
+      "unknown name" rejection out of admission and into the boot.
+
+    Float keys carry no epsilon and need none: the pool plan and the per-sample
+    lookup call THIS function on the SAME parsed values, so equality holds by
+    construction.
+    """
+    asset_ref = str(spec["asset"])
+    if asset_ref != BOX_ASSET_REF:
+        return (asset_ref, None)
+    return (
+        BOX_ASSET_REF,
+        (
+            float(spec.get("width", DEBUG_OBSTACLE_DEFAULT_WIDTH)),
+            float(spec.get("depth", DEBUG_OBSTACLE_DEFAULT_DEPTH)),
+            float(spec.get("height", DEBUG_OBSTACLE_DEFAULT_HEIGHT)),
+        ),
+    )
+
+
+def obstacle_pool_plan(per_sample: list[list[dict]]) -> dict[tuple, int]:
+    """Every sample's obstacle list -> how many prims of each bucket to spawn ONCE.
+
+    The pool is the per-sample MAXIMUM multiplicity, never the sum: sample i uses
+    k_i members of a bucket and PARKS the rest, so a batch of 12 samples that each
+    place 2 chairs needs 2 chairs, not 24. Raises ValueError when the total
+    exceeds ``OBSTACLE_POOL_MAX`` (the caller turns it into a pre-boot exit 2).
+
+    Pure — it runs in admission at 0 GPU seconds, and its result is exactly what
+    the pre-reset spawn hook authors, so "what admission approved" and "what the
+    boot creates" cannot be two different numbers.
+    """
+    plan: dict[tuple, int] = {}
+    for entries in per_sample:
+        multiplicity: dict[tuple, int] = {}
+        for spec in entries:
+            key = obstacle_pool_key(spec)
+            multiplicity[key] = multiplicity.get(key, 0) + 1
+        for key, needed in multiplicity.items():
+            plan[key] = max(plan.get(key, 0), needed)
+    total = sum(plan.values())
+    if total > OBSTACLE_POOL_MAX:
+        raise ValueError(
+            f"the obstacle pool would need {total} prim(s) across {len(plan)} bucket(s), "
+            f"over the {OBSTACLE_POOL_MAX} cap — the pool is the per-sample MAXIMUM "
+            f"multiplicity, so this is one sample asking for that many at once "
+            f"(buckets: {dict(sorted(plan.items(), key=lambda kv: -kv[1]))})"
+        )
+    return plan
+
+
+def obstacle_slug(key: tuple[str, tuple[float, float, float] | None]) -> str:
+    """USD-name-safe, collision-free slug for one bucket (pure).
+
+    ``"<readable>_<8 hex of sha256(repr(key))>"``: the readable half is ``box`` /
+    the registry name / ``usd`` for a direct ref, and the hash half is what makes
+    it injective. A dimension-spelled slug (``box_1p20x0p40x0p15``) reads better
+    and is WRONG: two buckets differing in the 4th decimal would render to the
+    same prim name and silently collapse into one pool.
+    """
+    designator = key[0]
+    if designator == BOX_ASSET_REF:
+        readable = BOX_ASSET_REF
+    elif designator in OBSTACLE_ASSETS:
+        readable = designator
+    else:
+        readable = "usd"  # a direct ref: its path is not a USD-safe name
+    digest = hashlib.sha256(repr(key).encode()).hexdigest()[:8]
+    return f"{readable}_{digest}"
+
+
+def obstacle_pool_paths(plan: dict[tuple, int]) -> dict[tuple, tuple[str, ...]]:
+    """Bucket -> its pool members' prim paths, ``/World/cv_obstacles/<slug>_<j>``.
+
+    Ordered and derived, never hand-listed: the spawn hook, the placement plan and
+    the parking sweep must name the same prims; a drift would author a SECOND set
+    — the exact failure ``DEBUG_OBSTACLE_PRIM``'s comment describes.
+    """
+    return {
+        key: tuple(f"{OBSTACLE_POOL_ROOT}/{obstacle_slug(key)}_{j}" for j in range(count))
+        for key, count in plan.items()
+    }
+
+
+def obstacle_pool_members(pool: dict[tuple, tuple[str, ...]]) -> tuple[str, ...]:
+    """Every pool member's prim path in ONE canonical order (pure).
+
+    That order IS the parking index (``obstacle_park_position``), so the spawn
+    hook (which parks at birth) and the per-sample parking sweep must agree on
+    it. Deriving it here is what makes them agree by construction instead of by
+    two identical comprehensions that can drift apart.
+    """
+    return tuple(path for paths in pool.values() for path in paths)
+
+
+def obstacle_park_position(pool_index: int) -> tuple[float, float, float]:
+    """Where pool member ``pool_index`` waits while it is not placed (pure)."""
+    return (0.0, 0.0, OBSTACLE_PARK_Z - pool_index * OBSTACLE_PARK_PITCH)
+
+
+def obstacle_place_transform(
+    spec: dict, asset: ObstacleAsset | None
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """One declared obstacle -> (world position, ``(w,x,y,z)`` orientation). Pure.
+
+    ``z`` is NEVER a consumer input — floor contact owns it (the reason
+    ``InitialPose`` has no z either):
+
+    * box (``asset is None``) -> ``debug_obstacle_position(spec)``, the legacy
+      ``height/2`` centring REUSED rather than re-derived;
+    * asset -> ``asset.z_offset``, 0.0 for a prop whose own origin is on its
+      footprint and non-zero only where W0 MEASURED otherwise.
+    """
+    if asset is None:
+        position = debug_obstacle_position(spec)
+    else:
+        position = (float(spec["x"]), float(spec["y"]), float(asset.z_offset))
+    return position, yaw_to_quat_wxyz(float(spec["yaw"]))
+
+
+def obstacle_placement_plan(
+    entries: list[dict], pool: dict[tuple, tuple[str, ...]]
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """(prim_path, declared entry) pairs to PLACE + prim paths to PARK. Pure.
+
+    Assignment is by DECLARED ORDER within a bucket, so sample i's j-th chair is
+    always pool member ``chair_<hash>_j`` — a stable mapping is what lets a
+    contact event's prim path be read back to the declaration that put it there.
+
+    BOTH lists are returned, and the parked one is computed HERE as pool minus
+    placed, so "forgot to park the surplus" is not expressible by the caller. A
+    bucket present in ``entries`` but absent from (or exhausted in) ``pool`` is a
+    loud ValueError: it means the pool was planned from a different sample set,
+    and the quiet alternative is a sample judged with fewer obstacles than it
+    declared.
+    """
+    placed: list[tuple[str, dict]] = []
+    used: dict[tuple, int] = {}
+    for spec in entries:
+        key = obstacle_pool_key(spec)
+        members = pool.get(key, ())
+        index = used.get(key, 0)
+        if index >= len(members):
+            raise ValueError(
+                f"obstacle bucket {key!r} needs pool member #{index} but the pool holds "
+                f"{len(members)} — the pool was planned from a different sample set "
+                f"(pool buckets: {sorted(pool)})"
+            )
+        used[key] = index + 1
+        placed.append((members[index], spec))
+    taken = {path for path, _ in placed}
+    parked = [path for path in obstacle_pool_members(pool) if path not in taken]
+    return placed, parked
+
+
+#: Verbatim grep marker (G-26 prove-it-ran gate; pinned by a CPU test + NEG-6 gate 5).
+OBSTACLE_SET_LOG_MARKER = "obstacle_set_applied="
+
+#: Verbatim grep marker of the BOOT-time per-member physics audit. A collider that
+#: was never applied is a GHOST obstacle — it changes nothing and the verdict
+#: still says pass (W0 measured exactly that on a RigidBody-carrying prop), so
+#: every pool member states what it got.
+OBSTACLE_PHYSICS_LOG_MARKER = "obstacle physics: "
+
+
+def obstacle_set_log_line(placed: list[tuple[str, dict]], parked: list[str]) -> str:
+    """One structured line per sample — what was PLACED and what was PARKED."""
+    rendered = [
+        (path, e["asset"], (float(e["x"]), float(e["y"]), float(e["yaw"]))) for path, e in placed
+    ]
+    return (
+        f"[cv-runner] {OBSTACLE_SET_LOG_MARKER}{len(placed)} parked={len(parked)} "
+        f"pool={len(placed) + len(parked)} placed={rendered} parked_paths={parked}"
+    )
+
+
+def obstacle_physics_log_line(
+    prim_path: str, collider: str, rigid_body: int, articulation: int
+) -> str:
+    """One audit line per pool member — what physics the runner gave it, and what
+    the asset brought with it.
+
+    The two counts are 0 on every line the runner ever prints (a non-zero census
+    is refused before this is reached — see ``_make_obstacle_static``); they are
+    printed anyway because "we looked and found none" and "we never looked" are
+    the same silence otherwise.
+    """
+    return (
+        f"[cv-runner] {OBSTACLE_PHYSICS_LOG_MARKER}{prim_path} collider={collider} "
+        f"rigid_body={rigid_body} articulation={articulation}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # REQ-EXEC-002: the DECLARED spawn pose (scenario.initial_pose) — CPU-testable.
 # --------------------------------------------------------------------------- #
 def resolve_initial_pose_target(pose: dict | None, robot_prim_path: str | None) -> str | None:
@@ -384,9 +710,8 @@ def initial_pose_world_transform(
     rotation (roll/pitch dropped for the same reason). Stdlib-only (no numpy) so
     the math is unit-tested on CPU; the GPU caller only moves the numbers.
     """
-    half_yaw = float(pose["yaw"]) / 2.0
     position = (float(pose["x"]), float(pose["y"]), float(current_position[2]))
-    return position, (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+    return position, yaw_to_quat_wxyz(float(pose["yaw"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +761,10 @@ class SimRuntime:
         # instrumentation (behavior identical; the runner works untraced).
         self.trace = trace
         self._first_step_traced = False
+        # p7: bucket -> pool member prim paths, set ONCE by spawn_obstacle_pool.
+        # ``apply_obstacle_set`` reads it rather than re-deriving the paths, so the
+        # placement sweep can only ever name prims the boot actually authored.
+        self._obstacle_pool: dict | None = None
         # p6 batch loop: the SingleArticulation wrapper ``repose_robot`` writes
         # through, created once and kept — building it per iteration would re-run
         # the physics-view handshake n times for no gain (and the wrapper is only
@@ -762,6 +1091,200 @@ class SimRuntime:
         SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=position)
         print(f"[cv-runner] debug obstacle moved: {DEBUG_OBSTACLE_PRIM} -> {position}", flush=True)
 
+    def _asset_url(self, usd_path: str, what: str) -> str:  # pragma: no cover - GPU path
+        """Assets-root-prefixed URL for a registry path; a direct ref passes through.
+
+        ``load_scene`` spells this same join for the SCENE. Folding the two would
+        touch the one code path every job boots through, which this obstacle task
+        deliberately leaves alone; the shared half is ``is_direct_usd_ref``, which
+        already has one home.
+        """
+        if is_direct_usd_ref(usd_path):
+            return usd_path
+        from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
+
+        root = get_assets_root_path()
+        if root is None:
+            raise RuntimeError(
+                "Isaac assets root unreachable (cloud assets / cache) — cannot "
+                f"resolve {what} {usd_path!r}; check network or asset cache "
+                "mounts (M5 cache seam)"
+            )
+        return root + usd_path
+
+    def _make_obstacle_static(self, prim_path: str) -> str:  # pragma: no cover - GPU path
+        """Give a REFERENCED prop colliders and refuse one that brings its own
+        dynamics. Returns the one-line audit string the caller prints.
+
+        The collider recipe is C3, ADOPTED BY MEASUREMENT (W0 gate ⓑ, CEO ruling
+        ⑤): walk the subtree, ``UsdPhysics.CollisionAPI.Apply`` on every Gprim,
+        plus ``MeshCollisionAPI`` with ``approximation="convexHull"`` on the
+        Meshes. The vendor one-liner that looks like this
+        (``omni.physx.scripts.utils.setCollider(prim, "convexHull")``) was
+        measured NOT to convexify anything: it leaves the child meshes as triangle
+        meshes, and every contact then emits a PhysX
+        ``getMaterialFromInternalFaceIndex`` warning (up to 6,035 per run against
+        0 in the obstacle-free control arm). Contact COUNT did not separate the
+        candidates — the warning class did (G-105).
+
+        v1 obstacles are STATIC, and a prop carrying ``RigidBodyAPI`` or
+        ``ArticulationRootAPI`` is REFUSED here instead of neutralized (ruling ④).
+        W0 measured all three failure modes on one such asset: with colliders
+        added its contacts drop to ZERO (a ghost obstacle that still reads as a
+        pass), disabling the body raises a vehicle-schema error, and leaving it
+        dynamic let the prop travel 297.8 m out of the scene. The three registry
+        assets carry no rigid bodies, so this only fires on a consumer's own USD —
+        loudly, at boot, with the offending prims named.
+        """
+        import omni.usd  # noqa: PLC0415 (legal only after SimulationApp)
+        from pxr import Usd, UsdGeom, UsdPhysics  # noqa: PLC0415
+
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath(prim_path)
+        if not root.IsValid():
+            raise RuntimeError(
+                f"obstacle prim {prim_path!r} is not on the stage after referencing its "
+                "asset — the reference did not compose (bad usd_path? unreachable root?)"
+            )
+        dynamic = [
+            str(prim.GetPath())
+            for prim in Usd.PrimRange(root)
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI) or prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+        ]
+        if dynamic:
+            raise RuntimeError(
+                f"obstacle asset at {prim_path!r} ships its own dynamics on {len(dynamic)} "
+                f"prim(s) {dynamic[:5]} (RigidBodyAPI/ArticulationRootAPI) — v1 obstacles are "
+                "STATIC. Measured: adding colliders to such a prop yields ZERO contacts (a "
+                "ghost obstacle that still passes), and leaving it dynamic lets it be shoved "
+                "into the next sample's world. Use a static prop, or the built-in 'box'."
+            )
+        gprims = 0
+        meshes = 0
+        for prim in Usd.PrimRange(root):
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            UsdPhysics.CollisionAPI.Apply(prim)
+            if prim.IsA(UsdGeom.Mesh):
+                mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                mesh_api.CreateApproximationAttr().Set("convexHull")
+                meshes += 1
+            gprims += 1
+        if not gprims:
+            raise RuntimeError(
+                f"obstacle asset at {prim_path!r} exposed NO Gprim to give a collider to — "
+                "an obstacle with no collider is invisible to the telemetry reduction, i.e. "
+                "a sample that silently drives through it and passes (W0 R1)"
+            )
+        return obstacle_physics_log_line(
+            prim_path, f"applied(C3/convexHull, {gprims} gprim, {meshes} mesh)", 0, 0
+        )
+
+    def spawn_obstacle_pool(self, plan: dict) -> None:  # pragma: no cover - GPU path
+        """Author the WHOLE pool once, every member PARKED (pre-reset hook, boot only).
+
+        This is the only site in the runner that creates a p7 obstacle prim, and
+        it runs exactly once per process — the same contract
+        ``spawn_debug_obstacle`` carries, for the same measured reason (p6c2 §2.1:
+        2 -> 48 material prims over 24 delete+respawn iterations). The batch loop
+        RE-POSES these prims (``apply_obstacle_set``); it never creates one.
+
+        Members are born at ``obstacle_park_position`` and NOTHING here reads a
+        declared x/y/yaw: "where sample 0's obstacles go" is a placement question,
+        answered by the SECOND pre-reset hook (``apply_obstacle_set``), so there
+        is one definition of placement rather than a spawn-time copy of it.
+
+        do-not-reinvent: a box is Isaac's ``FixedCuboid`` (the legacy debug
+        obstacle's body), a prop is ``add_reference_to_stage`` + the C3 collider
+        walk — we author no geometry and no physics schema of our own.
+        """
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.api.objects import FixedCuboid  # noqa: PLC0415
+        from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+        from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: PLC0415
+
+        pool = obstacle_pool_paths(plan)
+        self._obstacle_pool = pool
+        index = 0
+        for (designator, dimensions), paths in pool.items():
+            asset = resolve_obstacle_asset(designator)
+            for prim_path in paths:
+                position = obstacle_park_position(index)
+                if asset is None:
+                    width, depth, height = dimensions
+                    FixedCuboid(
+                        prim_path=prim_path,
+                        name=prim_path.rsplit("/", 1)[-1],
+                        position=np.array(position),
+                        scale=np.array([width, depth, height]),
+                    )
+                    audit = obstacle_physics_log_line(
+                        prim_path, "FixedCuboid (built-in, collider comes with the body)", 0, 0
+                    )
+                else:
+                    add_reference_to_stage(
+                        usd_path=self._asset_url(asset.usd_path, "obstacle asset"),
+                        prim_path=prim_path,
+                    )
+                    # W0 recipe: pump the app once so the reference composes before
+                    # the collider walk traverses it (a walk over an uncomposed
+                    # reference finds no Gprim and gives the prop nothing).
+                    self.simulation_app.update()
+                    audit = self._make_obstacle_static(prim_path)
+                    SingleXFormPrim(prim_path).set_world_pose(position=np.array(position))
+                print(audit, flush=True)
+                index += 1
+        print(
+            f"[cv-runner] obstacle pool spawned: {index} prim(s) under "
+            f"{OBSTACLE_POOL_ROOT} (parked) buckets={plan}",
+            flush=True,
+        )
+
+    def apply_obstacle_set(self, entries: list[dict]) -> None:  # pragma: no cover - GPU path
+        """Place THIS sample's obstacles on the existing pool; PARK every surplus.
+
+        The batch loop's obstacle-SET seam, sibling of ``move_debug_obstacle``. It
+        never creates and never removes a prim: every member authored at boot is
+        written to either its declared world pose or its parking pose, so the prim
+        census across samples is a CONSTANT (that constancy is NEG-6 gate 5's
+        ``pool`` column).
+
+        ``entries == []`` is NOT "nothing to do" — it is "this sample declares no
+        obstacles, so park the whole pool". The caller's ``None`` means "there is
+        no pool at all" and never reaches here. Collapsing the two is the first-order
+        trap of this feature: a 0-obstacle sample would inherit the previous
+        sample's placement and be judged against obstacles it never declared.
+
+        do-not-reinvent: the write goes through ``SingleXFormPrim.set_world_pose``,
+        the same wrapper the legacy move and the declared initial pose use — an
+        obstacle is a static prim, not an articulation (which is why
+        ``repose_robot`` needed a second spelling and this does not).
+        """
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+
+        pool = self._obstacle_pool
+        if pool is None:
+            raise RuntimeError(
+                "apply_obstacle_set ran before the pool was authored — the boot registers "
+                "spawn_obstacle_pool as the pre-reset hook BEFORE this one, so a missing pool "
+                "means this sample would be judged in an obstacle-free world"
+            )
+        placed, parked = obstacle_placement_plan(entries, pool)
+        for prim_path, spec in placed:
+            position, orientation = obstacle_place_transform(
+                spec, resolve_obstacle_asset(str(spec["asset"]))
+            )
+            SingleXFormPrim(prim_path).set_world_pose(
+                position=np.array(position), orientation=np.array(orientation)
+            )
+        parking_index = {path: index for index, path in enumerate(obstacle_pool_members(pool))}
+        for prim_path in parked:
+            SingleXFormPrim(prim_path).set_world_pose(
+                position=np.array(obstacle_park_position(parking_index[prim_path]))
+            )
+        print(obstacle_set_log_line(placed, parked), flush=True)
+
     def repose_robot(self, pose: dict) -> None:  # pragma: no cover - GPU path (W1 measured)
         """Put the PLAYING robot back at a declared pose (batch iteration step 3).
 
@@ -807,17 +1330,27 @@ class SimRuntime:
         print(repose_log_line(target, pose, position, orientation), flush=True)
 
     def restage(
-        self, pose: dict | None = None, obstacle: dict | None = None
+        self,
+        pose: dict | None = None,
+        obstacle: dict | None = None,
+        obstacle_set: list[dict] | None = None,
     ) -> None:  # pragma: no cover - GPU path (W1/W2/W3 measured)
         """Bring the world to the NEXT sample's start state (p6 batch iteration seam).
 
         NOT ``load_scene``: that re-opens the stage, and avoiding that cost is the
-        entire reason the batch carrier exists. The three steps and THEIR ORDER
-        are the contract:
+        entire reason the batch carrier exists. The steps and THEIR ORDER are the
+        contract:
 
         1. **obstacle move FIRST** — it is an authored (kinematic) prim, so the new
            transform must be on the stage before the reset publishes the start
            state to physics.
+        1b. **obstacle SET (p7)** — same reason, same window: the pool members are
+           re-posed here, before the reset. ``obstacle_set=None`` means "this
+           carrier has no pool" (nothing to do); ``[]`` means "this sample places
+           NOTHING — park the whole pool", and those are different instructions.
+           Folding ``[]`` into the None branch would leave a 0-obstacle sample
+           standing on sample i-1's placement and judge it against obstacles it
+           never declared. THAT is the first-order trap of this feature.
         2. **``world.reset(soft=True)``** — the SDK's own path that skips
            ``stop()``/``play()`` (``isaacsim/core/api/world/world.py``: ``if not
            soft: self.stop()``), so the physics simulation views are never
@@ -839,6 +1372,8 @@ class SimRuntime:
             raise RuntimeError("load_scene() must run before restage() (M2 §3.2 order)")
         if obstacle is not None:
             self.move_debug_obstacle(obstacle)
+        if obstacle_set is not None:
+            self.apply_obstacle_set(obstacle_set)
         self.world.reset(soft=True)
         if pose is not None:
             self.repose_robot(pose)

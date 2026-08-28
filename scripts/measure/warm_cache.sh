@@ -69,20 +69,38 @@ cache_mounts() {
     -v "$CACHE_ROOT/documents:/isaac-sim/Documents:rw"
 }
 
+obstacle_asset_paths() {
+  # The p7 obstacle registry, DERIVED from the runner's own OBSTACLE_ASSETS table
+  # rather than re-typed here: a warmed asset that is not the asset the runner
+  # references is a silently-cold measurement (the copy-drift class G-25 names,
+  # and the same reason warm_scene.py sources DEFAULT_SCENE_REL from SCENE_ASSETS).
+  # Import only — no SimulationApp, so this costs no GPU and no EULA.
+  docker run --rm --network none --entrypoint /isaac-sim/python.sh "$IMG" -c \
+    'from cv_infra.runner.sim_runtime import OBSTACLE_ASSETS
+for asset in OBSTACLE_ASSETS.values(): print(asset.usd_path)' \
+    | grep '^/'
+}
+
 warm_scene() {
   # Boot the runner image with warm_scene.py (entrypoint override, G-14) on a dedicated
   # non-host bridge (R8). One scene load fills the closure; --rm cleans up.
+  # Arg 1 = the USD to open (assets-root relative); default = the measurement scene.
+  local scene_rel="${1:-$CV_MEASURE_SCENE_REL}"
   docker network inspect "$CV_MEASURE_NET" >/dev/null 2>&1 \
     || docker network create --driver bridge "$CV_MEASURE_NET" >/dev/null
   local cname="cv-measure-warm-$$"
-  local evid="${CV_MEASURE_OUT:-$CACHE_ROOT/.warm-evidence}"
+  # One evidence dir PER TARGET: warm_scene.py always writes warm_rx_samples.csv,
+  # so a shared dir would leave only the last target's samples (G-18).
+  local slug
+  slug="$(printf '%s' "$scene_rel" | tr -c 'A-Za-z0-9._-' '_')"
+  local evid="${CV_MEASURE_OUT:-$CACHE_ROOT/.warm-evidence}/$slug"
   mkdir -p "$evid" 2>/dev/null || true
   measure_chown_dir "$evid" "$IMG"   # warm_scene writes as uid 1234
 
   local mounts=()
   mapfile -t mounts < <(cache_mounts)
 
-  log "warming closure: booting $IMG with warm_scene.py (net=$CV_MEASURE_NET, evidence=$evid)"
+  log "warming closure: $scene_rel via $IMG (net=$CV_MEASURE_NET, evidence=$evid)"
   docker rm -f "$cname" >/dev/null 2>&1 || true
   docker run --rm --name "$cname" \
     --network "$CV_MEASURE_NET" \
@@ -95,8 +113,8 @@ warm_scene() {
     -v "$evid:/cv/measure-out:rw" \
     --entrypoint /isaac-sim/python.sh \
     "$IMG" /cv/measure/warm_scene.py \
-    --scene-rel "$CV_MEASURE_SCENE_REL" --out /cv/measure-out \
-    || die "warm_scene failed (see $evid; container=$cname)"
+    --scene-rel "$scene_rel" --out /cv/measure-out \
+    || die "warm_scene failed for $scene_rel (see $evid; container=$cname)"
 }
 
 strip_gpu_cache() {
@@ -125,7 +143,18 @@ case "$MODE" in
     ;;
   warm)
     measure_provision_tree "$CACHE_ROOT" "$IMG"
-    warm_scene
+    warm_scene "$CV_MEASURE_SCENE_REL"
+    # The registered obstacle props ride the same warming, one open_stage each.
+    # Measured (p7c1 W0 gate ⓔ): the registry's closure costs 102.87 MiB / 35.6 s
+    # COLD against 0.14 MiB / 2.2 s fully warm — and that 35 s lands inside the
+    # runner's BOOT, where the batch watchdog is already counting.
+    obstacle_rels="$(obstacle_asset_paths)" || die \
+      "could not read OBSTACLE_ASSETS from $IMG (image older than the p7 wheel?) — a silent skip here leaves every obstacle asset COLD at boot"
+    while read -r rel; do
+      # `if`, not `[[ ]] &&`: a false test as the loop body's last command trips
+      # `set -e` and would kill the script on a trailing empty line.
+      if [[ -n "$rel" ]]; then warm_scene "$rel"; fi
+    done <<< "$obstacle_rels"
     ;;
   strip-gpu)
     measure_provision_tree "$CACHE_ROOT" "$IMG"   # ensure tree shape (idempotent)

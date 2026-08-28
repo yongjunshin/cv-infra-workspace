@@ -241,6 +241,242 @@ def test_parse_request_rejects_a_leaked_distribution(block, field, value):
     assert "materialize" in message
 
 
+def test_parse_request_accepts_a_materialized_obstacle_list():
+    """Positive control for the two rejections below: a CONCRETE group parses, and
+    ``obstacle_specs`` hands the sim layer plain dicts with the unset dimensions
+    ABSENT (so the runner's own defaults apply, never ``float(None)``)."""
+    spec = _randomizable_spec(
+        obstacles=[{"asset": "chair", "count": 1, "x": 1.0, "y": 2.0, "yaw": 0.5}]
+    )
+    request, _config = main.parse_request(spec)
+    assert main.obstacle_specs(request) == [
+        {"asset": "chair", "count": 1, "x": 1.0, "y": 2.0, "yaw": 0.5}
+    ]
+    # No obstacles declared -> [] (the contract says None; this is the one adapter).
+    assert main.obstacle_specs(main.parse_request(_randomizable_spec())[0]) == []
+
+
+def test_parse_request_rejects_an_unexpanded_obstacle_group():
+    """p7's widening of the §0-5 leak check: ``count: 3`` carries NO distribution.
+
+    Without it the runner places ONE box where the document declared three and
+    judges the sample as if that were the world — the silent-ignore failure (G-25)
+    with a verdict attached to it.
+    """
+    spec = _randomizable_spec(obstacles=[{"asset": "box", "count": 3, "x": 1.0, "y": 2.0}])
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    message = str(excinfo.value)
+    assert "scenario.obstacles[0].count" in message and "materialize" in message
+
+
+def test_parse_request_rejects_a_distribution_inside_an_obstacle_group():
+    spec = _randomizable_spec(obstacles=[{"asset": "box", "x": {"uniform": [-1.0, 1.0]}, "y": 2.0}])
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    assert "scenario.obstacles[0].x" in str(excinfo.value)
+
+
+def test_parse_request_rejects_an_obstacle_asset_the_runner_cannot_resolve():
+    """Pre-boot (exit 2) and named by GROUP INDEX — the alternative is a 404 at
+    reference time, mid-boot, after the GPU was already paid."""
+    spec = _randomizable_spec(
+        obstacles=[
+            {"asset": "box", "x": 1.0, "y": 2.0},
+            {"asset": "chairr", "x": 1.0, "y": 2.0},
+        ]
+    )
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.parse_request(spec)
+    message = str(excinfo.value)
+    assert "scenario.obstacles[1]" in message and "chairr" in message
+
+
+# --------------------------------------------------------------------------- #
+# p7 obstacle sets — the pure layer (asset resolution / pool / placement).
+# --------------------------------------------------------------------------- #
+def _obstacle(asset: str = "box", **overrides) -> dict:
+    """One CONCRETE obstacle entry, the shape ``obstacle_specs`` hands over."""
+    return {"asset": asset, "count": 1, "x": 1.0, "y": 2.0, "yaw": 0.0, **overrides}
+
+
+def test_resolve_obstacle_asset_covers_box_registry_and_direct_refs():
+    # "box" is NOT an asset: None is the branch that says "author a cuboid".
+    assert sim_runtime.resolve_obstacle_asset(sim_runtime.BOX_ASSET_REF) is None
+    chair = sim_runtime.resolve_obstacle_asset("chair")
+    assert chair.usd_path.endswith(".usd") and chair.usd_path.startswith("/Isaac/")
+    # A direct ref passes through with NO registry knowledge (resolve_scene's grammar).
+    direct = sim_runtime.resolve_obstacle_asset("omniverse://host/props/crate.usd")
+    assert direct.usd_path == "omniverse://host/props/crate.usd" and direct.z_offset == 0.0
+
+
+def test_resolve_obstacle_asset_is_loud_about_an_unknown_name():
+    # REQ-INTAKE-005: a typo must name what IS available, never resolve to a 404
+    # at reference time (which would surface mid-boot, after the GPU was paid).
+    with pytest.raises(ValueError) as excinfo:
+        sim_runtime.resolve_obstacle_asset("chairr")
+    message = str(excinfo.value)
+    assert "chairr" in message and "chair" in message and "box" in message
+
+
+def test_every_registered_asset_carries_a_measured_offset_and_an_isaac_path():
+    # The registry is the one place a REMEMBERED path would hide (G-25/G-28): a
+    # relative /Isaac/... path is what gets joined onto the live assets root.
+    assert set(sim_runtime.OBSTACLE_ASSETS) == {"chair", "desk", "forklift"}
+    for name, asset in sim_runtime.OBSTACLE_ASSETS.items():
+        assert asset.usd_path.startswith("/Isaac/"), name
+        assert asset.usd_path.endswith((".usd", ".usda", ".usdz")), name
+        assert asset.z_offset >= 0.0, name
+
+
+def test_obstacle_pool_key_buckets_boxes_by_size_and_assets_verbatim():
+    # A box's dimensions are CONSTRUCTION-time on a FixedCuboid, so each distinct
+    # size is its own bucket; an undeclared dimension resolves to the runner default.
+    assert sim_runtime.obstacle_pool_key(_obstacle()) == (
+        "box",
+        (
+            sim_runtime.DEBUG_OBSTACLE_DEFAULT_WIDTH,
+            sim_runtime.DEBUG_OBSTACLE_DEFAULT_DEPTH,
+            sim_runtime.DEBUG_OBSTACLE_DEFAULT_HEIGHT,
+        ),
+    )
+    assert sim_runtime.obstacle_pool_key(_obstacle(height=0.5)) != sim_runtime.obstacle_pool_key(
+        _obstacle()
+    )
+    # An asset keys on the DESIGNATOR, not on the resolved path.
+    assert sim_runtime.obstacle_pool_key(_obstacle("chair")) == ("chair", None)
+
+
+def test_obstacle_pool_plan_is_the_per_sample_maximum_never_the_sum():
+    """The whole reason a pool exists: 12 samples x 2 chairs is 2 chairs, not 24.
+
+    The sum would grow the stage with the batch size and re-introduce exactly the
+    prim growth the boot-once design removed.
+    """
+    per_sample = [
+        [_obstacle("chair")] + [_obstacle("desk")] * 5,
+        [_obstacle("chair")] * 2,
+        [],
+    ]
+    assert sim_runtime.obstacle_pool_plan(per_sample) == {
+        ("chair", None): 2,
+        ("desk", None): 5,
+    }
+    assert sim_runtime.obstacle_pool_plan([[], []]) == {}
+
+
+def test_obstacle_pool_plan_rejects_a_pool_over_the_cap_before_any_gpu_second():
+    over = [[_obstacle("chair")] * (sim_runtime.OBSTACLE_POOL_MAX + 1)]
+    with pytest.raises(ValueError, match=str(sim_runtime.OBSTACLE_POOL_MAX)):
+        sim_runtime.obstacle_pool_plan(over)
+    at_cap = [[_obstacle("chair")] * sim_runtime.OBSTACLE_POOL_MAX]
+    assert sum(sim_runtime.obstacle_pool_plan(at_cap).values()) == sim_runtime.OBSTACLE_POOL_MAX
+
+
+def test_obstacle_pool_paths_are_derived_ordered_and_under_one_scope():
+    plan = {("chair", None): 1, ("desk", None): 2}
+    pool = sim_runtime.obstacle_pool_paths(plan)
+    members = sim_runtime.obstacle_pool_members(pool)
+    assert len(members) == 3 and len(set(members)) == 3
+    assert all(path.startswith(sim_runtime.OBSTACLE_POOL_ROOT + "/") for path in members)
+    assert pool[("desk", None)][1].endswith("_1")  # <slug>_<j>, j ascending
+    # The flat order is the PARKING index — one derivation, two call sites.
+    assert members == tuple(path for paths in pool.values() for path in paths)
+
+
+def test_obstacle_slug_separates_buckets_that_differ_in_the_fourth_decimal():
+    """A dimension-spelled slug would collapse these two into one pool."""
+    a = sim_runtime.obstacle_slug(("box", (1.2, 0.4, 0.15)))
+    b = sim_runtime.obstacle_slug(("box", (1.2, 0.4, 0.1501)))
+    assert a != b and a.startswith("box_") and b.startswith("box_")
+    assert sim_runtime.obstacle_slug(("chair", None)).startswith("chair_")
+    # A direct ref is not a USD-safe name, so the readable half degrades to "usd".
+    assert sim_runtime.obstacle_slug(("/mnt/props/crate.usd", None)).startswith("usd_")
+
+
+def test_obstacle_park_position_is_a_countable_column_under_the_floor():
+    first = sim_runtime.obstacle_park_position(0)
+    second = sim_runtime.obstacle_park_position(1)
+    assert first == (0.0, 0.0, sim_runtime.OBSTACLE_PARK_Z)
+    # DEPTH, not distance: a horizontal 2D-lidar ray cannot reach it at ANY range.
+    assert second[2] < first[2] < 0.0
+    assert first[2] - second[2] == sim_runtime.OBSTACLE_PARK_PITCH
+
+
+def test_obstacle_place_transform_lets_the_floor_own_z():
+    box_position, box_orientation = sim_runtime.obstacle_place_transform(
+        _obstacle(height=0.5, yaw=0.0), None
+    )
+    # box: the LEGACY height/2 centring, reused rather than re-derived.
+    assert box_position == sim_runtime.debug_obstacle_position(_obstacle(height=0.5))
+    assert box_orientation == (1.0, 0.0, 0.0, 0.0)
+    asset = sim_runtime.ObstacleAsset(usd_path="/Isaac/x.usd", z_offset=0.25)
+    position, orientation = sim_runtime.obstacle_place_transform(
+        _obstacle("chair", yaw=math.pi / 2), asset
+    )
+    assert position == (1.0, 2.0, 0.25)  # the MEASURED offset, never a consumer input
+    assert orientation == pytest.approx(sim_runtime.yaw_to_quat_wxyz(math.pi / 2))
+
+
+def test_yaw_to_quat_wxyz_is_the_one_home_the_initial_pose_also_uses():
+    pose = {"x": 1.0, "y": 2.0, "yaw": 3.1416}
+    _position, orientation = sim_runtime.initial_pose_world_transform(pose, (0.0, 0.0, 0.37))
+    assert orientation == sim_runtime.yaw_to_quat_wxyz(3.1416)
+    w, x, y, z = sim_runtime.yaw_to_quat_wxyz(0.7)
+    assert (x, y) == (0.0, 0.0) and w**2 + z**2 == pytest.approx(1.0)
+
+
+def test_obstacle_placement_plan_assigns_by_declared_order_and_parks_the_surplus():
+    pool = sim_runtime.obstacle_pool_paths({("chair", None): 1, ("desk", None): 2})
+    entries = [_obstacle("desk", x=9.0), _obstacle("chair")]
+    placed, parked = sim_runtime.obstacle_placement_plan(entries, pool)
+    # j-th desk of the sample is always pool member desk_<hash>_j (stable mapping:
+    # a contact event's prim path reads back to the declaration that put it there).
+    assert [path for path, _ in placed] == [
+        pool[("desk", None)][0],
+        pool[("chair", None)][0],
+    ]
+    assert [entry["x"] for _path, entry in placed] == [9.0, 1.0]
+    assert parked == [pool[("desk", None)][1]]  # the surplus is computed HERE
+    assert set(parked).isdisjoint({path for path, _ in placed})
+
+
+def test_an_empty_sample_parks_the_whole_pool():
+    """``[]`` is NOT "nothing to do" — it is "this sample places nothing".
+
+    Folding it into the no-pool branch would leave a 0-obstacle sample standing on
+    the PREVIOUS sample's placement, judged against obstacles it never declared.
+    """
+    pool = sim_runtime.obstacle_pool_paths({("chair", None): 2})
+    placed, parked = sim_runtime.obstacle_placement_plan([], pool)
+    assert placed == []
+    assert parked == list(sim_runtime.obstacle_pool_members(pool))
+
+
+def test_obstacle_placement_plan_is_loud_when_the_pool_cannot_serve_it():
+    pool = sim_runtime.obstacle_pool_paths({("chair", None): 1})
+    with pytest.raises(ValueError, match="chair"):
+        sim_runtime.obstacle_placement_plan([_obstacle("chair")] * 2, pool)
+    with pytest.raises(ValueError, match="desk"):
+        sim_runtime.obstacle_placement_plan([_obstacle("desk")], pool)
+
+
+def test_obstacle_set_log_line_carries_the_marker_and_both_sides():
+    pool = sim_runtime.obstacle_pool_paths({("chair", None): 2})
+    placed, parked = sim_runtime.obstacle_placement_plan([_obstacle("chair", yaw=0.5)], pool)
+    line = sim_runtime.obstacle_set_log_line(placed, parked)
+    # The grep marker is the G-26 prove-it-ran handle NEG-6 gate 5 counts.
+    assert f"{sim_runtime.OBSTACLE_SET_LOG_MARKER}1 parked=1 pool=2" in line
+    assert placed[0][0] in line and parked[0] in line
+    assert "(1.0, 2.0, 0.5)" in line  # what was DECLARED, next to where it went
+
+
+def test_obstacle_physics_log_line_states_the_census_it_took():
+    line = sim_runtime.obstacle_physics_log_line("/World/cv_obstacles/chair_0", "applied(C3)", 0, 0)
+    assert sim_runtime.OBSTACLE_PHYSICS_LOG_MARKER in line
+    assert "collider=applied(C3) rigid_body=0 articulation=0" in line
+
+
 # --------------------------------------------------------------------------- #
 # MVP oracles (REQ-EXEC-011).
 # --------------------------------------------------------------------------- #

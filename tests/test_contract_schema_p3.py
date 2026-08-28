@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from cv_infra.contract.apiversion import API_VERSION
 from cv_infra.contract.schema import (
+    BUILTIN_BOX_ASSET,
     VERDICTS,
     Artifacts,
     CustomCriterion,
@@ -33,6 +34,7 @@ from cv_infra.contract.schema import (
     Goal,
     InitialPose,
     NoCollisionCriterion,
+    Obstacle,
     ReachedGoalCriterion,
     RequestEnvelope,
     ResourceBudget,
@@ -207,6 +209,63 @@ def test_debug_obstacle_keys_match_the_runner_read_set():
     reads = set(re.findall(r"""spec(?:\.get\(|\[)\s*["'](\w+)["']""", src))
     assert reads, "read-set extraction went empty (positive control, G-07)"
     assert set(DebugObstacle.model_fields) == reads
+
+
+# --- scenario.obstacles (p7: kind + how many + yaw) -------------------------- #
+def test_obstacle_keys_match_the_runner_read_set():
+    """Same mechanical bind as ``DebugObstacle``'s, one plane wider (p7 §3).
+
+    The runner's obstacle read set is spread over three pure functions on
+    purpose: the pool BUCKET (asset + box dimensions), the placement TRANSFORM
+    (yaw, and the box's x/y/height by delegation) and the legacy centring it
+    delegates to. The guard takes their union, because that union is what the
+    execution plane actually consumes.
+
+    ``count`` is EXCLUDED, and that exclusion is the contract, not an oversight:
+    a count reaching the sim layer would mean the document was never expanded,
+    which ``parse_request`` rejects pre-boot via ``unmaterialized_fields``. The
+    sim layer sees singletons only, so a ``spec["count"]`` read HERE would be a
+    second, contradicting definition of "how many obstacles is this?".
+    """
+    import inspect
+    import re
+
+    from cv_infra.runner import sim_runtime
+
+    src = (
+        inspect.getsource(sim_runtime.obstacle_pool_key)  # asset, width, depth, height
+        + inspect.getsource(sim_runtime.obstacle_place_transform)  # yaw (+ x/y for an asset)
+        + inspect.getsource(sim_runtime.debug_obstacle_position)  # x, y, height (box reuse)
+    )
+    reads = set(re.findall(r"""spec(?:\.get\(|\[)\s*["'](\w+)["']""", src))
+    assert reads, "read-set extraction went empty (positive control, G-07)"
+    assert set(Obstacle.model_fields) - {"count"} == reads
+
+
+def test_the_two_planes_spell_the_built_in_box_the_same_way():
+    """The word "box" is defined twice on purpose — this pins the two together.
+
+    M1 owns it for the dimensions validator (``BUILTIN_BOX_ASSET``); the sim
+    layer owns its own (``BOX_ASSET_REF``) because that layer imports no
+    contract. A drift would be silent in the worst way: the schema would keep
+    accepting ``height`` on the built-in box while the runner resolved that same
+    word as an unknown ASSET name (or worse, the reverse — dimensions accepted
+    and then dropped). Same shape as the BATCH_RUNNER_COMMAND <-> Dockerfile pin.
+    """
+    from cv_infra.runner.sim_runtime import BOX_ASSET_REF
+
+    assert BUILTIN_BOX_ASSET == BOX_ASSET_REF
+
+
+def test_every_registered_obstacle_asset_name_is_a_usd_safe_prim_name():
+    """The registry name becomes half of a prim NAME (``obstacle_slug``), so a
+    name with a dot or a slash would author an invalid path — loudly, at boot,
+    on the workstation. Cheaper to hold here."""
+    from cv_infra.runner.sim_runtime import OBSTACLE_ASSETS
+
+    assert OBSTACLE_ASSETS, "the registry went empty (positive control, G-07)"
+    for name in OBSTACLE_ASSETS:
+        assert name.isidentifier(), f"registry name {name!r} is not a USD-safe prim name"
 
 
 # --- scenario.initial_pose (REQ-EXEC-002; CEO D-2 2026-08-04: OPTIONAL) ------ #

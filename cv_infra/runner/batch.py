@@ -16,7 +16,7 @@ Sequence — boot ONCE, then per sample i:
     admit every spec (0 GPU seconds) -> bridge bootstrap -> SimulationApp ->
     ros2 bridge -> scene/robot/telemetry (sample 0's staging) -> adapter wire ->
     render product
-      | i: re-pin seed -> restage (obstacle move, soft reset, repose) ->
+      | i: re-pin seed -> restage (obstacle move + set, soft reset, repose) ->
       |    sim_config line -> SUT realign + settle -> readiness -> cycle telemetry
       |    accumulator -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
       |    -> batch_summary.json (atomic flush = the carrier's heartbeat)
@@ -71,6 +71,7 @@ from cv_infra.runner.main import (
     criteria_view,
     hard_exit,
     insert_oracle_plugin_dir,
+    obstacle_specs,
     parse_request,
     read_request_identity_key,
     require_job_id,
@@ -78,7 +79,7 @@ from cv_infra.runner.main import (
     validate_oracle_params,
     write_result,
 )
-from cv_infra.runner.sim_runtime import EulaNotAcceptedError
+from cv_infra.runner.sim_runtime import EulaNotAcceptedError, obstacle_pool_plan
 
 #: Directory under ``RESULT_OUT`` holding the per-sample outputs. The runner owns
 #: the out-dir LAYOUT (M1 owns the index agreement — see job_batch's docstring).
@@ -268,6 +269,17 @@ def admit_specs(batch: JobSpecBatch) -> list[ParsedSpec]:
                     f"({read(item)!r} != {expected!r}) — one carrier boots ONE world and "
                     "wires the ROS side ONCE, so every sample of the batch must agree on it"
                 )
+
+    # Obstacles are the one axis whose SHAPE varies by design (CEO: "desk
+    # n={0..5}"), so they get NO uniformity row — the pool absorbs the variance.
+    # Two things still have to hold pre-boot, at 0 GPU seconds: every asset
+    # designator resolves (``parse_request`` proved that per spec above, where the
+    # index is known) and the POOL fits, which only the whole batch can decide —
+    # the pool is the per-sample MAXIMUM multiplicity over EVERY spec.
+    try:
+        obstacle_pool_plan([obstacle_specs(item.request) for item in parsed])
+    except ValueError as exc:
+        raise BadJobSpec(f"batch obstacles: {exc}") from exc
     return parsed
 
 
@@ -482,6 +494,17 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         )
         if head_obstacle is not None:
             sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(head_obstacle))
+        # The pool is the UNION over EVERY spec, not spec 0's: sample i's obstacle
+        # COUNT is exactly what varies (CEO: "desk n={0..5}"), so a spec-0-sized
+        # pool would leave sample 3 with nothing to place. Placement is NOT done
+        # here — the second hook owns it, so "where sample 0's obstacles go" has
+        # one definition shared with every later sample.
+        pool_plan = obstacle_pool_plan([obstacle_specs(p.request) for p in specs])
+        head_obstacles = obstacle_specs(head.request)
+        pool_total = sum(pool_plan.values())
+        if pool_plan:
+            sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(pool_plan))
+            sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(head_obstacles))
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
         sim.load_scene(identity_key)  # emits sample 0's sim_config line
@@ -532,12 +555,18 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 if request.scenario.debug_obstacle is None
                 else request.scenario.debug_obstacle.model_dump(exclude_none=True)
             )
+            # ``None`` = this carrier has no pool (nothing to do). A LIST — empty
+            # included — means "these are THIS sample's obstacles, park the rest":
+            # folding ``[]`` into None would leave a 0-obstacle sample standing on
+            # sample i-1's placement. A carrier without a pool passes None, so a
+            # legacy (debug_obstacle-only) batch logs exactly what it logged before.
+            obstacle_set = obstacle_specs(request) if pool_plan else None
 
             iter_watch.begin("restage")
             sim.config.seed = request.scenario.seed
             sim.pin_determinism_seeds()
             if position:  # sample 0's world is the one load_scene just staged
-                sim.restage(pose, obstacle)
+                sim.restage(pose, obstacle, obstacle_set=obstacle_set)
                 sim.emit_sim_config(identity_key)  # per-sample applied-settings line
             iter_watch.end("restage")
 
@@ -570,6 +599,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 "video_frames": 0,
                 "gt_pose_samples": 0,
                 "contact_events": 0,
+                # The obstacle-set counters (NEG-6 gate 5). ``placed`` is what this
+                # sample DECLARED, ``pool`` is what the boot authored once, and
+                # ``parked`` is the difference — so a pool that grows between
+                # samples (i.e. something respawned) is visible in the summary
+                # without reading a log. Derived, not GPU-observed: they prove the
+                # placement CALL, never that a prim is at those coordinates (W1
+                # owns that — same layering as the realign counters).
+                "obstacles_placed": len(obstacle_set or []),
+                "obstacles_parked": pool_total - len(obstacle_set or []),
+                "obstacles_pool": pool_total,
             }
             if not ready:
                 # The barrier is the carrier's trust boundary: without a live SUT

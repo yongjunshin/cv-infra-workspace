@@ -8,11 +8,14 @@ IS the M1 wire invariant, the summary heartbeat, the carrier exit mapping, and t
 re-exec argv — the one that made the first C-2 attempt die in 2.4 s by silently
 re-execing into the SINGLE-job entrypoint.
 
-Three structural guards close the loop on the parts a unit test cannot run:
-``restage`` must not contain the hard-reset spelling it replaced, ``run`` must not
-close a vendor object on its terminal path (G-62), and the telemetry accumulator
-must be swapped where the mission starts — not before the restage that teleports
-the robot (measured p6c3 T3 §4).
+Structural guards close the loop on the parts a unit test cannot run: the sample
+boundary (``restage`` and, since p7, ``apply_obstacle_set``) must not contain the
+authoring spellings it replaced, the p7 obstacle pool must be authored once at
+boot and never inside the loop, ``run`` must not close a vendor object on its
+terminal path (G-62), and the telemetry accumulator must be swapped where the
+mission starts — after everything that steps the world, not before the restage
+that teleports the robot (measured p6c3 T3 §4; the boundary's contact reports are
+p7c1 W0 ⓓ).
 """
 
 import ast
@@ -25,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from cv_infra.contract.job_batch import BATCH_SUMMARY_SCHEMA, JOB_SPEC_BATCH_ENV, JobSpecBatch
-from cv_infra.runner import batch, ros_bridge, sim_runtime
+from cv_infra.runner import batch, main, ros_bridge, sim_runtime
 
 CHASSIS = "/World/carter/chassis"
 
@@ -313,6 +316,54 @@ def test_admit_specs_accepts_the_axes_that_are_SUPPOSED_to_vary():
     assert [p.criteria["goal_position"][0] for p in parsed] == [3.0, 4.0, 5.0]
 
 
+def _with_obstacles(spec: dict, entries: list[dict] | None) -> dict:
+    """Swap the legacy box for p7 obstacle groups (the schema forbids BOTH)."""
+    spec["scenario"].pop("debug_obstacle", None)
+    if entries:
+        spec["scenario"]["obstacles"] = entries
+    return spec
+
+
+def test_admission_accepts_an_obstacle_count_that_differs_per_sample():
+    """The axis p7 exists for — and the positive control for the guard above.
+
+    Obstacles deliberately get NO uniformity row: "sample i places i chairs" is
+    the CEO's stated case ("desk n={0..5}"), and the pool absorbs the variance by
+    parking the surplus. If a future edit adds a uniformity row for obstacles,
+    THIS is what goes red instead of a live batch silently rejecting its samples.
+    """
+    doc = _batch_doc(3)
+    for index, spec in enumerate(doc["specs"]):
+        _with_obstacles(spec, [{"asset": "chair", "x": 1.0 + index, "y": 2.0}] * index)
+    parsed = batch.admit_specs(JobSpecBatch.model_validate(doc))
+    assert [len(main.obstacle_specs(p.request)) for p in parsed] == [0, 1, 2]
+    # ...and the pool the carrier would author is the per-sample MAXIMUM.
+    plan = sim_runtime.obstacle_pool_plan([main.obstacle_specs(p.request) for p in parsed])
+    assert plan == {("chair", None): 2}
+
+
+def test_admit_specs_names_the_spec_whose_obstacle_asset_is_unknown():
+    doc = _batch_doc(3)
+    for spec in doc["specs"]:
+        _with_obstacles(spec, [{"asset": "chair", "x": 1.0, "y": 2.0}])
+    doc["specs"][2]["scenario"]["obstacles"][0]["asset"] = "chairr"
+    with pytest.raises(batch.BadJobSpec, match=r"batch spec 2:.*obstacles\[0\]"):
+        batch.admit_specs(JobSpecBatch.model_validate(doc))
+
+
+def test_admit_specs_rejects_a_batch_whose_pool_would_not_fit():
+    """The one obstacle question a per-spec parse cannot answer: the pool is the
+    union over EVERY spec, so only admission sees the total (0 GPU seconds)."""
+    doc = _batch_doc(2)
+    for spec in doc["specs"]:
+        _with_obstacles(
+            spec,
+            [{"asset": "chair", "x": 1.0, "y": 2.0}] * (sim_runtime.OBSTACLE_POOL_MAX + 1),
+        )
+    with pytest.raises(batch.BadJobSpec, match="batch obstacles"):
+        batch.admit_specs(JobSpecBatch.model_validate(doc))
+
+
 # --------------------------------------------------------------------------- #
 # Sim-time monotonicity across the iteration boundary (the soft-restage property).
 # --------------------------------------------------------------------------- #
@@ -493,25 +544,46 @@ def _called_names(node: ast.AST) -> list[str]:
     return names
 
 
-@pytest.mark.parametrize("forbidden", ["stop", "RemovePrim", "FixedCuboid", "close"])
-def test_restage_never_falls_back_to_the_hard_reset_spelling(forbidden):
-    """``restage`` is the p6c2 measurement's whole product, so its body is pinned.
+@pytest.mark.parametrize("method", ["restage", "apply_obstacle_set"])
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "stop",
+        "RemovePrim",
+        "FixedCuboid",
+        "close",
+        # p7: the authoring/deleting spellings a prim POOL makes reachable.
+        "add_reference_to_stage",
+        "DefinePrim",
+        "delete_prim",
+        # ...and the helper names themselves, so the guard cannot be walked around
+        # by calling the boot-only spawn from inside the iteration.
+        "spawn_obstacle_pool",
+        "spawn_debug_obstacle",
+    ],
+)
+def test_the_iteration_boundary_never_authors_a_prim(method, forbidden):
+    """The two methods the sample boundary runs are pinned to CREATE NOTHING.
 
     ``stop()``/``RemovePrim``/``FixedCuboid`` ARE the hard path: they cycle the
     physics simulation views (+4.96 MiB/iteration, flat only once removed) and
-    leave two orphan material prims per respawn. ``close()`` would end the
-    process with status 0 mid-batch (G-62). None of them may reappear here — a
-    reviewer adding "just one" would not see the measurement they undo.
+    leave two orphan material prims per respawn (p6c2 §2.1: 2 -> 48 over 24
+    iterations). ``close()`` would end the process with status 0 mid-batch
+    (G-62). ``add_reference_to_stage``/``DefinePrim``/``delete_prim`` are the same
+    class one asset-referencing pool later. And the two SPAWN helpers are
+    forbidden by NAME: the measurement they encode is "author once at boot", so a
+    call to them from the boundary would satisfy every other guard here while
+    undoing the whole point (p7 §2-7).
     """
     source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
-    assert forbidden not in _called_names(_method(source, "SimRuntime", "restage"))
+    assert forbidden not in _called_names(_method(source, "SimRuntime", method))
 
 
-def test_restage_keeps_the_soft_reset_and_its_two_neighbours():
+def test_restage_keeps_the_soft_reset_and_its_three_neighbours():
     """Positive control: the guard above passes trivially on an EMPTY body."""
     source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
     called = _called_names(_method(source, "SimRuntime", "restage"))
-    assert {"reset", "move_debug_obstacle", "repose_robot"} <= set(called)
+    assert {"reset", "move_debug_obstacle", "apply_obstacle_set", "repose_robot"} <= set(called)
     reset_call = [
         node
         for node in ast.walk(_method(source, "SimRuntime", "restage"))
@@ -520,6 +592,89 @@ def test_restage_keeps_the_soft_reset_and_its_two_neighbours():
         and node.func.attr == "reset"
     ]
     assert [ast.unparse(k) for k in reset_call[0].keywords] == ["soft=True"]
+
+
+def test_both_obstacle_writes_precede_the_soft_reset():
+    """Order pin: an obstacle written AFTER the reset is not in the state the
+    reset published to physics.
+
+    The legacy box already carried this constraint ("obstacle move FIRST"); the
+    p7 set is the same authored-transform claim on n more prims, so it rides the
+    same window. A reviewer who appends the new call at the end of the method
+    would produce a body that runs, logs, and stages the obstacles one reset too
+    late.
+    """
+    source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
+    restage = _method(source, "SimRuntime", "restage")
+    lines: dict[str, list[int]] = {}
+    for node in ast.walk(restage):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            lines.setdefault(node.func.attr, []).append(node.lineno)
+    (move,) = lines["move_debug_obstacle"]
+    (apply_set,) = lines["apply_obstacle_set"]
+    (reset,) = lines["reset"]
+    assert move < reset, "the legacy obstacle move slipped past the soft reset"
+    assert apply_set < reset, "the obstacle SET is written after the reset published the state"
+
+
+@pytest.mark.parametrize(
+    ("method", "required"),
+    [
+        ("spawn_obstacle_pool", {"obstacle_pool_paths", "obstacle_park_position"}),
+        (
+            "apply_obstacle_set",
+            {"obstacle_placement_plan", "obstacle_place_transform", "obstacle_park_position"},
+        ),
+    ],
+)
+def test_the_obstacle_gpu_wrappers_go_through_the_pure_functions(method, required):
+    """Single-home pin (G-25), the sibling of ``spawn``/``move`` sharing
+    ``debug_obstacle_position``.
+
+    Where a prim is PARKED, where it is PLACED and which member serves which
+    declaration are pure, CPU-tested decisions. A GPU wrapper that inlines any of
+    them puts the arithmetic somewhere no unit test can see it — and the parking
+    sweep in particular has to agree with the spawn on the member ORDER, or a
+    parked prim lands on another parked prim's slot.
+    """
+    source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
+    assert required <= set(_called_names(_method(source, "SimRuntime", method)))
+
+
+def test_the_pool_is_spawned_once_at_boot_and_never_inside_the_sample_loop():
+    """Structural pin: the pool is authored by a pre-reset hook registered OUTSIDE
+    the sample loop, exactly once.
+
+    The name-based guard above stops the boundary from CALLING the spawn; this
+    stops the carrier from REGISTERING it per sample, which would author a second
+    pool on top of the first (the prim census that NEG-6 gate 5 watches would
+    climb, and the placement sweep would keep re-posing the members of the first).
+    """
+    run = _batch_run_function()
+    loop = next(
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.For) and ast.unparse(node.iter) == "enumerate(specs)"
+    )
+    spawns = [
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Attribute) and node.attr == "spawn_obstacle_pool"
+    ]
+    assert len(spawns) == 1, f"spawn_obstacle_pool named {len(spawns)}x in batch.run"
+    assert not (
+        loop.lineno <= spawns[0].lineno <= loop.end_lineno
+    ), "the pool spawn was registered from INSIDE the sample loop"
+    hooks = [
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and ast.unparse(node.func.value) == "sim.pre_reset"
+        and "spawn_obstacle_pool" in ast.unparse(node)
+    ]
+    assert len(hooks) == 1, "the pool must be authored by exactly one pre_reset hook"
 
 
 def test_spawn_and_move_share_one_obstacle_position_home():
@@ -592,6 +747,71 @@ def test_telemetry_accumulator_is_swapped_at_mission_start_not_at_restage():
     assert restage < realign < readiness < swaps[0] < mission, (
         f"record swap at line {swaps[0]} is not between readiness ({readiness}) "
         f"and the mission ({mission})"
+    )
+
+
+#: Calls inside the sample loop that ADVANCE sim time (and therefore let PhysX
+#: deliver contact reports). ``drive_mission`` is deliberately absent: it IS the
+#: boundary the guard below measures against.
+_SIM_ADVANCING_CALLS = ("step", "step_and_spin", "restage", "realign", "await_ready")
+
+
+def test_nothing_advances_the_sim_between_the_record_swap_and_the_mission():
+    """The sample BOUNDARY's contact reports must not land in the next sample's record.
+
+    Measured (p7c1 W0 gate ⓓ): PhysX delivers the contact-LOST reports for
+    whatever the chassis was touching at the end of sample i-1 in the first steps
+    AFTER the restage — a transition window, not the previous sample's window.
+    In this carrier every one of those steps (the soft reset's own internal step,
+    the realign, the settle pump, the readiness barrier) runs BEFORE
+    ``sampler.record`` is replaced, so those reports append to the RETIRED
+    record: sample i-1's, whose metrics were already computed and whose
+    result.json is already on disk. They are dropped, and sample i's collision
+    count starts at its own mission.
+
+    That holds only while NOTHING between the swap and the mission advances the
+    sim. A settle pump moved below the swap — or a "let the world breathe two
+    steps before recording" line — would charge sample i with the collision
+    sample i-1 was in when it was teleported away, and the verdict would be a
+    real FAIL for an event in another sample's world. The sibling guard
+    ``test_telemetry_accumulator_is_swapped_at_mission_start_not_at_restage``
+    holds the other direction (the swap must not move UP, which was measured to
+    inflate path_len and zero time_to_goal).
+    """
+    loop = next(
+        node
+        for node in ast.walk(_batch_run_function())
+        if isinstance(node, ast.For) and ast.unparse(node.iter) == "enumerate(specs)"
+    )
+    calls: dict[str, list[int]] = {}
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Call):
+            name = (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ast.unparse(node.func)
+            )
+            calls.setdefault(name, []).append(node.lineno)
+    (swap,) = [
+        node.lineno
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "sampler.record"
+        and ast.unparse(node.value) == "TelemetryRecord()"
+    ]
+    (mission,) = calls["drive_mission"]
+    advancing = sorted(
+        (line, name) for name in _SIM_ADVANCING_CALLS for line in calls.get(name, [])
+    )
+    # Positive control (G-07): the extraction must actually see the pre-mission
+    # stepping, or "nothing between the swap and the mission" is vacuously true.
+    assert [name for line, name in advancing if line < swap], (
+        f"no sim-advancing call found before the record swap — {_SIM_ADVANCING_CALLS} "
+        "no longer names how this loop steps the world, so this guard sees nothing"
+    )
+    between = [(line, name) for line, name in advancing if swap < line < mission]
+    assert not between, (
+        f"{between} advance the sim between the record swap (line {swap}) and the mission "
+        f"(line {mission}) — the boundary's contact-LOST reports would be charged to THIS "
+        "sample"
     )
 
 

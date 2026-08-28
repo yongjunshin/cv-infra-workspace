@@ -7,13 +7,16 @@ p6 설계 정본 §4(네거티브) 신설 게이트. 운반체(1 컨테이너 = 
 
 **왜 verdict 재현이 아니라 계측인가**(G-102): 표본은 서로 다른 난수 표본이고 런간
 분산이 이미 크므로(D-5 입력), *"두 반복이 같은 결과를 냈다"* 는 잔존 여부에 대해
-검정력이 없다. 정본 §4가 고정한 관측 가능 4게이트는 전부 **ROS/아티팩트 계측**이다:
+검정력이 없다. 정본 §4가 고정한 관측 가능 4게이트는 전부 **ROS/아티팩트 계측**이고, p7이 장애물
+평면에서 같은 형태의 게이트 하나를 더 얹는다(부록 B §B5.5):
 
 1. **realign 카운터 n/n** — 표본마다 SUT가 다시 씨딩됐다는 관측이 남는다.
 2. **반복별 bag 세션 독립** — 표본 i의 녹화는 표본 i의 디렉토리에만 있고 공유되지 않는다.
 3. **반복별 seed 라인 n/n** — 표본마다 적용된 설정(seed 포함) 한 줄이 로그에 찍힌다.
 4. **record 교체 · soft 경로 bind 0** — 표본의 텔레메트리 누산기는 표본 경계에서
    교체되고(잔존 GT 0), soft 리셋은 수집기를 **다시 bind 하지 않는다**.
+5. **표본별 장애물 세트 적용**(p7) — 표본마다 ``obstacle_set_applied=`` 라인 정확히 1,
+   그 카운터가 요약의 3키와 일치, 풀 크기는 전 표본 상수(증가 = 반복 중 재생성).
 
 **이 파일이 증명하는 것과 하지 않는 것 (GPU 정직성).**
 검사기는 **CPU에서 합성 증적**(W3 실물과 같은 형태)에 대해 돌고, 각 게이트마다
@@ -69,7 +72,16 @@ from cv_infra.runner.realign import (
     REALIGN_PUBLISH_COUNT,
 )
 from cv_infra.runner.recording import BAG_DIR_NAME, VIDEO_NAME
-from cv_infra.runner.sim_runtime import SIM_CONFIG_LOG_PREFIX, SimConfig, sim_config_log_line
+from cv_infra.runner.sim_runtime import (
+    OBSTACLE_SET_LOG_MARKER,
+    SIM_CONFIG_LOG_PREFIX,
+    SimConfig,
+    obstacle_placement_plan,
+    obstacle_pool_paths,
+    obstacle_pool_plan,
+    obstacle_set_log_line,
+    sim_config_log_line,
+)
 
 #: 물리 스텝률 = GT 표본률. 리터럴이 아니라 생산 기본값에서 유도한다 —
 #: ``execution_settings.fixed_dt``가 이것을 바꾸면 게이트 4의 상한도 같이 움직여야 한다.
@@ -80,6 +92,10 @@ PHYSICS_HZ = 1.0 / SimConfig.physics_dt
 SAMPLE_MARKER = "=== sample "
 _MARKER_INDEX = re.compile(r"=== sample \d+/\d+ index=(\d+) job_id=")
 _SEED_FIELD = re.compile(r"\bseed=(\S+)")
+#: 게이트 5가 읽는 세 카운터. 마커는 생산 상수에서 온다 (리터럴 재타이핑 금지, G-25).
+_OBSTACLE_SET_FIELDS = re.compile(
+    re.escape(OBSTACLE_SET_LOG_MARKER) + r"(\d+) parked=(\d+) pool=(\d+)"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -157,6 +173,11 @@ def _item(index: int, *, sim_start_s: float, mission_sim_s: float = 20.0) -> dic
         "video_frames": 196,
         "gt_pose_samples": gt_samples,
         "contact_events": 14160,
+        # p7 장애물 카운터. 이 픽스처는 **장애물을 선언하지 않은** 운반체(p6 형태)라
+        # 셋 다 0이다 — 풀을 가진 운반체는 아래 ``_obstacle_evidence``가 만든다.
+        "obstacles_placed": 0,
+        "obstacles_parked": 0,
+        "obstacles_pool": 0,
         "timings_s": {"iteration": 34.6, "mission": mission_sim_s, "restage": 0.31},
     }
 
@@ -182,7 +203,7 @@ def _evidence(out_root: Path, n: int = 4) -> tuple[dict, str]:
     return summary.doc, _log(summary.doc)
 
 
-def _log(summary: dict) -> str:
+def _log(summary: dict, obstacle_lines: dict[int, str] | None = None) -> str:
     """러너 stdout — 실물과 같이 **docker의 타임스탬프 접두가 붙은 채로** 캡처된다.
 
     (실측 W3 `logs/runner.log`: ``2026-08-27T02:09:24.893500865Z [cv-runner] …``.
@@ -191,7 +212,12 @@ def _log(summary: dict) -> str:
     n = summary["n"]
     stamp = "2026-08-27T02:09:24.893500865Z "
     seed_line = stamp + sim_config_log_line(1 / 60, 1 / 60, 42, "sha256:cb39be9a")
+    obstacle_lines = obstacle_lines or {}
     lines = [f"{stamp}[cv-runner] batch admitted: {n} sample(s)", seed_line]
+    if 0 in obstacle_lines:
+        # 표본 0의 배치는 두 번째 pre-reset 훅이 부팅 중에 한다 — load_scene이 seed
+        # 라인을 찍은 **뒤**다(훅은 emit_sim_config 다음에 돈다).
+        lines.append(stamp + obstacle_lines[0])
     for item in summary["iterations"]:
         index = item["index"]
         lines.append(
@@ -199,6 +225,8 @@ def _log(summary: dict) -> str:
             f"index={index} job_id={item['job_id']} ==="
         )
         if index:  # 표본 0의 라인은 load_scene이 이미 찍었다 (라인 수 = n, n+1 아님)
+            if index in obstacle_lines:  # restage가 emit_sim_config보다 먼저 찍는다
+                lines.append(stamp + obstacle_lines[index])
             lines.append(seed_line)
         lines.append(f"{stamp}[cv-runner] sut realign: {item['realign']}")
         lines.append(f"{stamp}[cv-runner] bag topics (4): ['/clock', '/odom']")
@@ -566,7 +594,262 @@ def test_a_non_reaching_sample_is_not_residue(evidence):
 
 
 # --------------------------------------------------------------------------- #
-# 구조 절반 — 네 게이트가 **생산 코드에서** 성립하는가 (합성 증적으로는 못 보는 층)
+# 게이트 5 — 장애물 세트 잔존 0 (p7)
+# --------------------------------------------------------------------------- #
+#: 장애물을 선언한 운반체의 표본별 그룹 구성 (chair, desk, forklift 개수).
+#: CEO 목표 표현력 그대로 — "의자 1 · 책상 n={0~5} · 지게차 2". 표본 2는 **0개**다:
+#: ``[]``(이 표본은 아무것도 놓지 않는다)와 ``None``(풀이 없다)의 갈림을 픽스처가
+#: 실제로 밟지 않으면 게이트는 그 함정에 대해 아무 말도 못 한다(G-59).
+_OBSTACLE_GROUPS = ((1, 0, 2), (1, 5, 2), (0, 0, 0), (1, 2, 2))
+
+
+def _obstacle_entries(chairs: int, desks: int, forklifts: int) -> list[dict]:
+    """구체형(싱글턴 전개 후) 장애물 엔트리 — M1 materialize가 내려보내는 그 모양."""
+    entries = []
+    for asset, count in (("chair", chairs), ("desk", desks), ("forklift", forklifts)):
+        for j in range(count):
+            entries.append({"asset": asset, "count": 1, "x": 1.0 + j, "y": 2.0 - j, "yaw": 0.3 * j})
+    return entries
+
+
+def _obstacle_evidence(out_root: Path) -> tuple[dict, str]:
+    """장애물 풀을 가진 건강한 운반체 1회분 (요약 문서 + 러너 로그).
+
+    라인·경로·개수는 전부 **생산 순수 함수에서 유도**한다(``obstacle_pool_plan`` ->
+    ``obstacle_pool_paths`` -> ``obstacle_placement_plan`` -> ``obstacle_set_log_line``).
+    손으로 적으면 이 검사기는 *자기가 만든 형태*만 통과시키게 된다(G-25).
+
+    표본 0의 세트 적용 라인은 **부팅 구간**에 있다: 배치는 두 번째 pre-reset 훅이고
+    루프는 ``if position:``에서만 restage 한다 — seed 라인과 정확히 같은 구조(n+1 아님).
+    부팅은 이 밖에도 ``obstacle pool spawned:`` 1줄과 멤버당 ``obstacle physics:`` 감사
+    1줄을 찍지만, 게이트 5는 그것을 소비하지 않는다(그 층은 W1 소유).
+    """
+    per_sample = [_obstacle_entries(*groups) for groups in _OBSTACLE_GROUPS]
+    pool = obstacle_pool_paths(obstacle_pool_plan(per_sample))
+    n = len(per_sample)
+    summary = BatchSummary(out_root, "env-obstacles/r0", n, started_at=1787796540.0)
+    summary.doc["boot"] = {"bootstrap_s": 0.0054, "total_s": 31.4}
+    set_lines: dict[int, str] = {}
+    start = 0.0
+    for index, entries in enumerate(per_sample):
+        placed, parked = obstacle_placement_plan(entries, pool)
+        set_lines[index] = obstacle_set_log_line(placed, parked)
+        item = _item(index, sim_start_s=start)
+        item["obstacles_placed"] = len(placed)
+        item["obstacles_parked"] = len(parked)
+        item["obstacles_pool"] = len(placed) + len(parked)
+        start = item["sim_time_end_s"]
+        summary.add_iteration(item)
+    summary.finish(finished_at=1787800313.6)
+    return summary.doc, _log(summary.doc, set_lines)
+
+
+@pytest.fixture
+def obstacle_evidence(tmp_path):
+    doc, log = _obstacle_evidence(tmp_path)
+    return doc, log, tmp_path
+
+
+def obstacle_set_residue(summary: dict, log: str) -> list[str]:
+    """게이트 5 — 표본 i는 표본 i-1의 **장애물 배치** 위에서 돌지 않는다.
+
+    잔존의 형태 셋: ① 표본마다 ``obstacle_set_applied=`` 라인 정확히 1(0이면 이전
+    표본의 배치가 그대로 살아 있다 — 가장 조용한 잔존이다: 로그도 요약도 아무 말을
+    안 하고 표본 i가 표본 i-1의 장애물 위에서 판정된다) ② 라인의 placed/parked/pool이
+    그 표본 항목의 3키와 일치하고 ``placed + parked == pool`` ③ pool이 전 표본
+    상수(증가 = 반복 중 재생성의 서명 — p6c2 §2.1이 실측한 그 증식).
+
+    **한계(숨기지 않는다)**: 카운터는 "배치 호출이 돌았다"만 증명한다. "prim이 실제로
+    그 좌표에 있다"는 GPU 관측이고 W0 ⓓ/W1이 소유한다 — realign 카운터가 12/12인데
+    AMCL 믿음은 1/12였던 p6c3 T3 §9-2와 같은 층위 구분이다.
+
+    장애물을 선언하지 않은 배치(풀 0)에서는 ①②③이 **공허**하다. 그 경우 이 검사기가
+    보는 것은 하나뿐이다: 풀이 없는데 세트 라인이 찍혔는가(찍혔다면 러너가 아무도
+    선언하지 않은 장애물을 놓고 있다). 무장된 팔은 ``obstacle_evidence`` 픽스처다(G-35).
+    """
+    complaints: list[str] = []
+    items = summary["iterations"]
+    n = summary["n"]
+    if len(items) != n:
+        complaints.append(f"obstacle evidence for {len(items)}/{n} sample(s)")
+    missing = [item["index"] for item in items if item.get("obstacles_pool") is None]
+    if missing:
+        complaints.append(f"sample(s) {missing}: no obstacle counters at all — nothing to check")
+        return complaints
+
+    lines = log.splitlines()
+    markers = [i for i, line in enumerate(lines) if SAMPLE_MARKER in line]
+    indices = [int(_MARKER_INDEX.search(lines[i]).group(1)) for i in markers]
+    if indices != list(range(n)):
+        complaints.append(f"sample markers {indices} != {list(range(n))} (n={n})")
+        return complaints
+    bounds = [0, *markers, len(lines)]
+    segments = [
+        [
+            found.groups()
+            for line in lines[bounds[position] : bounds[position + 1]]
+            if (found := _OBSTACLE_SET_FIELDS.search(line))
+        ]
+        for position in range(len(bounds) - 1)
+    ]
+
+    pools = [item["obstacles_pool"] for item in items]
+    if set(pools) == {0}:
+        stray = sum(len(found) for found in segments)
+        if stray:
+            complaints.append(
+                f"{stray} {OBSTACLE_SET_LOG_MARKER} line(s) in a batch that declared no "
+                "obstacles — the runner is placing something nobody asked for"
+            )
+        return complaints
+    if len(set(pools)) != 1:
+        complaints.append(
+            f"pool size is not constant across samples ({pools}) — a pool that GROWS is the "
+            "signature of re-spawning inside the sample loop (p6c2 §2.1: 2 -> 48 material "
+            "prims over 24 respawns)"
+        )
+
+    for position, found in enumerate(segments):
+        # 구간 0 = 부팅(표본 0의 배치 훅), 구간 1 = 표본 0(루프가 restage 하지 않는다),
+        # 그 뒤 = 표본 i. seed 라인과 같은 구조다.
+        expected = 0 if position == 1 else 1
+        if len(found) != expected:
+            where = "boot" if position == 0 else f"sample {position - 1}"
+            complaints.append(
+                f"{where}: {len(found)} obstacle-set line(s), expected {expected} (one per "
+                "sample; sample 0's is applied by the boot hook). A sample with no line ran "
+                "on the PREVIOUS sample's placement"
+            )
+    for item in items:
+        index = item["index"]
+        position = 0 if index == 0 else index + 1
+        found = segments[position] if position < len(segments) else []
+        if len(found) != 1:
+            continue  # 라인 수는 위에서 이미 울었다
+        placed, parked, pool = (int(value) for value in found[0])
+        counters = (item["obstacles_placed"], item["obstacles_parked"], item["obstacles_pool"])
+        if (placed, parked, pool) != counters:
+            complaints.append(
+                f"sample {index}: log says placed/parked/pool {(placed, parked, pool)} but the "
+                f"summary says {counters} — the line and the counters describe different worlds"
+            )
+        if placed + parked != pool:
+            complaints.append(
+                f"sample {index}: placed {placed} + parked {parked} != pool {pool} — some pool "
+                "member was neither placed nor parked, i.e. it kept the pose it had in the "
+                "PREVIOUS sample"
+            )
+    return complaints
+
+
+def test_healthy_carrier_applies_one_obstacle_set_per_sample(obstacle_evidence):
+    summary, log, _ = obstacle_evidence
+    assert obstacle_set_residue(summary, log) == []
+    # 픽스처가 실제로 무장돼 있는지: 0개 표본 하나 + 최대 다중도 표본 하나를 밟는다.
+    assert [item["obstacles_placed"] for item in summary["iterations"]] == [3, 8, 0, 5]
+    assert {item["obstacles_pool"] for item in summary["iterations"]} == {8}
+
+
+def test_a_carrier_that_declared_no_obstacles_is_not_residue(evidence):
+    """반대편(G-35): 장애물이 없는 배치는 세트 라인이 0인 것이 정상이다.
+
+    이 팔은 **공허하다** — 그리고 그것이 요점이다. 기능이 꺼진 배치에서 게이트가
+    울면 p6 배치가 전부 red가 된다. 무장 증명은 위/아래의 장애물 픽스처가 한다.
+    """
+    summary, log, _ = evidence
+    assert {item["obstacles_pool"] for item in summary["iterations"]} == {0}
+    assert obstacle_set_residue(summary, log) == []
+
+
+def test_a_pool_without_a_declaration_is_residue(evidence):
+    """공허한 팔의 무장 실증: 풀 0인 배치에 세트 라인이 하나라도 있으면 운다."""
+    summary, log, _ = evidence
+    log += f"[cv-runner] {OBSTACLE_SET_LOG_MARKER}2 parked=0 pool=2 placed=[] parked_paths=[]\n"
+    assert obstacle_set_residue(summary, log)
+
+
+def _drop_last(log: str, needle: str) -> str:
+    """마지막으로 ``needle``을 담은 줄 하나를 지운다 (심는 결핍용)."""
+    lines = log.splitlines()
+    for position in range(len(lines) - 1, -1, -1):
+        if needle in lines[position]:
+            del lines[position]
+            break
+    return "\n".join(lines)
+
+
+def _rewrite_set_lines(log: str, *, first_index: int, parked_delta: int, pool_delta: int) -> str:
+    """표본 ``first_index`` 이후의 세트 라인 카운터를 다시 쓴다 (심는 결핍용)."""
+    counters = re.compile(r"parked=(\d+) pool=(\d+)")
+    index = -1
+    rewritten = []
+    for line in log.splitlines():
+        found = _MARKER_INDEX.search(line)
+        if found:
+            index = int(found.group(1))
+        if index >= first_index and OBSTACLE_SET_LOG_MARKER in line:
+            line = counters.sub(
+                lambda m: f"parked={int(m.group(1)) + parked_delta} "
+                f"pool={int(m.group(2)) + pool_delta}",
+                line,
+            )
+        rewritten.append(line)
+    return "\n".join(rewritten)
+
+
+def _the_last_sample_never_applied_its_set(summary: dict, log: str) -> tuple[dict, str]:
+    return summary, _drop_last(log, OBSTACLE_SET_LOG_MARKER)
+
+
+def _the_surplus_was_never_parked(summary: dict, log: str) -> tuple[dict, str]:
+    summary["iterations"][2]["obstacles_parked"] = 0
+    return summary, log
+
+
+def _the_pool_grew_from_sample_2(summary: dict, log: str) -> tuple[dict, str]:
+    """반복 중 재생성 — 로그와 요약이 **함께** 커진다.
+
+    라인↔카운터 일치도, ``placed + parked == pool``도 여전히 성립하므로 이 결핍을
+    잡을 수 있는 규칙은 상수 규칙 하나뿐이다. 요약만 키우면 불일치 규칙이 먼저 울고,
+    그러면 이 대조는 상수 규칙이 지워져도 초록으로 남는다(G-59: 양성 대조는 겨냥한
+    규칙을 고립시켜야 한다 — 실측으로 확인했다).
+    """
+    for item in summary["iterations"][2:]:
+        item["obstacles_parked"] += 1
+        item["obstacles_pool"] += 1
+    return summary, _rewrite_set_lines(log, first_index=2, parked_delta=1, pool_delta=1)
+
+
+def _a_member_was_neither_placed_nor_parked(summary: dict, log: str) -> tuple[dict, str]:
+    """라인 자체가 안 맞는다: placed + parked < pool.
+
+    카운터도 같이 줄이므로 라인↔요약 일치 규칙은 침묵한다 — 남는 것은 합 규칙뿐이고,
+    그것이 뜻하는 바는 "어떤 풀 멤버가 배치도 파킹도 되지 않았다" = 그 멤버는 직전
+    표본의 포즈를 그대로 들고 있다.
+    """
+    for item in summary["iterations"][2:]:
+        item["obstacles_parked"] -= 1
+    return summary, _rewrite_set_lines(log, first_index=2, parked_delta=-1, pool_delta=0)
+
+
+@pytest.mark.parametrize(
+    ("label", "plant"),
+    [
+        ("한 표본이 세트를 적용하지 않았다", _the_last_sample_never_applied_its_set),
+        ("잉여가 파킹되지 않았다", _the_surplus_was_never_parked),
+        ("반복 중 풀이 커졌다 (재생성)", _the_pool_grew_from_sample_2),
+        ("어떤 멤버도 배치도 파킹도 되지 않았다", _a_member_was_neither_placed_nor_parked),
+    ],
+)
+def test_obstacle_set_gate_fires_on_planted_residue(obstacle_evidence, label, plant):
+    """양성 대조 (G-59): 결핍을 하나씩 심으면 게이트가 그 표본을 지목해 운다."""
+    summary, log, _ = obstacle_evidence
+    summary, log = plant(summary, log)
+    assert obstacle_set_residue(summary, log), label
+
+
+# --------------------------------------------------------------------------- #
+# 구조 절반 — 게이트들이 **생산 코드에서** 성립하는가 (합성 증적으로는 못 보는 층)
 # --------------------------------------------------------------------------- #
 def _run_function() -> ast.FunctionDef:
     tree = ast.parse(Path(m2_batch.__file__).read_text(encoding="utf-8"))
@@ -675,6 +958,43 @@ def test_the_applied_settings_line_is_emitted_once_per_sample_after_the_first():
         and node.lineno <= emits[0].lineno <= node.end_lineno
     ]
     assert guards, "emit_sim_config is no longer guarded by `if position:` (line count becomes n+1)"
+
+
+def test_every_sample_hands_its_own_obstacle_set_to_the_restage():
+    """게이트 5의 구조: 표본마다 **그 표본의** 세트를 넘기는가.
+
+    합성 증적만으로는 이 층을 볼 수 없다 — 운반체가 ``obstacle_set`` 인자를 통째로
+    빼도 요약·로그 픽스처는 그대로 초록이다(실측: M11 변이가 NEG-6 38개를 전부
+    통과시켰다). 그래서 인자 자체를 AST 에서 본다.
+
+    표본 0의 배치는 **부팅 훅**(``apply_obstacle_set``)이 하고 루프는 ``if position:``
+    아래에서만 restage 하므로, 등록도 호출도 각각 정확히 하나여야 한다.
+    """
+    loop = _sample_loop()
+    restages = [
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "restage"
+    ]
+    assert len(restages) == 1, "the sample loop restages exactly once"
+    assert "obstacle_set" in [kw.arg for kw in restages[0].keywords], (
+        "restage no longer receives this sample's obstacle set — every sample after 0 "
+        "would run on sample 0's placement, and nothing else in this file would notice"
+    )
+    run = _run_function()
+    applies = [
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and ast.unparse(node.func.value) == "sim.pre_reset"
+        and "apply_obstacle_set" in ast.unparse(node)
+    ]
+    assert len(applies) == 1, "sample 0's placement is exactly one boot hook"
+    assert not any(loop.lineno <= node.lineno <= loop.end_lineno for node in applies)
 
 
 def test_the_soft_path_never_rebinds_the_telemetry_sampler():
