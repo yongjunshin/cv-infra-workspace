@@ -18,7 +18,12 @@ re-derived from if it moves silently:
 * (5) the RANDOM_FIELDS <-> schema bind, BOTH ways (G-25: a randomizable field
   added to one side and not the other would never be drawn / would crash);
 * (6) the stamp and what it must not touch (seed carries over; the submitted
-  document is not mutated).
+  document is not mutated);
+* (7) the p7 obstacle walk — the same five properties for the LIST half of the
+  draw order (its own golden, its own accounting), plus the two things only a
+  list can get wrong: the expansion re-validates as a submitted document, and
+  an empty expansion is ``None`` (never ``[]``, which would move an identity
+  key — tests/test_report_regression.py holds the other end of that).
 """
 
 from __future__ import annotations
@@ -34,13 +39,15 @@ import pytest
 from cv_infra.contract import schema as schema_mod
 from cv_infra.contract.derive import (
     DERIVE_VERSION,
+    OBSTACLE_FIELDS,
     RANDOM_FIELDS,
     UNIFORM_DECIMALS,
     distribution_fields,
     materialize_request,
     sample_rng,
+    unmaterialized_fields,
 )
-from cv_infra.contract.schema import Choice, Uniform, VerificationRequest
+from cv_infra.contract.schema import Choice, Scenario, Uniform, VerificationRequest
 
 _DIST_DOC = {
     "apiVersion": "cv-infra/v1",
@@ -262,7 +269,12 @@ def _randomizable_schema_fields() -> set[tuple[str, str]]:
     union = typing.get_args(schema_mod.RandomizableFloat)[0]
     found: set[tuple[str, str]] = set()
     for block_name, block_field in schema_mod.Scenario.model_fields.items():
-        for candidate in (block_field.annotation, *getattr(block_field.annotation, "__args__", ())):
+        # One unwrap reaches a block model (``DebugObstacle | None``); a LIST of
+        # them (``list[Obstacle] | None``) needs a second one, or the obstacle
+        # fields would be invisible to this extractor and the bind would pass by
+        # never looking (the exact G-25 shape this function exists to prevent).
+        outer = (block_field.annotation, *getattr(block_field.annotation, "__args__", ()))
+        for candidate in (*outer, *(a for c in outer for a in getattr(c, "__args__", ()))):
             fields = getattr(candidate, "model_fields", None)
             if not fields:
                 continue
@@ -273,10 +285,13 @@ def _randomizable_schema_fields() -> set[tuple[str, str]]:
 
 
 def test_random_fields_matches_the_schema_both_ways():
+    """The union of the two walks (scalar blocks + the obstacle list) must be
+    exactly what the schema annotates randomizable — neither more nor less."""
     schema_fields = _randomizable_schema_fields()
     assert schema_fields, "extraction went empty (positive control, G-07)"
-    assert set(RANDOM_FIELDS) == schema_fields
-    assert len(RANDOM_FIELDS) == len(set(RANDOM_FIELDS)) == 8  # design §0-1
+    assert schema_fields == set(RANDOM_FIELDS) | {("obstacles", f) for f in OBSTACLE_FIELDS}
+    assert len(RANDOM_FIELDS) == len(set(RANDOM_FIELDS)) == 8  # design §0-1: scalars stay 8
+    assert OBSTACLE_FIELDS == ("x", "y", "yaw")  # draw order INSIDE one instance
 
 
 def test_distribution_fields_reports_wire_paths_in_draw_order():
@@ -334,3 +349,235 @@ def test_repeats_one_with_a_distribution_still_derives_sample_zero():
     sample = materialize_request(_request(doc), 0)
     assert sample.scenario.derivation.index == 0
     assert _drawn(sample) == _GOLDEN[0]  # repeats does not enter the derivation
+
+
+# --------------------------------------------------------------------------- #
+# (7) obstacles — the LIST half of the draw order (p7)
+# --------------------------------------------------------------------------- #
+
+# The CEO's own example ("의자 1개, 책상/상자 n={0~5}개, 자동차 2개"), narrowed to
+# n={0~3}. ``debug_obstacle`` is ABSENT on purpose: the legacy box and this list
+# are mutually exclusive (schema ``_one_home_for_world_obstacles``), so a document
+# that declares obstacles cannot carry it.
+_OBSTACLE_DOC = {
+    **_DIST_DOC,
+    "scenario": {
+        **{k: v for k, v in _DIST_DOC["scenario"].items() if k != "debug_obstacle"},
+        "obstacles": [
+            {"asset": "chair", "x": {"uniform": [-2.0, 2.0]}, "y": 1.0},
+            {
+                "asset": "box",
+                "count": {"randint": [0, 3]},
+                "x": {"uniform": [-6.0, 6.0]},
+                "y": {"uniform": [-3.0, 3.0]},
+                "yaw": {"choice": [0.0, 1.5708]},
+                "height": 0.5,
+            },
+            {"asset": "car", "count": 2, "x": {"uniform": [4.0, 5.0]}, "y": 2.0, "yaw": 3.1416},
+        ],
+    },
+}
+
+# GOLDEN EXPANSIONS — measured 2026-08-28 on this implementation (seed 42, samples
+# 0..2 of _OBSTACLE_DOC), the sibling of ``_GOLDEN`` for the list walk. Read the
+# rows as the wire: ``count`` is 1 on every one of them (a materialized entry IS
+# one obstacle), the static fields are broadcast verbatim to every instance of
+# their group, and the ORDER is the order the runner assigns prims in.
+_OBSTACLE_GOLDEN: dict[int, list[dict]] = {
+    0: [
+        {"asset": "chair", "count": 1, "x": 0.3333, "y": 1.0, "yaw": 0.0},
+        {"asset": "box", "count": 1, "x": -4.9205, "y": -2.5721, "yaw": 0.0, "height": 0.5},
+        {"asset": "car", "count": 1, "x": 4.9142, "y": 2.0, "yaw": 3.1416},
+        {"asset": "car", "count": 1, "x": 4.9293, "y": 2.0, "yaw": 3.1416},
+    ],
+    1: [
+        {"asset": "chair", "count": 1, "x": -1.5497, "y": 1.0, "yaw": 0.0},
+        {"asset": "box", "count": 1, "x": 3.2747, "y": 1.324, "yaw": 1.5708, "height": 0.5},
+        {"asset": "box", "count": 1, "x": -5.7696, "y": -0.9704, "yaw": 1.5708, "height": 0.5},
+        {"asset": "car", "count": 1, "x": 4.2538, "y": 2.0, "yaw": 3.1416},
+        {"asset": "car", "count": 1, "x": 4.1814, "y": 2.0, "yaw": 3.1416},
+    ],
+    2: [
+        {"asset": "chair", "count": 1, "x": -0.2027, "y": 1.0, "yaw": 0.0},
+        {"asset": "car", "count": 1, "x": 4.2268, "y": 2.0, "yaw": 3.1416},
+        {"asset": "car", "count": 1, "x": 4.5301, "y": 2.0, "yaw": 3.1416},
+    ],
+}
+
+
+def _obstacles_of(request: VerificationRequest) -> list[dict] | None:
+    return request.scenario.model_dump(exclude_none=True).get("obstacles")
+
+
+@pytest.mark.parametrize("index", sorted(_OBSTACLE_GOLDEN))
+def test_obstacle_expansions_match_the_golden(index):
+    assert (
+        _obstacles_of(materialize_request(_request(_OBSTACLE_DOC), index))
+        == _OBSTACLE_GOLDEN[index]
+    )
+
+
+def test_the_scalar_draws_are_untouched_by_the_obstacle_walk():
+    """The reason ``DERIVE_VERSION`` did not move: the list walk APPENDS.
+
+    The obstacle document draws the same scalars as ``_DIST_DOC`` — checked
+    against the pre-p7 ``_GOLDEN`` literal itself, on the three scalar fields
+    this document has (it drops ``debug_obstacle``, which was drawn LAST of the
+    eight, so the shared prefix is untouched).
+    """
+    for index, golden in _GOLDEN.items():
+        scenario = materialize_request(_request(_OBSTACLE_DOC), index).scenario
+        assert {
+            "initial_pose.x": scenario.initial_pose.x,
+            "goal.x": scenario.goal.x,
+            "goal.yaw": scenario.goal.yaw,
+        } == {k: v for k, v in golden.items() if k != "debug_obstacle.x"}
+
+
+def test_the_count_sequence_is_deterministic_per_seed():
+    """A random COUNT is a draw like any other: same (seed, index) -> same n.
+
+    Positive control (G-35): another seed gives a different sequence, so the pin
+    above is not "every sample expands to the same thing".
+    """
+    counts = [
+        len(materialize_request(_request(_OBSTACLE_DOC), i).scenario.obstacles) for i in range(6)
+    ]
+    assert counts == [4, 5, 3, 3, 6, 5]
+
+    other_seed = copy.deepcopy(_OBSTACLE_DOC)
+    other_seed["scenario"] = {**other_seed["scenario"], "seed": 43}
+    assert [
+        len(materialize_request(_request(other_seed), i).scenario.obstacles) for i in range(6)
+    ] != counts
+
+
+def test_the_expansion_re_validates_as_a_submitted_document():
+    """Why there is no parallel ``MaterializedObstacle`` model: the expansion is
+    the SAME schema (that is what the runner re-validates), and it leaves nothing
+    for the execution plane to choke on."""
+    sample = materialize_request(_request(_OBSTACLE_DOC), 1)
+    dumped = sample.scenario.model_dump()
+    assert Scenario.model_validate(dumped).obstacles == sample.scenario.obstacles
+    assert all(entry.count == 1 for entry in sample.scenario.obstacles)
+    assert unmaterialized_fields(sample.scenario) == ()
+
+
+def test_a_static_group_broadcasts_and_consumes_no_draw():
+    """``count: 3`` with static x/y/yaw = three identical instances, zero draws.
+
+    Positive control (G-35): the draws of the group AFTER it are unchanged by its
+    presence, and DO shift when the same group's x becomes a distribution — so
+    "consumes no draw" is a fact about accounting, not about the groups being
+    unrelated. (Obstacles are last in the draw order, so the neighbour that can
+    witness a shift is the next GROUP, not the scalar blocks.)
+    """
+    car = {"asset": "car", "count": 2, "x": {"uniform": [4.0, 5.0]}, "y": 2.0, "yaw": 3.1416}
+    static_group = {"asset": "box", "count": 3, "x": -1.0, "y": 2.0, "yaw": 0.5, "height": 0.5}
+
+    def cars(*groups) -> list[float]:
+        doc = copy.deepcopy(_OBSTACLE_DOC)
+        doc["scenario"] = {**doc["scenario"], "obstacles": copy.deepcopy(list(groups))}
+        sample = materialize_request(_request(doc), 0)
+        return [o.x for o in sample.scenario.obstacles if o.asset == "car"]
+
+    assert cars(static_group, car) == cars(car)
+    assert cars({**static_group, "x": {"uniform": [-1.0, 1.0]}}, car) != cars(car)
+
+    doc = copy.deepcopy(_OBSTACLE_DOC)
+    doc["scenario"] = {**doc["scenario"], "obstacles": [static_group]}
+    expanded = _obstacles_of(materialize_request(_request(doc), 0))
+    assert expanded == [{**static_group, "count": 1}] * 3  # broadcast, verbatim
+
+
+def test_an_empty_expansion_leaves_no_obstacles_key_at_all():
+    """``n = 0`` for every group = "this sample has no obstacles", spelled the way
+    a document with no obstacles spells it: the key is ABSENT from the wire.
+    ``[]`` would be a different identity key (report/regression.py prunes nulls,
+    never lists) — the other end of this is pinned in test_report_regression.py.
+    """
+    doc = copy.deepcopy(_OBSTACLE_DOC)
+    doc["scenario"] = {
+        **doc["scenario"],
+        "obstacles": [{"asset": "box", "count": {"randint": [0, 0]}, "x": 1.0, "y": 2.0}],
+    }
+    sample = materialize_request(_request(doc), 0)
+    assert sample.scenario.obstacles is None
+    assert "obstacles" not in sample.scenario.model_dump(exclude_none=True)
+
+
+def test_a_document_with_obstacles_is_materialized_even_with_no_distribution():
+    """Declaring obstacles IS derivation (the expansion is the derived thing), so
+    the static short-circuit does not apply — the sample is a new object and
+    carries the stamp. The ``is`` asymmetry with a static document is deliberate.
+    """
+    doc = copy.deepcopy(_STATIC_DOC)
+    doc["scenario"] = {
+        **{k: v for k, v in doc["scenario"].items() if k != "debug_obstacle"},
+        "obstacles": [{"asset": "chair", "count": 2, "x": 1.0, "y": 2.0}],
+    }
+    request = _request(doc)
+    sample = materialize_request(request, 0)
+    assert sample is not request
+    assert sample.scenario.derivation.index == 0
+    assert [o.count for o in sample.scenario.obstacles] == [1, 1]
+
+
+def test_obstacle_determinism_survives_a_fresh_interpreter():
+    """``rng.randint`` rides the same ``_randbelow`` machinery ``rng.choice``
+    already does — this is the cross-process pin that says so (R1)."""
+    code = (
+        "import json;"
+        "from cv_infra.contract.schema import VerificationRequest;"
+        "from cv_infra.contract.derive import materialize_request;"
+        f"doc={_OBSTACLE_DOC!r};"
+        "req=VerificationRequest.model_validate(doc);"
+        "print(json.dumps(materialize_request(req,1).scenario.model_dump(),sort_keys=True))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout
+    expected = json.dumps(
+        materialize_request(_request(_OBSTACLE_DOC), 1).scenario.model_dump(), sort_keys=True
+    )
+    assert out.strip() == expected
+
+
+def test_distribution_fields_reports_the_obstacle_paths_after_the_scalars():
+    """The wire path names the DECLARATION (group index), which is exactly what
+    ``errors.render_loc`` prints for the same violation."""
+    assert distribution_fields(_request(_OBSTACLE_DOC).scenario) == (
+        "scenario.initial_pose.x",
+        "scenario.goal.x",
+        "scenario.goal.yaw",
+        "scenario.obstacles[0].x",
+        "scenario.obstacles[1].x",
+        "scenario.obstacles[1].y",
+        "scenario.obstacles[1].yaw",
+        "scenario.obstacles[2].x",
+    )
+
+
+def test_unmaterialized_fields_reports_unexpanded_counts_too():
+    """The runner's single window (§A5.3): ``count: 3`` is not a distribution, but
+    handing it to the execution plane would put ONE box where three were asked
+    for and judge the run anyway (G-25). After materialization: nothing left.
+    """
+    doc = copy.deepcopy(_OBSTACLE_DOC)
+    doc["scenario"] = {
+        **doc["scenario"],
+        "goal": {"x": -6.0, "y": 5.0, "yaw": 1.5708},
+        "initial_pose": {"x": -6.0, "y": -1.0, "yaw": 3.1416},
+        "obstacles": [
+            {"asset": "box", "count": 3, "x": 1.0, "y": 2.0},  # static, but NOT expanded
+            {"asset": "chair", "count": {"randint": [0, 2]}, "x": 1.0, "y": 2.0},
+            {"asset": "car", "count": 1, "x": 1.0, "y": 2.0},  # already concrete
+        ],
+    }
+    scenario = _request(doc).scenario
+    assert distribution_fields(scenario) == ()  # no DISTRIBUTION anywhere...
+    assert unmaterialized_fields(scenario) == (  # ...but two groups are unexpanded
+        "scenario.obstacles[0].count",
+        "scenario.obstacles[1].count",
+    )
+    assert unmaterialized_fields(materialize_request(_request(doc), 0).scenario) == ()

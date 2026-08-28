@@ -212,8 +212,13 @@ def test_admitted_spec_rides_fanned_out_jobs_and_persists(tmp_path):
 
 
 def _randomized_doc() -> dict:
-    """캐노니컬 요청 + 3축 분포 + p6 실행 노브 — parity 가드의 입력을 계약 성장에 맞춰
-    키운다(G-59 ③: optional 필드를 더하면 그것을 선언하는 입력을 함께 넣어라)."""
+    """캐노니컬 요청 + 3축 분포 + p6 실행 노브 + p7 장애물 — parity 가드의 입력을 계약
+    성장에 맞춰 키운다(G-59 ③: optional 필드를 더하면 그것을 선언하는 입력을 함께 넣어라).
+
+    장애물 블록은 세 갈래를 다 밟는다: 개수 고정(chair) · 개수 randint(box) · 인스턴스
+    내부 분포(x/y/yaw). 자산명은 ``uniform``/``choice``/``randint``를 **부분문자열로도**
+    포함하지 않는 것만 쓴다 — 아래 §④ 누출 검사가 스펙 전체를 문자열로 훑기 때문이다.
+    """
     doc = _request_doc()
     doc["scenario"]["goal"] = {
         "x": {"choice": [-6.0, 5.0]},
@@ -221,6 +226,10 @@ def _randomized_doc() -> dict:
         "yaw": {"uniform": [0.0, 3.14]},
     }
     doc["scenario"]["initial_pose"] = {"x": {"uniform": [-6.5, -5.5]}, "y": -1.0, "yaw": 3.1416}
+    doc["scenario"]["obstacles"] = [
+        {"asset": "chair", "x": {"uniform": [-2.0, 2.0]}, "y": 1.0, "yaw": {"choice": [0.0, 1.57]}},
+        {"asset": "box", "count": {"randint": [0, 2]}, "x": {"uniform": [-6.0, 6.0]}, "y": 2.0},
+    ]
     doc["execution_settings"] = {"repeats": 3, "fixed_dt": 0.02, "min_pass_ratio": 0.8}
     return doc
 
@@ -295,6 +304,7 @@ def test_materialization_is_identical_on_the_rest_and_cli_planes(tmp_path):
         assert spec["scenario"]["initial_pose"]["x"] == derived.initial_pose.x
         # ④ 분포 표기는 실행 평면으로 새지 않는다 (§0-5 러너 거부의 반대편 끝)
         assert "uniform" not in json.dumps(spec) and "choice" not in json.dumps(spec)
+        assert "randint" not in json.dumps(spec)  # 개수 축도 같은 규칙 (p7)
 
     # 표본 3개가 서로 다른 문서다 (핀이 "전부 같은 상수"로도 통과하지 않는다는 대조).
     goals = {spec["scenario"]["goal"]["yaw"] for spec in runner.specs.values()}
@@ -312,6 +322,31 @@ def test_a_materialized_spec_is_accepted_by_the_real_runner_seam():
     restored, _adapter = parse_request(_job_spec_for(sample, "jid-1"))
     assert restored.scenario.derivation.index == 2
     assert restored.scenario.goal.x == sample.scenario.goal.x
+
+
+def test_the_runner_seam_receives_obstacles_already_expanded():
+    """장애물의 착지 확인: 러너가 복원한 스펙에는 **구체형만** 있다 — 그룹이 아니라
+    인스턴스, 즉 모든 원소가 ``count == 1``이고 좌표는 평범한 float다.
+
+    개수가 표본마다 다르므로(randint) 특정 길이를 가정하지 않고, 대신 세 표본을 모두
+    태워 **키가 없는 표본도 정상**임을 함께 건다(빈 전개 = 키 자체가 없음).
+    """
+    from cv_infra.contract.derive import materialize_request, unmaterialized_fields
+    from cv_infra.runner.main import parse_request
+
+    request = _admit(_randomized_doc()).request
+    lengths = set()
+    for index in range(3):
+        sample = materialize_request(request, index)
+        restored, _adapter = parse_request(_job_spec_for(sample, f"jid-{index}"))
+        obstacles = restored.scenario.obstacles or []
+        lengths.add(len(obstacles))
+        assert all(entry.count == 1 for entry in obstacles)
+        assert all(
+            isinstance(entry.x, float) and isinstance(entry.yaw, float) for entry in obstacles
+        )
+        assert unmaterialized_fields(restored.scenario) == ()
+    assert lengths, "no sample carried the obstacle block (G-59: the input must reach it)"
 
 
 # --------------------------------------------------------------------------- #

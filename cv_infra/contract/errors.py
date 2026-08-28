@@ -134,7 +134,8 @@ def _render_got(err: Mapping[str, Any]) -> str:
 
 
 def _unwrap_annotation(annotation: Any, index_step: bool) -> Any:
-    """Best-effort unwrap of ``list[X]`` / ``X | None`` / ``Annotated[X, ...]``."""
+    """Best-effort unwrap of ``list[X]`` / ``X | None`` / ``list[X] | None`` /
+    ``Annotated[X, ...]``."""
     import typing  # stdlib; local so module import stays trivially cheap
 
     origin = typing.get_origin(annotation)
@@ -143,6 +144,12 @@ def _unwrap_annotation(annotation: Any, index_step: bool) -> Any:
         # stepping through a sequence index -> the element annotation
         if origin in (list, tuple) and args:
             return args[0]
+        # an OPTIONAL list (``list[X] | None`` — every optional block-list in the
+        # contract) still has an element type: peel the union and retry, or the
+        # example is silently lost for every violation under it (NFR-INTAKE-001).
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return _unwrap_annotation(non_none[0], index_step=True)
         return None
     if origin is None:
         return annotation

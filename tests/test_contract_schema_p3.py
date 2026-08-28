@@ -289,7 +289,8 @@ def test_resource_budget_shape_and_bounds():
         # debug_obstacle = the D-2' addition (2026-07-10) on the Phase-2 set;
         # initial_pose = the D-2 addition (CEO 2026-08-04, landed p5c11);
         # derivation = the p6c3 platform stamp (optional/None on every submitted
-        # document, so the identity keys behind it do not move — D-5).
+        # document, so the identity keys behind it do not move — D-5);
+        # obstacles = the p7 list (same optional/None shape, same reason).
         (
             Scenario,
             {
@@ -301,6 +302,7 @@ def test_resource_budget_shape_and_bounds():
                 "debug_obstacle",
                 "initial_pose",
                 "derivation",
+                "obstacles",
             },
         ),
     ],

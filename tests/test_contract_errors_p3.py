@@ -207,3 +207,32 @@ def test_sut_image_examples_are_shapes_not_a_named_image():
     assert _names_a_runnable_image("image_ref: ghcr.io/o/i@sha256:" + "d" * 64)
     # ...and the shipped shape teaches the digest pin (CLAUDE §2-7).
     assert "@sha256:" in EXAMPLE_IMAGE_REF
+
+
+def test_an_optional_list_field_still_exemplifies_its_element(monkeypatch):
+    """``list[X]`` and ``list[X] | None`` must behave the SAME at an index step.
+
+    Measured before the repair (p7c1): the plain list kept its example, the
+    OPTIONAL list returned "" — so every violation under an optional block-list
+    (``scenario.obstacles[0].x`` is the live one) silently lost the fixable half
+    of the friendly error (NFR-INTAKE-001). The two rows below are that table.
+    """
+    from pydantic import BaseModel, Field
+
+    class Item(BaseModel):
+        x: float = Field(examples=[-6.0])
+
+    class Required(BaseModel):
+        items: list[Item]
+
+    class Optional_(BaseModel):
+        items: list[Item] | None = None
+
+    examples = []
+    for model in (Required, Optional_):
+        with pytest.raises(ValidationError) as exc_info:
+            model.model_validate({"items": [{"x": "later"}]})
+        (err,) = from_validation_error(exc_info.value, model=model)
+        assert err.field_path == "items[0].x"
+        examples.append(err.example)
+    assert examples == ["x: -6.0", "x: -6.0"]

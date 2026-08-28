@@ -17,7 +17,11 @@ tests/test_contract_derive.py; this file is the schema surface only:
 * (5) the platform stamp ``scenario.derivation`` is rejected at ADMIT when a
   consumer submits it (paired with the same document minus the stamp being
   admitted — G-35: a rejection test alone is true even if nothing is admitted);
-* (6) ``min_pass_ratio`` bounds (shape only this cycle — p6c4 consumes it).
+* (6) ``min_pass_ratio`` bounds (shape only this cycle — p6c4 consumes it);
+* (7) the p7 obstacle notation — the COUNT axis (``randint``, its own union),
+  what an ``Obstacle`` may say, and the two loud rules that keep a stage from
+  quietly disagreeing with the document (dimensions are the box's only; the
+  legacy single box and the list are mutually exclusive).
 """
 
 from __future__ import annotations
@@ -32,12 +36,16 @@ from pydantic import ValidationError
 from cv_infra.contract.errors import ContractError, from_validation_error
 from cv_infra.contract.loader import load_request
 from cv_infra.contract.schema import (
+    BUILTIN_BOX_ASSET,
+    MAX_OBSTACLE_COUNT,
     Choice,
     DebugObstacle,
     DerivationMeta,
     ExecutionSettings,
     Goal,
     InitialPose,
+    Obstacle,
+    Randint,
     Scenario,
     Uniform,
     VerificationRequest,
@@ -179,8 +187,9 @@ def test_determinism_inputs_reject_a_distribution(field):
 def test_model_field_sets_pin_the_notation_shape():
     assert set(Uniform.model_fields) == {"uniform"}
     assert set(Choice.model_fields) == {"choice"}
+    assert set(Randint.model_fields) == {"randint"}
     assert set(DerivationMeta.model_fields) == {"version", "index"}
-    for model in (Uniform, Choice, DerivationMeta):
+    for model in (Uniform, Choice, Randint, DerivationMeta):
         with pytest.raises(ValidationError):  # extra="forbid" at every level
             model.model_validate({**_valid_of(model), "bogus": 1})
 
@@ -189,6 +198,7 @@ def _valid_of(model) -> dict:
     return {
         Uniform: {"uniform": [0.0, 1.0]},
         Choice: {"choice": [0.0]},
+        Randint: {"randint": [0, 2]},
         DerivationMeta: {"version": "cv-derive/1", "index": 0},
     }[model]
 
@@ -315,3 +325,155 @@ def test_initial_pose_and_debug_obstacle_still_require_their_core_keys():
         InitialPose.model_validate({"x": 1.0, "y": 2.0})
     with pytest.raises(ValidationError):
         DebugObstacle.model_validate({"x": 1.0})
+
+
+# --------------------------------------------------------------------------- #
+# (7) obstacles — the count axis and the Obstacle block (p7)
+# --------------------------------------------------------------------------- #
+_BOX = {"asset": BUILTIN_BOX_ASSET, "x": -6.0, "y": 2.0}
+
+
+def _obstacle_errors(**overrides) -> list[dict]:
+    with pytest.raises(ValidationError) as excinfo:
+        Obstacle.model_validate({**_BOX, **overrides})
+    return excinfo.value.errors(include_url=False)
+
+
+@pytest.mark.parametrize("bounds", [[0, 0], [2, 2], [0, MAX_OBSTACLE_COUNT], [0, 5]])
+def test_randint_accepts_the_closed_interval(bounds):
+    """``lo == hi`` is legal for the same reason it is on ``uniform``: pinning one
+    group's count while another sweeps must not force a shape rewrite."""
+    assert Obstacle.model_validate({**_BOX, "count": {"randint": bounds}}).count.randint == bounds
+
+
+@pytest.mark.parametrize(
+    ("count", "expect_type"),
+    [
+        ({"randint": [5, 0]}, "value_error"),  # lo > hi = a typo, not a descending range
+        ({"randint": [-1, 2]}, "greater_than_equal"),  # there is no negative count
+        ({"randint": [0, 99]}, "less_than_equal"),  # MAX_OBSTACLE_COUNT: expansion runaway
+        ({"randint": [3]}, "too_short"),
+        ({"randint": [1, 2, 3]}, "too_long"),
+        (2.5, "int_from_float"),  # a count is an integer, never rounded into one
+        (None, "int_type"),  # non-optional on purpose (a pruned null forks identity)
+        (-1, "greater_than_equal"),
+        (MAX_OBSTACLE_COUNT + 1, "less_than_equal"),
+    ],
+)
+def test_malformed_count_is_rejected_loudly(count, expect_type):
+    assert [e["type"] for e in _obstacle_errors(count=count)] == [expect_type]
+
+
+def test_randint_bounds_error_names_the_bounds_and_the_fix():
+    (err,) = _obstacle_errors(count={"randint": [5, 0]})
+    assert "[5, 0]" in err["msg"] and "randint: [0, 5]" in err["msg"]
+
+
+def test_the_count_axis_has_its_own_vocabulary_and_says_so():
+    """A count is not a float axis: writing the FLOAT notation there must teach
+    the consumer the words that DO belong (NFR-INTAKE-001), not silently coerce."""
+    (err,) = _obstacle_errors(count={"uniform": [0, 5]})
+    assert err["type"] == "union_tag_invalid"
+    assert "uniform" in err["msg"]
+    for word in ("static", "randint"):
+        assert f"'{word}'" in err["msg"], err["msg"]
+
+
+@pytest.mark.parametrize("field", ["x", "y", "yaw"])
+@pytest.mark.parametrize("notation", [{"uniform": [-1.0, 1.0]}, {"choice": [0.0, 1.5708]}])
+def test_placement_fields_accept_a_distribution(field, notation):
+    obstacle = Obstacle.model_validate({**_BOX, field: notation})
+    assert isinstance(getattr(obstacle, field), (Uniform, Choice))
+
+
+@pytest.mark.parametrize("field", ["asset", "height", "width", "depth"])
+def test_the_obstacles_neighbouring_scalars_reject_a_distribution(field):
+    """Dimensions carry the ``DebugObstacle`` reason (None already means "default",
+    so a distribution would need a third state); ``asset`` is a name, and "a random
+    asset" is a choice the consumer must write as one, not smuggle past the union."""
+    assert _obstacle_errors(**{field: {"uniform": [0.1, 0.2]}})
+
+
+def test_dimensions_belong_to_the_built_in_box_only():
+    """A USD asset carries its own extent, so height/width/depth have nowhere to
+    land — silently ignoring them is the ``goal_tolerance_m`` defect (G-25).
+
+    G-35 pair: the same asset WITHOUT dimensions is accepted, and the box WITH
+    them is accepted — so the rejection is about the combination, not about
+    ``chair`` being unusable.
+    """
+    box = Obstacle.model_validate({**_BOX, "height": 0.5, "width": 1.2, "depth": 0.4})
+    assert (box.height, box.width, box.depth) == (0.5, 1.2, 0.4)
+    assert Obstacle.model_validate({**_BOX, "asset": "chair"}).height is None
+
+    (err,) = _obstacle_errors(asset="chair", height=0.5)
+    assert "'height'" in err["msg"] and "chair" in err["msg"]
+    assert f"asset: {BUILTIN_BOX_ASSET}" in err["msg"]  # the fix is spelled out
+
+
+@pytest.mark.parametrize("asset", ["box", "chair", "warehouse_desk", "/mnt/assets/car.usd"])
+def test_asset_is_a_free_name_not_a_literal_enum(asset):
+    """The registry of asset NAMES is the runner's (M2), exactly as ``scene`` is:
+    duplicating it here as a ``Literal[...]`` would make adding one asset a
+    contract change and let the two planes drift (G-25)."""
+    assert Obstacle.model_validate({**_BOX, "asset": asset}).asset == asset
+    assert _obstacle_errors(asset="")  # but it must NAME something
+
+
+def test_the_legacy_box_and_the_list_are_mutually_exclusive():
+    """Declaring both would stand a box AND the list on the stage while the
+    document reads as if the list replaced the field — an unmeasurable extra
+    obstacle. G-35 pair: each one ALONE is accepted.
+    """
+    both = _doc(obstacles=[{"asset": "box", "x": 1.0, "y": 2.0}])
+    (err,) = _errors(both)  # _doc() already carries debug_obstacle
+    assert err["type"] == "value_error"
+    assert "'asset': 'box'" in err["msg"] and "-6.0" in err["msg"]  # migration dict, verbatim
+
+    legacy_only = VerificationRequest.model_validate(_doc())
+    assert legacy_only.scenario.debug_obstacle is not None
+    list_only = _doc(obstacles=[{"asset": "box", "x": 1.0, "y": 2.0}])
+    list_only["scenario"].pop("debug_obstacle")
+    assert len(VerificationRequest.model_validate(list_only).scenario.obstacles) == 1
+
+
+def test_an_empty_obstacle_list_is_not_how_you_say_no_obstacles():
+    """``[]`` rides the identity projection verbatim (lists are never pruned), so
+    it would fork the key of a request that simply omits the block."""
+    empty = _doc(obstacles=[])
+    empty["scenario"].pop("debug_obstacle")
+    assert [e["type"] for e in _errors(empty)] == ["too_short"]
+
+
+def test_a_document_without_obstacles_is_unchanged_by_the_new_field():
+    """The p7 addition is optional-and-None, like every other growth of this
+    contract: absent from the dump, so no identity key moves (D-5)."""
+    scenario = Scenario.model_validate(_STATIC_DOC["scenario"])
+    assert scenario.obstacles is None
+    assert "obstacles" not in scenario.model_dump(exclude_none=True)
+
+
+def test_a_bad_obstacle_entry_keeps_its_fixable_example_through_the_list_index():
+    """The friendly error must survive BOTH the list index and the union branch
+    tag (NFR-INTAKE-001). Positive control: the two examples are the schema's own
+    (``x: -6.0`` for the placement, ``count: 2`` for the count), not one constant.
+
+    Before the ``errors._unwrap_annotation`` repair that shipped with this field,
+    an ``Optional[list[Model]]`` lost its element type at the index step and every
+    violation under ``scenario.obstacles[...]`` came back with NO example.
+    """
+    doc = _doc(obstacles=[{"asset": "box", "x": "later", "y": 2.0}])
+    doc["scenario"].pop("debug_obstacle")
+    with pytest.raises(ValidationError) as excinfo:
+        VerificationRequest.model_validate(doc)
+    (err,) = from_validation_error(excinfo.value, model=VerificationRequest)
+    assert err.field_path == "scenario.obstacles[0].x.static"
+    assert "valid number" in err.expected and err.got == "'later'"
+    assert err.example == "x: -6.0"
+
+    doc["scenario"]["obstacles"] = [{"asset": "box", "x": 1.0, "y": 2.0, "count": "many"}]
+    with pytest.raises(ValidationError) as excinfo:
+        VerificationRequest.model_validate(doc)
+    (err,) = from_validation_error(excinfo.value, model=VerificationRequest)
+    assert err.field_path == "scenario.obstacles[0].count.static"
+    assert err.example == "count: 2"

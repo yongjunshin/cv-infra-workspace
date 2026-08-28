@@ -262,6 +262,47 @@ def test_empty_list_is_kept_not_treated_as_absent():
     assert identity_key(without) != identity_key(dump)
 
 
+# The same canonical request with ``scenario.obstacles: []`` instead of absent.
+# Measured 2026-08-28 (p7c1 T2) — it is here to be DIFFERENT: the empty list is
+# the shape the contract forbids (``min_length=1``) and that derivation must
+# never emit (an empty expansion becomes ``None``), and this literal is why.
+CANONICAL_KEY_IF_OBSTACLES_WERE_AN_EMPTY_LIST = (
+    "sha256:7aed096bf07e951071cad77781009786be1e5fb85f62da7ada4ee55bd01f1536"
+)
+
+
+def test_the_p7_obstacles_field_is_null_on_every_pre_p7_request():
+    """The p7 growth, held to the same bar as D-2's (the test above, with the
+    field that existed then): a real dump of the canonical request carries
+    ``scenario.obstacles: null``, pruning drops it, and the live baseline key
+    does not move."""
+    from cv_infra.contract.loader import load_request
+
+    fixture = pathlib.Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
+    dump = load_request(fixture).request.model_dump(mode="json", by_alias=True)
+    assert dump["scenario"]["obstacles"] is None, "the p7 field must be in the dump"
+    pre_growth = copy.deepcopy(dump)
+    del pre_growth["scenario"]["obstacles"]  # byte-for-byte the pre-p7 wire
+    assert identity_key(dump) == identity_key(pre_growth) == CANONICAL_FIXTURE_KEY
+
+
+def test_an_empty_obstacle_list_would_move_the_canonical_key():
+    """Why ``default=None`` + ``min_length=1`` + "empty expansion -> None" are one
+    rule and not three tastes: a list is NOT pruned, so the ``[]`` spelling of
+    "no obstacles" lands on a different key — every baseline row for this
+    request would go ``no-baseline`` (the counter-example that makes the test
+    above a fact about pruning, not about the field being ignored)."""
+    from cv_infra.contract.loader import load_request
+
+    fixture = pathlib.Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
+    dump = load_request(fixture).request.model_dump(mode="json", by_alias=True)
+    assert identity_key(dump) == CANONICAL_FIXTURE_KEY
+    emptied = copy.deepcopy(dump)
+    emptied["scenario"]["obstacles"] = []
+    assert identity_key(emptied) == CANONICAL_KEY_IF_OBSTACLES_WERE_AN_EMPTY_LIST
+    assert identity_key(emptied) != CANONICAL_FIXTURE_KEY
+
+
 # --------------------------------------------------------------------------- #
 # (1c) p6 randomness (p6c3) — a request that DECLARES distributions has its own
 # key, and the axis that decides which samples get drawn is INSIDE it.

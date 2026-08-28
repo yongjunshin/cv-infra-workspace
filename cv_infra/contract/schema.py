@@ -158,6 +158,38 @@ class Choice(_ForbidExtra):
     choice: list[_FiniteFloat] = Field(min_length=1, examples=[[-6.0, 5.0]])
 
 
+#: 한 그룹이 전개할 수 있는 인스턴스 수의 상한. 물리값이 아니라 **구조적 상한**이다(측정
+#: 아님 — CLAUDE §2-4의 "측정 없는 상수" 금지는 물리/성능 값에 대한 것): count 오타 하나가
+#: JOB_SPEC 바이트와 스테이지 prim 수를 곱셈으로 부풀리고, 그 실패는 dispatch·store 기록
+#: **이후** GPU에서만 드러난다. 상한을 계약에 두면 admit 단계(0 GPU초, NFR-INTAKE-003)에서
+#: 죽는다. 실수요가 상한을 넘으면 올린다 — 올리는 것은 하위호환(기존 문서는 전부 이하).
+MAX_OBSTACLE_COUNT = 32
+
+#: 개수 축의 정수: 음수 개수는 없고, 상한은 위 구조적 상한. ``_FiniteFloat``와 같은 자리.
+_CountInt = Annotated[int, Field(ge=0, le=MAX_OBSTACLE_COUNT)]
+
+
+class Randint(_ForbidExtra):
+    """정수 개수의 균등 draw — 닫힌 구간 ``[lo, hi]`` (양끝 포함).
+
+    CEO 표기 "n={0~5}"의 계약형. ``lo == hi``는 합법(``Uniform``과 같은 이유: 한 축을
+    고정한 채 다른 축을 쓸어야 한다), ``lo > hi``는 오타로 loud 거부. 값은 개수이므로
+    반올림 개념이 없고(정수), ``choice``처럼 verbatim이다.
+    """
+
+    randint: list[_CountInt] = Field(min_length=2, max_length=2, examples=[[0, 5]])
+
+    @model_validator(mode="after")
+    def _bounds_are_ordered(self) -> Randint:
+        low, high = self.randint
+        if low > high:
+            raise ValueError(
+                f"randint bounds must be [lo, hi] with lo <= hi (got [{low}, {high}]) — "
+                f"write 'randint: [{high}, {low}]'"
+            )
+        return self
+
+
 def _randomizable_tag(value: Any) -> str:
     """Discriminate a randomizable scalar: plain number vs distribution mapping.
 
@@ -175,6 +207,8 @@ def _randomizable_tag(value: Any) -> str:
         return "uniform"
     if isinstance(value, Choice):
         return "choice"
+    if isinstance(value, Randint):
+        return "randint"
     return "static"
 
 
@@ -186,6 +220,13 @@ RandomizableFloat = Annotated[
         | Annotated[Uniform, Tag("uniform")]
         | Annotated[Choice, Tag("choice")]
     ),
+    Discriminator(_randomizable_tag),
+]
+
+#: 개수 축의 union. ``RandomizableFloat``과 **같은 관용구**(callable Discriminator + Tag),
+#: 같은 태그 함수 — 이 계약에는 union 스타일이 하나뿐이다.
+RandomizableCount = Annotated[
+    (Annotated[_CountInt, Tag("static")] | Annotated[Randint, Tag("randint")]),
     Discriminator(_randomizable_tag),
 ]
 
@@ -249,6 +290,11 @@ class InitialPose(_ForbidExtra):
 class DebugObstacle(_ForbidExtra):
     """FAIL-injection cuboid dropped into the stage pre-reset (D-2' 2026-07-10).
 
+    LEGACY SHAPE since p7: a new document declares world obstacles in
+    ``Scenario.obstacles`` (kind + how many + yaw). This single box stays for the
+    documents already shipped, and the two are MUTUALLY EXCLUSIVE — declaring both
+    is rejected (``Scenario._one_home_for_world_obstacles``).
+
     An obstacle is WORLD STATE, not a judging criterion — hence a ``Scenario``
     field (supersedes the P2 free-form criteria-params ride-along). Keys are
     1:1 with the runner's ``SimRuntime.spawn_debug_obstacle`` read set
@@ -261,7 +307,9 @@ class DebugObstacle(_ForbidExtra):
     path" is the FAIL-injection sweep this block exists for. The DIMENSIONS are
     not: they are optional (``None`` = runner default), and a distribution
     inside an optional-with-a-default field would need a third state to mean
-    "unspecified" (module-header convention). No demand, so no shape.
+    "unspecified" (module-header convention). That third-state problem is
+    unchanged, so dimensions stay non-randomizable in ``Obstacle`` too; the
+    demand for kinds/counts/yaw is answered by ``Scenario.obstacles``, not here.
     """
 
     x: RandomizableFloat = Field(examples=[-6.0])
@@ -269,6 +317,68 @@ class DebugObstacle(_ForbidExtra):
     height: float | None = Field(default=None, gt=0, examples=[0.15])
     width: float | None = Field(default=None, gt=0, examples=[1.2])
     depth: float | None = Field(default=None, gt=0, examples=[0.4])
+
+
+#: The asset name that means "the built-in cuboid, not an asset at all". Single
+#: definition on this plane (the ``Obstacle`` validator uses it); the runner
+#: defines its own ``BOX_ASSET_REF`` — the shim layer imports no contract — and a
+#: pin test holds the two equal (BATCH_RUNNER_COMMAND <-> Dockerfile precedent).
+BUILTIN_BOX_ASSET = "box"
+
+
+class Obstacle(_ForbidExtra):
+    """스테이지에 놓을 장애물 선언 — ``count``개를 같은 규칙으로 배치한다.
+
+    한 블록이 **두 형태**로 읽힌다(같은 스키마, 두 시점):
+    * 제출형 — ``count``가 개수/분포, ``x/y/yaw``가 값/분포인 "이런 걸 n개".
+    * 구체형 — 파생이 전개한 뒤(derive.materialize_request): ``count == 1``,
+      ``x/y/yaw``는 평범한 float. 러너는 이 형태만 본다(§0-5 누출 거부의 확장).
+    평행 모델 트리를 만들지 않는 이유가 이것이다: 전개 결과가 **제출 스키마로 재검증**된다.
+
+    ``asset``은 ``scenario.scene``과 **동일한 해석 패턴**(runner/sim_runtime.py
+    ``resolve_scene``:203-217): 레지스트리 이름 | ``.usd/.usda/.usdz`` 직접 참조 |
+    내장 큐보이드 ``"box"``. 레지스트리 표는 M1에 없다 — 러너가 소유하고, 알 수 없는
+    이름은 러너가 아는 이름을 나열하며 loud 거부한다(M1이 ``Literal[...]``로 복제하면
+    자산 하나 추가할 때마다 계약 변경이 되고 두 평면이 갈린다).
+
+    ``height/width/depth``는 **내장 box 전용**이다. USD 자산은 자기 extent를 갖고
+    오므로 이 값들은 적용할 곳이 없다 — 조용히 무시하면 ``goal_tolerance_m`` 결함
+    (G-25)이라 loud 거부한다. 자산 크기 조절(``scale``)은 v1 미포함: CEO 요구는
+    종류·개수·yaw였고, 수요 없는 필드는 만들지 않는다(나중에 optional 추가는 안전).
+
+    치수는 랜덤화하지 않는다(``DebugObstacle``과 같은 이유: optional-with-None 필드
+    안의 분포는 "미지정"을 뜻할 제3상태를 요구한다). ``z``도 없다: 바닥 접촉이 결정한다
+    (``InitialPose``의 z 부재 사유와 동일).
+    """
+
+    asset: str = Field(
+        min_length=1,
+        examples=["box"],
+        description=(
+            "Obstacle asset: a runner-registry name, a direct .usd/.usda/.usdz "
+            "reference, or 'box' for the built-in cuboid (same resolution as scenario.scene)."
+        ),
+    )
+    count: RandomizableCount = Field(default=1, examples=[2])
+    x: RandomizableFloat = Field(examples=[-6.0])
+    y: RandomizableFloat = Field(examples=[2.0])
+    yaw: RandomizableFloat = Field(default=0.0, examples=[1.5708])
+    height: float | None = Field(default=None, gt=0, examples=[0.15])
+    width: float | None = Field(default=None, gt=0, examples=[1.2])
+    depth: float | None = Field(default=None, gt=0, examples=[0.4])
+
+    @model_validator(mode="after")
+    def _dimensions_are_the_boxs_only(self) -> Obstacle:
+        if self.asset == BUILTIN_BOX_ASSET:
+            return self
+        declared = [n for n in ("height", "width", "depth") if getattr(self, n) is not None]
+        if declared:
+            raise ValueError(
+                f"{declared} are dimensions of the built-in '{BUILTIN_BOX_ASSET}' obstacle, but "
+                f"asset is {self.asset!r} — a USD asset carries its own extent. Delete "
+                f"{declared}, or write asset: {BUILTIN_BOX_ASSET}"
+            )
+        return self
 
 
 class DerivationMeta(_ForbidExtra):
@@ -328,6 +438,35 @@ class Scenario(_ForbidExtra):
             "carries it; the platform writes it when it materializes a sample."
         ),
     )
+    obstacles: list[Obstacle] | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Obstacles to place in the scene (world state, like debug_obstacle). Each entry "
+            "declares an asset + how many + where; the platform expands it into one entry per "
+            "instance when it materializes a sample (contract.derive). Omit the key entirely "
+            "for a scene with no obstacles — never write an empty list."
+        ),
+        examples=[[{"asset": "box", "count": 2, "x": {"uniform": [-6.0, 6.0]}, "y": 2.0}]],
+    )
+
+    @model_validator(mode="after")
+    def _one_home_for_world_obstacles(self) -> Scenario:
+        """레거시 단일 상자와 목록은 **택일**이다 — 조용한 합집합은 없다.
+
+        둘 다 선언하면 스테이지에는 상자 1개 + 목록 n개가 함께 서고, 소비자는 목록이
+        레거시 필드를 대체했다고 읽는다(측정 불가한 초과 장애물 = 조용한 오판정).
+        ``position_tolerance_m`` XOR ``goal_tolerance_budget``(D-6)과 같은 관용구.
+        """
+        if self.debug_obstacle is not None and self.obstacles is not None:
+            box = self.debug_obstacle.model_dump(exclude_none=True)
+            migrated = {"asset": BUILTIN_BOX_ASSET, **box}
+            raise ValueError(
+                "'debug_obstacle' and 'obstacles' both declare world obstacles — declare "
+                f"exactly one. Move the box into the list ({migrated!r}) and delete the "
+                "'debug_obstacle:' block"
+            )
+        return self
 
 
 class SutRef(_ForbidExtra):

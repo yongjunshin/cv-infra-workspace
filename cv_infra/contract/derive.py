@@ -18,7 +18,12 @@ Three properties every consumer depends on:
   ``request_identity_key``: the p6 path is provably not on it.
 * FIXED DRAW ORDER — ``RANDOM_FIELDS`` below. A randomizable field added later
   APPENDS to that tuple (never inserts), or every existing seed silently starts
-  producing different samples.
+  producing different samples. The scalar blocks are drawn FIRST, in that order;
+  then — only if the document declares ``scenario.obstacles`` — each group in
+  list order: its ``count`` (one draw iff ``Randint``), then instance ``j`` in
+  ascending order over ``OBSTACLE_FIELDS``. A document with no ``obstacles``
+  consumes nothing there, which is why this whole extension left
+  ``DERIVE_VERSION`` where it was.
 
 WHAT IS NOT DERIVED: ``scenario.seed`` rides the sample UNCHANGED (it is the
 sim's determinism seed — the same one every sample of a request uses, exactly
@@ -32,7 +37,14 @@ from __future__ import annotations
 import hashlib
 import random
 
-from cv_infra.contract.schema import Choice, Scenario, Uniform, VerificationRequest
+from cv_infra.contract.schema import (
+    Choice,
+    Obstacle,
+    Randint,
+    Scenario,
+    Uniform,
+    VerificationRequest,
+)
 
 #: Derivation algorithm version — stamped onto every materialized sample
 #: (``Scenario.derivation.version``). Bump ONLY together with a change that
@@ -48,12 +60,15 @@ DERIVE_VERSION = "cv-derive/1"
 #: are the consumer's own literals (verbatim, §2).
 UNIFORM_DECIMALS = 4
 
-#: The randomizable fields, in FIXED DRAW ORDER — ``(scenario block, field)``.
-#: This is the single definition of "which fields may carry a distribution";
-#: ``tests/test_contract_derive.py`` binds it BOTH ways to the schema (every
-#: entry is a ``RandomizableFloat`` field, and every ``RandomizableFloat`` field
-#: in the schema is an entry), so a field added to one side and not the other
-#: fails loudly instead of never being drawn (G-25).
+#: The randomizable fields of the SCALAR blocks, in FIXED DRAW ORDER —
+#: ``(scenario block, field)``. This is their single definition of "which fields
+#: may carry a distribution"; inside a LIST (``Scenario.obstacles``) that job
+#: belongs to ``OBSTACLE_FIELDS`` + its own walk, because a 2-tuple + one
+#: ``getattr`` hop cannot address a list index. ``tests/test_contract_derive.py``
+#: binds the UNION of the two BOTH ways to the schema (every entry is a
+#: ``RandomizableFloat`` field, and every ``RandomizableFloat`` field in the
+#: schema is an entry), so a field added to one side and not the other fails
+#: loudly instead of never being drawn (G-25).
 RANDOM_FIELDS: tuple[tuple[str, str], ...] = (
     ("initial_pose", "x"),
     ("initial_pose", "y"),
@@ -64,6 +79,10 @@ RANDOM_FIELDS: tuple[tuple[str, str], ...] = (
     ("debug_obstacle", "x"),
     ("debug_obstacle", "y"),
 )
+
+#: 장애물 인스턴스 1개 안의 FIXED DRAW ORDER. 위 ``RANDOM_FIELDS``와 같은 규칙이 적용된다
+#: (append, never insert). 리스트 안이라 (block, field) 튜플로 주소지정할 수 없어 별도로 산다.
+OBSTACLE_FIELDS: tuple[str, ...] = ("x", "y", "yaw")
 
 
 def sample_rng(seed: int, index: int) -> random.Random:
@@ -87,18 +106,74 @@ def distribution_fields(scenario: Scenario) -> tuple[str, ...]:
     consumer of this function reads (the request document and the JOB_SPEC),
     so the string can go straight into a rejection message.
 
-    Two callers: ``materialize_request`` (nothing to derive -> hand the request
-    back untouched) and the runner's ``parse_request`` leak check (§0-5): the
+    Callers: ``materialize_request`` (nothing to derive -> hand the request back
+    untouched) and the leak check that guards the execution plane (§0-5): the
     union extension means ``extra="forbid"`` no longer stops a distribution
-    from reaching the execution plane, so the runner rejects one explicitly —
-    an unmaterialized ``{uniform: [...]}`` is a platform bug, not a pose.
+    from reaching it, so the runner rejects one explicitly — an unmaterialized
+    ``{uniform: [...]}`` is a platform bug, not a pose. ``unmaterialized_fields``
+    below composes this with the groups that are not EXPANDED yet — that wider
+    window is what the execution plane needs once a document declares obstacles.
+
+    Order: the scalar paths first (draw order), then the obstacle paths, group by
+    group. An obstacle path names the DECLARATION (``scenario.obstacles[1].x``),
+    not an instance — the instances do not exist until materialization.
     """
-    return tuple(
+    scalar = tuple(
         f"scenario.{block_name}.{field_name}"
         for block_name, field_name in RANDOM_FIELDS
         if (block := getattr(scenario, block_name, None)) is not None
         and isinstance(getattr(block, field_name), (Uniform, Choice))
     )
+    obstacles = tuple(
+        f"scenario.obstacles[{index}].{field_name}"
+        for index, group in enumerate(scenario.obstacles or ())
+        for field_name in OBSTACLE_FIELDS
+        if isinstance(getattr(group, field_name), (Uniform, Choice))
+    )
+    return scalar + obstacles
+
+
+def unmaterialized_fields(scenario: Scenario) -> tuple[str, ...]:
+    """실행 평면이 그대로 실행할 수 **없는** 필드의 와이어 경로 — 러너의 단일 창구.
+
+    두 종류를 합친다: 아직 분포인 필드(``distribution_fields``)와, 아직 전개되지 않은
+    장애물 그룹(``count``가 1이 아니거나 ``Randint``). 후자는 분포가 아니지만 러너가
+    받으면 선언된 개수보다 적게 놓고 조용히 오판정한다(G-25).
+    """
+    unexpanded = tuple(
+        f"scenario.obstacles[{index}].count"
+        for index, group in enumerate(scenario.obstacles or ())
+        if isinstance(group.count, Randint) or group.count != 1
+    )
+    return distribution_fields(scenario) + unexpanded
+
+
+def _draw(value: float | Uniform | Choice, rng: random.Random) -> float:
+    """분포면 draw 1회, 정적이면 그 값 그대로(draw 비소비) — 두 walk의 단일 정의."""
+    if isinstance(value, Uniform):
+        low, high = value.uniform
+        return round(rng.uniform(low, high), UNIFORM_DECIMALS)
+    if isinstance(value, Choice):
+        return rng.choice(value.choice)
+    return value
+
+
+def _expand_obstacles(groups: list[Obstacle], rng: random.Random) -> list[dict]:
+    """제출형 그룹 목록 -> 구체형(싱글턴) 목록. 순서 = 파생 순서 = 러너의 prim 배정 순서."""
+    expanded: list[dict] = []
+    for group in groups:
+        template = group.model_dump()
+        count = group.count
+        n = rng.randint(*count.randint) if isinstance(count, Randint) else int(count)
+        for _ in range(n):
+            expanded.append(
+                {
+                    **template,
+                    "count": 1,
+                    **{name: _draw(getattr(group, name), rng) for name in OBSTACLE_FIELDS},
+                }
+            )
+    return expanded
 
 
 def materialize_request(request: VerificationRequest, index: int) -> VerificationRequest:
@@ -106,17 +181,20 @@ def materialize_request(request: VerificationRequest, index: int) -> Verificatio
 
     Draws ``RANDOM_FIELDS`` in order from ``sample_rng(scenario.seed, index)``,
     consuming a draw ONLY for a field that actually declares a distribution (a
-    static field next to a random one must not shift the stream), and stamps
-    ``scenario.derivation = {version, index}`` so the sample carries its own
-    provenance. Absent blocks (no ``initial_pose`` / no ``debug_obstacle``)
-    consume nothing.
+    static field next to a random one must not shift the stream), then EXPANDS
+    ``scenario.obstacles`` (each group -> ``count`` singleton entries, header),
+    and stamps ``scenario.derivation = {version, index}`` so the sample carries
+    its own provenance. Absent blocks (no ``initial_pose`` / no
+    ``debug_obstacle`` / no ``obstacles``) consume nothing.
 
-    Returns the ORIGINAL object when the document declares no distribution —
-    identity (``is``), not equality: the static/repeats=1/self-test paths keep
-    byte-identical JOB_SPECs and cannot be broken by a change in here.
+    Returns the ORIGINAL object when there is nothing to derive — identity
+    (``is``), not equality: the static/repeats=1/self-test paths keep
+    byte-identical JOB_SPECs and cannot be broken by a change in here. Declaring
+    ``obstacles`` is derivation even with no distribution in it (the expansion
+    IS the derivation), so such a document gets a new object and a stamp.
     """
     scenario = request.scenario
-    if not distribution_fields(scenario):
+    if not distribution_fields(scenario) and scenario.obstacles is None:
         return request
 
     rng = sample_rng(scenario.seed, index)
@@ -125,12 +203,13 @@ def materialize_request(request: VerificationRequest, index: int) -> Verificatio
         block = getattr(scenario, block_name, None)
         if block is None:
             continue
-        value = getattr(block, field_name)
-        if isinstance(value, Uniform):
-            low, high = value.uniform
-            materialized[block_name][field_name] = round(rng.uniform(low, high), UNIFORM_DECIMALS)
-        elif isinstance(value, Choice):
-            materialized[block_name][field_name] = rng.choice(value.choice)
+        materialized[block_name][field_name] = _draw(getattr(block, field_name), rng)
+    if scenario.obstacles is not None:
+        expanded = _expand_obstacles(scenario.obstacles, rng)
+        # An empty expansion is "this sample has no obstacles" — and that is
+        # spelled ``None``, never ``[]``: a list rides the identity projection
+        # verbatim (report/regression.py prunes nulls, not lists).
+        materialized["obstacles"] = expanded or None
     materialized["derivation"] = {"version": DERIVE_VERSION, "index": index}
     # Re-validated (not assigned) so the sample is a genuinely valid document:
     # the drawn values pass every Scenario constraint the submitted one did.
