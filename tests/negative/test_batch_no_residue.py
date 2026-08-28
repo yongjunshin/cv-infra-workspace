@@ -851,16 +851,20 @@ def test_obstacle_set_gate_fires_on_planted_residue(obstacle_evidence, label, pl
 # --------------------------------------------------------------------------- #
 # 구조 절반 — 게이트들이 **생산 코드에서** 성립하는가 (합성 증적으로는 못 보는 층)
 # --------------------------------------------------------------------------- #
-def _run_function() -> ast.FunctionDef:
-    tree = ast.parse(Path(m2_batch.__file__).read_text(encoding="utf-8"))
+def _carrier_source() -> str:
+    return Path(m2_batch.__file__).read_text(encoding="utf-8")
+
+
+def _run_function(source: str | None = None) -> ast.FunctionDef:
+    tree = ast.parse(_carrier_source() if source is None else source)
     return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
 
 
-def _sample_loop() -> ast.For:
+def _sample_loop(source: str | None = None) -> ast.For:
     """운반체의 표본 루프 = ``for position, parsed in enumerate(specs)``."""
     return next(
         node
-        for node in ast.walk(_run_function())
+        for node in ast.walk(_run_function(source))
         if isinstance(node, ast.For) and ast.unparse(node.iter) == "enumerate(specs)"
     )
 
@@ -995,6 +999,137 @@ def test_every_sample_hands_its_own_obstacle_set_to_the_restage():
     ]
     assert len(applies) == 1, "sample 0's placement is exactly one boot hook"
     assert not any(loop.lineno <= node.lineno <= loop.end_lineno for node in applies)
+
+
+# --------------------------------------------------------------------------- #
+# 전 게이트 공통 — 표본별 호출이 **이 표본의 값**을 받는가 (G-106 ① 동종 점검)
+# --------------------------------------------------------------------------- #
+#: 게이트별 "이 표본의 값" 이음매: (이음매, 루프가 부르는 이름, 그 값이 서는 자리,
+#: 거기 서야 하는 이름, 그 이름을 이 표본에서 길어 오는 식). 자리 = 위치 인자 색인(int)
+#: 또는 키워드 이름(str).
+_PER_SAMPLE_PAYLOADS = (
+    ("realign", "realign", 0, "pose", "request.scenario.initial_pose"),
+    ("plan_artifacts", "plan_artifacts", 0, "out_dir", "iteration_dir(out_root, index)"),
+    ("restage", "restage", "obstacle_set", "obstacle_set", "obstacle_specs(request)"),
+)
+
+
+def _calls_named(node: ast.AST, name: str) -> list[ast.Call]:
+    found = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if called == name:
+                found.append(child)
+    return found
+
+
+def per_sample_payload_residue(loop: ast.For) -> list[str]:
+    """표본별 증적을 만드는 호출이 **이 표본에서 길어 온 값**을 받고 있나.
+
+    G-106 ①의 동종 점검이 찾아낸 구멍이다. 기존 구조 핀들은 *"호출이 루프 안에
+    정확히 한 번 있다"* 까지만 보고, **그 호출에 무엇이 들어가는지**는 보지 않았다.
+    그래서 인자를 운반체 상수로 바꾸는 편측 변이가 전부 초록이었다 (실측 2026-08-28,
+    전 스위트 1543/1543 통과):
+
+    * ``realigner.realign(pose)`` -> ``realign(None)`` — 표본마다 "시도 안 함"이
+      찍히고 표본 i는 표본 i-1의 AMCL 믿음 위에서 돈다 (게이트 1이 겨냥한 그 잔존).
+    * ``plan_artifacts(out_dir)`` -> ``plan_artifacts(iteration_dir(out_root, 0))``
+      — 전 표본의 녹화가 ``results/0/``에 겹쳐 쌓인다 (게이트 2).
+    * ``obstacle_set=obstacle_set`` -> ``head_obstacles`` — 표본 1..n-1이 표본 0의
+      배치 위에서 판정된다 (게이트 5. 인자 **이름**만 보던 p7c2 핀은 이걸 못 봤다).
+
+    합성 증적으로는 원리상 볼 수 없는 층이다 — 픽스처는 언제나 완벽한 증적을 만든다.
+    시드는 호출이 아니라 대입이라 아래에서 따로 본다.
+    """
+    complaints: list[str] = []
+    for seam, called, where, name, origin in _PER_SAMPLE_PAYLOADS:
+        calls = _calls_named(loop, called)
+        if len(calls) != 1:
+            complaints.append(f"{seam}: {len(calls)} call(s) in the sample loop, expected 1")
+            continue
+        call = calls[0]
+        if isinstance(where, int):
+            passed = ast.unparse(call.args[where]) if len(call.args) > where else None
+        else:
+            passed = next((ast.unparse(kw.value) for kw in call.keywords if kw.arg == where), None)
+        if passed != name:
+            complaints.append(
+                f"{seam}: receives {passed!r} where this sample's {name!r} belongs — "
+                "every sample would be handed the same thing, and no synthetic evidence "
+                "in this file would look any different"
+            )
+            continue
+        bound = [
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == name
+        ]
+        if len(bound) != 1 or origin not in ast.unparse(bound[0].value):
+            complaints.append(
+                f"{seam}: {name!r} is no longer drawn from {origin} inside the loop "
+                f"({len(bound)} binding(s) found)"
+            )
+    seeds = [
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "sim.config.seed"
+    ]
+    if len(seeds) != 1 or ast.unparse(seeds[0].value) != "request.scenario.seed":
+        complaints.append(
+            "sim.config.seed: this sample's seed is not applied before the applied-settings "
+            "line is emitted — every line would carry boot's seed while gate 3 stays green "
+            "(it only asks that a seed field is present and not 'none')"
+        )
+    return complaints
+
+
+def test_every_per_sample_call_is_handed_this_samples_value():
+    assert per_sample_payload_residue(_sample_loop()) == []
+
+
+#: 위 핀이 실제로 무장돼 있는지의 대조군. 변이는 **생산 소스에 그대로 적용**한다 —
+#: 미니어처를 손으로 적으면 그것은 실물이 아니라 내가 만든 형태를 검사하게 된다(G-25).
+#: 각 항목은 정확히 한 규칙만 울려야 한다(G-59: 대조는 겨냥한 규칙을 고립해야 한다).
+_MEASURED_MUTATIONS = (
+    (
+        "게이트 1 — 이 표본의 포즈로 재정렬하지 않는다",
+        "realigner.realign(pose)",
+        "realigner.realign(None)",
+        "realign",
+    ),
+    (
+        "게이트 2 — 전 표본이 표본 0의 디렉토리에 녹화한다",
+        "plan = plan_artifacts(out_dir)",
+        "plan = plan_artifacts(iteration_dir(out_root, 0))",
+        "plan_artifacts",
+    ),
+    (
+        "게이트 3 — 이 표본의 시드가 적용되지 않는다",
+        "            sim.config.seed = request.scenario.seed\n",
+        "",
+        "sim.config.seed",
+    ),
+    (
+        "게이트 5 — 전 표본이 표본 0의 배치 위에서 돈다",
+        "obstacle_set=obstacle_set",
+        "obstacle_set=head_obstacles",
+        "restage",
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "old", "new", "seam"), _MEASURED_MUTATIONS)
+def test_the_per_sample_payload_pin_fires_on_each_measured_mutation(label, old, new, seam):
+    source = _carrier_source()
+    assert source.count(old) == 1, (
+        f"{label}: the mutation anchor {old!r} is no longer in the carrier verbatim — "
+        "this positive control is disarmed until it is re-aimed"
+    )
+    complaints = per_sample_payload_residue(_sample_loop(source.replace(old, new)))
+    assert len(complaints) == 1, f"{label}: expected exactly one rule to fire, got {complaints}"
+    assert complaints[0].startswith(f"{seam}:"), f"{label}: the wrong rule fired — {complaints[0]}"
 
 
 def test_the_soft_path_never_rebinds_the_telemetry_sampler():
