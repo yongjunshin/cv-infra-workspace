@@ -20,7 +20,9 @@ Stdlib + pyyaml + pytest — parses the YAML with ``yaml.safe_load`` (never exec
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -756,3 +758,299 @@ def test_no_consent_or_secret_value_injection(path):
     # negative pattern drift, and the difference between them is the hole.
     text = path.read_text(encoding="utf-8")
     assert baked_consent_bindings(text) == []
+
+
+# --------------------------------------------------------------------------- #
+# (H) CI INPUT plane — workspace pre-clean + residue guard (p7c3 T7, v1.2.1)
+# --------------------------------------------------------------------------- #
+# The GPU job does NO `actions/checkout` (R10) and checkout was the only step that
+# ever emptied its workspace, so `download-artifact` MERGED onto the previous run's
+# tree: consumer PR #4 (run 33230008911) delivered 4 scenarios, `scenarios/*.yaml`
+# selected 5, and the 5th was a document that push had DELETED (same identity key
+# as the run before). The repair is two steps in the workflow, and it is TESTED
+# THE WAY IT SHIPS: the assertions below both (a) read the workflow text and
+# (b) EXECUTE the shell it embeds against a planted residue tree, because a repair
+# that only exists in prose is not a repair (G-100). YAML-plane, not CLI-plane, on
+# purpose — the release tag moves only this plane (G-43).
+
+_CLEAN_STEP_ID = "clean-workspace"
+_GUARD_STEP_ID = "input-guard"
+#: the file the PR had removed and that got verified anyway (the actual residue).
+_RESIDUE = "scenarios/nova_carter_warehouse_obstacles_random.yaml"
+_DELIVERED = [
+    "scenarios/nova_carter_warehouse_goal.yaml",
+    "scenarios/nova_carter_warehouse_goal_b.yaml",
+    "scenarios/nova_carter_warehouse_goal_random.yaml",
+    "scenarios/nova_carter_warehouse_obstacles_low_random.yaml",
+]
+
+
+def _step_index(doc: dict[str, Any], predicate) -> int:
+    for i, step in enumerate(_steps(doc)):
+        if predicate(step):
+            return i
+    raise AssertionError("no step matched")
+
+
+def _by_id(step_id: str):
+    return lambda s: s.get("id") == step_id
+
+
+def _by_uses(family: str):
+    return lambda s: str(s.get("uses", "")).startswith(family)
+
+
+def _script(doc: dict[str, Any], step_id: str) -> str:
+    return next(s for s in _steps(doc) if s.get("id") == step_id)["run"]
+
+
+def _plant(ws: Path, relpaths: list[str]) -> None:
+    for rel in relpaths:
+        path = ws / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {rel}\n", encoding="utf-8")
+
+
+def _runner_layout(tmp_path: Path) -> tuple[Path, Path]:
+    """The measured runner layout: `<runner>/_work/{_temp,<repo>/<repo>}`."""
+    work = tmp_path / "runner" / "_work"
+    ws = work / "cv-infra-user" / "cv-infra-user"
+    temp = work / "_temp"
+    ws.mkdir(parents=True)
+    temp.mkdir(parents=True)
+    return ws, temp
+
+
+def _workflow_input_default(name: str) -> str:
+    """Read an input default out of the workflow itself — the test must not carry a
+    second copy of the consumer contract (G-25/G-56)."""
+    return _trigger(_load(_VERIFY_WORKFLOW))["workflow_call"]["inputs"][name]["default"]
+
+
+def _exec(script: str, ws: Path, temp: Path, *, cwd: Path | None = None, **overrides):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(temp.parent.parent),  # <runner>, never the developer's $HOME
+        "GITHUB_WORKSPACE": str(ws),
+        "RUNNER_TEMP": str(temp),
+        "GITHUB_RUN_ID": "33230008911",
+        "GITHUB_RUN_ATTEMPT": "1",
+        # what the workflow's `env:` block binds for the guard step, at their
+        # DECLARED defaults (the consumer-facing glob included).
+        "CV_SCENARIOS": _workflow_input_default("scenarios"),
+        "CV_SCENARIOS_ARTIFACT": _workflow_input_default("scenarios_artifact"),
+    }
+    env.update({k: v for k, v in overrides.items() if v is not None})
+    for key, value in overrides.items():
+        if value is None:
+            env.pop(key, None)
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd or ws if (cwd or ws).is_dir() else temp),
+    )
+
+
+# --- (H1) workflow TEXT: the clean happens first, and only in the workspace ----
+def test_workspace_is_cleaned_before_any_input_is_downloaded():
+    doc = _load(_VERIFY_WORKFLOW)
+    clean = _step_index(doc, _by_id(_CLEAN_STEP_ID))
+    download = _step_index(doc, _by_uses("actions/download-artifact"))
+    submit = _step_index(doc, _by_id("verify"))
+    assert clean == 0, "the clean must be the FIRST step (nothing may precede the emptying)"
+    assert clean < download < submit
+
+
+def test_workspace_clean_is_scoped_to_the_workspace_and_refuses_by_control_flow():
+    script = _script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID)
+    # (a) the deletion target comes ONLY from $GITHUB_WORKSPACE — never an input,
+    # never a literal path.
+    deletions = [line.strip() for line in script.splitlines() if "-delete" in line]
+    assert deletions == ['find "${ws}" -mindepth 1 -delete'], deletions
+    assert 'ws="${GITHUB_WORKSPACE:-}"' in script
+    assert "${{" not in script  # no expression interpolation into a deleting shell
+    # (b) each refusal is control flow, not an echo (G-93).
+    assert script.count("die ") >= 6
+    assert 'die() { echo "::error::' in script
+    assert "exit 2; }" in script
+    # (c) the post-condition that makes the clean provable, not merely attempted.
+    assert 'left="$(find "${ws}" -mindepth 1 | wc -l)"' in script
+    assert '[ "${left}" -eq 0 ] || die' in script
+
+
+def test_residue_guard_sits_between_download_and_submit_and_keeps_the_glob_contract():
+    doc = _load(_VERIFY_WORKFLOW)
+    download = _step_index(doc, _by_uses("actions/download-artifact"))
+    guard = _step_index(doc, _by_id(_GUARD_STEP_ID))
+    submit = _step_index(doc, _by_id("verify"))
+    assert download < guard < submit
+    # the consumer contract is untouched: same input, same default glob, and the
+    # guard reads the SAME input the submit step expands (no second source).
+    inputs = _trigger(doc)["workflow_call"]["inputs"]
+    assert inputs["scenarios"]["default"] == "scenarios/*.yaml"
+    step = next(s for s in _steps(doc) if s.get("id") == _GUARD_STEP_ID)
+    assert step["env"]["CV_SCENARIOS"] == "${{ inputs.scenarios }}"
+    assert "cv-infra submit ${{ inputs.scenarios }}" in _script(doc, "verify")
+
+
+# --- (H2) the shell ITSELF, executed against a planted residue tree ------------
+def test_the_clean_script_removes_the_previous_runs_residue_and_says_what_it_removed(
+    tmp_path,
+):
+    ws, temp = _runner_layout(tmp_path)
+    _plant(ws, [_RESIDUE, "report.json", "payloads/check-run.json", "artifacts/req-a/x.mcap"])
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stderr
+    assert list(ws.iterdir()) == []
+    # G-26: the operator must be able to READ what disappeared.
+    assert "4 top-level entries BEFORE:" in result.stdout
+    assert "- d scenarios" in result.stdout
+    assert "- f report.json" in result.stdout
+    assert "workspace AFTER = 0 entries" in result.stdout
+    # the attestation the guard consumes (and nothing written into the workspace).
+    assert (temp / "cv-infra-workspace-clean.stamp").read_text().split() == [
+        "33230008911",
+        "1",
+        str(ws),
+    ]
+
+
+def test_the_clean_script_never_reaches_outside_the_workspace(tmp_path):
+    ws, temp = _runner_layout(tmp_path)
+    canaries = [ws.parent / "sibling-checkout.txt", temp / "other-job.txt"]
+    for canary in canaries:
+        canary.write_text("must survive", encoding="utf-8")
+    _plant(ws, [_RESIDUE])
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stderr
+    assert all(c.exists() for c in canaries)
+
+
+def test_the_clean_script_unlinks_a_symlinked_entry_without_following_it(tmp_path):
+    ws, temp = _runner_layout(tmp_path)
+    outside = tmp_path / "production-store"
+    outside.mkdir()
+    (outside / "cv-infra.sqlite3").write_text("production", encoding="utf-8")
+    (ws / "link-to-store").symlink_to(outside, target_is_directory=True)
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stderr
+    assert not (ws / "link-to-store").exists()
+    assert (outside / "cv-infra.sqlite3").read_text() == "production"  # referent untouched
+
+
+@pytest.mark.parametrize(
+    "label,overrides",
+    [
+        ("unset", {"GITHUB_WORKSPACE": None}),
+        ("empty", {"GITHUB_WORKSPACE": ""}),
+        ("relative", {"GITHUB_WORKSPACE": "workspace"}),
+        ("shallow", {"GITHUB_WORKSPACE": "/tmp"}),
+        ("root", {"GITHUB_WORKSPACE": "/"}),
+    ],
+)
+def test_the_clean_script_refuses_a_workspace_it_cannot_vouch_for(tmp_path, label, overrides):
+    ws, temp = _runner_layout(tmp_path)
+    _plant(ws, [_RESIDUE])
+    result = _exec(
+        _script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp, cwd=temp, **overrides
+    )
+    assert result.returncode != 0, f"{label} was accepted"
+    assert "::error::cv-infra workspace pre-clean:" in result.stdout
+    assert (ws / _RESIDUE).exists()  # refused BEFORE deleting anything
+
+
+def test_the_clean_script_refuses_home_its_ancestor_and_a_path_outside_the_work_root(tmp_path):
+    ws, temp = _runner_layout(tmp_path)
+    _plant(ws, [_RESIDUE])
+    script = _script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID)
+    # $HOME itself / an ancestor of $HOME
+    for home in (str(ws), str(ws / "nested" / "deeper")):
+        result = _exec(script, ws, temp, HOME=home)
+        assert result.returncode != 0, home
+        assert "HOME" in result.stdout
+    # the runner work root itself, and a path outside it (production data lives on
+    # the same host — this is the guard that keeps a mis-set workspace off it).
+    for target in (str(temp.parent), str(tmp_path / "cv-infra-prod" / "store" / "db")):
+        result = _exec(script, ws, temp, GITHUB_WORKSPACE=target, cwd=temp)
+        assert result.returncode != 0, target
+        assert "work root" in result.stdout
+    assert (ws / _RESIDUE).exists()
+
+
+def test_the_clean_script_is_a_no_op_on_a_fresh_workspace(tmp_path):
+    ws, temp = _runner_layout(tmp_path)
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stderr
+    assert "(already empty)" in result.stdout
+
+
+# --- (H3) the guard shell, executed ------------------------------------------
+def _clean_then_deliver(tmp_path, delivered=None):
+    """Run the real clean step, then plant what the download step would deliver."""
+    ws, temp = _runner_layout(tmp_path)
+    _plant(ws, [_RESIDUE])  # ← yesterday's run, exactly as measured on etri6000
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stderr
+    _plant(ws, _DELIVERED if delivered is None else delivered)
+    return ws, temp
+
+
+def test_clean_then_download_submits_exactly_what_this_run_delivered(tmp_path):
+    """The defect, end to end: the residue is gone and the glob selects only the 4."""
+    ws, temp = _clean_then_deliver(tmp_path)
+    assert not (ws / _RESIDUE).exists()
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID), ws, temp)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "4 scenario file(s) selected, all delivered by this run." in result.stdout
+    selected = {line[4:] for line in result.stdout.splitlines() if line.startswith("  + ")}
+    assert selected == set(_DELIVERED)
+
+
+def test_without_the_clean_the_residue_would_ride_and_the_guard_says_so(tmp_path):
+    """편측 변이 (G-59): remove ONLY the clean step and the pair must go loud.
+
+    This is the pre-v1.2.1 workflow: download-artifact merges onto the surviving
+    tree. The glob then selects 5 documents for a push that delivered 4 — silently,
+    before this release. The guard's attestation check is what turns that into a
+    stop, so it must fire here and name the missing pre-clean.
+    """
+    ws, temp = _runner_layout(tmp_path)
+    _plant(ws, [_RESIDUE])
+    _plant(ws, _DELIVERED)  # the merge, with NO clean before it
+    assert len(list((ws / "scenarios").iterdir())) == 5  # ← the defect, reproduced
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID), ws, temp)
+    assert result.returncode == 2
+    assert "no workspace-clean attestation" in result.stdout
+
+
+def test_the_guard_rejects_an_attestation_from_another_run(tmp_path):
+    ws, temp = _clean_then_deliver(tmp_path)
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID), ws, temp, GITHUB_RUN_ID="1")
+    assert result.returncode == 2
+    assert "attestation is from another run/workspace" in result.stdout
+
+
+def test_the_guard_rejects_a_glob_that_selects_nothing(tmp_path):
+    ws, temp = _clean_then_deliver(tmp_path, delivered=["inputs/goal.yaml"])
+    result = _exec(_script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID), ws, temp)
+    assert result.returncode == 2
+    # the message must point at the delivery, not at a stack trace (NFR-INTAKE-001)
+    assert "matches no file at 'scenarios/*.yaml'" in result.stdout
+    assert "  - inputs/goal.yaml" in result.stdout  # what WAS delivered, listed
+
+
+def test_the_guard_rejects_a_selection_from_outside_the_delivered_tree(tmp_path):
+    ws, temp = _clean_then_deliver(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "smuggled.yaml").write_text("# not from this artifact\n", encoding="utf-8")
+    result = _exec(
+        _script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID),
+        ws,
+        temp,
+        CV_SCENARIOS=f"{outside}/*.yaml",
+    )
+    assert result.returncode == 2
+    assert "is NOT one of this run's delivered inputs" in result.stdout

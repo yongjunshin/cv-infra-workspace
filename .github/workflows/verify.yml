@@ -34,6 +34,14 @@
 # the caller's build job uploaded. Least-privilege `permissions` (checks/PR write,
 # contents read).
 #
+# INPUT HYGIENE (p7c3 T7, v1.2.1): because there is no checkout, nothing emptied
+# this job's workspace between runs — `download-artifact` merged onto the previous
+# run's tree and `scenarios: <glob>` picked up files the caller had DELETED. The
+# job now starts by emptying `$GITHUB_WORKSPACE` and, right before submit, asserts
+# that everything the glob selects was delivered by THIS run's artifact. The
+# consumer-facing contract (the inputs below, `scenarios` default included) is
+# unchanged — a consumer pinning `@v1` gets the repair with no edit.
+#
 # PINS (§2-7): every `uses:` is an immutable commit SHA (trailing comment = the
 # semver tag). No floating/mutable tag ref (moving major or branch). Bump = new SHA.
 # p5c20 ⑤: the three stock actions moved to their first `runs.using: node24` major
@@ -100,13 +108,160 @@ jobs:
     # self-hosted GPU selection by LABEL (input, not hardcoded IP — LOCKED §16 / §7.2).
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
     steps:
-      # Scenario declarations arrive as an artifact (NO PR-head checkout — R10).
+      # ── (0) WORKSPACE PRE-CLEAN (p7c3 T7 — CI 입력 잔존 수리) ──────────────────
+      # This job does NO `actions/checkout` (R10) — and checkout was the ONLY step
+      # that ever emptied this workspace. On a self-hosted runner the tree therefore
+      # SURVIVES between runs and `download-artifact` MERGES onto it, so the glob
+      # below picks up residue as if the caller had delivered it.
+      # MEASURED 2026-08-29 (consumer PR #4, run 33230008911): the caller delivered
+      # 4 scenarios, `scenarios/*.yaml` matched 5, and the 5th was a document the PR
+      # had REMOVED the day before (its `request_identity_key` equals the previous
+      # run's). It was verified anyway, with no warning. Both directions are wrong:
+      # a deleted scenario keeps being verified, and a scenario deleted BECAUSE it
+      # was broken keeps producing passes. Until now the "잔존물 0" contract this
+      # project holds on the OUTPUT plane had no counterpart on the INPUT plane.
+      #
+      # WHY IN THE WORKFLOW AND NOT IN THE CLI (G-43): `@vN` moves the YAML plane
+      # only; the `cv_infra` package this job executes is pre-installed on the runner
+      # and does NOT move with the tag. A repair written in Python would not reach a
+      # consumer until the runtime plane is redeployed — this one takes effect the
+      # moment the tag moves, which is what makes v1.2.1 "소비자 조치 불요".
+      #
+      # LAYERING (deliberately not the same cleaner): this empties the WHOLE
+      # workspace ONCE, before any input arrives. `publish_glue._prepare_staging_dir`
+      # still empties `artifacts/` right before upload (p5c9 — the output-plane twin
+      # of this defect, and the composite plane's only cleaner). They do not overlap:
+      # after this step that one simply reports `cleared 0 stale entries`.
+      #
+      # SAFETY: this is a recursive delete on the deployment host (production data
+      # lives on the same box). Every guard is CONTROL FLOW, never an echo (G-93);
+      # the target comes ONLY from `$GITHUB_WORKSPACE`, never from an input; and
+      # `find -delete` unlinks a symlinked entry without following it out. Same guard
+      # set as the tested Python twin, minus its `.git` refusal (a sibling workflow
+      # may legitimately have checked out into this workspace).
+      - name: Clean the workspace before downloading inputs
+        id: clean-workspace
+        run: |
+          set -euo pipefail
+          die() { echo "::error::cv-infra workspace pre-clean: $*"; exit 2; }
+
+          ws="${GITHUB_WORKSPACE:-}"
+          [ -n "${ws}" ] || die "GITHUB_WORKSPACE is unset/empty — refusing to delete anything"
+          case "${ws}" in /*) ;; *) die "GITHUB_WORKSPACE is not an absolute path: '${ws}'" ;; esac
+          case "${ws}" in */*/*/*) ;; *) die "GITHUB_WORKSPACE is too shallow to be a runner workspace: '${ws}'" ;; esac
+          [ ! -L "${ws}" ] || die "GITHUB_WORKSPACE is a symlink: '${ws}'"
+          if [ -n "${HOME:-}" ]; then
+            [ "${ws}" != "${HOME}" ] || die "GITHUB_WORKSPACE is \$HOME: '${ws}'"
+            case "${HOME}/" in "${ws}"/*) die "GITHUB_WORKSPACE is an ancestor of \$HOME: '${ws}'" ;; esac
+          fi
+          # Containment: the workspace must live under the runner work root. Measured
+          # on the deployment host 2026-08-29 — RUNNER_TEMP is `<runner>/_work/_temp`
+          # and the workspace is `<runner>/_work/<repo>/<repo>`. Skipped (not failed)
+          # when RUNNER_TEMP is unset: that layout is then unmeasured, not violated.
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            work_root="$(dirname "${RUNNER_TEMP}")"
+            [ "${ws}" != "${work_root}" ] || die "GITHUB_WORKSPACE IS the runner work root: '${ws}'"
+            case "${ws}/" in
+              "${work_root}"/*) ;;
+              *) die "GITHUB_WORKSPACE '${ws}' is outside the runner work root '${work_root}'" ;;
+            esac
+          else
+            echo "cv-infra: RUNNER_TEMP unset — work-root containment check skipped"
+          fi
+
+          # 무엇을 지웠는지가 운영자에게 보여야 한다 (G-26): before / after are logged.
+          mkdir -p "${ws}"
+          echo "cv-infra: workspace pre-clean target = ${ws}"
+          before="$(find "${ws}" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | LC_ALL=C sort)"
+          n="$(find "${ws}" -mindepth 1 -maxdepth 1 | wc -l)"
+          echo "cv-infra: ${n} top-level entries BEFORE:"
+          if [ -n "${before}" ]; then
+            printf '%s\n' "${before}" | sed 's/^/  - /'
+          else
+            echo "  (already empty)"
+          fi
+          find "${ws}" -mindepth 1 -delete
+          left="$(find "${ws}" -mindepth 1 | wc -l)"
+          [ "${left}" -eq 0 ] || die "workspace still holds ${left} entries AFTER cleaning — inputs could not be attributed to this run"
+          echo "cv-infra: removed ${n} top-level entries; workspace AFTER = 0 entries"
+
+          # Attestation for the input guard below: it is what makes "everything in
+          # the workspace was delivered by THIS run" a fact instead of an assumption
+          # (a guard that only re-measures the tree it is guarding is empty — G-59).
+          stamp="${RUNNER_TEMP:-/tmp}/cv-infra-workspace-clean.stamp"
+          printf '%s %s %s\n' "${GITHUB_RUN_ID:-none}" "${GITHUB_RUN_ATTEMPT:-none}" "${ws}" > "${stamp}"
+          echo "cv-infra: clean attested for run ${GITHUB_RUN_ID:-none} attempt ${GITHUB_RUN_ATTEMPT:-none} -> ${stamp}"
+
+      # ── (1) Scenario declarations arrive as an artifact (NO PR-head checkout — R10);
+      # they land in the workspace the step above just emptied.
       - name: Download scenario inputs
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
         with:
           name: ${{ inputs.scenarios_artifact }}
 
-      # Submit + wait: the exit code is the terminal aggregated verdict (0/1/2/3,
+      # ── (2) RESIDUE GUARD — what the glob selects must be what this run delivered
+      # The pre-clean above is the repair; this is the tripwire that says so OUT LOUD
+      # if it ever stops working (silent recurrence is what cost us PR #4). It runs
+      # immediately before `submit` and asserts, in order:
+      #   (a) this run's workspace-clean attestation exists and belongs to THIS run
+      #       — a removed/reordered/failed pre-clean is caught HERE, at runtime, not
+      #       only by the static workflow test;
+      #   (b) the `scenarios` pattern selects at least one existing file;
+      #   (c) every selected file is one the input artifact put in this workspace.
+      # Mismatch = exit 2 (contract-error class) with the delivered list printed, so
+      # the operator sees the two sets side by side instead of guessing.
+      # NOT strict set equality: the artifact may legitimately carry non-scenario
+      # files (a custom-oracle plugin, a README), so the assertion is "selected ⊆
+      # delivered", plus "selected ≠ ∅".
+      - name: Guard against residual inputs
+        id: input-guard
+        env:
+          CV_SCENARIOS: ${{ inputs.scenarios }}
+          CV_SCENARIOS_ARTIFACT: ${{ inputs.scenarios_artifact }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::cv-infra input guard: $*"; exit 2; }
+
+          ws="${GITHUB_WORKSPACE:-${PWD}}"
+          tmp="${RUNNER_TEMP:-/tmp}"
+          artifact="${CV_SCENARIOS_ARTIFACT:-the input artifact}"
+          [ -n "${CV_SCENARIOS:-}" ] || die "the 'scenarios' input is empty — nothing to submit"
+
+          stamp="${tmp}/cv-infra-workspace-clean.stamp"
+          expected="${GITHUB_RUN_ID:-none} ${GITHUB_RUN_ATTEMPT:-none} ${ws}"
+          [ -f "${stamp}" ] || die "no workspace-clean attestation — the pre-clean step did not run, so files here cannot be attributed to this run's artifact '${artifact}'"
+          got="$(cat "${stamp}")"
+          [ "${got}" = "${expected}" ] || die "workspace-clean attestation is from another run/workspace (got '${got}', expected '${expected}')"
+
+          cd "${ws}"
+          delivered="${tmp}/cv-infra-delivered-inputs.txt"
+          find . -mindepth 1 -type f -printf '%P\n' | LC_ALL=C sort > "${delivered}"
+          echo "cv-infra: $(wc -l < "${delivered}") file(s) delivered by artifact '${artifact}':"
+          sed 's/^/  - /' "${delivered}"
+          echo "cv-infra: scenario pattern = ${CV_SCENARIOS}"
+
+          matched=0
+          bad=0
+          for f in ${CV_SCENARIOS}; do
+            if [ ! -f "${f}" ]; then
+              echo "::error::cv-infra input guard: pattern '${CV_SCENARIOS}' matches no file at '${f}'. This job never checks out the consumer repo (R10) — only the files listed above exist here. Check the path/prefix the caller uploads into '${artifact}'."
+              bad=1
+              continue
+            fi
+            matched=$((matched + 1))
+            rel="${f#./}"
+            if grep -Fxq -- "${rel}" "${delivered}"; then
+              echo "  + ${rel}"
+            else
+              echo "::error::cv-infra input guard: '${rel}' is NOT one of this run's delivered inputs — it is residue or lives outside the downloaded artifact '${artifact}'. Verifying it would report on a document this push did not deliver."
+              bad=1
+            fi
+          done
+          [ "${matched}" -gt 0 ] || die "the scenario pattern '${CV_SCENARIOS}' selected 0 files — nothing to verify"
+          [ "${bad}" -eq 0 ] || die "the submitted scenario set does not match this run's delivered inputs (see the errors above)"
+          echo "cv-infra: ${matched} scenario file(s) selected, all delivered by this run."
+
+      # ── (3) Submit + wait: the exit code is the terminal aggregated verdict (0/1/2/3,
       # M8-D11). `set +e` + a captured code keeps publishing on failure; the final
       # step re-exits it so the job reflects the CLI verdict.
       - name: Submit and await verdict
