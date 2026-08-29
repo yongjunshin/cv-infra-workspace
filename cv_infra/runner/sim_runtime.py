@@ -326,9 +326,18 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
 DEBUG_OBSTACLE_PRIM = "/World/cv_debug_obstacle"
 
 #: Runner-owned dimension defaults (M1 schema None = "the runner default
-#: applies"). The LOW default height keeps the box below the 2D-lidar scan plane,
-#: so it stays invisible to the blackbox nav's costmaps and deterministically
-#: meets the chassis.
+#: applies"). The box is low so it deterministically meets the chassis.
+#:
+#: CORRECTION (p7c3 T5, 2026-08-29 — this comment used to claim the default height
+#: keeps the box BELOW the 2D-lidar scan plane and therefore invisible to the
+#: blackbox nav; that was never measured and is FALSE for the carter SUT). The
+#: measured band is z in [0.1256, 2.0256] m (`XT_32` prim at world z 0.5256 minus
+#: `pointcloud_to_laserscan` min_height 0.4), so a 0.15 m box reaches 2.4 cm INTO
+#: the band and IS seen: 17 % of scans detect it, and the SUT's AMCL then loses
+#: localisation (end-of-mission belief error up to 5.66 m vs 0.73 m at 0.10 m).
+#: The default is NOT changed — shipped documents that omit `height` must keep
+#: their bytes and their behaviour. A scenario that wants an invisible probe
+#: declares `height: 0.10` explicitly (measured: 0/241 scan detections, 5/5 pass).
 DEBUG_OBSTACLE_DEFAULT_HEIGHT = 0.15
 DEBUG_OBSTACLE_DEFAULT_WIDTH = 1.2
 DEBUG_OBSTACLE_DEFAULT_DEPTH = 0.4
