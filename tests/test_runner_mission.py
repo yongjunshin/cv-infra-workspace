@@ -277,3 +277,43 @@ def test_runner_imports_stay_isaac_free():
 
     for forbidden in ("isaacsim", "omni", "pxr", "rclpy", "cv2", "numpy"):
         assert forbidden not in sys.modules, f"{forbidden} leaked into a CPU import"
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the pump seam the realigner shares, and the node it shares it through.
+# --------------------------------------------------------------------------- #
+def test_node_is_a_public_seam_that_reads_none_before_wire():
+    """``runner.realign`` creates its publisher/clients on THIS node (one node per
+    runner process = one DDS participant per job). Before ``wire`` there is none,
+    and the realigner's ``node is None`` arm reports that instead of crashing —
+    so the property must answer None rather than raise or auto-create."""
+    assert ros2.Ros2Adapter().node is None
+
+
+def test_public_step_and_spin_is_the_same_pump_the_internal_callers_use():
+    """p6c3 exposed the pump so collaborators (batch's realign/settle waits) stop
+    reaching into ``_step_and_spin``. Public and private must stay ONE behavior:
+    a public alias that drifted would give the carrier a wait that steps the sim a
+    different number of times than the barrier does."""
+    steps: list[int] = []
+    adapter = ros2.Ros2Adapter(Ros2AdapterConfig(), stepper=lambda: steps.append(1))
+    fake = _spun(adapter)
+
+    adapter.step_and_spin()
+
+    assert len(steps) == 1  # exactly ONE sim step per pump (the /clock source)
+    assert len(fake.spins) == ros2.SPIN_CALLBACK_BUDGET_PER_STEP
+
+
+def test_pumping_without_a_stepper_still_drains_callbacks():
+    """The stepper is an OPTIONAL dependency (both entrypoints inject one; the
+    adapter is constructible without it — see the teardown test above). Every
+    public method has to stay safe in that state, so the pump degrades to a pure
+    rclpy drain rather than raising ``TypeError: 'NoneType' is not callable``
+    inside a readiness loop."""
+    adapter = ros2.Ros2Adapter()  # no stepper
+    fake = _spun(adapter)
+
+    adapter.step_and_spin()
+
+    assert len(fake.spins) == ros2.SPIN_CALLBACK_BUDGET_PER_STEP

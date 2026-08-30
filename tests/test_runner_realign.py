@@ -331,3 +331,32 @@ def test_costmap_services_are_nav2s_published_interfaces():
         "/local_costmap/clear_entirely_local_costmap",
     )
     assert INITIALPOSE_TOPIC == "/initialpose"
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the SUCCESS side of the two bounded waits (the failure side is above).
+# --------------------------------------------------------------------------- #
+def test_both_costmap_waits_pump_the_sim_and_then_succeed():
+    """The waits are bounded AND they STEP — and both halves have to be true.
+
+    A wait that returns immediately proves nothing about a real SUT: nav2's
+    clear-entirely services are advertised late (the SUT is still bringing up
+    when the carrier restages) and the future answers only after the SUT gets
+    /clock time. Since the sim IS the clock source (G-19), a wait that does not
+    step waits forever on a clock it just stopped feeding. Here the service is
+    ready on the 2nd poll and the call answers on the 2nd poll, so both loop
+    bodies run once — and the service still lands in ``costmaps_cleared``,
+    never in ``missing``.
+    """
+    steps: list = []
+    clients = {
+        service: _FakeClient(ready=[False, False, True], done_after=1)
+        for service in COSTMAP_CLEAR_SERVICES
+    }
+    observed = _realigner(_FakeNode(clients=clients), steps).realign(None)
+
+    assert observed["costmaps_cleared"] == list(COSTMAP_CLEAR_SERVICES)
+    assert observed["missing"] == []
+    # 2 services x (1 readiness step + 1 call step); pose=None so no burst steps.
+    assert len(steps) == 4
+    assert all(len(client.calls) == 1 for client in clients.values())

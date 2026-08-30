@@ -825,12 +825,19 @@ class SimRuntime:
     def boot(self) -> object:
         """Instantiate SimulationApp FIRST, then it is legal to import omni/isaacsim."""
         eula_boot_guard()
-        # LOCKED §7.7 — SimulationApp before any omni.*/isaacsim.* import.
-        from isaacsim import SimulationApp  # noqa: PLC0415 (deferred by design)
+        # LOCKED §7.7 — SimulationApp before any omni.*/isaacsim.* import (deferred
+        # by design; the AST guard in tests/negative/test_eula_gate.py pins the order).
+        # Everything below this line IS the Isaac kit: no ``isaacsim`` module exists on
+        # a CPU host, so it can only ever run on the workstation — hence the per-line
+        # pragmas. The guard above stays measured: it is the one CPU-reachable
+        # statement here, and NEG-2 drives it on every host.
+        from isaacsim import SimulationApp  # noqa: PLC0415  # pragma: no cover - GPU path
 
-        self.simulation_app = SimulationApp(simulation_app_launch_config())
-        self._apply_texture_budget()
-        return self.simulation_app
+        self.simulation_app = SimulationApp(  # pragma: no cover - GPU path
+            simulation_app_launch_config()
+        )
+        self._apply_texture_budget()  # pragma: no cover - GPU path
+        return self.simulation_app  # pragma: no cover - GPU path
 
     def _apply_texture_budget(self) -> None:  # pragma: no cover - GPU path (T4 observes)
         """R4 belt-and-suspenders: explicit carb set + read-back, one loud line.

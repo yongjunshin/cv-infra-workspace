@@ -61,3 +61,38 @@ def test_non_oraclebase_class_rejects():
 def test_abstract_oracle_rejects_at_bind_time():
     with pytest.raises(ContractError):
         load_oracle("tests.oracle_plugin_fixture:AbstractOracle")
+
+
+def test_an_entry_point_that_explodes_on_import_rejects_instead_of_crashing(monkeypatch):
+    """A THIRD-PARTY oracle's own import error must land as the same friendly
+    rejection as a typo'd name (REQ-INTAKE-008): the registration is discovered,
+    so the "no such entry point" arm never runs, and without this guard the
+    plugin's traceback would escape ``load_oracle`` and reach the operator as a
+    platform crash instead of a contract error they can fix.
+
+    The failure is injected at the ``importlib.metadata`` seam — a real broken
+    registration would have to be installed into the environment.
+    """
+    import cv_infra.oracles.base as base_mod
+
+    class _BrokenEntryPoint:
+        name = "broken_oracle"
+
+        def load(self):
+            raise ImportError("no module named 'the_plugins_own_dependency'")
+
+    class _Metadata:
+        @staticmethod
+        def entry_points(group=None, name=None):
+            assert group == ENTRY_POINT_GROUP
+            return [_BrokenEntryPoint()]
+
+    monkeypatch.setattr(base_mod, "metadata", _Metadata)
+
+    with pytest.raises(ContractError) as exc_info:
+        load_oracle("broken_oracle")
+    err = exc_info.value
+    assert "entry point failed to load" in err.expected
+    assert "the_plugins_own_dependency" in err.expected  # the cause is not swallowed
+    assert "'broken_oracle'" == err.got
+    assert "Traceback" not in str(err)

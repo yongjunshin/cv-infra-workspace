@@ -265,3 +265,96 @@ def test_loop_recorder_capture_between_samples_is_a_noop(tmp_path):
 
 def test_recorder_unavailable_is_runtime_error():
     assert issubclass(recording.RecorderUnavailable, RuntimeError)
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — start()'s glue past the availability probe, and the two abort paths.
+#
+# The backend itself stays absent on CPU (that is what the pragma on the Popen
+# call says); what is pinned here is everything start() DECIDES before handing
+# over: the two measured M5 §6-1 constraints (sourced-env argv, interpreter-key
+# stripping) and the G-26/G-18 evidence it leaves behind.
+# --------------------------------------------------------------------------- #
+class _FakePopen:
+    """Records the child the recorder would have spawned."""
+
+    calls: list = []
+
+    def __init__(self, args, stdout=None, stderr=None, env=None) -> None:
+        self.args = args
+        self.stdout = stdout
+        self.env = env
+        self.killed = 0
+        _FakePopen.calls.append(self)
+
+    def kill(self) -> None:
+        self.killed += 1
+
+
+def _fake_backend(monkeypatch, tmp_path):
+    """Make the availability probe find a setup script, and stub out the spawn."""
+    setup = tmp_path / "opt" / "ros" / "jazzy" / "setup.bash"
+    setup.parent.mkdir(parents=True)
+    setup.write_text("# a sourced env script\n", encoding="utf-8")
+    monkeypatch.setattr(recording, "ros_setup_script", lambda distro: setup)
+    _FakePopen.calls = []
+    monkeypatch.setattr(recording.subprocess, "Popen", _FakePopen)
+    return setup
+
+
+def test_rosbag_start_spawns_the_sourced_child_and_says_what_it_records(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PYTHONPATH", "/isaac-sim/site")  # the bundled-interpreter key
+    monkeypatch.setenv("ROS_DOMAIN_ID", "11")  # the DDS join key
+    setup = _fake_backend(monkeypatch, tmp_path)
+    paths = recording.plan_artifacts(tmp_path / "out")
+    config = _cfg()
+
+    recording.RosbagRecorder(paths, config).start()
+
+    topics = recording.bag_topics(config, include_sensors=False)
+    # G-26 feature-on gate: what it records is what it SAYS it records.
+    assert capsys.readouterr().out == f"[cv-runner] bag topics ({len(topics)}): {topics}\n"
+    child = _FakePopen.calls[-1]
+    # M5 §6-1 constraint 1: bare ``ros2`` is not executable -> source, then exec.
+    assert child.args == recording.bag_record_shell_cmd(paths.bag_dir, topics, setup)
+    # M5 §6-1 constraint 2: the py3.11 bundle's keys would poison the py3.12 CLI,
+    # while the DDS keys must pass through or the child joins the wrong domain.
+    assert "PYTHONPATH" not in child.env
+    assert child.env["ROS_DOMAIN_ID"] == "11"
+    # G-18 evidence culture: the recorder's own output is kept as a file.
+    assert (paths.bag_dir.parent / "rosbag2.log").is_file()
+    assert child.stdout is not None
+
+
+def test_rosbag_abort_closes_the_log_file_and_stays_idempotent(tmp_path, monkeypatch):
+    """``main``/``batch`` call ``abort`` from a ``finally`` on failure paths, and
+    a leaked open file (or a second close raising) would turn a mission failure
+    into a teardown failure."""
+    _fake_backend(monkeypatch, tmp_path)
+    paths = recording.plan_artifacts(tmp_path / "out")
+    recorder = recording.RosbagRecorder(paths, _cfg())
+    recorder.start()
+
+    recorder.abort()
+    recorder.abort()
+
+    assert recorder._log_file is None
+    assert recorder._proc is None
+    assert _FakePopen.calls[-1].killed == 1  # killed once, not twice, never leaked
+
+
+def test_loop_recorder_abort_releases_the_open_writer(tmp_path, monkeypatch):
+    """Mid-sample failure: the writer allocated by ``begin_iteration`` is the only
+    per-sample resource, so aborting must release it — a leaked cv2 writer holds
+    the mp4 open and the NEXT sample's iteration inherits the leak."""
+    writer = _FakeWriter()
+    recorder = _loop_recorder(monkeypatch, [writer])
+    recorder.begin_iteration(tmp_path / "results" / "0" / "recording.mp4")
+
+    recorder.abort()
+    recorder.abort()  # idempotent: teardown may run twice on a failure path
+
+    assert writer.released is True
+    assert recorder._writer is None
