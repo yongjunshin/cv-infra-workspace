@@ -499,9 +499,25 @@ def _cache_volumes(
             f"cache_scratch_root {scratch_resolved} does not exist or is not a directory "
             f"(the scratch ROOT is host provisioning's job; per-job dirs are created here)"
         )
-    job_scratch = scratch_resolved / network_name_for(job_id)
+    return _seeded_cache_volumes(job_id, resolved, scratch_resolved)
+
+
+def _seeded_cache_volumes(
+    job_id: str, base_root: Path, scratch_root: Path
+) -> tuple[dict[str, dict[str, str]], Path]:
+    """The D-B per-job layout: seed the warm tiers, then bind all six **rw** from the copy.
+
+    The three warm cache SETS (``CACHE_BASE_MOUNTS``) are copied out of the shared base
+    into ``<scratch_root>/<slug(job_id)>/<same subpath>``; the three always-written
+    runtime dirs (``CACHE_SCRATCH_MOUNTS``) are created empty in the same per-job tree.
+    Every bind SOURCE therefore lives under the per-job scratch — the shared base is
+    never bound into any container (DoD-P4-15 불변식, structural rather than
+    mount-flag-dependent). Returns ``(volumes, per-job scratch)``; the tree is discarded
+    by the caller's finally-teardown (stateless, NFR-EXEC-002).
+    """
+    job_scratch = scratch_root / network_name_for(job_id)
     try:
-        _seed_cache_tiers(job_id, resolved, job_scratch)
+        _seed_cache_tiers(job_id, base_root, job_scratch)
     except Exception:
         # A failed seed leaves no ~1 GB orphan behind the loud error (the finally-
         # teardown never runs — this raises pre-resource, before run_job's try).
@@ -748,6 +764,191 @@ def _ensure_image_present(
     return "pulled"
 
 
+# --------------------------------------------------------------------------- #
+# Per-job spawn steps shared by BOTH entry points (``run_job`` = one sample per
+# container pair, ``run_batch`` = n samples per pair). Each helper is one step of
+# the same seam, so the two entry points cannot drift into two different
+# definitions of "how a supervised container pair is assembled" (p8c1 T2 분해 —
+# behavior-preserving: every emitted string, dict key order and call shape is
+# verbatim what the two inlined copies produced).
+# --------------------------------------------------------------------------- #
+
+
+def _ensure_images_present(
+    client: Any,
+    runner_image: str,
+    sut_image: str,
+    *,
+    stall_timeout_s: float,
+    poll_interval_s: float,
+) -> None:
+    """Make BOTH images present BEFORE any docker resource is created (T2 a+b).
+
+    This bounds the pull by a progress-liveness watchdog (a wedged pull fails the job
+    in finite time instead of hanging inside the implicit ``containers.run`` pull —
+    history 놀란점 3), and gates start ORDER: the SUT image must be present before the
+    runner container starts, so the runner never begins its mission against a
+    still-pulling SUT. A stall/failure raises, and the caller's infra boundary absorbs
+    it as ``infra_error`` (FAILED — finite), with no container/network left behind.
+    """
+    _ensure_image_present(
+        client,
+        runner_image,
+        kind="runner",
+        stall_timeout_s=stall_timeout_s,
+        poll_interval_s=poll_interval_s,
+    )
+    _ensure_image_present(
+        client,
+        sut_image,
+        kind="sut",
+        stall_timeout_s=stall_timeout_s,
+        poll_interval_s=poll_interval_s,
+    )
+
+
+def _resolve_docker_client(docker_client: Any) -> Any:
+    """The injected duck-typed client, else a lazily-imported real one.
+
+    Lazy: keeps ``import cv_infra.orchestrator`` docker-free (DoD-P2-12 — the runner
+    image installs the wheel ``--no-deps``, so the SDK is absent there).
+    """
+    if docker_client is not None:
+        return docker_client
+    import docker  # noqa: PLC0415
+
+    return docker.from_env()
+
+
+def _prepare_job_dir(out_dir: Path, net_name: str) -> tuple[Path, Path]:
+    """Create this job's host dir + result dir; returns ``(job_dir, result_dir)``.
+
+    G-15: every host path that gets bind-mounted is pre-created here (dockerd would
+    create missing dirs as root). The runner runs non-root (uid 1234, R2 실측), so the
+    result dir is made world-writable; precise chown is workstation glue (Wave 2).
+
+    Bind-safe host dir (p4c4 colon-bind fix, PM 룰링 옵션 A): fan-out job ids carry
+    ':' (store.job_key "<request_id>:<repeat_index>") and the docker bind spec is
+    colon-delimited "src:dst:mode", so a raw out_dir/job_id source is rejected by the
+    daemon with `invalid volume specification` — MEASURED, T4 L0 재현:
+    ~/cv-infra-p2-out/p4c4/T4/L0/colon-bind-repro.txt. The host dir therefore uses the
+    SAME slug idiom the per-job cache scratch already uses (``network_name_for`` —
+    docker-safe charset + collision-free hash; 비대칭 해소). ONLY the host directory
+    name changes: the JOB_SPEC content (its job_id key), labels, store keys and
+    domain-id derivation all keep the verbatim job_id.
+    """
+    job_dir = Path(out_dir) / net_name
+    result_dir = job_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.chmod(0o777)
+    return job_dir, result_dir
+
+
+def _runner_environment(
+    spec: dict[str, Any],
+    seam_env: dict[str, str],
+    *,
+    runner_env: dict[str, str] | None,
+    plugin_dir: str | None,
+    request_identity_key: str | None,
+) -> dict[str, str]:
+    """Assemble the RUNNER container env: operator passthrough + supervisor-owned keys.
+
+    Supervisor-owned seam keys override operator ``runner_env`` on collision;
+    everything else (e.g. the operator's consent env) passes through verbatim
+    (decision 2026-07-03). ``seam_env`` is the entry point's own mount/isolation triple
+    (single-job ``JOB_SPEC`` vs carrier ``JOB_SPEC_BATCH`` + ``RESULT_OUT`` +
+    ``ROS_DOMAIN_ID``), applied in the caller's order.
+
+    Then, in order: the D-1 oracle plugin dir (runner-only announcement of the ro
+    mount), the p5c18 request identity key (omitted entirely when unknown — a
+    fabricated key would be worse than the honest absence), and the FU-14
+    scenario-derived ROS env, injected only when the key exists in
+    ``interface.adapter_config`` (scenario is the SoT, so these supervisor-owned keys
+    override operator ``runner_env`` like the seam keys). Image-internal paths
+    (LD_LIBRARY_PATH etc.) stay M2 boot-glue knowledge, never set here.
+    """
+    environment = dict(runner_env or {})
+    environment.update(seam_env)
+    if plugin_dir is not None:
+        environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
+    if request_identity_key is not None:
+        environment[REQUEST_IDENTITY_KEY_ENV] = request_identity_key
+    interface = spec.get("interface")
+    adapter_config = interface.get("adapter_config") if isinstance(interface, dict) else None
+    if isinstance(adapter_config, dict):
+        for cfg_key, env_key in (("ros_distro", "ROS_DISTRO"), ("rmw", "RMW_IMPLEMENTATION")):
+            if cfg_key in adapter_config:
+                environment[env_key] = str(adapter_config[cfg_key])
+    return environment
+
+
+def _runner_run_extra(shm_size: str | int | None, runner_gpus: bool) -> dict[str, Any]:
+    """The runner-only ``containers.run`` kwargs that are OMITTED when turned off.
+
+    ``shm_size`` (R-shm): /dev/shm for Kit — omitted entirely when None so the
+    pre-p5c15 call shape stays byte-identical. ``runner_gpus``: the runner = Isaac =
+    always GPU on the default path (``--gpus all`` equivalent);
+    ``NVIDIA_DRIVER_CAPABILITIES=all`` is baked into the runner image (M5), so no env
+    propagation is needed. The ``docker.types`` import is lazy, same discipline as
+    ``_resolve_docker_client`` (DoD-P2-12 — module import stays docker-free; this line
+    only ever executes on the control-plane host where the SDK is pinned).
+    """
+    extra: dict[str, Any] = {}
+    if shm_size is not None:
+        extra["shm_size"] = shm_size
+    if runner_gpus:
+        from docker.types import DeviceRequest  # noqa: PLC0415
+
+        extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+    return extra
+
+
+def _runner_volumes(
+    cache_volumes: dict[str, dict[str, str]],
+    plugin_dir: str | None,
+    spec_path: Path,
+    spec_mount: str,
+    result_dir: Path,
+) -> dict[str, dict[str, str]]:
+    """The runner's docker ``volumes`` map (cache/plugin binds first, seam mounts last).
+
+    Cache/plugin binds come first so the seam mounts win on any host-path collision
+    (same principle as the seam env keys in ``_runner_environment``). The plugin bind
+    is the SAME absolute path host->container, read-only (D-1). ``spec_mount`` is the
+    entry point's spec seam (``JOB_SPEC_MOUNT`` vs ``JOB_SPEC_BATCH_MOUNT``).
+    """
+    return {
+        **cache_volumes,
+        **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
+        str(spec_path): {"bind": spec_mount, "mode": "ro"},
+        str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
+    }
+
+
+def _gate_runner(
+    runner_ct: Any,
+    readiness_probe: ReadinessProbe | None,
+    readiness_timeout_s: float,
+    poll_interval_s: float,
+) -> tuple[str, int | None, str | None]:
+    """Readiness-gate the started runner: ``(gate, runner_exit_code, infra_error)``.
+
+    ``_GATE_EXITED`` — the runner died before ready (e.g. usage error): no SUT start;
+    its exit code is kept and the caller falls through to collection (a degraded runner
+    may still have written an error result — the REQ-EXEC-013 invariant decides).
+    ``_GATE_TIMEOUT`` — an infra_error. ``_GATE_READY`` — neither is set and the caller
+    co-spawns the SUT.
+    """
+    probe = readiness_probe if readiness_probe is not None else default_readiness_probe
+    gate = _gate_runner_ready(runner_ct, probe, readiness_timeout_s, poll_interval_s)
+    if gate == _GATE_EXITED:
+        return gate, _exit_code(runner_ct), None
+    if gate == _GATE_TIMEOUT:
+        return gate, None, f"runner readiness gate timed out after {readiness_timeout_s}s"
+    return gate, None, None
+
+
 def run_job(
     job_spec: dict[str, Any],
     out_dir: Path,
@@ -867,33 +1068,10 @@ def run_job(
     cache_volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, job_id)
     plugin_dir = _resolve_oracle_plugin_dir(oracle_plugin_dir)
 
-    client = docker_client
-    if client is None:
-        # Lazy: keep `import cv_infra.orchestrator` docker-free (DoD-P2-12 — the
-        # runner image installs the wheel --no-deps, so the SDK is absent there).
-        import docker  # noqa: PLC0415
+    client = _resolve_docker_client(docker_client)
 
-        client = docker.from_env()
-
-    # G-15: pre-create every host path that gets bind-mounted (dockerd would create
-    # missing dirs as root). The runner runs non-root (uid 1234, R2 실측), so the
-    # result dir is made world-writable; precise chown is workstation glue (Wave 2).
-    #
-    # Bind-safe host dir (p4c4 colon-bind fix, PM 룰링 옵션 A): fan-out job ids
-    # carry ':' (store.job_key "<request_id>:<repeat_index>") and the docker
-    # bind spec is colon-delimited "src:dst:mode", so a raw out_dir/job_id
-    # source is rejected by the daemon with `invalid volume specification` —
-    # MEASURED, T4 L0 재현: ~/cv-infra-p2-out/p4c4/T4/L0/colon-bind-repro.txt.
-    # The host dir therefore uses the SAME slug idiom the per-job cache scratch
-    # already uses (network_name_for — docker-safe charset + collision-free
-    # hash; 비대칭 해소). ONLY the host directory name changes: the JOB_SPEC
-    # content (its job_id key), labels, store keys and domain-id derivation all
-    # keep the verbatim job_id.
     net_name = network_name_for(job_id)
-    job_dir = Path(out_dir) / net_name
-    result_dir = job_dir / "result"
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.chmod(0o777)
+    job_dir, result_dir = _prepare_job_dir(out_dir, net_name)
     spec_path = job_dir / "job_spec.json"
     spec_path.write_text(json.dumps(job_spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -912,24 +1090,10 @@ def run_job(
     result_path: Path | None = None
     infra_error: str | None = None
     try:
-        # (a)+(b) T2: make BOTH images present BEFORE creating any docker resource. This
-        # bounds the pull by a progress-liveness watchdog (a wedged pull fails the job in
-        # finite time instead of hanging inside the implicit ``containers.run`` pull —
-        # history 놀란점 3), and gates start ORDER: the SUT image must be present before
-        # the runner container starts, so the runner never begins its mission against a
-        # still-pulling SUT. A stall/failure raises here and is absorbed as infra_error by
-        # the boundary below (FAILED — finite), with no container/network left behind.
-        _ensure_image_present(
+        _ensure_images_present(
             client,
             runner_image,
-            kind="runner",
-            stall_timeout_s=pull_stall_timeout_s,
-            poll_interval_s=poll_interval_s,
-        )
-        _ensure_image_present(
-            client,
             sut_image,
-            kind="sut",
             stall_timeout_s=pull_stall_timeout_s,
             poll_interval_s=poll_interval_s,
         )
@@ -938,60 +1102,20 @@ def run_job(
         # net_name was computed above (it also names the bind-safe job_dir).
         network = client.networks.create(net_name, driver="bridge", labels=labels)
 
-        # Runner FIRST — the sim supplies /clock (G-19 supply order). Supervisor-owned
-        # seam keys override operator runner_env on collision; everything else (e.g.
-        # the operator's consent env) passes through verbatim (decision 2026-07-03).
-        environment = dict(runner_env or {})
-        environment.update(
+        # Runner FIRST — the sim supplies /clock (G-19 supply order).
+        environment = _runner_environment(
+            job_spec,
             {
                 "JOB_SPEC": JOB_SPEC_MOUNT,
                 "RESULT_OUT": RESULT_OUT_MOUNT,
                 "ROS_DOMAIN_ID": str(domain_id),
-            }
+            },
+            runner_env=runner_env,
+            plugin_dir=plugin_dir,
+            request_identity_key=request_identity_key,
         )
-        if plugin_dir is not None:
-            # D-1: announce the mounted plugin dir to the runner ONLY (supervisor-
-            # owned, so it overrides operator runner_env like the seam keys above).
-            environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
-        if request_identity_key is not None:
-            # p5c18 T4: same supervisor-owned seam-key idiom — the request identity key
-            # (derived ONCE by M4's identity_key at admission) reaches the job plane so
-            # the runner can name its own request. Omitted entirely when unknown: a
-            # fabricated key would be worse than the honest absence (T3 실측 근거).
-            environment[REQUEST_IDENTITY_KEY_ENV] = request_identity_key
-        # FU-14: scenario-derived ROS env — injected only when the key exists in
-        # interface.adapter_config (scenario is the SoT, so these supervisor-owned
-        # keys override operator runner_env like the seam keys above). Image-internal
-        # paths (LD_LIBRARY_PATH etc.) stay M2 boot-glue knowledge, never set here.
-        interface = job_spec.get("interface")
-        adapter_config = interface.get("adapter_config") if isinstance(interface, dict) else None
-        if isinstance(adapter_config, dict):
-            for cfg_key, env_key in (("ros_distro", "ROS_DISTRO"), ("rmw", "RMW_IMPLEMENTATION")):
-                if cfg_key in adapter_config:
-                    environment[env_key] = str(adapter_config[cfg_key])
-        runner_extra: dict[str, Any] = {}
-        if shm_size is not None:
-            # R-shm: /dev/shm for Kit (runner only — the SUT keeps the docker default).
-            # Omitted entirely when None so the pre-p5c15 call shape stays byte-identical.
-            runner_extra["shm_size"] = shm_size
-        if runner_gpus:
-            # Runner = Isaac = always GPU on the default path (--gpus all equivalent);
-            # NVIDIA_DRIVER_CAPABILITIES=all is baked into the runner image (M5), so
-            # no env propagation is needed. Lazy import, same discipline as `import
-            # docker` above (DoD-P2-12 — module import stays docker-free; this line
-            # only ever executes on the control-plane host where the SDK is pinned).
-            from docker.types import DeviceRequest  # noqa: PLC0415
-
-            runner_extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
-        volumes = {
-            # Cache/plugin binds first so the seam mounts below win on any
-            # host-path collision (same principle as the seam env keys above).
-            # Plugin bind = SAME absolute path host->container, read-only (D-1).
-            **cache_volumes,
-            **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
-            str(spec_path): {"bind": JOB_SPEC_MOUNT, "mode": "ro"},
-            str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
-        }
+        runner_extra = _runner_run_extra(shm_size, runner_gpus)
+        volumes = _runner_volumes(cache_volumes, plugin_dir, spec_path, JOB_SPEC_MOUNT, result_dir)
         _log_runner_mounts(job_id, volumes, shm_size=shm_size)
         runner_ct = client.containers.run(
             runner_image,
@@ -1004,16 +1128,10 @@ def run_job(
             **runner_extra,
         )
 
-        probe = readiness_probe if readiness_probe is not None else default_readiness_probe
-        gate = _gate_runner_ready(runner_ct, probe, readiness_timeout_s, poll_interval_s)
-        if gate == _GATE_EXITED:
-            # Runner died before ready (e.g. usage error) — no SUT start; keep its
-            # exit code and fall through to collection (a degraded runner may still
-            # have written an error result — the REQ-EXEC-013 invariant decides).
-            runner_exit_code = _exit_code(runner_ct)
-        elif gate == _GATE_TIMEOUT:
-            infra_error = f"runner readiness gate timed out after {readiness_timeout_s}s"
-        else:
+        gate, runner_exit_code, infra_error = _gate_runner(
+            runner_ct, readiness_probe, readiness_timeout_s, poll_interval_s
+        )
+        if gate == _GATE_READY:
             # SUT joins the same network + domain as an unmodified blackbox: no
             # command/entrypoint override, no operator env leak (DoD-P2-03), and
             # no GPU device request (carter nav2 is CPU-only — GPU slots stay
@@ -1093,6 +1211,44 @@ def _mission_budget_s(spec: dict[str, Any], index: int) -> float:
     return float(budget)
 
 
+def _validate_batch_specs(job_specs: list[dict[str, Any]], batch_id: str) -> list[str]:
+    """Pre-resource carrier guards; returns the per-slot ``job_id``s in wire order.
+
+    Raises BEFORE any docker resource exists (exactly like ``run_job``'s ``job_id``
+    check — the caller runs inside the supervisor's crash boundary): fewer than 2
+    specs, an empty ``batch_id``, a missing/duplicate ``job_id``, or specs that
+    disagree on ``sut_image_ref``.
+    """
+    if len(job_specs) < 2:
+        raise ValueError(
+            f"run_batch needs at least 2 job specs, got {len(job_specs)} — a 1-sample carrier"
+            " is exactly what the frozen run_job seam already is (설계 §0-10 트리거 = 대기"
+            " 형제 그룹 크기 > 1)"
+        )
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError("run_batch requires a non-empty batch_id (the carrier's identity)")
+    job_ids: list[str] = []
+    first_seen: dict[str, int] = {}
+    for index, spec in enumerate(job_specs):
+        job_id = spec.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError(f"batch spec {index} must carry a non-empty job_id (seam contract)")
+        first = first_seen.setdefault(job_id, index)
+        if first != index:
+            raise ValueError(
+                f"batch spec {index}: job_id {job_id!r} is already used by spec {first} —"
+                " each sample names its own JobResult/store row"
+            )
+        job_ids.append(job_id)
+    sut_refs = {spec.get("sut_image_ref") for spec in job_specs}
+    if len(sut_refs) != 1:
+        raise ValueError(
+            f"batch specs disagree on sut_image_ref ({sorted(map(repr, sut_refs))}) — ONE"
+            " carrier wires ONE SUT, so every sample of the batch must name the same image"
+        )
+    return job_ids
+
+
 def run_batch(
     job_specs: list[dict[str, Any]],
     out_dir: Path,
@@ -1159,50 +1315,17 @@ def run_batch(
     wiring them before there is a consumer would be a store write from an executor thread
     (설계 §0-11 — 그룹 헤드만 RUNNING).
     """
-    if len(job_specs) < 2:
-        raise ValueError(
-            f"run_batch needs at least 2 job specs, got {len(job_specs)} — a 1-sample carrier"
-            " is exactly what the frozen run_job seam already is (설계 §0-10 트리거 = 대기"
-            " 형제 그룹 크기 > 1)"
-        )
-    if not isinstance(batch_id, str) or not batch_id:
-        raise ValueError("run_batch requires a non-empty batch_id (the carrier's identity)")
-    job_ids: list[str] = []
-    first_seen: dict[str, int] = {}
-    for index, spec in enumerate(job_specs):
-        job_id = spec.get("job_id")
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError(f"batch spec {index} must carry a non-empty job_id (seam contract)")
-        first = first_seen.setdefault(job_id, index)
-        if first != index:
-            raise ValueError(
-                f"batch spec {index}: job_id {job_id!r} is already used by spec {first} —"
-                " each sample names its own JobResult/store row"
-            )
-        job_ids.append(job_id)
-    sut_refs = {spec.get("sut_image_ref") for spec in job_specs}
-    if len(sut_refs) != 1:
-        raise ValueError(
-            f"batch specs disagree on sut_image_ref ({sorted(map(repr, sut_refs))}) — ONE"
-            " carrier wires ONE SUT, so every sample of the batch must name the same image"
-        )
+    job_ids = _validate_batch_specs(job_specs, batch_id)
     if sut_restart_limit < 0:
         raise ValueError(f"sut_restart_limit must be >= 0, got {sut_restart_limit}")
     # Same seat as run_job: a bad cache/plugin path fails loud BEFORE any resource.
     cache_volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, batch_id)
     plugin_dir = _resolve_oracle_plugin_dir(oracle_plugin_dir)
 
-    client = docker_client
-    if client is None:
-        import docker  # noqa: PLC0415
-
-        client = docker.from_env()
+    client = _resolve_docker_client(docker_client)
 
     net_name = network_name_for(batch_id)  # carrier key = request id (설계 §0-10)
-    job_dir = Path(out_dir) / net_name
-    result_dir = job_dir / "result"
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.chmod(0o777)  # runner is non-root (uid 1234) — same idiom as run_job
+    job_dir, result_dir = _prepare_job_dir(out_dir, net_name)
     batch_path = job_dir / "job_spec_batch.json"
     # M1 owns the wrapper SHAPE (G-56 import, never a re-declared dict): validating it here
     # means a malformed carrier document is a producer-side error, not an exit-2 GPU round trip.
@@ -1220,55 +1343,32 @@ def run_batch(
     vehicle_exit: int | None = None
     carrier_error: str | None = None
     try:
-        _ensure_image_present(
+        _ensure_images_present(
             client,
             runner_image,
-            kind="runner",
-            stall_timeout_s=pull_stall_timeout_s,
-            poll_interval_s=poll_interval_s,
-        )
-        _ensure_image_present(
-            client,
             sut_image,
-            kind="sut",
             stall_timeout_s=pull_stall_timeout_s,
             poll_interval_s=poll_interval_s,
         )
         network = client.networks.create(net_name, driver="bridge", labels=labels)
 
-        environment = dict(runner_env or {})
-        environment.update(
+        # FU-14 scenario-derived ROS env off spec 0 — the carrier wires the ROS side ONCE and
+        # M2's ``admit_specs`` refuses a batch whose specs disagree on the adapter config.
+        environment = _runner_environment(
+            job_specs[0],
             {
                 JOB_SPEC_BATCH_ENV: JOB_SPEC_BATCH_MOUNT,
                 "RESULT_OUT": RESULT_OUT_MOUNT,  # the batch out-dir ROOT (results/<i>/ under it)
                 "ROS_DOMAIN_ID": str(domain_id),
-            }
+            },
+            runner_env=runner_env,
+            plugin_dir=plugin_dir,
+            request_identity_key=request_identity_key,
         )
-        if plugin_dir is not None:
-            environment[ORACLE_PLUGIN_DIR_ENV] = plugin_dir
-        if request_identity_key is not None:
-            environment[REQUEST_IDENTITY_KEY_ENV] = request_identity_key
-        # FU-14 scenario-derived ROS env off spec 0 — the carrier wires the ROS side ONCE and
-        # M2's ``admit_specs`` refuses a batch whose specs disagree on the adapter config.
-        interface = job_specs[0].get("interface")
-        adapter_config = interface.get("adapter_config") if isinstance(interface, dict) else None
-        if isinstance(adapter_config, dict):
-            for cfg_key, env_key in (("ros_distro", "ROS_DISTRO"), ("rmw", "RMW_IMPLEMENTATION")):
-                if cfg_key in adapter_config:
-                    environment[env_key] = str(adapter_config[cfg_key])
-        runner_extra: dict[str, Any] = {}
-        if shm_size is not None:
-            runner_extra["shm_size"] = shm_size
-        if runner_gpus:
-            from docker.types import DeviceRequest  # noqa: PLC0415
-
-            runner_extra["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
-        volumes = {
-            **cache_volumes,
-            **({plugin_dir: {"bind": plugin_dir, "mode": "ro"}} if plugin_dir else {}),
-            str(batch_path): {"bind": JOB_SPEC_BATCH_MOUNT, "mode": "ro"},
-            str(result_dir): {"bind": RESULT_OUT_MOUNT, "mode": "rw"},
-        }
+        runner_extra = _runner_run_extra(shm_size, runner_gpus)
+        volumes = _runner_volumes(
+            cache_volumes, plugin_dir, batch_path, JOB_SPEC_BATCH_MOUNT, result_dir
+        )
         _log_runner_mounts(batch_id, volumes, shm_size=shm_size)
         runner_ct = client.containers.run(
             runner_image,
@@ -1285,13 +1385,10 @@ def run_batch(
             **runner_extra,
         )
 
-        probe = readiness_probe if readiness_probe is not None else default_readiness_probe
-        gate = _gate_runner_ready(runner_ct, probe, readiness_timeout_s, poll_interval_s)
-        if gate == _GATE_EXITED:
-            vehicle_exit = _exit_code(runner_ct)
-        elif gate == _GATE_TIMEOUT:
-            carrier_error = f"runner readiness gate timed out after {readiness_timeout_s}s"
-        else:
+        gate, vehicle_exit, carrier_error = _gate_runner(
+            runner_ct, readiness_probe, readiness_timeout_s, poll_interval_s
+        )
+        if gate == _GATE_READY:
             sut_ct = client.containers.run(
                 sut_image,
                 detach=True,
