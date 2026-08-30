@@ -64,6 +64,7 @@ import pytest
 
 from cv_infra.contract.job_batch import BATCH_SUMMARY_FILENAME, BATCH_SUMMARY_SCHEMA
 from cv_infra.runner import batch as m2_batch
+from cv_infra.runner import recording as m2_recording
 from cv_infra.runner import sim_runtime
 from cv_infra.runner.batch import BATCH_RESULTS_DIRNAME, BatchSummary, iteration_dir
 from cv_infra.runner.realign import (
@@ -82,6 +83,10 @@ from cv_infra.runner.sim_runtime import (
     obstacle_set_log_line,
     sim_config_log_line,
 )
+from tests.negative.reachability import callable_index, reaching
+
+#: 저장소 루트 — ``cv_infra`` 패키지를 담고 있는 디렉토리 (도달성의 import 해석용).
+_REPO_ROOT = Path(m2_batch.__file__).resolve().parents[2]
 
 #: 물리 스텝률 = GT 표본률. 리터럴이 아니라 생산 기본값에서 유도한다 —
 #: ``execution_settings.fixed_dt``가 이것을 바꾸면 게이트 4의 상한도 같이 움직여야 한다.
@@ -869,6 +874,21 @@ def _sample_loop(source: str | None = None) -> ast.For:
     )
 
 
+def _callables(
+    source: str | None = None, sources: dict[str, str] | None = None
+) -> dict[tuple[str, ...], ast.AST]:
+    """``run``이 **이름으로 부를 수 있는** 같은-모듈 함수들 (도달성 펼침의 사전).
+
+    금지 호출을 모듈-로컬 헬퍼 뒤로 한 칸 옮기면 직접-이름 스캔은 아무것도 보지
+    못한다(p8c2 T6 실측: 전 스위트 1683/1683 초록). 옆 모듈에 두고 import 해도
+    마찬가지였다(1701/1701 초록). 아래 게이트들은 그래서 이름이 아니라
+    **도달성**으로 판정한다 — G-106 ④ / ``tests/negative/reachability.py``.
+    """
+    tree = ast.parse(_carrier_source() if source is None else source)
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    return callable_index(tree, _REPO_ROOT, inside=run, sources=sources)
+
+
 def _call_lines(node: ast.AST) -> dict[str, list[int]]:
     calls: dict[str, list[int]] = {}
     for child in ast.walk(node):
@@ -920,10 +940,19 @@ def test_the_realigner_outlives_the_iteration_but_realigns_inside_it():
     '재정렬했다'를 찍은 채 아무 일도 안 한다(G-26).
     """
     loop = _sample_loop()
+    callables = _callables()
     assert len(_call_lines(loop).get("realign", [])) == 1
     boot_lines = set(_call_lines(_run_function()).get("SutRealigner", []))
     assert len(boot_lines) == 1
     assert not any(loop.lineno <= line <= loop.end_lineno for line in boot_lines)
+    # ...and not one hop away either: a ``realigner = _fresh_realigner(adapter)`` in
+    # the loop leaves the two asserts above untouched (the construction is spelled
+    # at module level, outside the loop) while building a publisher per sample.
+    hidden = reaching(loop, callables, "SutRealigner")
+    assert hidden == [], (
+        f"the realigner is built inside the sample loop behind a helper: {[str(h) for h in hidden]}"
+        " — a per-sample publisher is never discovered in time (G-26)"
+    )
 
 
 def test_the_bag_session_is_per_sample_and_the_render_product_is_per_carrier():
@@ -932,11 +961,22 @@ def test_the_bag_session_is_per_sample_and_the_render_product_is_per_carrier():
     레코더를 루프 밖으로 끌어올리면 한 세션이 n 표본을 이어 담고(잔존), 렌더
     프로덕트를 루프 안으로 내리면 p6c2가 제거한 VRAM 증가항이 돌아온다.
     """
-    loop_calls = _call_lines(_sample_loop())
+    loop = _sample_loop()
+    callables = _callables()
+    loop_calls = _call_lines(loop)
     for per_sample in ("plan_artifacts", "RosbagRecorder", "begin_iteration", "end_iteration"):
         assert len(loop_calls.get(per_sample, [])) == 1, per_sample
-    assert "open_render_product" not in loop_calls
-    assert len(_call_lines(_run_function()).get("open_render_product", [])) == 1
+    # 도달성으로 판정한다(이름이 아니라). ``_reopen_products(video)`` 한 줄이면
+    # 직접-이름 스캔은 침묵하고 VRAM 증가항만 돌아온다 — p8c2 T6 실측.
+    hidden = reaching(loop, callables, "open_render_product")
+    assert hidden == [], (
+        f"the render product is re-opened per sample: {[str(h) for h in hidden]} — "
+        "this is the VRAM growth term p6c2 removed"
+    )
+    opens = reaching(_run_function(), callables, "open_render_product")
+    assert (
+        len(opens) == 1
+    ), f"exactly one render product per carrier, found {[str(o) for o in opens]}"
 
 
 def test_the_applied_settings_line_is_emitted_once_per_sample_after_the_first():
@@ -999,6 +1039,14 @@ def test_every_sample_hands_its_own_obstacle_set_to_the_restage():
     ]
     assert len(applies) == 1, "sample 0's placement is exactly one boot hook"
     assert not any(loop.lineno <= node.lineno <= loop.end_lineno for node in applies)
+    # 등록 자체가 헬퍼 뒤로 숨는 판: ``_register_set(sim, ...)`` 를 루프에서 부르면
+    # 위 두 단정은 그대로 통과하고(등록 코드가 모듈 최상위에 있으므로) 훅만 표본마다
+    # 쌓인다 = 부팅 훅이 n번 돈다.
+    registrations = reaching(loop, _callables(), "pre_reset.append")
+    assert registrations == [], (
+        f"a pre-reset hook is registered from inside the sample loop: "
+        f"{[str(r) for r in registrations]} — boot hooks must be registered exactly once"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1144,7 +1192,11 @@ def test_the_soft_path_never_rebinds_the_telemetry_sampler():
     교체가 루프 안에 정확히 하나 있다는 것만 확인하고 중복하지 않는다.
     """
     loop = _sample_loop()
-    assert "bind" not in _call_lines(loop)
+    rebinds = reaching(loop, _callables(), "bind")
+    assert rebinds == [], (
+        f"the sampler is re-bound inside the sample loop: {[str(r) for r in rebinds]} — "
+        "every iteration would stack a ContactReportAPI Apply + a tensor view (p6c2)"
+    )
     binds = [
         node
         for node in ast.walk(_run_function())
@@ -1172,3 +1224,128 @@ def test_the_soft_path_never_rebinds_the_telemetry_sampler():
         if isinstance(node, ast.FunctionDef) and node.name == "restage"
     )
     assert "pre_reset" not in ast.unparse(restage)
+
+
+# --------------------------------------------------------------------------- #
+# 위 네 봉합의 대조군 — "헬퍼 이름 뒤로 한 칸" 변이 (p8c2 T6 실측, G-106 ④)
+# --------------------------------------------------------------------------- #
+#: 운반체 소스에 헬퍼를 심는 자리. 리터럴이 사라지면 아래 대조군이 **무장 해제**되므로
+#: 심기 전에 verbatim 존재를 확인한다(``_MEASURED_MUTATIONS``와 같은 규율).
+_HELPER_ANCHOR = "\ndef run(env: dict | None = None) -> int:"
+_LOOP_ANCHOR = "            out_dir = iteration_dir(out_root, index)\n"
+
+#: (라벨, 모듈-로컬 헬퍼 정의, 루프에 심을 호출, 그 변이가 되살리는 회귀를 잡는 철자).
+#: 넷 다 **인라인으로 쓰면 예전 가드도 red**였다 — 헬퍼 한 칸이 그 red를 지웠다
+#: (p8c2 T6 실측: 봉합 전 전 스위트 1683/1683 초록).
+_HELPER_HIDING_MUTATIONS = (
+    (
+        "게이트 2 — 렌더 프로덕트가 표본마다 다시 열린다 (p6c2 VRAM 증가항 부활)",
+        "def _reopen_products(video: object) -> None:\n    video.open_render_product()\n",
+        "            _reopen_products(video)\n",
+        "open_render_product",
+    ),
+    (
+        "게이트 4 — soft 경로가 표본마다 수집기를 다시 bind 한다",
+        "def _rebind_sampler(sampler: object, world: object) -> None:\n"
+        "    sampler.bind(world)\n",
+        "            _rebind_sampler(sampler, sim.world)\n",
+        "bind",
+    ),
+    (
+        "게이트 1 — 발행자가 표본마다 새로 만들어진다 (G-26)",
+        "def _fresh_realigner(adapter: object) -> object:\n"
+        "    step, clock = adapter.step_and_spin, lambda: adapter.sim_time_s\n"
+        "    return SutRealigner(adapter.node, step, clock)\n",
+        "            realigner = _fresh_realigner(adapter)\n",
+        "SutRealigner",
+    ),
+    (
+        "게이트 5 — 부팅 훅이 표본마다 다시 등록된다",
+        "def _register_set(sim: object, entries: object) -> None:\n"
+        "    sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(entries))\n",
+        "            _register_set(sim, staging.head_obstacles)\n",
+        "pre_reset.append",
+    ),
+)
+
+_HIDDEN_SPELLINGS = tuple(spelling for *_, spelling in _HELPER_HIDING_MUTATIONS)
+
+
+def _hidden_behind_a_helper(helper: str, loop_call: str) -> str:
+    """운반체 소스에 모듈-로컬 헬퍼를 하나 심고 표본 루프에서 그것을 부른다."""
+    source = _carrier_source()
+    assert source.count(_HELPER_ANCHOR) == 1, "헬퍼를 심을 자리가 사라졌다 — 대조군 무장 해제"
+    assert source.count(_LOOP_ANCHOR) == 1, "루프 앵커가 사라졌다 — 대조군 무장 해제"
+    return source.replace(_HELPER_ANCHOR, "\n" + helper + _HELPER_ANCHOR).replace(
+        _LOOP_ANCHOR, _LOOP_ANCHOR + loop_call
+    )
+
+
+def _planted_name(helper: str) -> str:
+    """심은 헬퍼의 이름 — 판정을 그 **경유 경로**에 걸기 위해."""
+    return helper.split("(", 1)[0].removeprefix("def ").strip()
+
+
+@pytest.mark.parametrize(("label", "helper", "loop_call", "spelling"), _HELPER_HIDING_MUTATIONS)
+def test_the_sealed_pins_see_through_one_helper_hop(label, helper, loop_call, spelling):
+    """봉합된 네 단정은 호출이 **헬퍼 이름 뒤로 한 칸** 옮겨져도 발화한다.
+
+    옛 판(직접 호출 이름만 세는 스캔)에서는 이 변이 넷이 **전부 초록**이었다.
+    판정은 **심은 헬퍼를 경유했는가**로 한다(절대 도달량이 아니라): 그래야 운반체에
+    이미 진짜 회귀가 있어도 이 대조군은 자기 명제만 계속 재고, 동시에 겨냥한 규칙이
+    고립된다(G-59 — 이 헬퍼로 다른 철자가 울리면 대조가 아니라 두 번째 실험군이다).
+    """
+    hop = _planted_name(helper)
+    mutated = _hidden_behind_a_helper(helper, loop_call)
+    loop, callables = _sample_loop(mutated), _callables(mutated)
+    assert any(
+        hop in hit.via for hit in reaching(loop, callables, spelling)
+    ), f"{label}: 봉합된 핀이 헬퍼 한 칸을 못 본다"
+    others = [other for other in _HIDDEN_SPELLINGS if other != spelling]
+    assert not any(
+        hop in hit.via for hit in reaching(loop, callables, *others)
+    ), f"{label}: 겨냥하지 않은 철자가 이 헬퍼를 통해 울렸다"
+
+
+def test_the_healthy_carrier_reaches_none_of_the_hidden_spellings():
+    """비공허 대조: 현행 운반체에서는 네 철자 중 어느 것도 루프에서 도달되지 않는다."""
+    assert reaching(_sample_loop(), _callables(), *_HIDDEN_SPELLINGS) == []
+
+
+#: 교차-모듈 은폐 대조군의 앵커들. 헬퍼를 **옆 모듈**에 두고 import 해서 부르는 판도
+#: 봉합 전에는 전 스위트 1701/1701 초록이었다(p8c2 T6 실측).
+_NEIGHBOUR_MODULE = "cv_infra.runner.recording"
+_NEIGHBOUR_ANCHOR = "\ndef plan_artifacts("
+_CARRIER_IMPORT_ANCHOR = (
+    "        LoopVideoRecorder,\n        RosbagRecorder,\n        plan_artifacts,\n"
+)
+
+
+def test_the_sealed_pin_sees_a_helper_hidden_in_a_neighbouring_module():
+    """봉합된 핀은 헬퍼가 **옆 모듈**에 있어도 발화한다 (한 칸 import 펼침).
+
+    같은 회귀를 모듈-로컬 헬퍼로 숨기는 판은 위에서 다뤘고, 이것은 그 다음 수다:
+    ``recording.reopen_products(video)`` 를 루프에서 부르면 운반체 소스 어디에도
+    ``open_render_product`` 가 없다.
+    """
+    neighbour = Path(m2_recording.__file__).read_text(encoding="utf-8")
+    carrier = _carrier_source()
+    assert neighbour.count(_NEIGHBOUR_ANCHOR) == 1, "옆 모듈 앵커가 사라졌다 — 대조군 무장 해제"
+    assert carrier.count(_CARRIER_IMPORT_ANCHOR) == 1, "import 앵커가 사라졌다 — 대조군 무장 해제"
+    assert carrier.count(_LOOP_ANCHOR) == 1
+    mutated_neighbour = neighbour.replace(
+        _NEIGHBOUR_ANCHOR,
+        "\ndef reopen_products(video: object) -> None:\n"
+        "    video.open_render_product()\n\n" + _NEIGHBOUR_ANCHOR,
+    )
+    mutated_carrier = carrier.replace(
+        _CARRIER_IMPORT_ANCHOR, _CARRIER_IMPORT_ANCHOR + "        reopen_products,\n"
+    ).replace(_LOOP_ANCHOR, _LOOP_ANCHOR + "            reopen_products(video)\n")
+    sources = {_NEIGHBOUR_MODULE: mutated_neighbour}
+    loop = _sample_loop(mutated_carrier)
+    callables = _callables(mutated_carrier, sources)
+    hits = reaching(loop, callables, "open_render_product")
+    assert any("reopen_products" in hit.via for hit in hits), f"옆 모듈 헬퍼를 못 봤다: {hits}"
+    # 비공허: 심은 헬퍼를 **경유해서만** 잡혀야 한다 — 현행 운반체에는 그 경로가 없다.
+    pristine = reaching(_sample_loop(), _callables(None, sources), "open_render_product")
+    assert not any("reopen_products" in hit.via for hit in pristine)
