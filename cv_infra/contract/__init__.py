@@ -7,6 +7,8 @@ Public surface (consumers import from here or the submodules — never redefine)
   (the Phase-2 stdlib models.py / adapter package retired, D-4')
 * ``load_request`` 6-stage loader + ``AdmittedRequest`` (loader.py)
 * ``ContractError`` friendly error object (errors.py)
+* ``build_job_spec`` canonical JOB_SPEC assembly (job_spec.py) — stdlib-only and
+  duck-typed, but NOT re-exported here (submodule import; p8c1)
 
 Third-party-backed symbols are exported LAZILY (PEP 562): the runner image
 installs the wheel ``--no-deps`` — ``import cv_infra.contract`` alone stays

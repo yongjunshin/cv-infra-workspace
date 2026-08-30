@@ -777,7 +777,7 @@ class Result(_ForbidExtra):
     ``origin``. Their one home is ``RequestEnvelope`` above — domain-model
     *Request Envelope* attribute, ``orchestrator/selftest.py`` MARKER PLACEMENT,
     store v8 ``envelopes`` — and the runner is never told which envelope it came
-    from (the M3->M2 JOB_SPEC seam is frozen, ``orchestrator/api._job_spec_for``).
+    from (the M3->M2 JOB_SPEC seam is frozen, ``contract/job_spec.py``).
     A copy here could only be empty or WRONG, and it was wrong: every self-test
     job emitted ``is_self_test: false`` (QA p5c15 D6). One home per field
     (2026-08-04 D-8 idiom); do not re-add without a real producer.

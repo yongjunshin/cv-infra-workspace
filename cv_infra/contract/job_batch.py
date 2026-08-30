@@ -53,7 +53,7 @@ class JobSpecBatch(BaseModel):
     """The ``JOB_SPEC_BATCH`` document: n canonical JOB_SPECs + carrier identity.
 
     ``specs`` are the JOB_SPEC dicts EXACTLY as the single-job seam defines them
-    (``orchestrator/api._job_spec_for`` / ``cli/main._job_spec_from_request``) —
+    (``contract/job_spec.build_job_spec`` — p8c1 unified the two plane copies) —
     kept as opaque mappings here on purpose: this contract is about the CARRIER,
     and re-declaring the spec shape would fork the frozen seam into two
     definitions (blueprint §8). The runner re-validates each one through
