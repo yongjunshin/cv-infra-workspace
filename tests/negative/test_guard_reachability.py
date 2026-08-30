@@ -28,9 +28,11 @@ import pytest
 from cv_infra.runner import batch as m2_batch
 from cv_infra.runner import main as m2_main
 from cv_infra.runner import sim_runtime
-from tests.negative.reachability import local_callables, reachable_calls, reaching
+from tests.negative.reachability import callable_index, reachable_calls, reaching
 
 _OWNER_GUARD = Path(__file__).resolve().parents[1] / "test_runner_batch.py"
+#: ``cv_infra`` 패키지를 담고 있는 디렉토리 (도달성의 import 해석용).
+_REPO_ROOT = Path(m2_batch.__file__).resolve().parents[2]
 
 _MODULES = {
     "batch": Path(m2_batch.__file__),
@@ -95,7 +97,9 @@ def test_the_borrowed_deny_lists_are_not_empty():
 # --------------------------------------------------------------------------- #
 # 스코프 해석
 # --------------------------------------------------------------------------- #
-def _scope(source: str, spec: str) -> tuple[ast.AST, dict[tuple[str, ...], ast.AST]]:
+def _scope(
+    source: str, spec: str, sources: dict[str, str] | None = None
+) -> tuple[ast.AST, dict[tuple[str, ...], ast.AST]]:
     """``"batch:run"`` / ``"batch:run:loop"`` / ``"sim_runtime:SimRuntime.restage"``."""
     tree = ast.parse(source)
     _, _, target = spec.partition(":")
@@ -111,12 +115,14 @@ def _scope(source: str, spec: str) -> tuple[ast.AST, dict[tuple[str, ...], ast.A
             for node in klass.body
             if isinstance(node, ast.FunctionDef) and node.name == method_name
         )
-        return method, local_callables(tree, inside=method, method_of=klass)
+        return method, callable_index(
+            tree, _REPO_ROOT, inside=method, method_of=klass, sources=sources
+        )
     name, _, inner = target.partition(":")
     function = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
     )
-    callables = local_callables(tree, inside=function)
+    callables = callable_index(tree, _REPO_ROOT, inside=function, sources=sources)
     if inner == "loop":
         loop = next(
             node

@@ -64,6 +64,7 @@ import pytest
 
 from cv_infra.contract.job_batch import BATCH_SUMMARY_FILENAME, BATCH_SUMMARY_SCHEMA
 from cv_infra.runner import batch as m2_batch
+from cv_infra.runner import recording as m2_recording
 from cv_infra.runner import sim_runtime
 from cv_infra.runner.batch import BATCH_RESULTS_DIRNAME, BatchSummary, iteration_dir
 from cv_infra.runner.realign import (
@@ -82,7 +83,10 @@ from cv_infra.runner.sim_runtime import (
     obstacle_set_log_line,
     sim_config_log_line,
 )
-from tests.negative.reachability import local_callables, reaching
+from tests.negative.reachability import callable_index, reaching
+
+#: 저장소 루트 — ``cv_infra`` 패키지를 담고 있는 디렉토리 (도달성의 import 해석용).
+_REPO_ROOT = Path(m2_batch.__file__).resolve().parents[2]
 
 #: 물리 스텝률 = GT 표본률. 리터럴이 아니라 생산 기본값에서 유도한다 —
 #: ``execution_settings.fixed_dt``가 이것을 바꾸면 게이트 4의 상한도 같이 움직여야 한다.
@@ -870,16 +874,19 @@ def _sample_loop(source: str | None = None) -> ast.For:
     )
 
 
-def _callables(source: str | None = None) -> dict[tuple[str, ...], ast.AST]:
+def _callables(
+    source: str | None = None, sources: dict[str, str] | None = None
+) -> dict[tuple[str, ...], ast.AST]:
     """``run``이 **이름으로 부를 수 있는** 같은-모듈 함수들 (도달성 펼침의 사전).
 
     금지 호출을 모듈-로컬 헬퍼 뒤로 한 칸 옮기면 직접-이름 스캔은 아무것도 보지
-    못한다(p8c2 T6 실측: 전 스위트 1683/1683 초록). 아래 게이트들은 그래서 이름이
-    아니라 **도달성**으로 판정한다 — G-106 ④ / ``tests/negative/reachability.py``.
+    못한다(p8c2 T6 실측: 전 스위트 1683/1683 초록). 옆 모듈에 두고 import 해도
+    마찬가지였다(1701/1701 초록). 아래 게이트들은 그래서 이름이 아니라
+    **도달성**으로 판정한다 — G-106 ④ / ``tests/negative/reachability.py``.
     """
     tree = ast.parse(_carrier_source() if source is None else source)
     run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
-    return local_callables(tree, inside=run)
+    return callable_index(tree, _REPO_ROOT, inside=run, sources=sources)
 
 
 def _call_lines(node: ast.AST) -> dict[str, list[int]]:
@@ -1303,3 +1310,44 @@ def test_the_sealed_pins_see_through_one_helper_hop(label, helper, loop_call, sp
 def test_the_healthy_carrier_reaches_none_of_the_hidden_spellings():
     """비공허 대조: 현행 운반체에서는 네 철자 중 어느 것도 루프에서 도달되지 않는다."""
     assert reaching(_sample_loop(), _callables(), *_HIDDEN_SPELLINGS) == []
+
+
+#: 교차-모듈 은폐 대조군의 앵커들. 헬퍼를 **옆 모듈**에 두고 import 해서 부르는 판도
+#: 봉합 전에는 전 스위트 1701/1701 초록이었다(p8c2 T6 실측).
+_NEIGHBOUR_MODULE = "cv_infra.runner.recording"
+_NEIGHBOUR_ANCHOR = "\ndef plan_artifacts("
+_CARRIER_IMPORT_ANCHOR = (
+    "        LoopVideoRecorder,\n        RosbagRecorder,\n        plan_artifacts,\n"
+)
+
+
+def test_the_sealed_pin_sees_a_helper_hidden_in_a_neighbouring_module():
+    """봉합된 핀은 헬퍼가 **옆 모듈**에 있어도 발화한다 (한 칸 import 펼침).
+
+    같은 회귀를 모듈-로컬 헬퍼로 숨기는 판은 위에서 다뤘고, 이것은 그 다음 수다:
+    ``recording.reopen_products(video)`` 를 루프에서 부르면 운반체 소스 어디에도
+    ``open_render_product`` 가 없다.
+    """
+    neighbour = Path(m2_recording.__file__).read_text(encoding="utf-8")
+    carrier = _carrier_source()
+    assert neighbour.count(_NEIGHBOUR_ANCHOR) == 1, "옆 모듈 앵커가 사라졌다 — 대조군 무장 해제"
+    assert carrier.count(_CARRIER_IMPORT_ANCHOR) == 1, "import 앵커가 사라졌다 — 대조군 무장 해제"
+    assert carrier.count(_LOOP_ANCHOR) == 1
+    mutated_neighbour = neighbour.replace(
+        _NEIGHBOUR_ANCHOR,
+        "\ndef reopen_products(video: object) -> None:\n"
+        "    video.open_render_product()\n\n" + _NEIGHBOUR_ANCHOR,
+    )
+    mutated_carrier = carrier.replace(
+        _CARRIER_IMPORT_ANCHOR, _CARRIER_IMPORT_ANCHOR + "        reopen_products,\n"
+    ).replace(_LOOP_ANCHOR, _LOOP_ANCHOR + "            reopen_products(video)\n")
+    sources = {_NEIGHBOUR_MODULE: mutated_neighbour}
+    loop = _sample_loop(mutated_carrier)
+    callables = _callables(mutated_carrier, sources)
+    hits = reaching(loop, callables, "open_render_product")
+    assert any("reopen_products" in hit.via for hit in hits), f"옆 모듈 헬퍼를 못 봤다: {hits}"
+    # 현행 소스에서는 같은 배관이 조용하다 (비공허 대조).
+    assert (
+        reaching(_sample_loop(), _callables(source=None, sources=sources), "open_render_product")
+        == []
+    )
