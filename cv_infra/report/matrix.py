@@ -19,6 +19,7 @@ matrix without a rename. Stdlib only.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Sequence
 from typing import Any
 
 from cv_infra.orchestrator.models import RequestRollup, Verdict
@@ -108,23 +109,38 @@ def render_text(matrix: dict[str, Any]) -> str:
         f"Report matrix ({summary['total']} requests: {summary['passed']} passed, "
         f"{summary['failed']} failed, {summary['errored']} errored)"
     )
-    rows = [
-        (
-            row["request_id"],
-            row["verdict"] if row["verdict"] is not None else "errored",
-            "-" if row["flakiness"] is None else f"{row['flakiness']:.3f}",
-            str(row["jobs"]),
-            str(row["counts"]["pass"]),
-            str(row["counts"]["fail"]),
-            identity_cell(row.get("request_identity_key"), absent=_ABSENT),
-        )
-        for row in matrix["matrix"]
-    ]
+    rows = [_row_cells(row) for row in matrix["matrix"]]
     widths = [
         max([len(header), *(len(row[i]) for row in rows)]) for i, header in enumerate(_HEADERS)
     ]
-    lines = [head, "  ".join(h.ljust(w) for h, w in zip(_HEADERS, widths)).rstrip()]
-    lines += ["  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in rows]
+    lines = [head, _justify(_HEADERS, widths), *(_justify(row, widths) for row in rows)]
     if any(was_abbreviated(row[-1]) for row in rows):
         lines.append(_IDENTITY_LEGEND)
     return "\n".join(lines)
+
+
+def _row_cells(row: dict[str, Any]) -> tuple[str, ...]:
+    """One row's cells as text, in ``_HEADERS`` order — the fixed cell formats the
+    golden pins live here and nowhere else (``None`` verdict → ``errored``, ``None``
+    flakiness → the table's ``_ABSENT`` idiom, flakiness ``.3f``, identity via the
+    shared ``identity_display`` rule)."""
+    return (
+        row["request_id"],
+        row["verdict"] if row["verdict"] is not None else "errored",
+        _ABSENT if row["flakiness"] is None else f"{row['flakiness']:.3f}",
+        str(row["jobs"]),
+        str(row["counts"]["pass"]),
+        str(row["counts"]["fail"]),
+        identity_cell(row.get("request_identity_key"), absent=_ABSENT),
+    )
+
+
+def _justify(cells: Sequence[str], widths: Sequence[int]) -> str:
+    """One padded table line (two-space gutter, trailing padding stripped).
+
+    The header line and every data line go through THIS function, so the two can
+    never pad differently. ``strict=True`` is the honest value: ``_HEADERS`` and
+    every ``_row_cells`` tuple are the same fixed length by construction, so a
+    column added on one side only must be loud rather than silently dropped from
+    the render (``zip`` would truncate to the shorter side)."""
+    return "  ".join(c.ljust(w) for c, w in zip(cells, widths, strict=True)).rstrip()
