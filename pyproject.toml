@@ -80,7 +80,41 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP"]
+# p8c1 (CEO 결정 2026-08-30 ④) — 확장 룰 상시 채택 = 래칫. The extended half
+# (B/SIM/RET/PIE/PERF/C901) was adopted only AFTER every violation it flags was
+# fixed in production code, so `ruff check .` stays the single green/red signal
+# (CI: .github/workflows/ci.yml tier-1) and a regression cannot slip in behind a
+# growing baseline. Adding a rule family here is a cycle-level decision; silencing
+# one is too (per-file-ignores below carries its reason in writing).
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RET", "PIE", "PERF", "C901"]
+
+[tool.ruff.lint.mccabe]
+# 래칫: p8c1 took the codebase to radon E/D = 0 and this ceiling keeps the worst
+# shapes out, while leaving the surviving C blocks alone — C is tolerated (개선이
+# 명확할 때만 수리, karpathy: 지표 허영 churn 금지), D/E is not. ruff's own default
+# (10) would flag C blocks we deliberately kept, turning the gate into noise.
+#
+# ⚠ 실측 주의 (2026-08-30, T5) — ruff's C901 and radon's cc are DIFFERENT metrics
+# and this number is ruff's. Measured on the pre-p8c1 tree, the four monsters p8c1
+# removed scored: runner/batch.run radon E(32) = ruff 15 · supervisor.run_batch
+# D(30) = ruff 20 · supervisor.run_job D(21) = ruff 15 · runner/main.run D(21) =
+# ruff 15. So `> 15` re-admits three of the four EXACTLY at the boundary; only
+# `<= 14` blocks all of them (today's loudest surviving block is ruff 11 —
+# scripts/isaac_smoke/headless_smoke.py::run_handshake — so 14 is adoptable with a
+# margin of 3). 15 is the value CEO 결정 2026-08-30 ④ names; tightening it to 14 is
+# a decision, not a team edit (p8c1 T5 report에 근거·권고 기재).
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+# §3-9 그물 보존 — 테스트 단언 바이트 동결(B017 등은 단언 의미를 바꾼다).
+# 실측 2026-08-30(채택 config 기준, T5): tests 발화 23건, 전부 의도적 미적용.
+# (ruff 기본 mccabe=10 기준으로는 25건 — 차이는 tests/negative/test_batch_no_residue.py
+# 의 C901 2건.) 발화 내역: SIM300 12 · PERF401 3 · B018 2 · SIM117 2 ·
+# B017 1 · B905 1 · RET501 1 · SIM102 1. 예: B017 `pytest.raises(Exception)` 은
+# 좁히는 순간 다른 명제를 단정하게 되고, SIM300 은 단언의 좌우(기대값 vs 실측값)를
+# 뒤집는다 — 리팩토링 금지 사이클에서 그물을 건드리지 않기 위한 의도적 침묵이다.
+# E/F/I/W/UP 는 tests 에도 그대로 적용된다(문법·미사용·정렬은 그물이 아니다).
+"tests/**" = ["B", "SIM", "RET", "PIE", "PERF", "C901"]
 
 [tool.black]
 line-length = 100
