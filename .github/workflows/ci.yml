@@ -1,7 +1,8 @@
 # Platform CI — 2 tiers (M8 §3.8 / DoD-P0-04, NFR-SELFTEST-001).
 #
 #   1. `lint`     — `ubuntu-latest`, always: lint + format + import-lint boundary
-#                   enforcement. No GPU, no consumer repo.
+#                   enforcement, then the test suite under BRANCH-COVERAGE
+#                   instrumentation. No GPU, no consumer repo.
 #   2. `selftest` — `[self-hosted, cv-infra-gpu]`, OPT-IN: `cv-infra selftest`
 #                   round-trips the BUILT-IN stub through the deployed
 #                   orchestrator. Zero consumer dependency by construction — the
@@ -10,6 +11,14 @@
 #
 # Both tiers use only this repository: the platform CI never checks out, builds
 # or reads a consumer repo (boundary rule ③ / NFR-SELFTEST-001).
+#
+# ⚠ p8c2 T0 (2026-08-30): tier 1's two coverage steps are an ADDITION, not a
+# swap. This workflow had NO pytest step before that commit — so until then the
+# platform CI had never run the suite anywhere but a developer's shell, and
+# tier 1 could not go red for a broken test. It can now, and it costs ~60 s more
+# (57 s measured locally, 1591 tests; hosted-runner cost unmeasured — §2-4).
+# They were added rather than skipped because CEO 결정 2026-08-30 ④ places the
+# branch-coverage gate in platform CI and a gate needs the suite to run.
 #
 # Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:`
 # action is version-pinned (no mutable / floating-major tags), the uv binary is
@@ -38,6 +47,11 @@ concurrency:
 
 jobs:
   lint:
+    # The `name:` below is deliberately NOT updated for the coverage steps: it is
+    # the check name GitHub publishes, and it may be a REQUIRED status check in
+    # branch protection (not verifiable from here — the PAT gets 403 on the
+    # protection API), where a rename shows up as a check that is "expected" and
+    # never arrives. Renaming it is a repo-admin change, not a CI-file edit.
     name: lint + import-boundary (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
@@ -65,6 +79,31 @@ jobs:
 
       - name: Import-boundary enforcement (import-linter)
         run: uv run lint-imports --config .importlinter
+
+      # p8c2 T0 — the suite under branch-coverage instrumentation (CEO 결정
+      # 2026-08-30 ④). Two steps, not one, so that a TEST failure and the
+      # COVERAGE verdict stay distinguishable in the run log: `coverage run`
+      # exits with pytest's own status, and only the step after it is about the
+      # number.
+      #
+      # `env -u PYTHONPATH` is a no-op on `ubuntu-latest`; it is here so this
+      # line stays BYTE-IDENTICAL to the hermetic command teams run locally
+      # (G-84) and to the one quoted in pyproject.toml's coverage block. One
+      # command in one form — nobody has to translate between planes.
+      #
+      # Every coverage flag (branch / source / show_missing / precision) comes
+      # from pyproject.toml `[tool.coverage.*]`; none is passed here, so CI and
+      # local cannot drift apart in configuration.
+      - name: Test suite under branch coverage
+        run: env -u PYTHONPATH uv run coverage run -m pytest -q
+
+      # REPORT ONLY today. `fail_under` is deliberately absent from pyproject
+      # (see the ⚠ there), so this step prints the percentage and CANNOT fail the
+      # build for it — turning the 100% ratchet on is one line, added by PM in
+      # pyproject after 웨이브 C/D lands. Until then this step exists to keep the
+      # gap VISIBLE on every push rather than invisible.
+      - name: Coverage report (report only — the 100% ratchet lands later)
+        run: env -u PYTHONPATH uv run coverage report
 
   # --------------------------------------------------------------------------
   # Tier 2 — platform self-test on the GPU workstation (REQ-SELFTEST-001..004,
