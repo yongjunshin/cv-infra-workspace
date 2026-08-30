@@ -137,6 +137,7 @@ class _Row:
     scope: str
     forbidden: tuple[str, ...]
     hardens: str
+    hop: str  # 변이가 심는 헬퍼 이름 — 대조군은 "이 경로로 도달했나"를 잰다
     edits: tuple[tuple[str, str], ...]  # (verbatim 앵커, 대체 텍스트)
 
 
@@ -147,6 +148,7 @@ _ROWS = (
         scope="sim_runtime:SimRuntime.restage",
         forbidden=_PRIM_AUTHORING,
         hardens="test_runner_batch.py::test_the_iteration_boundary_never_authors_a_prim",
+        hop="_purge_stale",
         edits=(
             (
                 "\nclass SimRuntime:",
@@ -170,6 +172,7 @@ _ROWS = (
         scope="sim_runtime:SimRuntime.apply_obstacle_set",
         forbidden=_PRIM_AUTHORING,
         hardens="test_runner_batch.py::test_the_iteration_boundary_never_authors_a_prim",
+        hop="self._purge_stale",
         edits=(
             (
                 "    def apply_obstacle_set(self, entries: list[dict]) -> None:",
@@ -191,6 +194,7 @@ _ROWS = (
         scope="batch:run",
         forbidden=("close",),
         hardens="test_runner_batch.py::test_batch_run_closes_no_vendor_object_on_its_terminal_path",
+        hop="_shutdown",
         edits=(
             (
                 "\ndef run(env: dict | None = None) -> int:",
@@ -208,6 +212,7 @@ _ROWS = (
         scope="main:run",
         forbidden=("close",),
         hardens="test_runner_exit_contract.py::test_run_closes_no_vendor_object_on_its_terminal_path",
+        hop="_shutdown",
         edits=(
             (
                 "\ndef run(env: dict | None = None) -> int:",
@@ -228,6 +233,7 @@ _ROWS = (
             "test_runner_batch.py::"
             "test_the_pool_is_spawned_once_at_boot_and_never_inside_the_sample_loop"
         ),
+        hop="_respawn_pool",
         edits=(
             (
                 "\ndef run(env: dict | None = None) -> int:",
@@ -271,15 +277,15 @@ def test_the_reachability_pin_fires_when_the_call_hides_behind_a_helper(row: _Ro
 
     이 변이들은 **봉합 전 전 스위트 1683/1683 초록**이었다(p8c2 T6 실측). 같은 회귀를
     인라인으로 쓰면 소유자의 직접-이름 가드가 잡는다 — 헬퍼 한 칸이 그 red 를 지웠다.
+
+    판정을 절대 도달량이 아니라 **심은 헬퍼 경유 여부**에 거는 이유: 생산 소스에 이미
+    같은 클래스의 진짜 회귀가 있어도 이 대조군은 자기 명제만 계속 재야 한다.
     """
-    pristine, pristine_callables = _scope(
-        _MODULES[row.module].read_text(encoding="utf-8"), row.scope
-    )
-    before = len(reaching(pristine, pristine_callables, *row.forbidden))
     scope, callables = _scope(_mutated(row), row.scope)
     hits = reaching(scope, callables, *row.forbidden)
-    assert len(hits) > before, f"{row.label}: 도달성 판정이 헬퍼 한 칸을 못 본다"
-    assert any(hit.via for hit in hits), f"{row.label}: 헬퍼를 거치지 않고 잡혔다 — 변이가 틀렸다"
+    assert any(
+        row.hop in hit.via for hit in hits
+    ), f"{row.label}: 도달성 판정이 헬퍼 한 칸({row.hop})을 못 본다 — {[str(h) for h in hits]}"
 
 
 # --------------------------------------------------------------------------- #

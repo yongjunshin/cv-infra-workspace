@@ -1274,9 +1274,9 @@ def _hidden_behind_a_helper(helper: str, loop_call: str) -> str:
     )
 
 
-def _spellings_reached(source: str) -> set[str]:
-    loop, callables = _sample_loop(source), _callables(source)
-    return {spelling for spelling in _HIDDEN_SPELLINGS if reaching(loop, callables, spelling)}
+def _planted_name(helper: str) -> str:
+    """심은 헬퍼의 이름 — 판정을 그 **경유 경로**에 걸기 위해."""
+    return helper.split("(", 1)[0].removeprefix("def ").strip()
 
 
 @pytest.mark.parametrize(("label", "helper", "loop_call", "spelling"), _HELPER_HIDING_MUTATIONS)
@@ -1284,15 +1284,20 @@ def test_the_sealed_pins_see_through_one_helper_hop(label, helper, loop_call, sp
     """봉합된 네 단정은 호출이 **헬퍼 이름 뒤로 한 칸** 옮겨져도 발화한다.
 
     옛 판(직접 호출 이름만 세는 스캔)에서는 이 변이 넷이 **전부 초록**이었다.
-    판정은 **델타**로 한다 — 변이가 *추가로* 도달시키는 철자가 겨냥한 하나뿐이어야
-    한다(G-59: 대조는 규칙을 고립해야 한다). 절대량이 아니라 델타인 이유: 운반체에
-    이미 진짜 회귀가 심겨 있어도 이 대조군은 자기 명제만 계속 재야 한다.
+    판정은 **심은 헬퍼를 경유했는가**로 한다(절대 도달량이 아니라): 그래야 운반체에
+    이미 진짜 회귀가 있어도 이 대조군은 자기 명제만 계속 재고, 동시에 겨냥한 규칙이
+    고립된다(G-59 — 이 헬퍼로 다른 철자가 울리면 대조가 아니라 두 번째 실험군이다).
     """
-    added = _spellings_reached(_hidden_behind_a_helper(helper, loop_call)) - _spellings_reached(
-        _carrier_source()
-    )
-    assert spelling in added, f"{label}: 봉합된 핀이 헬퍼 한 칸을 못 본다"
-    assert added == {spelling}, f"{label}: 겨냥하지 않은 철자가 같이 울렸다 — {added}"
+    hop = _planted_name(helper)
+    mutated = _hidden_behind_a_helper(helper, loop_call)
+    loop, callables = _sample_loop(mutated), _callables(mutated)
+    assert any(
+        hop in hit.via for hit in reaching(loop, callables, spelling)
+    ), f"{label}: 봉합된 핀이 헬퍼 한 칸을 못 본다"
+    others = [other for other in _HIDDEN_SPELLINGS if other != spelling]
+    assert not any(
+        hop in hit.via for hit in reaching(loop, callables, *others)
+    ), f"{label}: 겨냥하지 않은 철자가 이 헬퍼를 통해 울렸다"
 
 
 def test_the_healthy_carrier_reaches_none_of_the_hidden_spellings():
