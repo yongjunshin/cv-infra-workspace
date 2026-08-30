@@ -420,3 +420,160 @@ def test_step_callbacks_still_fire_on_the_traced_first_step():
 
 def test_adapter_readiness_phase_is_none_before_the_barrier_runs():
     assert Ros2Adapter().readiness_phase is None  # the trace field's pre-barrier value
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the degradation paths. Every one of these exists because instrumentation
+# runs inside the boot path: a diagnostic that raises kills the job it measures.
+# --------------------------------------------------------------------------- #
+def test_a_phase_re_entered_per_sample_stays_one_entry_in_the_fold():
+    """The batch carrier begins ``mission`` once per SAMPLE (batch.run's loop), so
+    the phase order must not grow one entry per iteration: ``pending()`` would name
+    the same phase n times and the summary would carry n ``mission_s=`` fields.
+    One entry per phase, carrying the LAST span."""
+    trace, clock, _stream = _trace()
+    for i in range(3):
+        trace.begin(boot_trace.PHASE_MISSION)
+        clock.t += 1.0 + i  # each sample's mission is longer than the last
+        trace.end(boot_trace.PHASE_MISSION)
+
+    assert trace.pending() == []
+    assert list(trace.durations()) == [boot_trace.PHASE_MISSION]
+    assert trace.durations()[boot_trace.PHASE_MISSION] == 3.0  # the last sample's span
+    fields = trace.summary_line().split()
+    assert [f for f in fields if f.startswith("mission_s=")] == ["mission_s=3.00"]
+
+
+def test_probe_writable_on_something_that_is_not_a_directory_answers_nothing(tmp_path):
+    """``probe_writable`` is called directly (see the EROFS test above), so its own
+    not-a-directory guard has to hold: a bind mount that landed as a FILE, or a
+    path that vanished between the probe and now, is "nothing to write into" —
+    (None, None) — and NOT ``writable=False``, which would read as an RO mount and
+    send a reader chasing the wrong fix."""
+    a_file = tmp_path / "not-a-dir"
+    a_file.write_text("bind mount landed wrong", encoding="utf-8")
+
+    assert boot_trace.probe_writable(a_file) == (None, None)
+    assert boot_trace.probe_writable(tmp_path / "absent") == (None, None)
+
+
+def test_scan_dir_degrades_to_zeros_on_an_unreadable_root(tmp_path):
+    """The census is a diagnostic on the boot path: an unreadable/absent subtree is
+    skipped, never raised. Both shapes an operator actually hits are here — the
+    path is gone, and the path is not a directory."""
+    a_file = tmp_path / "file"
+    a_file.write_bytes(b"x")
+
+    assert boot_trace.scan_dir(tmp_path / "absent") == (0, 0, None, False)
+    assert boot_trace.scan_dir(a_file) == (0, 0, None, False)
+
+
+class _VanishedEntry:
+    """A dirent whose inode is gone by the time it is stat()ed.
+
+    A real one cannot be produced deterministically (it needs another process to
+    unlink between readdir and fstatat — exactly the race a kit cache trim runs
+    against a boot census), so the entry is faked at the ``os.scandir`` seam.
+    """
+
+    path = "/cache/vanished"
+
+    def is_dir(self, follow_symlinks: bool = True) -> bool:  # noqa: ARG002
+        return False
+
+    def stat(self, follow_symlinks: bool = True):  # noqa: ARG002
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+
+class _StableEntry:
+    def __init__(self, size: int, mtime: float) -> None:
+        self.path = "/cache/stable"
+        self._stat = type("_St", (), {"st_size": size, "st_mtime": mtime})()
+
+    def is_dir(self, follow_symlinks: bool = True) -> bool:  # noqa: ARG002
+        return False
+
+    def stat(self, follow_symlinks: bool = True):  # noqa: ARG002
+        return self._stat
+
+
+class _FakeScandir:
+    """``os.scandir``'s dual shape: a context manager AND an iterator."""
+
+    def __init__(self, entries) -> None:
+        self._entries = entries
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+    def __iter__(self):
+        return iter(self._entries)
+
+
+def test_a_file_that_vanishes_mid_scan_is_skipped_not_raised(monkeypatch):
+    """The count becomes a lower bound; the boot does not die. Silently dropping
+    the whole census (or crashing) would blind H1 exactly when the cache is being
+    written to — the moment the census exists to observe."""
+    entries = [_VanishedEntry(), _StableEntry(size=64, mtime=1000.0)]
+    monkeypatch.setattr(boot_trace.os, "scandir", lambda path: _FakeScandir(entries))
+
+    assert boot_trace.scan_dir("/cache") == (1, 64, 1000.0, False)
+
+
+def test_the_counter_keeps_counting_when_the_forwarded_sink_blows_up():
+    """Forwarding exists so measuring does not CONSUME the lastResort evidence; if
+    the forwarded sink itself raises, the measurement must survive it — otherwise a
+    broken sink silently deletes the EROFS count that diagnoses the mount."""
+
+    class _AngrySink(logging.Handler):
+        def handle(self, record):
+            raise RuntimeError("the sink is gone")
+
+    stream = io.StringIO()
+    counter = boot_trace.ReadOnlyErrorCounter(stream=stream, forward=_AngrySink())
+    counter.emit(_record(OSError(errno.EROFS, "Read-only file system")))
+
+    assert counter.count == 1
+    assert "cache_write_denied errno=30" in stream.getvalue()
+
+
+def test_a_record_whose_own_formatting_is_broken_is_still_examined():
+    """``getMessage()`` runs the caller's ``msg % args`` and a library that logs
+    mismatched args raises there. The EROFS evidence is in ``exc_info``, not in the
+    formatting, so a broken format must degrade to the raw template — dropping the
+    record would lose the very line p4c4 harvested."""
+    stream = io.StringIO()
+    counter = boot_trace.ReadOnlyErrorCounter(stream=stream)
+    broken = logging.LogRecord(
+        name="asyncio",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="cache write failed after %d attempts",
+        args=("not-an-int",),  # -> TypeError inside getMessage()
+        exc_info=(OSError, OSError(errno.EROFS, "Read-only file system"), None),
+    )
+
+    counter.emit(broken)
+
+    assert counter.count == 1
+    assert "cache write failed after %d attempts" in stream.getvalue()  # the raw template
+
+
+def test_a_malformed_record_never_poisons_logging(capsys):
+    """The counter is installed on the ROOT logger, so anything it raises is raised
+    inside every library's ``log()`` call. A record whose ``exc_info`` is not the
+    (type, value, tb) triple must therefore be dropped in silence."""
+    stream = io.StringIO()
+    counter = boot_trace.ReadOnlyErrorCounter(stream=stream)
+    malformed = _record(None)
+    malformed.exc_info = True  # truthy but not subscriptable
+
+    counter.emit(malformed)  # must not raise
+
+    assert counter.count == 0
+    assert stream.getvalue() == ""
+    assert capsys.readouterr().err == ""

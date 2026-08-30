@@ -244,3 +244,58 @@ def test_matched_but_nothing_to_flip_is_not_reported_missing():
     )
     assert enabled == []  # gateless + already-enabled -> nothing to flip...
     assert unmatched == []  # ...and NOT reported as missing publishers
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the walk's own termination guards. The upstream BFS runs over a graph
+# the ASSET authors, not one we build, so it has to survive both shapes a real
+# OmniGraph produces: a connection to a prim that is not there, and a node that
+# more than one branch reaches.
+# --------------------------------------------------------------------------- #
+def test_the_walk_survives_a_dangling_connection_and_a_shared_upstream_node():
+    """Without the skip, a dangling ``inputs:*`` connection would push ``None``
+    onto the queue and the next ``GetAttributes()`` would raise inside boot; without
+    the ``seen`` guard, a diamond (two chains fed by ONE node — the single playback
+    tick every carter graph has) would revisit it, and a cycle would never return.
+
+    Both are asserted through the public entry point: the declared topic must still
+    resolve to its render product.
+    """
+    g = "/World/Robot/graph"
+    stage = FakeStage(
+        [
+            # a self-referencing tick: the cycle a ``seen``-less BFS never leaves
+            FakePrim(
+                f"{g}/tick",
+                [
+                    FakeAttr("node:type", "omni.graph.action.OnPlaybackTick"),
+                    FakeAttr("inputs:execIn", connections=[f"{g}/tick"]),
+                ],
+            ),
+            FakePrim(
+                f"{g}/rp",
+                [
+                    FakeAttr("node:type", RENDER_PRODUCT_TYPE),
+                    FakeAttr("inputs:enabled", False),
+                    FakeAttr("inputs:execIn", connections=[f"{g}/tick"]),
+                ],
+            ),
+            # publisher A: reaches the tick BOTH directly and through rp (diamond)
+            FakePrim(
+                f"{g}/pub_a",
+                [
+                    FakeAttr("node:type", "isaacsim.ros2.bridge.ROS2PublishLaserScan"),
+                    FakeAttr("inputs:topicName", "front_2d_lidar/scan"),
+                    FakeAttr("inputs:execIn", connections=[f"{g}/tick", f"{g}/rp"]),
+                    # ...and one connection whose target prim is NOT in the stage
+                    FakeAttr("inputs:renderProductPath", connections=[f"{g}/deleted_node"]),
+                ],
+            ),
+        ]
+    )
+
+    enabled, unmatched = enable_sensor_render_products(stage, ["/front_2d_lidar/scan"])
+
+    assert enabled == [f"{g}/rp"]
+    assert unmatched == []
+    assert stage.GetPrimAtPath(f"{g}/rp").GetAttribute("inputs:enabled").set_calls == [True]

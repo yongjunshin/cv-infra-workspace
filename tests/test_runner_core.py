@@ -769,3 +769,132 @@ def test_closest_approach_line_is_emitted_verbatim_and_stays_silent_without_data
     main._print_closest_approach(telemetry.TelemetryRecord(), [3.0, 0.0, 0.0])
     main._print_closest_approach(record, None)
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the surfaces the branch census found unmeasured. Each one is a path the
+# runner takes in production but no CPU test had ever driven.
+# --------------------------------------------------------------------------- #
+def test_read_field_reads_an_attribute_object_the_same_way_it_reads_a_dict():
+    """``read_field`` is the ONE accessor both oracles use, and criteria reach it
+    in two shapes: a plain dict (batch/JOB_SPEC path) and an M1 pydantic model
+    (``AcceptanceCriterion.params`` after model_validate). If the attribute arm
+    ever diverged, an oracle would silently read its default off a typed
+    criteria object and judge the mission against the wrong tolerance."""
+
+    class _TypedCriteria:  # the attribute shape an M1 model presents
+        goal_position = [1.0, 2.0, 3.0]
+        timeout_s = 30.0
+
+    typed = _TypedCriteria()
+    assert evaluate.read_field(typed, "goal_position") == [1.0, 2.0, 3.0]
+    assert evaluate.read_field(typed, "timeout_s") == 30.0
+    assert evaluate.read_field(typed, "absent") is None
+    assert evaluate.read_field(typed, "absent", 0.25) == 0.25
+    # ...and identically off the dict form, which is what makes them one accessor.
+    as_dict = {"goal_position": [1.0, 2.0, 3.0], "timeout_s": 30.0}
+    assert evaluate.read_field(as_dict, "goal_position") == [1.0, 2.0, 3.0]
+    assert evaluate.read_field(as_dict, "absent", 0.25) == 0.25
+
+
+def test_time_to_goal_is_none_when_the_mission_produced_no_samples():
+    """An empty trajectory means "we never observed the robot", which must read as
+    "no time-to-goal" — NOT as 0.0 s, the value a bare ``samples[0]`` index error
+    would have to be papered over with and the one a report renders as instant."""
+    assert telemetry.time_to_goal_s([], (3.0, 0.0, 0.0), 0.1) is None
+
+
+def test_telemetry_detach_is_cpu_safe_and_idempotent_before_any_bind():
+    """``main.run``'s ``finally`` calls ``detach()`` on EVERY path, including the
+    ones that died before ``bind`` ever ran on GPU. A raise here would replace the
+    real failure with a teardown traceback (REQ-EXEC-015 clean shutdown)."""
+    sampler = telemetry.PhysicsTelemetrySampler(CHASSIS, ["/World/ground"])
+    sampler.detach()
+    sampler.detach()  # idempotent: the batch carrier detaches once per sample
+    assert sampler._contact_sub is None  # the subscription ref is what unsubscribes
+    assert sampler._chassis_prim is None
+
+
+def test_no_collision_without_a_chassis_path_reports_bad_criteria_instead_of_passing():
+    """D-E/R7: the filter is meaningless without the chassis prim, so the oracle
+    must FAIL LOUD. Passing would be the worst outcome — an unfilterable run would
+    read as "no collisions" and ship a green verdict for an unjudged mission."""
+    from cv_infra.oracles.no_collision import NoCollisionOracle
+
+    rec = _record(events=[ContactEvent(0.3, CHASSIS, "/World/obstacle")])
+    out = NoCollisionOracle().evaluate(rec, {"collision_excluded_paths": ["/World/ground"]})
+    assert out.passed is False
+    assert out.reason == "bad_criteria"
+    assert "chassis_path" in out.detail
+
+
+def test_reached_goal_separates_bad_criteria_from_an_empty_trajectory():
+    """Two DIFFERENT unjudgeable states, and the reason tag is what tells them
+    apart in the result: no goal = the request was wrong; no samples = the mission
+    produced nothing (telemetry never bound / the sim died). Both must fail — a
+    pass here would be a verdict about a mission nobody observed."""
+    from cv_infra.oracles.reached_goal import ReachedGoalOracle
+
+    no_goal = ReachedGoalOracle().evaluate(_record(samples=_line(4)), {})
+    assert (no_goal.passed, no_goal.reason) == (False, "bad_criteria")
+
+    no_samples = ReachedGoalOracle().evaluate(
+        _record(samples=[]), {"goal_position": [3.0, 0.0, 0.0], "position_tolerance_m": 0.1}
+    )
+    assert (no_samples.passed, no_samples.reason) == (False, "no_telemetry")
+
+
+def test_parse_request_accepts_the_nested_sut_block_not_only_the_flat_pin():
+    """The JOB_SPEC wire allows BOTH spellings: the flattened ``sut_image_ref``
+    (T1 seam, what M3 dispatches) and the canonical nested ``sut`` block (what a
+    scenario document carries). The flat one is adapted INTO the nested one, so
+    the nested path must survive untouched — and declaring both stays ambiguous."""
+    spec = _randomizable_spec()
+    del spec["sut_image_ref"]
+    spec["sut"] = {"image_ref": "sut:nested"}
+    request, _adapter = main.parse_request(spec)
+    assert request.sut.image_ref == "sut:nested"
+
+    with pytest.raises(main.BadJobSpec, match="ambiguous SUT pin"):
+        main.parse_request({**spec, "sut_image_ref": "sut:flat"})
+
+
+def test_main_maps_a_refused_eula_to_the_platform_exit_code(monkeypatch, capsys):
+    """``run`` RE-RAISES ``EulaNotAcceptedError`` (it must not be folded into the
+    generic error result), so this outer handler is the production owner of the
+    NEG-2 exit code. The subprocess proof lives in tests/negative/test_eula_gate.py;
+    this pins the mapping itself, in-process, without a GPU-shaped boot."""
+
+    def _refuse(_env):
+        raise sim_runtime.EulaNotAcceptedError("Isaac Sim EULA not accepted — boot refused")
+
+    monkeypatch.setattr(main, "run", _refuse)
+    assert main.main({}) == main.EXIT_PLATFORM == 3
+    assert "boot refused" in capsys.readouterr().err
+
+
+def test_step_before_load_scene_is_a_loud_order_violation():
+    """M2 §3.2 order: ``world`` exists only after ``load_scene``. Stepping before
+    it must name the missing step — an ``AttributeError`` on ``None.step`` would
+    reach M3 as an anonymous platform error."""
+    sim = sim_runtime.SimRuntime(sim_runtime.SimConfig(scene_ref="s.usd", robot_usd_ref="r.usd"))
+    with pytest.raises(RuntimeError, match="load_scene"):
+        sim.step()
+
+
+def test_repose_log_line_states_both_the_declared_pose_and_the_written_one():
+    """G-26 prove-it-ran: a repose that silently did nothing and one that never ran
+    read the same in a log. The line carries the marker NEG-6 greps plus BOTH
+    sides — declared (planar x/y/yaw) and written (the asset's own z) — because
+    they are different objects and only the pair shows the repose took effect."""
+    line = sim_runtime.repose_log_line(
+        "/World/Nova_Carter",
+        {"x": -6.0, "y": -1.5, "yaw": 1.57},
+        (-6.0, -1.5, 0.24),
+        (0.707, 0.0, 0.0, 0.707),
+    )
+    assert line.startswith(f"[cv-runner] {sim_runtime.REPOSE_LOG_MARKER}/World/Nova_Carter ")
+    assert "declared={'x': -6.0, 'y': -1.5, 'yaw': 1.57}" in line
+    assert "position=(-6.0, -1.5, 0.24)" in line
+    assert "orientation_wxyz=(0.707, 0.0, 0.0, 0.707)" in line
+    assert "joint POSITIONS untouched" in line  # the scope this repose does NOT claim

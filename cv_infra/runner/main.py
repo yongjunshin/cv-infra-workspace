@@ -214,7 +214,13 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
     except ValidationError as exc:
         friendly = "; ".join(str(e) for e in from_validation_error(exc, model=VerificationRequest))
         raise BadJobSpec(f"JOB_SPEC is not a canonical VerificationRequest: {friendly}") from exc
-    if request.interface.type != "ros2":
+    # Unreachable TODAY and kept on purpose: ``Interface`` is the MVP alias for
+    # ``Ros2Interface``, whose ``type`` is ``Literal["ros2"]``, so a non-ros2 value
+    # is already rejected two lines up as a ValidationError. The day the adapter
+    # union lands (adapter_schema module docstring) this becomes the runner-side
+    # half of NFR-EXEC-003 — a document the CONTRACT accepts but this runner has no
+    # adapter for. Deleting it would make that day's failure a silent mis-drive.
+    if request.interface.type != "ros2":  # pragma: no cover - unreachable: Literal["ros2"]
         raise BadJobSpec(f"unsupported interface.type {request.interface.type!r} (MVP: ros2 only)")
     # p6 §0-5: the randomizable fields are a UNION (float | Uniform | Choice), so
     # ``extra="forbid"`` no longer stops ``{uniform: [...]}`` from reaching the

@@ -955,3 +955,48 @@ def test_carrier_never_uses_exit_code_1():
     source = Path(batch.__file__).read_text(encoding="utf-8")
     assert "EXIT_FAIL" not in source
     assert {batch.EXIT_PASS, batch.EXIT_USAGE, batch.EXIT_PLATFORM} == {0, 2, 3}
+
+
+# --------------------------------------------------------------------------- #
+# p8c2 — the per-iteration stopwatch and the carrier's platform-exit mapping.
+# --------------------------------------------------------------------------- #
+def test_stopwatch_records_a_named_span_and_forgets_it_after_the_end():
+    """The W2 per-iteration anchors: every span is named, so a summary reader can
+    tell "restage was slow" from "the mission was slow". ``end`` pops its start —
+    a span left armed would make the NEXT sample's identically-named span measure
+    from the wrong t0, quietly inflating every later iteration."""
+    watch = batch._Stopwatch()
+    assert watch.spans == {}
+
+    watch.begin("restage")
+    elapsed = watch.end("restage")
+
+    assert elapsed >= 0.0
+    assert watch.spans == {"restage": round(elapsed, 4)}  # rounded once, at the source
+    with pytest.raises(KeyError):  # the start was consumed, not left behind
+        watch.end("restage")
+
+
+def test_stopwatch_keeps_concurrent_spans_apart():
+    """Iterations nest spans (an outer per-sample one around inner phases), so two
+    open names must not share a t0."""
+    watch = batch._Stopwatch()
+    watch.begin("sample")
+    watch.begin("mission")
+    watch.end("mission")
+    watch.end("sample")
+    assert sorted(watch.spans) == ["mission", "sample"]
+    assert watch.spans["sample"] >= watch.spans["mission"]
+
+
+def test_carrier_main_maps_a_refused_eula_to_the_platform_exit_code(monkeypatch, capsys):
+    """The carrier's half of NEG-2. ``run`` re-raises ``EulaNotAcceptedError`` past
+    its own error handling on purpose, so this outer handler owns the exit code —
+    and it must be 3 (platform), never 2 (the operator's spec was fine)."""
+
+    def _refuse(_env):
+        raise sim_runtime.EulaNotAcceptedError("Isaac Sim EULA not accepted — boot refused")
+
+    monkeypatch.setattr(batch, "run", _refuse)
+    assert batch.main({}) == batch.EXIT_PLATFORM == 3
+    assert "boot refused" in capsys.readouterr().err
