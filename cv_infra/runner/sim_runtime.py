@@ -304,15 +304,30 @@ def _normalized_topic(name) -> str:
     return str(name).lstrip("/")
 
 
+def _enable_upstream_render_products(stage, publish_node) -> list[str]:
+    """Turn ON every still-disabled render-product node upstream of ONE publish node.
+
+    In-memory attribute set only (never a stage save — the asset stays
+    unmodified) and idempotent: an already-enabled node is left untouched, which
+    is what makes a second call a no-op. Returns the node paths this call flipped.
+    """
+    flipped: list[str] = []
+    for node in _upstream_prims(stage, publish_node):
+        if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
+            continue
+        enabled_attr = node.GetAttribute("inputs:enabled")
+        if enabled_attr and not enabled_attr.Get():
+            enabled_attr.Set(True)
+            flipped.append(str(node.GetPath()))
+    return flipped
+
+
 def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
     """FU-17: enable the render products feeding the DECLARED sensor topics.
 
-    For each publish node whose ``inputs:topicName`` names a declared topic
-    (slash-normalized comparison — see ``_normalized_topic``), walk its
-    upstream graph and set ``inputs:enabled=true`` on every
-    ``IsaacCreateRenderProduct`` node still False. In-memory attribute set only
-    (never a stage save — the asset stays unmodified); idempotent (already-enabled
-    nodes are left untouched, so a second call is a no-op). Returns
+    This half answers "WHICH publish nodes are ours" (a declared topic names them,
+    slash-normalized — see ``_normalized_topic``); ``_enable_upstream_render_products``
+    answers "which nodes upstream of one of them to flip". Returns
     ``(newly_enabled_node_paths, declared_topics_with_no_publish_node)`` — the
     second list (declared spelling, as-written) is the original FU-17 bug class
     (declared but publisher-less) and is surfaced loudly by the caller.
@@ -329,13 +344,7 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
         if topic is None or _normalized_topic(topic) not in wanted:
             continue
         matched.add(_normalized_topic(topic))
-        for node in _upstream_prims(stage, prim):
-            if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
-                continue
-            enabled_attr = node.GetAttribute("inputs:enabled")
-            if enabled_attr and not enabled_attr.Get():
-                enabled_attr.Set(True)
-                enabled.append(str(node.GetPath()))
+        enabled.extend(_enable_upstream_render_products(stage, prim))
     return sorted(set(enabled)), sorted(wanted[k] for k in set(wanted) - matched)
 
 
