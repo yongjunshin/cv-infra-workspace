@@ -41,7 +41,11 @@ runner-only. Likewise (p4c4 glue, T1 report §7-1 (a)) each ADMITTED request
 materializes into the canonical per-job JOB_SPEC (``_job_spec_for``) riding —
 and persisting with — its Jobs (``Job.job_spec``), so ``RunJobRunner`` drives
 the real ``run_job`` without ever re-admitting; the env-configured production
-wiring lives in ``serve.py``.
+wiring lives in ``serve.py``. That builder is M1's own
+(``contract.job_spec.build_job_spec``, imported here under the frozen local
+name): p8c1 replaced this plane's twin COPY of the assembly with the single
+definition both submission planes now call — the M8 CLI keeps its own handle,
+and neither plane imports the other (layer direction unchanged).
 
 Submission is all-or-nothing (비전파): every request must admit before ANY job
 is created — one bad request rejects the whole envelope with a structured 422
@@ -123,6 +127,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from cv_infra.contract.derive import materialize_request
 from cv_infra.contract.errors import ContractError
+from cv_infra.contract.job_spec import build_job_spec as _job_spec_for  # M1 owns the shape
 from cv_infra.contract.loader import AdmittedRequest, load_request
 from cv_infra.contract.schema import RequestEnvelope, ResourceBudget
 from cv_infra.orchestrator.allocator import DomainIdAllocator
@@ -401,57 +406,6 @@ def _admit_all(
             continue
         admitted_requests.append(admitted)
     return admitted_requests, errors
-
-
-def _job_spec_for(request: Any, job_id: str) -> dict[str, Any]:
-    """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict (p4c4 glue).
-
-    The wire shape is the frozen Phase-2 M3->M2 seam (supervisor JOB_SPEC file
-    -> runner ``resolve_job_spec_dict``): top-level key set ``{job_id, scenario,
-    sut_image_ref, interface, acceptance_criteria}`` with ``sut.image_ref``
-    flattened (REQ-INTAKE-006), plus ``execution_settings`` when it carries a
-    runner-actionable knob (below). ``exclude_none=True`` keeps "None =
-    downstream default applies" fields ABSENT (a present-but-null known-key
-    param would defeat the oracle ``read_field`` fallback); free-form
-    custom-criterion params are not filtered, so explicit user nulls survive.
-
-    ``execution_settings`` (decision 2026-08-04 D-8): the knobs the RUNNER can
-    act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
-    each fanned-out job IS one repeat, so shipping it would tell the runner
-    something false about the job it holds (one home per field). ``min_pass_ratio``
-    is excluded for the same reason (p6 §0-14): it judges the REQUEST's samples
-    as a set, which is not a fact about the one sample the runner holds. The
-    subtree is dumped mechanically (``exclude={"repeats", "min_pass_ratio"}`` +
-    ``exclude_none``) so a future
-    M1 knob rides without an allowlist to drift (G-25), and it is OMITTED when
-    nothing survives that filter — an undeclared ``fixed_dt`` leaves the frozen
-    key set byte-identical. Nesting (not flattening like ``sut_image_ref``) is
-    what the seam actually admits: the runner re-validates the spec as a whole
-    ``VerificationRequest`` (``runner/main.py::parse_request``, ``extra=forbid``)
-    — measured 2026-08-05, a top-level ``fixed_dt`` is rejected with exit 2.
-    Consuming the value is M2's (T4); this producer only stops swallowing it.
-
-    SOURCE OF TRUTH anchor (G-25): the envelope-less producer of this exact
-    shape is ``cv_infra/cli/main.py::_job_spec_from_request`` (M8, ``cv-infra
-    run``). This REST-path twin is kept verbatim-equal by the mechanical parity
-    guard ``tests/test_orchestrator_rest_glue.py`` — production M3 deliberately
-    does NOT import the M8 CLI plane (layer direction: M8 wraps M3).
-    """
-    spec = {
-        "job_id": job_id,
-        "scenario": request.scenario.model_dump(exclude_none=True),
-        "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
-        "interface": request.interface.model_dump(exclude_none=True),
-        "acceptance_criteria": [
-            criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
-        ],
-    }
-    runner_knobs = request.execution_settings.model_dump(
-        exclude_none=True, exclude={"repeats", "min_pass_ratio"}
-    )
-    if runner_knobs:
-        spec["execution_settings"] = runner_knobs
-    return spec
 
 
 def _result_wire(result: JobResult) -> dict[str, Any]:

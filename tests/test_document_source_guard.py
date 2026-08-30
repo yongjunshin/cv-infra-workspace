@@ -160,8 +160,12 @@ _SOURCES = [
 _CONSTRUCTION_SITES = {
     "cv_infra/orchestrator/selftest.py": "document-source",
     "cv_infra/contract/loader.py": "projection-of-admitted",
-    "cv_infra/cli/main.py": "projection-of-admitted",
-    "cv_infra/orchestrator/api.py": "projection-of-admitted",
+    # p8c1: the JOB_SPEC projection that used to be DUPLICATED in
+    # ``cv_infra/cli/main.py`` and ``cv_infra/orchestrator/api.py`` is now a
+    # single definition here; both planes call it and author no dict of their
+    # own, so the two entries are gone and this one replaces them (the guard's
+    # own instruction — same classification, one site instead of two).
+    "cv_infra/contract/job_spec.py": "projection-of-admitted",
 }
 
 
