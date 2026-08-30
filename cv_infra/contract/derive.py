@@ -165,14 +165,18 @@ def _expand_obstacles(groups: list[Obstacle], rng: random.Random) -> list[dict]:
         template = group.model_dump()
         count = group.count
         n = rng.randint(*count.randint) if isinstance(count, Randint) else int(count)
-        for _ in range(n):
-            expanded.append(
-                {
-                    **template,
-                    "count": 1,
-                    **{name: _draw(getattr(group, name), rng) for name in OBSTACLE_FIELDS},
-                }
-            )
+        # The generator is consumed by ``extend`` one entry at a time, in order,
+        # so each instance draws its own fields at exactly the point the append
+        # loop drew them — draw ORDER and draw COUNT are unchanged (the golden
+        # expansions in tests/test_contract_derive.py are the gate).
+        expanded.extend(
+            {
+                **template,
+                "count": 1,
+                **{name: _draw(getattr(group, name), rng) for name in OBSTACLE_FIELDS},
+            }
+            for _ in range(n)
+        )
     return expanded
 
 

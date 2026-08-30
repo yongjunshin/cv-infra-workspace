@@ -92,18 +92,7 @@ def load_request(
     text, source_path = _read(source, source_path)
 
     # (1) safe parse -------------------------------------------------------- #
-    try:
-        doc = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise _parse_error(exc, source_path) from exc
-    if not isinstance(doc, dict):
-        raise ContractError(
-            expected="a YAML mapping (scenario / sut / interface / acceptance_criteria)",
-            got=repr(doc),
-            example=f"sut:\n  image_ref: {EXAMPLE_IMAGE_REF}",
-            doc_link=_DOC_LINK,
-            source_path=source_path,
-        )
+    doc = _safe_parse(text, source_path)
     locator = _Locator(text)
 
     # (2) apiVersion resolve (version.py — 3-state) -------------------------- #
@@ -131,19 +120,74 @@ def load_request(
     _reject_platform_stamp(request, source_path)
 
     # (5) oracle load + bind (REQ-INTAKE-007/008) ---------------------------- #
-    # D-1(a) submission plane (decision 2026-07-11 §D-1 wiring item 1):
-    # scenario-adjacent custom oracle modules ("module:Class" next to the YAML)
-    # resolve while binding — the anchor directory joins sys.path for stage 5
-    # ONLY, try/finally-restored. An explicit ``plugin_dir`` wins (stream
-    # submissions carry their anchor, p4c3); otherwise a file source anchors
-    # its parent dir, and anchor-less streams stay anchor-less.
+    bound = _bind_oracles(
+        request,
+        anchor=_plugin_anchor(source, plugin_dir),
+        source_path=source_path,
+        locator=locator,
+    )
+
+    # (6) admit marking (REQ-INTAKE-009) ------------------------------------- #
+    return AdmittedRequest(
+        request=request,
+        oracles=tuple(bound),
+        warnings=tuple(warnings),
+        source_path=source_path,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# internals — one helper per stage that owns more than a call (stages 1 and 5),
+# so ``load_request`` above reads as the 6-stage gate its docstring describes.
+# --------------------------------------------------------------------------- #
+def _safe_parse(text: str, source_path: str | None) -> dict:
+    """Stage 1: SafeLoader parse -> the request MAPPING (anything else rejects)."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise _parse_error(exc, source_path) from exc
+    if not isinstance(doc, dict):
+        raise ContractError(
+            expected="a YAML mapping (scenario / sut / interface / acceptance_criteria)",
+            got=repr(doc),
+            example=f"sut:\n  image_ref: {EXAMPLE_IMAGE_REF}",
+            doc_link=_DOC_LINK,
+            source_path=source_path,
+        )
+    return doc
+
+
+def _plugin_anchor(source: str | Path | io.TextIOBase, plugin_dir: str | None) -> str | None:
+    """The stage-5 custom-oracle anchor directory, resolved — or ``None``.
+
+    An explicit ``plugin_dir`` wins (stream submissions carry their anchor,
+    p4c3); otherwise a file source anchors its parent dir, and anchor-less
+    streams stay anchor-less.
+    """
     if plugin_dir is not None:
-        plugin_dir = str(Path(plugin_dir).resolve())
-    elif isinstance(source, (str, Path)):
-        plugin_dir = str(Path(source).parent.resolve())
+        return str(Path(plugin_dir).resolve())
+    if isinstance(source, (str, Path)):
+        return str(Path(source).parent.resolve())
+    return None
+
+
+def _bind_oracles(
+    request: VerificationRequest,
+    *,
+    anchor: str | None,
+    source_path: str | None,
+    locator: _Locator,
+) -> list[str]:
+    """Stage 5: load + bind every criterion's oracle, returning the bound names.
+
+    D-1(a) submission plane (decision 2026-07-11 §D-1 wiring item 1):
+    scenario-adjacent custom oracle modules ("module:Class" next to the YAML)
+    resolve while binding — the ``anchor`` directory joins sys.path for stage 5
+    ONLY, try/finally-restored.
+    """
     bound: list[str] = []
-    if plugin_dir is not None:
-        sys.path.insert(0, plugin_dir)
+    if anchor is not None:
+        sys.path.insert(0, anchor)
     try:
         for i, criterion in enumerate(request.acceptance_criteria):
             try:
@@ -157,21 +201,11 @@ def load_request(
                 ) from err
             bound.append(oracle.name)
     finally:
-        if plugin_dir is not None and plugin_dir in sys.path:
-            sys.path.remove(plugin_dir)
-
-    # (6) admit marking (REQ-INTAKE-009) ------------------------------------- #
-    return AdmittedRequest(
-        request=request,
-        oracles=tuple(bound),
-        warnings=tuple(warnings),
-        source_path=source_path,
-    )
+        if anchor is not None and anchor in sys.path:
+            sys.path.remove(anchor)
+    return bound
 
 
-# --------------------------------------------------------------------------- #
-# internals
-# --------------------------------------------------------------------------- #
 def _read(source: str | Path | io.TextIOBase, source_path: str | None) -> tuple[str, str | None]:
     if isinstance(source, (str, Path)):
         path = Path(source)

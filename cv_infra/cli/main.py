@@ -308,50 +308,17 @@ def _default_job_id(scenario_path: Path) -> str:
 def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
-    The wire shape is the frozen Phase-2 seam (supervisor JOB_SPEC file ->
-    runner parse): top-level key set ``{job_id, scenario, sut_image_ref,
-    interface, acceptance_criteria}`` with ``sut.image_ref`` flattened
-    (REQ-INTAKE-006), plus ``execution_settings`` when it carries a
-    runner-actionable knob (below). ``apiVersion`` (resolved at admit) and
-    ``sut.image_id`` stay OFF the wire — no execution-plane consumer exists.
-
-    ``exclude_none=True`` keeps "None = downstream default applies" fields
-    ABSENT exactly as the raw-YAML pass-through did: a present-but-``null``
-    known-key param (e.g. ``goal_orientation_wxyz``) would defeat the oracle's
-    ``read_field(name, default)`` fallback. Free-form dict values (custom
-    criterion params) are NOT filtered by pydantic's ``exclude_none`` —
-    explicit nulls a user wrote survive verbatim (measured 2026-07-10).
-    ``scenario.debug_obstacle`` (D-2') rides the wire only when declared.
-
-    ``execution_settings`` (decision 2026-08-04 D-8): the knobs the RUNNER can
-    act on ride the wire, ``repeats`` does NOT — it is M3's own fan-out axis and
-    each fanned-out job IS one repeat (this CLI path runs exactly one), so
-    shipping it would tell the runner something false about the job it holds.
-    ``min_pass_ratio`` is excluded for the same reason (p6 §0-14) — it judges the
-    request's samples as a set, not the one sample the runner holds.
-    The subtree is dumped mechanically (``exclude={"repeats", "min_pass_ratio"}``
-    + ``exclude_none``) so a future M1 knob rides without an allowlist to drift,
-    and it is OMITTED when nothing survives that filter — an undeclared
-    ``fixed_dt`` leaves the frozen key set byte-identical. It nests (rather than
-    flattening like ``sut_image_ref``) because the runner re-validates the spec
-    as a whole ``VerificationRequest`` (``extra=forbid``): a top-level
-    ``fixed_dt`` is rejected with exit 2 (measured 2026-08-05).
+    Thin alias of the M1 definition (``contract.job_spec.build_job_spec``, which
+    holds the frozen wire shape and the reasons for it) — this plane owns no
+    second assembly of the spec (p8c1: the twin the M3 REST path used to carry
+    became an alias of the same function). Kept as a module-level function so
+    the run path's lazy-import discipline holds: the contract stays OFF this
+    module's import surface (--help must not pull it), and call sites/tests keep
+    the handle they already have.
     """
-    spec = {
-        "job_id": job_id,
-        "scenario": request.scenario.model_dump(exclude_none=True),
-        "sut_image_ref": request.sut.image_ref,  # flattened canonical field (REQ-INTAKE-006)
-        "interface": request.interface.model_dump(exclude_none=True),
-        "acceptance_criteria": [
-            criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
-        ],
-    }
-    runner_knobs = request.execution_settings.model_dump(
-        exclude_none=True, exclude={"repeats", "min_pass_ratio"}
-    )
-    if runner_knobs:
-        spec["execution_settings"] = runner_knobs
-    return spec
+    from cv_infra.contract.job_spec import build_job_spec
+
+    return build_job_spec(request, job_id)
 
 
 def _render_contract_errors(err: Any) -> None:
