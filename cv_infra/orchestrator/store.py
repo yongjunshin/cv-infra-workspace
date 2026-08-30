@@ -149,8 +149,14 @@ CREATE TABLE IF NOT EXISTS envelope_reports (
 );
 """
 
-# Envelope status literals persisted in the envelopes table — the same two the
-# api.py wire exposes (module docstring shape pin).
+# Envelope status literals persisted in the envelopes table — and the DEFINITION
+# HOME of that vocabulary for the whole system (p8c2 T2). Both wire producers read
+# them from here (``api._status_from_store`` puts the persisted value on the wire
+# verbatim; ``api._envelope_status`` mints the live one) and so does the CLI
+# consumer that folds a terminal envelope (``cli/batch._poll_until_terminal``), so
+# the value cannot drift between the two planes behind a spelling that matches by
+# habit. Same-spelled but DIFFERENT vocabularies stay separate on purpose:
+# ``models.JobState`` (per-job state machine) and docker's own container status.
 ENVELOPE_RUNNING = "running"
 ENVELOPE_COMPLETED = "completed"
 
