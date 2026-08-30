@@ -23,6 +23,7 @@ submodules (D-C/R20).
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -133,6 +134,15 @@ def _render_got(err: Mapping[str, Any]) -> str:
     return repr(err.get("input"))
 
 
+def _peel_optional(args: tuple[Any, ...]) -> list[Any]:
+    """Union members minus ``NoneType`` — the peel BOTH walk modes below share.
+
+    Exactly one survivor = an unambiguous ``X | None``; anything else (a real
+    multi-member union, a non-union) is left alone by the callers.
+    """
+    return [a for a in args if a is not type(None)]
+
+
 def _unwrap_annotation(annotation: Any, index_step: bool) -> Any:
     """Best-effort unwrap of ``list[X]`` / ``X | None`` / ``list[X] | None`` /
     ``Annotated[X, ...]``."""
@@ -140,6 +150,7 @@ def _unwrap_annotation(annotation: Any, index_step: bool) -> Any:
 
     origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
+    non_none = _peel_optional(args)
     if index_step:
         # stepping through a sequence index -> the element annotation
         if origin in (list, tuple) and args:
@@ -147,17 +158,11 @@ def _unwrap_annotation(annotation: Any, index_step: bool) -> Any:
         # an OPTIONAL list (``list[X] | None`` — every optional block-list in the
         # contract) still has an element type: peel the union and retry, or the
         # example is silently lost for every violation under it (NFR-INTAKE-001).
-        non_none = [a for a in args if a is not type(None)]
-        if len(non_none) == 1:
-            return _unwrap_annotation(non_none[0], index_step=True)
-        return None
+        return _unwrap_annotation(non_none[0], index_step=True) if len(non_none) == 1 else None
     if origin is None:
         return annotation
     # Optional[X] / unions: only unambiguous (X | None) unwraps
-    non_none = [a for a in args if a is not type(None)]
-    if len(non_none) == 1:
-        return non_none[0]
-    return annotation
+    return non_none[0] if len(non_none) == 1 else annotation
 
 
 def _example_for(model: Any, loc: Iterable[Any]) -> str:
@@ -225,10 +230,8 @@ def from_validation_error(
     if locator is None:
         locator = getattr(exc, _LOCATOR_ATTR, None)
     else:
-        try:
+        with contextlib.suppress(AttributeError, TypeError):  # exotic exc: best-effort
             setattr(exc, _LOCATOR_ATTR, locator)
-        except (AttributeError, TypeError):  # exotic exc types: stay best-effort
-            pass
     out: list[ContractError] = []
     for err in exc.errors(include_url=False):
         loc = tuple(err.get("loc") or ())
