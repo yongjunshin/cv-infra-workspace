@@ -351,6 +351,46 @@ def insert_oracle_plugin_dir(env: dict | None = None) -> str | None:
     return plugin_dir
 
 
+def announce_oracle_plugin_dir(env: dict | None = None) -> str | None:
+    """``insert_oracle_plugin_dir`` + the one boot line both entrypoints print.
+
+    Two call sites (one job, one carrier) that must agree on WHEN the dir goes on
+    ``sys.path`` (before the engine composes) and on what the log says about it.
+    Returns the inserted dir, or None when the supervisor injected none.
+    """
+    plugin_dir = insert_oracle_plugin_dir(env)
+    if plugin_dir is not None:
+        print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
+    return plugin_dir
+
+
+def plan_obstacle_pool(obstacles: list[dict]) -> dict:
+    """Plan ONE job's obstacle pool, rejecting an over-cap plan as bad input.
+
+    Pre-boot, for the same reason ``admit_specs`` plans the batch's: a pool that
+    does not fit must cost 0 GPU seconds and read as exit 2, never as a platform
+    failure after the boot is paid. Pure — the pre-reset hooks only execute it.
+    """
+    try:
+        return obstacle_pool_plan([obstacles])
+    except ValueError as exc:
+        raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
+
+
+def artifact_paths(mcap_path: object, mp4_path: object) -> dict[str, str | None]:
+    """``{mcap, mp4}`` as strings, or None where the recorder produced nothing.
+
+    ONE rendering for both consumers of the pair (the canonical ``Artifacts``
+    block and the carrier's summary item), so a job and a sample cannot describe
+    the same two files differently. None is the honest absence (P2-02): a
+    recorder that failed leaves the field null, never an empty string.
+    """
+    return {
+        "mcap": str(mcap_path) if mcap_path is not None else None,
+        "mp4": str(mp4_path) if mp4_path is not None else None,
+    }
+
+
 def read_request_identity_key(env: dict | None = None) -> str | None:
     """The M3-injected request identity key, or None when it was not injected.
 
@@ -465,7 +505,6 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     from cv_infra.runner.sim_runtime import SimRuntime
     from cv_infra.runner.telemetry import (
         PhysicsTelemetrySampler,
-        contact_partners,
         count_real_collisions,
         min_clearance_m,
         path_length_m,
@@ -485,17 +524,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # input (exit 2), not as a platform failure after the boot is paid. The plan
     # is pure; the pre-reset hooks below only execute it.
     obstacles = obstacle_specs(request)
-    try:
-        obstacle_pool = obstacle_pool_plan([obstacles])
-    except ValueError as exc:
-        raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
+    obstacle_pool = plan_obstacle_pool(obstacles)
     # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
     # engine composes uniformly via the M1 loader — still PRE-sim, so a load
     # failure (defence-in-depth; admit already rejected it once) is
     # BadJobSpec -> exit 2 before any Isaac import/boot, like the parse above.
-    plugin_dir = insert_oracle_plugin_dir(env)
-    if plugin_dir is not None:
-        print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
+    announce_oracle_plugin_dir(env)
     # DoD-P2-06 ①: read the request identity key ONCE, pre-boot, so BOTH consumers
     # (the sim_config line and result.json) carry the same value even if the job
     # dies mid-mission. Absent stays absent — never substituted.
@@ -600,24 +634,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         mp4_path = _stop_quiet(video)
 
         record = sampler.record  # step 9: evaluate
-        goal_dbg = read_field(criteria, "goal_position")
-        if record.gt_pose_samples and goal_dbg is not None:
-            # Bring-up debug surface (T4 tolerance tuning): the exact GT
-            # closest-approach — run5 measured nav2 "Reached the goal!" with GT
-            # still outside the oracle tol (AMCL error + nav xy tol stack).
-            import math  # noqa: PLC0415
-
-            gxyz = (float(goal_dbg[0]), float(goal_dbg[1]), float(goal_dbg[2]))
-            closest = min(math.dist(s.position, gxyz) for s in record.gt_pose_samples)
-            print(f"[cv-runner] GT closest-approach to goal: {closest:.3f} m", flush=True)
-        if record.contact_events:  # bring-up debug surface: name the contact partners
-            partners = contact_partners(record.contact_events, chassis_path)
-            print(
-                f"[cv-runner] contact events: {len(record.contact_events)} with "
-                f"{len(partners)} distinct partner prim(s): {partners[:10]}",
-                flush=True,
-            )
         goal = read_field(criteria, "goal_position")
+        _print_closest_approach(record, goal)  # bring-up debug surface
+        _print_contact_partners(record, chassis_path)  # bring-up debug surface
         # ONE home for the tolerance (G-25): the metric below and the oracle verdict
         # must be taken with the SAME number, so both call the oracle's resolver
         # instead of re-reading the criteria (this site used to re-read the key AND
@@ -640,10 +659,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
             verdict,
             outcomes,
             metrics,
-            artifacts=Artifacts(
-                mcap=str(mcap_path) if mcap_path is not None else None,
-                mp4=str(mp4_path) if mp4_path is not None else None,
-            ),
+            artifacts=Artifacts(**artifact_paths(mcap_path, mp4_path)),
             request_identity_key=identity_key,
         )
         write_result(result, result_path)  # step 10: exactly one result
@@ -667,9 +683,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
         if sampler is not None:
             sampler.detach()
-        for recorder in (rosbag, video):  # failure paths: no child proc/writer leak
-            if recorder is not None:
-                recorder.abort()
+        _abort_recorders(rosbag, video)  # failure paths: no child proc/writer leak
         adapter.teardown()  # step 11: clean shutdown (rclpy node + DDS domain leave)
         # step 12: the sim is deliberately NOT closed here (G-62). Isaac's
         # SimulationApp.close() does not return — it ends the process with status 0,
@@ -692,6 +706,54 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # markers printed, i.e. the process ended INSIDE close(). Skipping it was the
         # only option, not a conservative guess. Re-opening this needs a new probe
         # run showing 42 (raised) or 43 (returned), never an assumption (G-62 ④).
+
+
+def _print_closest_approach(record, goal) -> None:  # pragma: no cover - GPU path helper
+    """Bring-up debug surface (T4 tolerance tuning): the exact GT closest approach.
+
+    run5 measured nav2 reporting "Reached the goal!" with the GROUND TRUTH still
+    outside the oracle tolerance (AMCL error + nav xy tol stack), which is the
+    number this line makes visible. Silent when there is no trajectory or no goal
+    to measure against — an absent debug line, never a fake one.
+    """
+    if not record.gt_pose_samples or goal is None:
+        return
+    import math  # noqa: PLC0415
+
+    gxyz = (float(goal[0]), float(goal[1]), float(goal[2]))
+    closest = min(math.dist(s.position, gxyz) for s in record.gt_pose_samples)
+    print(f"[cv-runner] GT closest-approach to goal: {closest:.3f} m", flush=True)
+
+
+def _print_contact_partners(record, chassis_path: str) -> None:  # pragma: no cover - GPU helper
+    """Bring-up debug surface: name the prims the chassis actually touched.
+
+    Both entrypoints print this same line (the carrier once per sample), so it
+    has one home. It is what a consumer extends ``collision_excluded_paths``
+    from — measured prim paths, never guessed ones (R7).
+    """
+    if not record.contact_events:
+        return
+    from cv_infra.runner.telemetry import contact_partners  # noqa: PLC0415
+
+    partners = contact_partners(record.contact_events, chassis_path)
+    print(
+        f"[cv-runner] contact events: {len(record.contact_events)} with "
+        f"{len(partners)} distinct partner prim(s): {partners[:10]}",
+        flush=True,
+    )
+
+
+def _abort_recorders(*recorders) -> None:
+    """Abort every recorder that exists — no child process / writer leak.
+
+    Called from both entrypoints' ``finally``, i.e. above all on the failure
+    paths: a rosbag2 child left running would hold the out-dir open after the
+    job is gone. A recorder that never started is None and is skipped.
+    """
+    for recorder in recorders:
+        if recorder is not None:
+            recorder.abort()
 
 
 def _start_quiet(recorder):  # pragma: no cover - GPU path helper
