@@ -20,6 +20,7 @@ Fixture anchor (G-28): the read-only signature under test is ``OSError(errno 30,
 import errno
 import io
 import logging
+import os
 
 from cv_infra.orchestrator import supervisor
 from cv_infra.runner import boot_trace, sim_runtime
@@ -466,6 +467,26 @@ def test_scan_dir_degrades_to_zeros_on_an_unreadable_root(tmp_path):
 
     assert boot_trace.scan_dir(tmp_path / "absent") == (0, 0, None, False)
     assert boot_trace.scan_dir(a_file) == (0, 0, None, False)
+
+
+def test_scan_dir_newest_is_a_max_not_a_last_write_wins(tmp_path):
+    """`newest` keeps the MAX mtime — a later-scanned file that is not newer must
+    not advance it (branch 332->320, the `stat.st_mtime > newest` False arm).
+
+    p8 CI post-mortem (run 33298309719): the whole suite covered this arm only by
+    LUCK — real cache dirs on the dev box happened to yield a not-newer file, the
+    hosted runner's tmp dirs never did, and the 100% gate went red on an arc no
+    test owned. Two files with the SAME mtime close it deterministically: whichever
+    one `os.scandir` yields second sees `newest is None` False and `mtime > newest`
+    False (equal), on any host and any scan order.
+    """
+    stamp = 1_000_000.0
+    for name in ("a", "b"):
+        f = tmp_path / name
+        f.write_bytes(b"x" * 3)
+        os.utime(f, (stamp, stamp))
+
+    assert boot_trace.scan_dir(tmp_path) == (2, 6, stamp, False)
 
 
 class _VanishedEntry:
