@@ -30,6 +30,7 @@ from cv_infra.orchestrator.models import RequestRollup, Verdict
 from cv_infra.orchestrator.store import Store
 from cv_infra.report.aggregate import RequestReportInput, build_report
 from cv_infra.report.baseline import update_baseline
+from cv_infra.report import regression
 from cv_infra.report.regression import identity_key
 
 # --- canonical report builders (verbatim-anchored to test_report_verification_report) --
@@ -225,6 +226,35 @@ def test_regressed_report_identifies_request_sut_and_date(monkeypatch, tmp_path,
     assert "carter-sut:old" in out  # baseline SUT identified
     assert "2026-07-10" in out  # baseline established date
     assert "pass→fail" in out  # the domain transition (from the report detail)
+
+
+def test_regression_clause_follows_the_status_vocabulary_definition(monkeypatch, tmp_path, capsys):
+    """Drift guard (G-56, 선례 ``1f62b49``): the regression clause keys off M4's
+    ``report.regression.STATUS_REGRESSED``, never a local ``"regressed"`` literal.
+
+    Rename the status at its DEFINITION and in the produced row (what a real
+    vocabulary rename does) — the clause must still list the regressed request.
+    With a local literal the failure is silent, not loud: the header still prints
+    (it reads the ``baseline_summary`` FIELD name, which no rename touches) and
+    the rows underneath simply vanish, so a reviewer sees *"1 request(s)
+    regressed"* followed by nothing.
+    """
+    renamed = "worsened"
+    report = _regressed_report(tmp_path)
+    # Premise (non-vacuous): the produced row really carries the status today.
+    assert [row["regression"]["status"] for row in report["matrix"]] == [
+        regression.STATUS_REGRESSED
+    ]
+    monkeypatch.setattr(regression, "STATUS_REGRESSED", renamed)
+    for row in report["matrix"]:
+        row["regression"]["status"] = renamed
+
+    _wire(monkeypatch, _serve(report))
+    rc = main(["report", "env-1"])
+    out = capsys.readouterr().out
+    assert rc == EXIT_PASS
+    assert "1 request(s) regressed vs baseline:" in out  # the field-name header
+    assert "carter-sut:old" in out  # the ROW followed the rename — clause not empty
 
 
 # --------------------------------------------------------------------------- #

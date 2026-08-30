@@ -772,8 +772,17 @@ def _render_baseline(report: dict[str, Any]) -> None:
     is never consulted (REQ-REPORT-006). Absent baseline = regression check
     *skip(정상)*, never a failure (REQ-REPORT-004); regressed = which request
     got worse against which SUT/date (NFR-REPORT-001).
+
+    The status vocabulary is M4's definition IMPORTED (G-56, 선례 ``1f62b49``),
+    never a literal: a rename at the definition must take this clause with it —
+    otherwise the header still prints and the rows underneath silently vanish.
     """
+    from cv_infra.report.regression import STATUS_REGRESSED
+
     bsum = report.get("baseline_summary") or {}
+    # NOTE: ``absent``/``regressed`` here are ``baseline_summary`` FIELD names
+    # (report JSON §3.4), not regression STATUS values — same spelling, different
+    # namespace, so they stay literals (the same pin ``report/github.py`` carries).
     absent = bsum.get("absent", 0)
     regressed = bsum.get("regressed", 0)
     if absent:
@@ -785,7 +794,7 @@ def _render_baseline(report: dict[str, Any]) -> None:
         print(f"baseline: {regressed} request(s) regressed vs baseline:")
         for row in report.get("matrix", []):
             reg = row.get("regression") or {}
-            if reg.get("status") == "regressed":
+            if reg.get("status") == STATUS_REGRESSED:
                 print(
                     f"  {reg.get('detail')} — vs SUT {reg.get('baseline_sut_ref')} "
                     f"(baseline established {reg.get('baseline_established_at')})"
