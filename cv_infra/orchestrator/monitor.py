@@ -258,6 +258,68 @@ def _monitor_request(
     )
 
 
+def _monitor_requests(store: Store) -> list[MonitorRequest]:
+    """The per-request half of the projection: recent envelopes x their requests.
+
+    Reads ``load_operational_jobs`` ONCE and groups it by request (the rows carry no
+    domain column — the SELECT is the boundary), then joins each request with its
+    ``RequestRollup`` COUNTs. A request with no rollup yet reports absence, never a
+    fabricated 0/None-shaped verdict list.
+    """
+    jobs_by_request: dict[str, list[OperationalJobRow]] = {}
+    for row in store.load_operational_jobs():
+        jobs_by_request.setdefault(row.request_id, []).append(row)
+
+    requests: list[MonitorRequest] = []
+    for envelope in store.load_recent_envelopes(RECENT_ENVELOPE_LIMIT):
+        for request_id in envelope.request_ids:
+            rollup = store.load_rollup(request_id)
+            requests.append(
+                _monitor_request(
+                    envelope,
+                    request_id,
+                    jobs_by_request.get(request_id, []),
+                    rollup.flakiness if rollup is not None else None,
+                    rollup.verdicts if rollup is not None else [],
+                )
+            )
+    return requests
+
+
+def _monitor_health(sample: ResourceSample | None) -> MonitorHealth:
+    """Service health off the latest sampler snapshot (defaults when never sampled)."""
+    return MonitorHealth(
+        orchestrator_up=True,  # serving this projection IS the liveness proof
+        gpu_reachable=sample.gpu_reachable if sample is not None else False,
+        last_sample_at=sample.sampled_at if sample is not None else None,
+    )
+
+
+def _monitor_resources(
+    counts: dict[str, int],
+    sample: ResourceSample | None,
+    concurrency_budget_k: int | None,
+    resource_budget: ResourceBudget | None,
+) -> MonitorResources:
+    """Queue/slot + NVML header: LIVE store counts, sampler snapshot, carried budgets.
+
+    queue_depth / running_k are the LIVE store counts (the resource-sample copies lag
+    by a poll interval); vram/util/over_launch come from the latest snapshot and are
+    the documented defaults when it was never taken. The two budget values are carried
+    from the caller that owns them — never re-derived here, never invented.
+    """
+    return MonitorResources(
+        queue_depth=counts.get(JobState.QUEUED.value, 0),  # live store count
+        running_k=counts.get(JobState.RUNNING.value, 0),  # live store count
+        concurrency_budget_k=concurrency_budget_k,  # admission budget (None = not supplied)
+        resource_budget=resource_budget,  # the budget k came from (REQ-DEPLOY-012)
+        over_launch_count=sample.over_launch_count if sample is not None else 0,
+        vram_used_mib=sample.vram_used_mib if sample is not None else None,
+        vram_total_mib=sample.vram_total_mib if sample is not None else None,
+        gpu_util_pct=sample.gpu_util_pct if sample is not None else None,
+    )
+
+
 def build_operational_record(
     store: Store,
     *,
@@ -279,43 +341,13 @@ def build_operational_record(
     ``resource_budget`` rides the same seam and the same rule (the store holds no
     budget either — it is boot config, ``serve.ServeConfig.resource_budget``).
     """
-    jobs_by_request: dict[str, list[OperationalJobRow]] = {}
-    for row in store.load_operational_jobs():
-        jobs_by_request.setdefault(row.request_id, []).append(row)
-
-    requests: list[MonitorRequest] = []
-    for envelope in store.load_recent_envelopes(RECENT_ENVELOPE_LIMIT):
-        for request_id in envelope.request_ids:
-            rollup = store.load_rollup(request_id)
-            requests.append(
-                _monitor_request(
-                    envelope,
-                    request_id,
-                    jobs_by_request.get(request_id, []),
-                    rollup.flakiness if rollup is not None else None,
-                    rollup.verdicts if rollup is not None else [],
-                )
-            )
-
+    requests = _monitor_requests(store)
     counts = store.job_state_counts()
     sample = store.load_resource_sample()
     return OperationalRecord(
         generated_at=_now_iso(),
-        health=MonitorHealth(
-            orchestrator_up=True,  # serving this projection IS the liveness proof
-            gpu_reachable=sample.gpu_reachable if sample is not None else False,
-            last_sample_at=sample.sampled_at if sample is not None else None,
-        ),
-        resources=MonitorResources(
-            queue_depth=counts.get(JobState.QUEUED.value, 0),  # live store count
-            running_k=counts.get(JobState.RUNNING.value, 0),  # live store count
-            concurrency_budget_k=concurrency_budget_k,  # admission budget (None = not supplied)
-            resource_budget=resource_budget,  # the budget k came from (REQ-DEPLOY-012)
-            over_launch_count=sample.over_launch_count if sample is not None else 0,
-            vram_used_mib=sample.vram_used_mib if sample is not None else None,
-            vram_total_mib=sample.vram_total_mib if sample is not None else None,
-            gpu_util_pct=sample.gpu_util_pct if sample is not None else None,
-        ),
+        health=_monitor_health(sample),
+        resources=_monitor_resources(counts, sample, concurrency_budget_k, resource_budget),
         requests=requests,
     )
 

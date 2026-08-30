@@ -116,7 +116,6 @@ import io
 import json
 import uuid
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Any, get_args
 
@@ -336,20 +335,31 @@ def _parse_envelope(body: Any) -> _ParsedEnvelope:
             raise _wire_error(f"requests[{i}]", "a Verification Request object", repr(doc))
     trigger_source = _trigger_source_of(body)
     is_self_test, origin = _self_test_markers_of(body)
-    parsed = partial(
-        _ParsedEnvelope,
+    return _ParsedEnvelope(
         documents=requests,
+        plugin_dirs=_plugin_dirs_of(body, len(requests)),
         trigger_source=trigger_source,
         is_self_test=is_self_test,
         origin=origin,
     )
+
+
+def _plugin_dirs_of(body: dict[str, Any], request_count: int) -> list[str | None]:
+    """Parse the optional ``oracle_plugin_dirs`` per-request stage-5 anchors (p4c3).
+
+    Absent (or explicit null) -> ``[None] * request_count``, i.e. no anchors (previous
+    behavior, unchanged). When present it must be an equal-length list whose items are
+    ``null`` (no anchor) or ABSOLUTE directory path strings; anything else is a 422
+    wrapper violation (same 8-key shape as an admit error). Anchors are same-host
+    trusted paths (module docstring — MVP, M8 §8 g5); existence is the loader's check,
+    not this one's."""
     plugin_dirs = body.get("oracle_plugin_dirs")
     if plugin_dirs is None:  # field absent (or explicit null): no anchors — unchanged path
-        return parsed(plugin_dirs=[None] * len(requests))
-    if not isinstance(plugin_dirs, list) or len(plugin_dirs) != len(requests):
+        return [None] * request_count
+    if not isinstance(plugin_dirs, list) or len(plugin_dirs) != request_count:
         raise _wire_error(
             "oracle_plugin_dirs",
-            f"a list of exactly {len(requests)} items — one per request, null = no anchor",
+            f"a list of exactly {request_count} items — one per request, null = no anchor",
             repr(plugin_dirs),
             example=_ANCHOR_EXAMPLE,
         )
@@ -361,7 +371,7 @@ def _parse_envelope(body: Any) -> _ParsedEnvelope:
                 repr(anchor),
                 example=_ANCHOR_EXAMPLE,
             )
-    return parsed(plugin_dirs=plugin_dirs)
+    return plugin_dirs
 
 
 def _admit_all(
@@ -524,6 +534,304 @@ def _report_inputs(record: _EnvelopeRecord) -> list[RequestReportInput]:
     return inputs
 
 
+@dataclass
+class _AppState:
+    """One app's wiring in a single value — the explicit parameter the handlers take.
+
+    The route handlers below used to be CLOSURES over ``create_app``'s locals (p8c1 T2
+    분해: that made the factory a 24-branch function and every handler unreachable from
+    a test or a reader without going through it). They are module-level functions now
+    and receive this state explicitly; the objects, their lifetimes and their sharing
+    are exactly what the closure captured — this is per-app state, never a global.
+    """
+
+    store: Store
+    runner: Runner
+    k: int
+    max_attempts: int
+    retry_on_timeout: bool
+    job_timeout_s: float | None
+    allocator: DomainIdAllocator
+    envelopes: dict[str, _EnvelopeRecord] = field(default_factory=dict)
+    #: single-flight envelopes (module docstring)
+    drive_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: strong refs — a bare create_task can be GC'd
+    drive_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+
+
+def _persist_terminal(store: Store, record: _EnvelopeRecord) -> None:
+    """Write-through at completion (p4c4 영속 + p5c2 report/baseline seam).
+
+    A crashed supervision persists the error marker only — NO report is
+    assembled and NO baseline is written (its results are not trustworthy).
+
+    A clean completion (순서 불변식):
+      ① assemble the VerificationReport server-side (``build_report`` reads the
+         PRE-advance baseline for the regression judgement — C-1 internal store
+         the only source);
+      ② persist it (store v7) so ``GET /envelopes/{id}/report`` survives restart;
+      ③ ONLY THEN advance baselines from the report rows (전달-not-재도출: the
+         advance-on-pass / errored-skip / fail-no-overwrite policy is owned by
+         ``update_baseline``; the seam passes row values, never re-deriving) —
+         advancing BEFORE ① would let a request regress against itself;
+      ④ persist the per-request rollups + envelope ``report_outcome`` (unchanged
+         — the job-level fold M8 keys exit off).
+    """
+    if record.error is not None:
+        store.complete_envelope(record.envelope_id, error=record.error)
+        return
+    inputs = _report_inputs(record)
+    report = build_report(
+        inputs,
+        store,
+        envelope_id=record.envelope_id,
+        trigger_source=record.trigger_source,  # 봉투 기록값 verbatim (재도출 금지)
+        # 잡별 상한 = 32 MiB provisional (결정 #2 · 실측-후-기입 §2-4). QA 재검(75개 실 bag,
+        # MCAP-only): max 50.7 KB/s → 최악(scenario timeout 120s) ≈ 5.94 MiB; 32 MiB는
+        # 5.38x 마진(정상 bag 미제외)·폭주(raw PointCloud2 >GB) 아래(오설정 bag 제외+경고).
+        # 실 120s consent 미션으로 확정 권고(decisions/2026-07-16-p5-artifact-return.md 결정2).
+        max_mcap_bytes=32 * 1024 * 1024,
+    )
+    store.save_report(record.envelope_id, report)  # ② 영속 BEFORE ③ advance
+    for row in report["matrix"]:  # ③ advance-on-pass — values off the report rows
+        update_baseline(
+            store,
+            request_identity_key=row["request_identity_key"],
+            sut_ref=row["sut_ref"],
+            verdict=row["rollup"]["verdict"],
+            key_metrics=row["metrics"],
+            established_at=report["generated_at"],
+        )
+    for inp in inputs:  # ④ rollups + outcome
+        store.upsert_rollup(inp.rollup)
+    # The SAME rollup instances that were just persisted (and that the report matrix
+    # above already carries) decide the envelope outcome — one aggregation, one answer.
+    store.complete_envelope(
+        record.envelope_id,
+        report_outcome=report_outcome_of(record.results, [inp.rollup for inp in inputs]),
+    )
+
+
+async def _drive(state: _AppState, record: _EnvelopeRecord, supervisor: ParallelSupervisor) -> None:
+    """Supervise one envelope to completion, then write through (background task)."""
+    async with state.drive_lock:
+        try:
+            record.results = await supervisor.run()
+        except asyncio.CancelledError:
+            # App/loop shutdown mid-envelope: leave the envelope 'running'
+            # in the store — reconcile_at_restart (R14) marks it on the
+            # next boot. Persisting a fabricated outcome from partial
+            # results here would be a lie.
+            raise
+        except Exception as exc:  # loud on the status read, never swallowed
+            record.error = f"{type(exc).__name__}: {exc}"
+        try:
+            _persist_terminal(state.store, record)
+        except Exception as exc:  # persistence failure is loud too, never masked
+            record.error = record.error or f"persist failed: {type(exc).__name__}: {exc}"
+        finally:
+            record.done = True
+
+
+async def _parse_request(request: Request) -> _ParsedEnvelope:
+    """Read + validate the submitted wire wrapper, or raise the structured 422.
+
+    A malformed body and a wrapper violation both surface as
+    ``{"detail": {"errors": [<annotation dict>]}}`` — never a 500, never a raw
+    traceback (M3 §7 / NFR-INTAKE-001).
+    """
+    try:
+        body = await request.json()
+        return _parse_envelope(body)
+    except json.JSONDecodeError as exc:
+        err = _wire_error("(document)", "a JSON body", str(exc))
+        raise HTTPException(status_code=422, detail={"errors": [err.to_annotation_dict()]}) from exc
+    except ContractError as err:
+        raise HTTPException(status_code=422, detail={"errors": [err.to_annotation_dict()]}) from err
+
+
+def _materialize_envelope(
+    state: _AppState,
+    envelope_id: str,
+    envelope: _ParsedEnvelope,
+    admitted: list[AdmittedRequest],
+) -> tuple[_EnvelopeRecord, ParallelSupervisor]:
+    """Fan the admitted requests out into jobs and build this envelope's supervision.
+
+    Everything the fan-out stamps onto a job (stage-5 anchor, canonical JOB_SPEC,
+    request identity key) is derived from ONE per-request wire dump, computed here and
+    reused by the completion-time report assembly (``_EnvelopeRecord.request_dumps``).
+    The durable registry is written BEFORE the queue exists (p4c4 영속), so a restart
+    can serve status for this envelope even though the in-memory record dies with us.
+    """
+    request_ids = [f"{envelope_id}/r{i}" for i in range(len(envelope.documents))]
+    repeats = [a.request.execution_settings.repeats for a in admitted]
+    jobs = fan_out_requests(list(zip(request_ids, repeats, strict=True)))
+    anchor_of = dict(zip(request_ids, envelope.plugin_dirs, strict=True))
+    admitted_of = dict(zip(request_ids, admitted, strict=True))
+    # ONE wire dump per request, computed here and reused by BOTH consumers: the
+    # runner-facing identity key just below and the completion-time report assembly
+    # (``_EnvelopeRecord.request_dumps``). Same bytes in => same key out, so the
+    # runner's CV_REQUEST_IDENTITY_KEY equals the report row's request_identity_key
+    # by construction rather than by a parallel derivation.
+    request_dumps = {
+        rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True) for rid in request_ids
+    }
+    # p5c18 T4 (DoD-P2-06 ①): the M4 단일 정의를 IMPORT 해서 부른다 (G-56). Deriving
+    # the key from any other input (e.g. the JOB_SPEC) would produce *a different key
+    # under the same name* — worse than the null the job plane reported until now.
+    identity_of = {rid: identity_key(dump) for rid, dump in request_dumps.items()}
+    for job in jobs:
+        # D-1 wiring #3 (p4c4): the stage-5 anchor rides each fanned-out job
+        # so the runner seam can hand it to run_job(oracle_plugin_dir=...).
+        job.oracle_plugin_dir = anchor_of[job.request_id]
+        # p4c4 glue (T1 §7-1 (a)): the ADMITTED model materializes into the
+        # canonical per-job JOB_SPEC riding (and persisting with) the job —
+        # the production runner seam (RunJobRunner) drives run_job off it.
+        # p6c3: the request is first materialized for THIS job's sample index
+        # (derive.materialize_request) — a static document is returned
+        # unchanged (same object), so this line is byte-identical for every
+        # pre-p6 request; a randomized one yields sample `repeat_index`.
+        job.job_spec = _job_spec_for(
+            materialize_request(admitted_of[job.request_id].request, job.repeat_index),
+            job_key(job),
+        )
+        # p5c18 T4: the request identity key rides the job to the runner env, so the
+        # job plane's own artifacts can name the request that produced them.
+        job.request_identity_key = identity_of[job.request_id]
+    # Durable registry FIRST (p4c4 영속): a restart can then serve status for
+    # this envelope even though the in-memory record below dies with us. The
+    # self-test markers ride the SAME write (v8) — the operational projection
+    # reads them from the store, so they survive a restart too.
+    state.store.record_envelope(
+        envelope_id,
+        request_ids,
+        envelope.plugin_dirs,
+        is_self_test=envelope.is_self_test,
+        origin=envelope.origin,
+    )
+    queue = JobQueue(  # persists every job QUEUED via the store (REQ-ORCH-011)
+        jobs,
+        store=state.store,
+        max_attempts=state.max_attempts,
+        retry_on_timeout=state.retry_on_timeout,
+    )
+    supervisor = ParallelSupervisor(
+        queue,
+        SlotAccountant(k=state.k),
+        state.runner,
+        allocator=state.allocator,
+        job_timeout_s=state.job_timeout_s,
+    )
+    record = _EnvelopeRecord(
+        envelope_id=envelope_id,
+        request_ids=request_ids,
+        jobs=jobs,
+        # Capture each request's M1 wire dump AT SUBMIT (p5c2 report seam): the
+        # completion-time assembly consumes it for identity_key/sut_ref/scenario
+        # (전달-not-재도출) — the admitted models would otherwise be gone by then.
+        # Same object the job-plane keys above were derived from (one dump, two uses).
+        request_dumps=request_dumps,
+        # p5c3: submitted value (or default), recorded verbatim
+        trigger_source=envelope.trigger_source,
+    )
+    return record, supervisor
+
+
+async def _submit_envelope(state: _AppState, request: Request) -> dict[str, str]:
+    """``POST /envelopes`` — admit all, fan out, start supervision, return 202."""
+    envelope = await _parse_request(request)
+    admitted, errors = _admit_all(envelope.documents, envelope.plugin_dirs)
+    if errors:  # all-or-nothing: zero jobs were created (비전파)
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    envelope_id = f"env-{uuid.uuid4().hex[:12]}"
+    record, supervisor = _materialize_envelope(state, envelope_id, envelope, admitted)
+    state.envelopes[envelope_id] = record
+    task = asyncio.get_running_loop().create_task(_drive(state, record, supervisor))
+    state.drive_tasks.add(task)
+    task.add_done_callback(state.drive_tasks.discard)
+    return {"envelope_id": envelope_id}
+
+
+def _status_from_store(store: Store, envelope_id: str) -> dict[str, Any]:
+    """Serve status for an envelope this process never saw (restart path, p4c4).
+
+    Everything comes from the persisted registry / jobs / rollups — never
+    recomputed from results (which did not survive the restart). A crash /
+    restart marker surfaces as the same loud 500 the in-memory path uses.
+    """
+    stored = store.load_envelope(envelope_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
+    if stored.error is not None:
+        raise HTTPException(status_code=500, detail=f"envelope supervision crashed: {stored.error}")
+    position = {rid: pos for pos, rid in enumerate(stored.request_ids)}
+    jobs = sorted(
+        (job for job in store.load_jobs() if job.request_id in position),
+        key=lambda job: (position[job.request_id], job.repeat_index),
+    )
+    rollups = [
+        store.load_rollup(rid) or RequestRollup(request_id=rid)  # empty while running
+        for rid in stored.request_ids
+    ]
+    return _status_body(
+        envelope_id,
+        status=stored.status,
+        jobs=jobs,
+        rollups=rollups,
+        report_outcome=stored.report_outcome,
+    )
+
+
+async def _envelope_status(state: _AppState, envelope_id: str) -> dict[str, Any]:
+    """``GET /envelopes/{id}`` — the live record when this process owns it, else the store."""
+    record = state.envelopes.get(envelope_id)
+    if record is None:
+        return _status_from_store(state.store, envelope_id)
+    if record.error is not None:
+        raise HTTPException(status_code=500, detail=f"envelope supervision crashed: {record.error}")
+    rollups = [
+        roll_up(
+            rid,
+            [r for r in record.results if r.job.request_id == rid],
+            min_pass_ratio=_min_pass_ratio(record.request_dumps[rid]),
+        )
+        for rid in record.request_ids
+    ]
+    return _status_body(
+        envelope_id,
+        status="completed" if record.done else "running",
+        jobs=record.jobs,
+        rollups=rollups,
+        # Same instances the response body carries (no second aggregation).
+        report_outcome=report_outcome_of(record.results, rollups) if record.done else None,
+    )
+
+
+async def _envelope_report(store: Store, envelope_id: str) -> dict[str, Any]:
+    """Serve the DURABLE assembled VerificationReport (p5c2, 재시작 생존).
+
+    Always the persisted twin (never re-assembled): a completed envelope's
+    report was written by ``_persist_terminal`` and is returned verbatim (200).
+    Absence is disambiguated off the envelope registry — unknown -> 404 (same
+    body as ``GET /envelopes/{id}``); a supervision-crash marker -> 409
+    supervision-error; a still-in-flight envelope -> 409 not-terminal.
+    """
+    report = store.load_report(envelope_id)
+    if report is not None:
+        return report
+    stored = store.load_envelope(envelope_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
+    if stored.error is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "supervision-error", "error": stored.error},
+        )
+    raise HTTPException(status_code=409, detail={"reason": "not-terminal", "status": stored.status})
+
+
 def create_app(
     store: Store,
     runner: Runner,
@@ -548,235 +856,29 @@ def create_app(
     here, and it never touches a domain result surface. Default None = the
     caller supplied no budget (CPU test apps, and any deployment whose VRAM
     figure is unset), reported as ``null`` rather than invented.
+
+    Wiring only (p8c1 T2): every handler body is a module-level function above,
+    so this function stays a route table — the app-scoped state they share is the
+    ONE ``_AppState`` value built here and passed explicitly.
     """
     app = FastAPI(title="cv-infra orchestrator", docs_url=None, redoc_url=None)
-    envelopes: dict[str, _EnvelopeRecord] = {}
-    allocator = DomainIdAllocator(store)
-    drive_lock = asyncio.Lock()  # single-flight envelopes (module docstring)
-    drive_tasks: set[asyncio.Task[None]] = set()  # strong refs — a bare create_task can be GC'd
-
-    def _persist_terminal(record: _EnvelopeRecord) -> None:
-        """Write-through at completion (p4c4 영속 + p5c2 report/baseline seam).
-
-        A crashed supervision persists the error marker only — NO report is
-        assembled and NO baseline is written (its results are not trustworthy).
-
-        A clean completion (순서 불변식):
-          ① assemble the VerificationReport server-side (``build_report`` reads the
-             PRE-advance baseline for the regression judgement — C-1 internal store
-             the only source);
-          ② persist it (store v7) so ``GET /envelopes/{id}/report`` survives restart;
-          ③ ONLY THEN advance baselines from the report rows (전달-not-재도출: the
-             advance-on-pass / errored-skip / fail-no-overwrite policy is owned by
-             ``update_baseline``; the seam passes row values, never re-deriving) —
-             advancing BEFORE ① would let a request regress against itself;
-          ④ persist the per-request rollups + envelope ``report_outcome`` (unchanged
-             — the job-level fold M8 keys exit off).
-        """
-        if record.error is not None:
-            store.complete_envelope(record.envelope_id, error=record.error)
-            return
-        inputs = _report_inputs(record)
-        report = build_report(
-            inputs,
-            store,
-            envelope_id=record.envelope_id,
-            trigger_source=record.trigger_source,  # 봉투 기록값 verbatim (재도출 금지)
-            # 잡별 상한 = 32 MiB provisional (결정 #2 · 실측-후-기입 §2-4). QA 재검(75개 실 bag,
-            # MCAP-only): max 50.7 KB/s → 최악(scenario timeout 120s) ≈ 5.94 MiB; 32 MiB는
-            # 5.38x 마진(정상 bag 미제외)·폭주(raw PointCloud2 >GB) 아래(오설정 bag 제외+경고).
-            # 실 120s consent 미션으로 확정 권고(decisions/2026-07-16-p5-artifact-return.md 결정2).
-            max_mcap_bytes=32 * 1024 * 1024,
-        )
-        store.save_report(record.envelope_id, report)  # ② 영속 BEFORE ③ advance
-        for row in report["matrix"]:  # ③ advance-on-pass — values off the report rows
-            update_baseline(
-                store,
-                request_identity_key=row["request_identity_key"],
-                sut_ref=row["sut_ref"],
-                verdict=row["rollup"]["verdict"],
-                key_metrics=row["metrics"],
-                established_at=report["generated_at"],
-            )
-        for inp in inputs:  # ④ rollups + outcome
-            store.upsert_rollup(inp.rollup)
-        # The SAME rollup instances that were just persisted (and that the report matrix
-        # above already carries) decide the envelope outcome — one aggregation, one answer.
-        store.complete_envelope(
-            record.envelope_id,
-            report_outcome=report_outcome_of(record.results, [inp.rollup for inp in inputs]),
-        )
-
-    async def _drive(record: _EnvelopeRecord, supervisor: ParallelSupervisor) -> None:
-        async with drive_lock:
-            try:
-                record.results = await supervisor.run()
-            except asyncio.CancelledError:
-                # App/loop shutdown mid-envelope: leave the envelope 'running'
-                # in the store — reconcile_at_restart (R14) marks it on the
-                # next boot. Persisting a fabricated outcome from partial
-                # results here would be a lie.
-                raise
-            except Exception as exc:  # loud on the status read, never swallowed
-                record.error = f"{type(exc).__name__}: {exc}"
-            try:
-                _persist_terminal(record)
-            except Exception as exc:  # persistence failure is loud too, never masked
-                record.error = record.error or f"persist failed: {type(exc).__name__}: {exc}"
-            finally:
-                record.done = True
+    state = _AppState(
+        store=store,
+        runner=runner,
+        k=k,
+        max_attempts=max_attempts,
+        retry_on_timeout=retry_on_timeout,
+        job_timeout_s=job_timeout_s,
+        allocator=DomainIdAllocator(store),
+    )
 
     @app.post("/envelopes", status_code=202)
     async def submit_envelope(request: Request) -> dict[str, str]:
-        try:
-            body = await request.json()
-            envelope = _parse_envelope(body)
-            documents, plugin_dirs = envelope.documents, envelope.plugin_dirs
-        except json.JSONDecodeError as exc:
-            err = _wire_error("(document)", "a JSON body", str(exc))
-            raise HTTPException(
-                status_code=422, detail={"errors": [err.to_annotation_dict()]}
-            ) from exc
-        except ContractError as err:
-            raise HTTPException(
-                status_code=422, detail={"errors": [err.to_annotation_dict()]}
-            ) from err
-        admitted, errors = _admit_all(documents, plugin_dirs)
-        if errors:  # all-or-nothing: zero jobs were created (비전파)
-            raise HTTPException(status_code=422, detail={"errors": errors})
-
-        envelope_id = f"env-{uuid.uuid4().hex[:12]}"
-        request_ids = [f"{envelope_id}/r{i}" for i in range(len(documents))]
-        repeats = [a.request.execution_settings.repeats for a in admitted]
-        jobs = fan_out_requests(list(zip(request_ids, repeats)))
-        anchor_of = dict(zip(request_ids, plugin_dirs, strict=True))
-        admitted_of = dict(zip(request_ids, admitted, strict=True))
-        # ONE wire dump per request, computed here and reused by BOTH consumers: the
-        # runner-facing identity key just below and the completion-time report assembly
-        # (``_EnvelopeRecord.request_dumps``). Same bytes in => same key out, so the
-        # runner's CV_REQUEST_IDENTITY_KEY equals the report row's request_identity_key
-        # by construction rather than by a parallel derivation.
-        request_dumps = {
-            rid: admitted_of[rid].request.model_dump(mode="json", by_alias=True)
-            for rid in request_ids
-        }
-        # p5c18 T4 (DoD-P2-06 ①): the M4 단일 정의를 IMPORT 해서 부른다 (G-56). Deriving
-        # the key from any other input (e.g. the JOB_SPEC) would produce *a different key
-        # under the same name* — worse than the null the job plane reported until now.
-        identity_of = {rid: identity_key(dump) for rid, dump in request_dumps.items()}
-        for job in jobs:
-            # D-1 wiring #3 (p4c4): the stage-5 anchor rides each fanned-out job
-            # so the runner seam can hand it to run_job(oracle_plugin_dir=...).
-            job.oracle_plugin_dir = anchor_of[job.request_id]
-            # p4c4 glue (T1 §7-1 (a)): the ADMITTED model materializes into the
-            # canonical per-job JOB_SPEC riding (and persisting with) the job —
-            # the production runner seam (RunJobRunner) drives run_job off it.
-            # p6c3: the request is first materialized for THIS job's sample index
-            # (derive.materialize_request) — a static document is returned
-            # unchanged (same object), so this line is byte-identical for every
-            # pre-p6 request; a randomized one yields sample `repeat_index`.
-            job.job_spec = _job_spec_for(
-                materialize_request(admitted_of[job.request_id].request, job.repeat_index),
-                job_key(job),
-            )
-            # p5c18 T4: the request identity key rides the job to the runner env, so the
-            # job plane's own artifacts can name the request that produced them.
-            job.request_identity_key = identity_of[job.request_id]
-        # Durable registry FIRST (p4c4 영속): a restart can then serve status for
-        # this envelope even though the in-memory record below dies with us. The
-        # self-test markers ride the SAME write (v8) — the operational projection
-        # reads them from the store, so they survive a restart too.
-        store.record_envelope(
-            envelope_id,
-            request_ids,
-            plugin_dirs,
-            is_self_test=envelope.is_self_test,
-            origin=envelope.origin,
-        )
-        queue = JobQueue(  # persists every job QUEUED via the store (REQ-ORCH-011)
-            jobs, store=store, max_attempts=max_attempts, retry_on_timeout=retry_on_timeout
-        )
-        supervisor = ParallelSupervisor(
-            queue,
-            SlotAccountant(k=k),
-            runner,
-            allocator=allocator,
-            job_timeout_s=job_timeout_s,
-        )
-        record = _EnvelopeRecord(
-            envelope_id=envelope_id,
-            request_ids=request_ids,
-            jobs=jobs,
-            # Capture each request's M1 wire dump AT SUBMIT (p5c2 report seam): the
-            # completion-time assembly consumes it for identity_key/sut_ref/scenario
-            # (전달-not-재도출) — the admitted models would otherwise be gone by then.
-            # Same object the job-plane keys above were derived from (one dump, two uses).
-            request_dumps=request_dumps,
-            # p5c3: submitted value (or default), recorded verbatim
-            trigger_source=envelope.trigger_source,
-        )
-        envelopes[envelope_id] = record
-        task = asyncio.get_running_loop().create_task(_drive(record, supervisor))
-        drive_tasks.add(task)
-        task.add_done_callback(drive_tasks.discard)
-        return {"envelope_id": envelope_id}
-
-    def _status_from_store(envelope_id: str) -> dict[str, Any]:
-        """Serve status for an envelope this process never saw (restart path, p4c4).
-
-        Everything comes from the persisted registry / jobs / rollups — never
-        recomputed from results (which did not survive the restart). A crash /
-        restart marker surfaces as the same loud 500 the in-memory path uses.
-        """
-        stored = store.load_envelope(envelope_id)
-        if stored is None:
-            raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
-        if stored.error is not None:
-            raise HTTPException(
-                status_code=500, detail=f"envelope supervision crashed: {stored.error}"
-            )
-        position = {rid: pos for pos, rid in enumerate(stored.request_ids)}
-        jobs = sorted(
-            (job for job in store.load_jobs() if job.request_id in position),
-            key=lambda job: (position[job.request_id], job.repeat_index),
-        )
-        rollups = [
-            store.load_rollup(rid) or RequestRollup(request_id=rid)  # empty while running
-            for rid in stored.request_ids
-        ]
-        return _status_body(
-            envelope_id,
-            status=stored.status,
-            jobs=jobs,
-            rollups=rollups,
-            report_outcome=stored.report_outcome,
-        )
+        return await _submit_envelope(state, request)
 
     @app.get("/envelopes/{envelope_id}")
     async def envelope_status(envelope_id: str) -> dict[str, Any]:
-        record = envelopes.get(envelope_id)
-        if record is None:
-            return _status_from_store(envelope_id)
-        if record.error is not None:
-            raise HTTPException(
-                status_code=500, detail=f"envelope supervision crashed: {record.error}"
-            )
-        rollups = [
-            roll_up(
-                rid,
-                [r for r in record.results if r.job.request_id == rid],
-                min_pass_ratio=_min_pass_ratio(record.request_dumps[rid]),
-            )
-            for rid in record.request_ids
-        ]
-        return _status_body(
-            envelope_id,
-            status="completed" if record.done else "running",
-            jobs=record.jobs,
-            rollups=rollups,
-            # Same instances the response body carries (no second aggregation).
-            report_outcome=report_outcome_of(record.results, rollups) if record.done else None,
-        )
+        return await _envelope_status(state, envelope_id)
 
     @app.get("/envelopes/{envelope_id}/report")
     async def envelope_report(envelope_id: str) -> dict[str, Any]:
@@ -788,20 +890,7 @@ def create_app(
         body as ``GET /envelopes/{id}``); a supervision-crash marker -> 409
         supervision-error; a still-in-flight envelope -> 409 not-terminal.
         """
-        report = store.load_report(envelope_id)
-        if report is not None:
-            return report
-        stored = store.load_envelope(envelope_id)
-        if stored is None:
-            raise HTTPException(status_code=404, detail=f"unknown envelope {envelope_id!r}")
-        if stored.error is not None:
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "supervision-error", "error": stored.error},
-            )
-        raise HTTPException(
-            status_code=409, detail={"reason": "not-terminal", "status": stored.status}
-        )
+        return await _envelope_report(state.store, envelope_id)
 
     # M6 operational view (DoD-P4-12/13): read-only projection surfaces on the
     # SAME app (no separate server). Routes only — the resident sampler is wired
