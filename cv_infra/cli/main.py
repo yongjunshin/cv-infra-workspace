@@ -406,6 +406,51 @@ def _exit_from_outcome(outcome: Any) -> int:
     return code
 
 
+def _run_job_kwargs(admitted: Any, scenario_path: Path) -> dict[str, Any]:
+    """Assemble the kw-only extras ``run_job`` takes for THIS admitted request.
+
+    Every key here is CONDITIONAL-BY-CONTRACT except the identity key: an absent
+    key means the supervisor's pinned kw-only default applies (no mount, no env),
+    so "not passed" is a real value and must not become an explicit ``None``.
+
+    * ``runner_env`` — consent pass-through (decision 2026-07-03): the
+      operator-provided consent env keys forwarded VERBATIM, only when present.
+      When absent the kwarg is not passed at all and the runner boot guard
+      honestly refuses to start Isaac (FU-8 is P5). Bag sensor opt-in (p5c12)
+      rides the same seam; the key NAME comes from ``recording.BAG_SENSORS_ENV``
+      via lazy import (G-25 — keep ``--help`` free of runner imports).
+    * ``oracle_plugin_dir`` — D-1 wiring contract #2 (decision 2026-07-11): an
+      admitted ``CustomCriterion`` means consumer oracle plugin ``.py`` files live
+      next to the scenario YAML, so that directory (resolved absolute) goes to the
+      supervisor, which ro-mounts it into the runner at the SAME path + announces
+      ``CV_ORACLE_PLUGIN_DIR`` (contract #3). Detection is ``isinstance`` on the
+      ADMITTED model, never a string heuristic.
+    * ``request_identity_key`` — p5c20 ③ (DoD-P2-06 ① / REQ-REPORT-002),
+      UNCONDITIONAL: the single-run entrypoint hands the runner the SAME key the
+      envelope/REST entrypoint does, so a ``result.json`` produced by ``cv-infra
+      run`` names WHICH request produced it instead of reporting
+      ``identity_key=none`` (the p5c18 T3 defect, one half of which stayed open on
+      this path). The key is M4's 단일 정의 IMPORTED (G-56) and fed the SAME input
+      M3 feeds it (``VerificationRequest`` wire dump) — deriving it here from the
+      JOB_SPEC would mint *a different key wearing the same name* (p5c18 T4's
+      mutation: well-formed, per-request distinct, and wrong).
+    """
+    from cv_infra.contract.schema import CustomCriterion
+    from cv_infra.report.regression import identity_key
+    from cv_infra.runner.recording import BAG_SENSORS_ENV
+
+    runner_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
+    if BAG_SENSORS_ENV in os.environ:
+        runner_env[BAG_SENSORS_ENV] = os.environ[BAG_SENSORS_ENV]
+    kwargs: dict[str, Any] = {"runner_env": runner_env} if runner_env else {}
+    if any(isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria):
+        kwargs["oracle_plugin_dir"] = str(scenario_path.parent.resolve())
+    kwargs["request_identity_key"] = identity_key(
+        admitted.request.model_dump(mode="json", by_alias=True)
+    )
+    return kwargs
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """``cv-infra run``: M1 6-stage admit gate -> JOB_SPEC -> supervisor -> exit code.
 
@@ -430,22 +475,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         verdict "fail" / "timeout"                                1
         verdict "error" / unknown                                 3
 
-    Operator consent (``ACCEPT_EULA``/``PRIVACY_CONSENT``) is forwarded from
-    the CLI process env to ``runner_env`` only when present — when absent the
-    runner boot guard honestly refuses (surfaces on the infra path, exit 3).
-
-    A ``CustomCriterion`` among the ADMITTED criteria means consumer oracle
-    plugin ``.py`` files sit next to the scenario YAML: the scenario's parent
-    directory rides to the supervisor as kw-only ``oracle_plugin_dir`` (D-1
-    wiring contract #2, decision 2026-07-11) for the read-only runner mount
-    (contract #3). MVP-only criteria leave the kwarg unpassed — the pinned
-    kw-only default ``None`` (no mount, no env) applies.
-
-    ``request_identity_key`` (p5c20 ③) rides UNCONDITIONALLY: this entrypoint
-    always holds an ADMITTED request, so the key is always derivable and the
-    honest-absence branch (``run_job``'s ``None`` default) belongs to callers
-    that have no request at all. Both entrypoints — ``run`` and the REST
-    envelope — therefore emit the same key for the same request document.
+    What rides ALONGSIDE the JOB_SPEC (operator consent, the custom-oracle plugin
+    dir, ``request_identity_key``) is assembled by ``_run_job_kwargs`` — see its
+    docstring for each key's contract. ``request_identity_key`` rides
+    UNCONDITIONALLY here because this entrypoint always holds an ADMITTED request:
+    the honest-absence branch (``run_job``'s ``None`` default) belongs to callers
+    that have no request at all, so ``run`` and the REST envelope emit the same
+    key for the same request document.
     """
     scenario_path = Path(args.scenario)
     job_id = args.job_id or _default_job_id(scenario_path)
@@ -454,7 +490,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # --help / placeholder paths must never load (REQ-INTAKE-003/005).
     from cv_infra.contract.errors import ContractError
     from cv_infra.contract.loader import load_request
-    from cv_infra.contract.schema import CustomCriterion
 
     try:
         admitted = load_request(scenario_path)
@@ -496,40 +531,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_INFRA
 
-    # Consent pass-through (decision 2026-07-03): forward the operator-provided
-    # consent env keys verbatim, only when present. When absent, ``runner_env``
-    # is NOT passed — the runner boot guard refuses to start Isaac (FU-8 is P5).
-    # Bag sensor opt-in (p5c12): same seam; key name from recording.BAG_SENSORS_ENV
-    # via lazy import (G-25; keep --help free of runner imports).
-    from cv_infra.runner.recording import BAG_SENSORS_ENV
-
-    runner_env = {k: os.environ[k] for k in _CONSENT_ENV_KEYS if k in os.environ}
-    if BAG_SENSORS_ENV in os.environ:
-        runner_env[BAG_SENSORS_ENV] = os.environ[BAG_SENSORS_ENV]
-    kwargs: dict[str, Any] = {"runner_env": runner_env} if runner_env else {}
-    # D-1 wiring contract #2 (decision 2026-07-11): an admitted CustomCriterion
-    # means consumer oracle plugin .py files live next to the scenario YAML —
-    # hand that directory (resolved absolute) to the supervisor, which ro-mounts
-    # it into the runner at the SAME path + announces CV_ORACLE_PLUGIN_DIR
-    # (contract #3). Detection is isinstance on the ADMITTED model, never a
-    # string heuristic. MVP-only criteria -> kwarg unpassed = the pinned
-    # kw-only default None (no mount, no env), mirroring runner_env above.
-    if any(isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria):
-        kwargs["oracle_plugin_dir"] = str(scenario_path.parent.resolve())
-    # p5c20 ③ (DoD-P2-06 ① / REQ-REPORT-002): the single-run entrypoint hands the
-    # runner the SAME request identity key the envelope/REST entrypoint does, so a
-    # ``result.json`` produced by ``cv-infra run`` names WHICH request produced it
-    # instead of reporting ``identity_key=none`` (the p5c18 T3 defect, one half of
-    # which stayed open on this path). The key is M4's 단일 정의 IMPORTED (G-56) and
-    # fed the SAME input M3 feeds it (``VerificationRequest`` wire dump) — deriving
-    # it here from the JOB_SPEC would mint *a different key wearing the same name*
-    # (p5c18 T4's mutation: well-formed, per-request distinct, and wrong).
-    from cv_infra.report.regression import identity_key
-
-    kwargs["request_identity_key"] = identity_key(
-        admitted.request.model_dump(mode="json", by_alias=True)
+    outcome = run_job(
+        job_spec,
+        out_dir,
+        args.runner_image,
+        job_spec["sut_image_ref"],
+        **_run_job_kwargs(admitted, scenario_path),
     )
-    outcome = run_job(job_spec, out_dir, args.runner_image, job_spec["sut_image_ref"], **kwargs)
     return _exit_from_outcome(outcome)
 
 
