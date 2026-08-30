@@ -272,9 +272,13 @@ def test_the_reachability_pin_fires_when_the_call_hides_behind_a_helper(row: _Ro
     이 변이들은 **봉합 전 전 스위트 1683/1683 초록**이었다(p8c2 T6 실측). 같은 회귀를
     인라인으로 쓰면 소유자의 직접-이름 가드가 잡는다 — 헬퍼 한 칸이 그 red 를 지웠다.
     """
+    pristine, pristine_callables = _scope(
+        _MODULES[row.module].read_text(encoding="utf-8"), row.scope
+    )
+    before = len(reaching(pristine, pristine_callables, *row.forbidden))
     scope, callables = _scope(_mutated(row), row.scope)
     hits = reaching(scope, callables, *row.forbidden)
-    assert hits, f"{row.label}: 도달성 판정이 헬퍼 한 칸을 못 본다"
+    assert len(hits) > before, f"{row.label}: 도달성 판정이 헬퍼 한 칸을 못 본다"
     assert any(hit.via for hit in hits), f"{row.label}: 헬퍼를 거치지 않고 잡혔다 — 변이가 틀렸다"
 
 
@@ -346,4 +350,4 @@ def test_the_band_pin_fires_when_the_pump_hides_behind_a_helper():
     _, callables = _scope(mutated, "batch:run:loop")
     _, between = _loop_band(mutated)
     hits = _advancing(between, callables)
-    assert hits and "via" in hits[0], f"헬퍼 뒤의 정착 펌프를 못 봤다: {hits}"
+    assert any("via" in hit for hit in hits), f"헬퍼 뒤의 정착 펌프를 못 봤다: {hits}"
