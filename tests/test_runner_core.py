@@ -534,6 +534,28 @@ def test_no_collision_positive_obstacle_fails():
     assert out.passed is False and out.reason == "collision"
 
 
+def test_reached_goal_orientation_gate_is_only_armed_by_a_declared_yaw():
+    """The declared-orientation arm of the verdict ladder (p8c1 ``_yaw_out_of_tolerance``).
+
+    Both directions matter: an UNDECLARED goal orientation must read as "not
+    judged" (position-only goals are the norm — reading it as a failure would
+    fail every shipped scenario), and a declared one must actually be able to
+    fail a run that arrived at the right place facing the wrong way.
+    """
+    from cv_infra.oracles.reached_goal import ReachedGoalOracle, _yaw_out_of_tolerance
+
+    rec = _record(samples=_line(4))  # every sample faces +X (yaw 0)
+    criteria = {"goal_position": [3.0, 0.0, 0.0], "position_tolerance_m": 0.1, "timeout_s": 10}
+    assert _yaw_out_of_tolerance(rec.gt_pose_samples[-1], criteria) is False
+
+    quarter_turn = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))  # 90deg about +Z
+    out = ReachedGoalOracle().evaluate(rec, dict(criteria, goal_orientation_wxyz=quarter_turn))
+    assert out.passed is False and out.reason == "orientation"
+    # ...and a yaw tolerance wide enough to cover it passes the same trajectory.
+    wide = dict(criteria, goal_orientation_wxyz=quarter_turn, yaw_tolerance_rad=math.pi)
+    assert ReachedGoalOracle().evaluate(rec, wide).passed is True
+
+
 def test_reached_goal_yaw_helpers():
     from cv_infra.oracles.reached_goal import angle_diff, yaw_from_quat_wxyz
 
@@ -666,3 +688,84 @@ def test_contact_partners_output_is_hash_seed_independent():
         "contact_partners output depends on PYTHONHASHSEED — the instrument is "
         f"non-deterministic (G-72): {by_output}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Seams both entrypoints share (p8c1 — extracted out of the two GPU ``run``
+# bodies, so the CPU tests that could not reach them there live here).
+# --------------------------------------------------------------------------- #
+def test_artifact_paths_renders_present_and_absent_recordings():
+    from pathlib import Path as _Path
+
+    assert main.artifact_paths(_Path("/cv/out/bag/bag_0.mcap"), _Path("/cv/out/run.mp4")) == {
+        "mcap": "/cv/out/bag/bag_0.mcap",
+        "mp4": "/cv/out/run.mp4",
+    }
+    # P2-02 honest degradation: a recorder that produced nothing leaves null,
+    # never "" — the field is read by M3/M8 as "there is no artifact".
+    assert main.artifact_paths(None, None) == {"mcap": None, "mp4": None}
+    assert main.artifact_paths(None, _Path("/cv/out/run.mp4"))["mcap"] is None
+
+
+def test_abort_recorders_aborts_what_exists_and_skips_what_does_not():
+    class _Rec:
+        def __init__(self):
+            self.aborted = 0
+
+        def abort(self):
+            self.aborted += 1
+
+    bag, video = _Rec(), _Rec()
+    main._abort_recorders(bag, None, video)  # the None arm is the failure path
+    assert (bag.aborted, video.aborted) == (1, 1)
+
+
+def test_announce_plugin_dir_prints_only_when_one_was_injected(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "path", list(sys.path))  # insertion is in-place
+    assert main.announce_oracle_plugin_dir({}) is None
+    assert capsys.readouterr().out == ""
+    assert main.announce_oracle_plugin_dir({"CV_ORACLE_PLUGIN_DIR": str(tmp_path)}) == str(tmp_path)
+    assert capsys.readouterr().out == f"[cv-runner] oracle plugin dir on sys.path: {tmp_path}\n"
+    assert sys.path[0] == str(tmp_path)
+
+
+def test_plan_obstacle_pool_plans_one_jobs_pool_and_rejects_an_over_cap_one():
+    obstacles = [{"asset": "box", "count": 1, "x": 1.0, "y": 2.0}] * 3
+    assert sum(main.plan_obstacle_pool(obstacles).values()) == 3
+    # Over-cap is BAD INPUT (exit 2), not a platform failure after a paid boot.
+    with pytest.raises(main.BadJobSpec) as excinfo:
+        main.plan_obstacle_pool([{"asset": "box", "count": 1, "x": 0.0, "y": 0.0}] * 999)
+    assert "scenario.obstacles" in str(excinfo.value)
+
+
+def test_contact_partner_line_is_emitted_verbatim_and_only_when_there_was_contact(capsys):
+    """The bring-up line both entrypoints print — byte-exact (§3-2 log syntax)."""
+    quiet = telemetry.TelemetryRecord()
+    main._print_contact_partners(quiet, CHASSIS)
+    assert capsys.readouterr().out == ""
+
+    record = telemetry.TelemetryRecord(
+        contact_events=[
+            ContactEvent(sim_time_s=1.0, actor0_path=CHASSIS, actor1_path="/World/box"),
+            ContactEvent(sim_time_s=1.1, actor0_path="/World/box", actor1_path=CHASSIS),
+        ]
+    )
+    main._print_contact_partners(record, CHASSIS)
+    assert capsys.readouterr().out == (
+        "[cv-runner] contact events: 2 with 1 distinct partner prim(s): ['/World/box']\n"
+    )
+
+
+def test_closest_approach_line_is_emitted_verbatim_and_stays_silent_without_data(capsys):
+    samples = [
+        PoseSample(sim_time_s=0.0, position=(0.0, 0.0, 0.0), orientation_wxyz=(1.0, 0.0, 0.0, 0.0)),
+        PoseSample(sim_time_s=1.0, position=(2.4, 0.0, 0.0), orientation_wxyz=(1.0, 0.0, 0.0, 0.0)),
+    ]
+    record = telemetry.TelemetryRecord(gt_pose_samples=samples)
+    main._print_closest_approach(record, [3.0, 0.0, 0.0])
+    assert capsys.readouterr().out == "[cv-runner] GT closest-approach to goal: 0.600 m\n"
+    # No trajectory / no goal -> no line at all (an absent debug line, never a
+    # fake one: a "0.000 m" here would read as "it arrived").
+    main._print_closest_approach(telemetry.TelemetryRecord(), [3.0, 0.0, 0.0])
+    main._print_closest_approach(record, None)
+    assert capsys.readouterr().out == ""

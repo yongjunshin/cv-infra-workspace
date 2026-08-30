@@ -8,6 +8,7 @@ bodies themselves are T3 (workstation) scope — no GPU claim is made here.
 
 import math
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -44,6 +45,31 @@ def test_is_direct_usd_ref():
     assert sim_runtime.is_direct_usd_ref("omniverse://assets/warehouse.usd")
     assert sim_runtime.is_direct_usd_ref("https://assets/warehouse.usd")
     assert sim_runtime.is_direct_usd_ref("/mnt/scenes/warehouse.usd")
+
+
+def test_asset_url_passes_a_direct_ref_through_untouched():
+    """The CPU-reachable arm of the assets-root join: a direct ref needs no root.
+
+    (The join itself imports isaacsim and stays GPU-only; what is testable here
+    is that a consumer-supplied URL/path is handed on verbatim, whatever the
+    caller is resolving.)
+    """
+    for ref in ("omniverse://assets/warehouse.usd", "https://a/w.usd", "/mnt/scenes/w.usd"):
+        assert sim_runtime._asset_url(ref, "sample scene") == ref
+        assert sim_runtime._asset_url(ref, "obstacle asset") == ref
+
+
+def test_the_assets_root_join_has_exactly_one_home():
+    """p8c1 dedup (G-17/G-25 anti-drift): scene and prop join through ONE function.
+
+    Before this cycle ``load_scene`` and ``SimRuntime._asset_url`` each spelled
+    the join AND the operator-facing unreachable-root message; the copies already
+    differed only in the noun. A re-inlined ``get_assets_root_path()`` join is
+    how they would drift again, so the call site is counted here.
+    """
+    source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
+    assert source.count("get_assets_root_path()") == 1
+    assert source.count("Isaac assets root unreachable") == 1
 
 
 # --------------------------------------------------------------------------- #

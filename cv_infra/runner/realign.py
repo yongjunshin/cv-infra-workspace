@@ -229,23 +229,42 @@ class SutRealigner:
             return observed
 
         if pose is not None:
-            pub = self._publisher()
-            deadline = time.monotonic() + DISCOVERY_TIMEOUT_S
-            while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
-                self.step()
-            observed["initialpose_subscribers"] = pub.get_subscription_count()
-            for _ in range(REALIGN_PUBLISH_COUNT):
-                # Built fresh per message: the stamp must be the clock NOW, and a
-                # burst is a burst of SEPARATE claims about the same pose, not one
-                # message sent N times (see REALIGN_PUBLISH_COUNT).
-                pub.publish(
-                    apply_initialpose_fields(
-                        self._pose_type()(), initialpose_fields(pose, self.sim_time())
-                    )
-                )
-                self.step()
-            observed["initialpose_published"] = REALIGN_PUBLISH_COUNT
+            self._seed_initialpose(pose, observed)
+        self._clear_costmaps(observed)
+        return observed
 
+    def _seed_initialpose(self, pose: dict, observed: dict) -> None:
+        """Publish the ``/initialpose`` burst and record what the wire showed.
+
+        Waits — BOUNDED, pumping the sim — for a matched subscription first: a
+        publisher used in the instant it was created has not been DISCOVERED yet,
+        so the seed goes nowhere while the counter says it was sent (G-26). The
+        observed subscriber count is what tells those two apart afterwards.
+        """
+        pub = self._publisher()
+        deadline = time.monotonic() + DISCOVERY_TIMEOUT_S
+        while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
+            self.step()
+        observed["initialpose_subscribers"] = pub.get_subscription_count()
+        for _ in range(REALIGN_PUBLISH_COUNT):
+            # Built fresh per message: the stamp must be the clock NOW, and a
+            # burst is a burst of SEPARATE claims about the same pose, not one
+            # message sent N times (see REALIGN_PUBLISH_COUNT).
+            pub.publish(
+                apply_initialpose_fields(
+                    self._pose_type()(), initialpose_fields(pose, self.sim_time())
+                )
+            )
+            self.step()
+        observed["initialpose_published"] = REALIGN_PUBLISH_COUNT
+
+    def _clear_costmaps(self, observed: dict) -> None:
+        """Call nav2's own clear-entirely services; an unanswered one lands in ``missing``.
+
+        Both waits (service readiness, then the call itself) are bounded and pump
+        the sim: a blackbox that never answers must degrade to a reported entry,
+        never to a hung carrier.
+        """
         for service in COSTMAP_CLEAR_SERVICES:
             client = self._client(service)
             if not client.service_is_ready():
@@ -260,4 +279,3 @@ class SutRealigner:
             while not future.done() and time.monotonic() < call_deadline:
                 self.step()
             observed["costmaps_cleared" if future.done() else "missing"].append(service)
-        return observed

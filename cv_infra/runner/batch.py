@@ -65,12 +65,15 @@ from cv_infra.runner.main import (
     EXIT_USAGE,
     READINESS_TIMEOUT_S,
     BadJobSpec,
+    _abort_recorders,
+    _print_contact_partners,
     _start_quiet,
     _stop_quiet,
+    announce_oracle_plugin_dir,
+    artifact_paths,
     build_oracles,
     criteria_view,
     hard_exit,
-    insert_oracle_plugin_dir,
     obstacle_specs,
     parse_request,
     read_request_identity_key,
@@ -350,10 +353,102 @@ class BatchSummary:
         self.doc["iterations"].append(item)
         return self.flush()
 
+    def verdicts(self) -> list:
+        """Every recorded sample's verdict, in iteration order.
+
+        A LIST, never a fold: "some sample failed" is not a property of the
+        carrier (see the exit contract in this module's docstring), so the
+        closing log line reports them side by side and M3 folds each sample
+        from its own result.json.
+        """
+        return [item["verdict"] for item in self.doc["iterations"]]
+
     def finish(self, error: str | None = None, finished_at: float | None = None) -> Path:
         self.doc["finished_at"] = time.time() if finished_at is None else finished_at
         self.doc["error"] = error
         return self.flush()
+
+
+def _dumped(model: object, *, exclude_none: bool = False) -> dict | None:
+    """``model.model_dump(...)`` or None — the "declared, or absent" hand-off shape.
+
+    No contract model crosses into ``sim_runtime``, so every declared block is
+    dumped to a plain dict at this boundary; an UNDECLARED one must arrive as
+    None (not as an empty dict) or the runner's own defaults never apply.
+    """
+    return None if model is None else model.model_dump(exclude_none=exclude_none)
+
+
+@dataclass(frozen=True)
+class _Admission:
+    """What the carrier knows before a single GPU second is spent."""
+
+    out_root: Path
+    settle_s: float
+    identity_key: str | None
+    specs: list[ParsedSpec]
+    summary: BatchSummary
+
+
+def _admit(env: dict | None = None) -> _Admission:
+    """Read the wire, admit EVERY spec, open the summary heartbeat. 0 GPU seconds.
+
+    Order matters and is the order a bad batch fails in: out-dir shape, wrapper
+    document, settle budget, plugin dir (on sys.path BEFORE any oracle loads),
+    identity key, then the per-spec + batch-wide admission. The heartbeat is
+    flushed HERE, before Isaac is touched, so a carrier that dies at the boot
+    guard still tells M3 "the container started and admitted n" (P5-13).
+    """
+    out_root = resolve_out_root(env)
+    batch = load_batch(env)
+    settle_s = realign_settle_s(env)
+    announce_oracle_plugin_dir(env)
+    identity_key = read_request_identity_key(env)
+    specs = admit_specs(batch)
+    print(
+        f"[cv-runner] batch admitted: {len(specs)} sample(s) request_id={batch.request_id} "
+        f"out_root={out_root} settle_s={settle_s}",
+        flush=True,
+    )
+    summary = BatchSummary(out_root, batch.request_id, len(specs))
+    summary.flush()  # heartbeat: the carrier exists, before Isaac is even touched
+    return _Admission(out_root, settle_s, identity_key, specs, summary)
+
+
+@dataclass(frozen=True)
+class _Staging:
+    """What the ONE boot stages, decided from EVERY admitted spec (pre-boot, pure)."""
+
+    debug_obstacle: dict | None
+    pool_plan: dict
+    head_obstacles: list[dict]
+    pool_total: int
+    sensor_topics: list[str]
+
+
+def _plan_staging(specs: list[ParsedSpec], base_config: object) -> _Staging:
+    """Plan sample 0's staging + the pool the whole batch shares.
+
+    The pool is the UNION over EVERY spec, not spec 0's: sample i's obstacle
+    COUNT is exactly what varies (CEO: "desk n={0..5}"), so a spec-0-sized pool
+    would leave sample 3 with nothing to place. Placement is NOT decided here —
+    the boot's second pre-reset hook owns it, so "where sample 0's obstacles go"
+    has one definition shared with every later sample.
+    """
+    head = specs[0]
+    pool_plan = obstacle_pool_plan([obstacle_specs(p.request) for p in specs])
+    return _Staging(
+        debug_obstacle=_dumped(head.request.scenario.debug_obstacle, exclude_none=True),
+        pool_plan=pool_plan,
+        head_obstacles=obstacle_specs(head.request),
+        pool_total=sum(pool_plan.values()),
+        sensor_topics=[s.topic for s in base_config.sensors],
+    )
+
+
+def boot_total_s(boot: dict) -> float:
+    """Sum of the boot phase spans recorded so far (every ``*_s`` key)."""
+    return round(sum(value for key, value in boot.items() if key.endswith("_s")), 4)
 
 
 def reexec_argv() -> list[str]:
@@ -365,6 +460,25 @@ def reexec_argv() -> list[str]:
     JOB_SPEC main expects. The parameter existed; passing it is the whole fix.
     """
     return [sys.executable, "-m", BATCH_MODULE]
+
+
+def _settle_world(adapter: object, settle_s: float) -> float:
+    """Pump the sim ``settle_s`` SIM-seconds after a realign; return the time reached.
+
+    SIM seconds (D-F) because that is what the teleported robot's physics and
+    AMCL's first re-convergence actually run on. The wall cap is the escape
+    hatch: a sim whose ``/clock`` has stopped would spin here forever, and a
+    hung carrier is strictly worse than a normal readiness failure — the loop
+    ends, the barrier below reports it, and the batch exits 3.
+
+    Pumping (not sleeping) is mandatory: the sim IS the /clock source the SUT is
+    waiting on (G-19), so a wait that does not step it waits on itself.
+    """
+    settle_until = adapter.sim_time_s + settle_s
+    settle_deadline = time.monotonic() + SETTLE_WALL_BUDGET_S
+    while adapter.sim_time_s < settle_until and time.monotonic() < settle_deadline:
+        adapter.step_and_spin()
+    return adapter.sim_time_s
 
 
 # --------------------------------------------------------------------------- #
@@ -415,7 +529,6 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     from cv_infra.runner.telemetry import (  # noqa: PLC0415
         PhysicsTelemetrySampler,
         TelemetryRecord,
-        contact_partners,
         count_real_collisions,
         min_clearance_m,
         path_length_m,
@@ -423,28 +536,15 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     )
 
     # ---- pre-boot: nothing below costs a GPU second ----------------------- #
-    out_root = resolve_out_root(env)
-    batch = load_batch(env)
-    settle_s = realign_settle_s(env)
-    plugin_dir = insert_oracle_plugin_dir(env)
-    if plugin_dir is not None:
-        print(f"[cv-runner] oracle plugin dir on sys.path: {plugin_dir}", flush=True)
-    identity_key = read_request_identity_key(env)
-    specs = admit_specs(batch)
-    print(
-        f"[cv-runner] batch admitted: {len(specs)} sample(s) request_id={batch.request_id} "
-        f"out_root={out_root} settle_s={settle_s}",
-        flush=True,
-    )
-
-    summary = BatchSummary(out_root, batch.request_id, len(specs))
-    summary.flush()  # heartbeat: the carrier exists, before Isaac is even touched
+    admitted = _admit(env)
+    out_root, specs, summary = admitted.out_root, admitted.specs, admitted.summary
+    identity_key, settle_s = admitted.identity_key, admitted.settle_s
 
     head = specs[0]
     base_config = head.adapter_config
     chassis_path = read_field(head.criteria, "chassis_path", "")
     excluded_paths = read_field(head.criteria, "collision_excluded_paths", []) or []
-    sensor_topics = [s.topic for s in base_config.sensors]
+    staging = _plan_staging(specs, base_config)
 
     trace = BootTrace()
     sim = SimRuntime(sim_config_for(head.request), trace=trace)
@@ -487,26 +587,13 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         # physics parse, and declared sensors' render products only engage pre-play.
         watch.begin("scene_load")
         sim.pre_reset.append(sampler.bind)
-        head_obstacle = (
-            None
-            if head.request.scenario.debug_obstacle is None
-            else head.request.scenario.debug_obstacle.model_dump(exclude_none=True)
-        )
-        if head_obstacle is not None:
-            sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(head_obstacle))
-        # The pool is the UNION over EVERY spec, not spec 0's: sample i's obstacle
-        # COUNT is exactly what varies (CEO: "desk n={0..5}"), so a spec-0-sized
-        # pool would leave sample 3 with nothing to place. Placement is NOT done
-        # here — the second hook owns it, so "where sample 0's obstacles go" has
-        # one definition shared with every later sample.
-        pool_plan = obstacle_pool_plan([obstacle_specs(p.request) for p in specs])
-        head_obstacles = obstacle_specs(head.request)
-        pool_total = sum(pool_plan.values())
-        if pool_plan:
-            sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(pool_plan))
-            sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(head_obstacles))
-        if sensor_topics:
-            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
+        if staging.debug_obstacle is not None:
+            sim.pre_reset.append(lambda _world: sim.spawn_debug_obstacle(staging.debug_obstacle))
+        if staging.pool_plan:
+            sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(staging.pool_plan))
+            sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(staging.head_obstacles))
+        if staging.sensor_topics:
+            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(staging.sensor_topics))
         sim.load_scene(identity_key)  # emits sample 0's sim_config line
         sampler.attach(sim.world)
         summary.doc["boot"]["scene_load_s"] = round(watch.end("scene_load"), 4)
@@ -524,9 +611,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         video.open_render_product()
         sim.on_step.append(video.capture_frame)
         realigner = SutRealigner(adapter.node, adapter.step_and_spin, lambda: adapter.sim_time_s)
-        summary.doc["boot"]["total_s"] = round(
-            sum(v for k, v in summary.doc["boot"].items() if k.endswith("_s")), 4
-        )
+        summary.doc["boot"]["total_s"] = boot_total_s(summary.doc["boot"])
         summary.flush()
         print(f"[cv-runner] boot done: {summary.doc['boot']}", flush=True)
 
@@ -545,22 +630,14 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 f"index={index} job_id={parsed.job_id} ===",
                 flush=True,
             )
-            pose = (
-                None
-                if request.scenario.initial_pose is None
-                else request.scenario.initial_pose.model_dump()
-            )
-            obstacle = (
-                None
-                if request.scenario.debug_obstacle is None
-                else request.scenario.debug_obstacle.model_dump(exclude_none=True)
-            )
+            pose = _dumped(request.scenario.initial_pose)
+            obstacle = _dumped(request.scenario.debug_obstacle, exclude_none=True)
             # ``None`` = this carrier has no pool (nothing to do). A LIST — empty
             # included — means "these are THIS sample's obstacles, park the rest":
             # folding ``[]`` into None would leave a 0-obstacle sample standing on
             # sample i-1's placement. A carrier without a pool passes None, so a
             # legacy (debug_obstacle-only) batch logs exactly what it logged before.
-            obstacle_set = obstacle_specs(request) if pool_plan else None
+            obstacle_set = obstacle_specs(request) if staging.pool_plan else None
 
             iter_watch.begin("restage")
             sim.config.seed = request.scenario.seed
@@ -574,10 +651,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             sim_time_start_s = adapter.sim_time_s
             realign = realigner.realign(pose)
             print(f"[cv-runner] sut realign: {realign}", flush=True)
-            settle_until = adapter.sim_time_s + settle_s
-            settle_deadline = time.monotonic() + SETTLE_WALL_BUDGET_S
-            while adapter.sim_time_s < settle_until and time.monotonic() < settle_deadline:
-                adapter.step_and_spin()
+            _settle_world(adapter, settle_s)
             iter_watch.end("realign")
 
             iter_watch.begin("readiness")
@@ -607,8 +681,8 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 # placement CALL, never that a prim is at those coordinates (W1
                 # owns that — same layering as the realign counters).
                 "obstacles_placed": len(obstacle_set or []),
-                "obstacles_parked": pool_total - len(obstacle_set or []),
-                "obstacles_pool": pool_total,
+                "obstacles_parked": staging.pool_total - len(obstacle_set or []),
+                "obstacles_pool": staging.pool_total,
             }
             if not ready:
                 # The barrier is the carrier's trust boundary: without a live SUT
@@ -686,24 +760,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 ),
                 "path_len_m": path_length_m(telemetry.gt_pose_samples),
             }
-            if telemetry.contact_events:  # bring-up debug surface (same as main)
-                partners = contact_partners(telemetry.contact_events, chassis_path)
-                print(
-                    f"[cv-runner] contact events: {len(telemetry.contact_events)} with "
-                    f"{len(partners)} distinct partner prim(s): {partners[:10]}",
-                    flush=True,
-                )
+            _print_contact_partners(telemetry, chassis_path)  # bring-up debug surface
             verdict, outcomes = EvaluationEngine(parsed.oracles).evaluate(telemetry, criteria)
+            artifacts = artifact_paths(mcap_path, mp4_path)
             write_result(
                 build_result_dict(
                     parsed.job_id,
                     verdict,
                     outcomes,
                     metrics,
-                    artifacts=Artifacts(
-                        mcap=str(mcap_path) if mcap_path is not None else None,
-                        mp4=str(mp4_path) if mp4_path is not None else None,
-                    ),
+                    artifacts=Artifacts(**artifacts),
                     request_identity_key=identity_key,
                 ),
                 iteration_result_path(out_root, index),
@@ -714,10 +780,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             item.update(
                 verdict=verdict,
                 metrics=metrics,
-                artifacts={
-                    "mcap": str(mcap_path) if mcap_path is not None else None,
-                    "mp4": str(mp4_path) if mp4_path is not None else None,
-                },
+                artifacts=artifacts,
                 video_frames=video.last_frame_count,
                 gt_pose_samples=len(telemetry.gt_pose_samples),
                 contact_events=len(telemetry.contact_events),
@@ -731,8 +794,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
 
         summary.finish()
         print(
-            f"[cv-runner] batch complete: {len(specs)} sample(s), "
-            f"verdicts={[i['verdict'] for i in summary.doc['iterations']]}",
+            f"[cv-runner] batch complete: {len(specs)} sample(s), verdicts={summary.verdicts()}",
             flush=True,
         )
         return EXIT_PASS
@@ -755,9 +817,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         observe("boot summary", trace.emit_summary)
         observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
         sampler.detach()
-        for recorder in (rosbag, video):  # no child process / writer leak
-            if recorder is not None:
-                recorder.abort()
+        _abort_recorders(rosbag, video)  # no child process / writer leak
         adapter.teardown()
         # The sim is deliberately NOT closed (G-62): SimulationApp.close() does not
         # return, it ends the process with status 0 and would erase the carrier's

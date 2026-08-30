@@ -226,6 +226,31 @@ def is_direct_usd_ref(scene_usd: str) -> bool:
     )
 
 
+def _asset_url(usd_path: str, what: str) -> str:  # pragma: no cover - GPU path
+    """Registry path -> assets-root-prefixed URL; a direct ref passes through.
+
+    ONE home for the join (p8c1). ``load_scene`` spelled it for the SCENE and
+    ``spawn_obstacle_pool`` for a prop, so the unreachable-root failure — the one
+    an operator actually meets when the cache mount is wrong — was authored
+    twice. ``what`` names the thing in that message, which is the only part that
+    ever differed between the two copies: with ``what="sample scene"`` this
+    raises the scene message character for character (asserted before the swap,
+    G-17). The direct-ref arm stays CPU-testable; the join needs isaacsim.
+    """
+    if is_direct_usd_ref(usd_path):
+        return usd_path
+    from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
+
+    root = get_assets_root_path()
+    if root is None:
+        raise RuntimeError(
+            "Isaac assets root unreachable (cloud assets / cache) — cannot "
+            f"resolve {what} {usd_path!r}; check network or asset cache "
+            "mounts (M5 cache seam)"
+        )
+    return root + usd_path
+
+
 # --------------------------------------------------------------------------- #
 # FU-17: declared-sensor render-product activation (pre-play) — CPU-testable.
 # --------------------------------------------------------------------------- #
@@ -279,15 +304,30 @@ def _normalized_topic(name) -> str:
     return str(name).lstrip("/")
 
 
+def _enable_upstream_render_products(stage, publish_node) -> list[str]:
+    """Turn ON every still-disabled render-product node upstream of ONE publish node.
+
+    In-memory attribute set only (never a stage save — the asset stays
+    unmodified) and idempotent: an already-enabled node is left untouched, which
+    is what makes a second call a no-op. Returns the node paths this call flipped.
+    """
+    flipped: list[str] = []
+    for node in _upstream_prims(stage, publish_node):
+        if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
+            continue
+        enabled_attr = node.GetAttribute("inputs:enabled")
+        if enabled_attr and not enabled_attr.Get():
+            enabled_attr.Set(True)
+            flipped.append(str(node.GetPath()))
+    return flipped
+
+
 def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
     """FU-17: enable the render products feeding the DECLARED sensor topics.
 
-    For each publish node whose ``inputs:topicName`` names a declared topic
-    (slash-normalized comparison — see ``_normalized_topic``), walk its
-    upstream graph and set ``inputs:enabled=true`` on every
-    ``IsaacCreateRenderProduct`` node still False. In-memory attribute set only
-    (never a stage save — the asset stays unmodified); idempotent (already-enabled
-    nodes are left untouched, so a second call is a no-op). Returns
+    This half answers "WHICH publish nodes are ours" (a declared topic names them,
+    slash-normalized — see ``_normalized_topic``); ``_enable_upstream_render_products``
+    answers "which nodes upstream of one of them to flip". Returns
     ``(newly_enabled_node_paths, declared_topics_with_no_publish_node)`` — the
     second list (declared spelling, as-written) is the original FU-17 bug class
     (declared but publisher-less) and is surfaced loudly by the caller.
@@ -304,13 +344,7 @@ def enable_sensor_render_products(stage, topics) -> tuple[list[str], list[str]]:
         if topic is None or _normalized_topic(topic) not in wanted:
             continue
         matched.add(_normalized_topic(topic))
-        for node in _upstream_prims(stage, prim):
-            if not _node_type(node).endswith(RENDER_PRODUCT_NODE_TYPE):
-                continue
-            enabled_attr = node.GetAttribute("inputs:enabled")
-            if enabled_attr and not enabled_attr.Get():
-                enabled_attr.Set(True)
-                enabled.append(str(node.GetPath()))
+        enabled.extend(_enable_upstream_render_products(stage, prim))
     return sorted(set(enabled)), sorted(wanted[k] for k in set(wanted) - matched)
 
 
@@ -894,18 +928,7 @@ class SimRuntime:
         from isaacsim.core.api import World  # noqa: PLC0415
 
         asset = resolve_scene(self.config.scene_ref)
-        scene_path = asset.scene_usd
-        if not is_direct_usd_ref(scene_path):
-            from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
-
-            root = get_assets_root_path()
-            if root is None:
-                raise RuntimeError(
-                    "Isaac assets root unreachable (cloud assets / cache) — cannot "
-                    f"resolve sample scene {scene_path!r}; check network or asset cache "
-                    "mounts (M5 cache seam)"
-                )
-            scene_path = root + scene_path
+        scene_path = _asset_url(asset.scene_usd, "sample scene")
 
         self._phase_begin(PHASE_SCENE_LOAD)
         t0 = time.monotonic()
@@ -1100,27 +1123,6 @@ class SimRuntime:
         SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=position)
         print(f"[cv-runner] debug obstacle moved: {DEBUG_OBSTACLE_PRIM} -> {position}", flush=True)
 
-    def _asset_url(self, usd_path: str, what: str) -> str:  # pragma: no cover - GPU path
-        """Assets-root-prefixed URL for a registry path; a direct ref passes through.
-
-        ``load_scene`` spells this same join for the SCENE. Folding the two would
-        touch the one code path every job boots through, which this obstacle task
-        deliberately leaves alone; the shared half is ``is_direct_usd_ref``, which
-        already has one home.
-        """
-        if is_direct_usd_ref(usd_path):
-            return usd_path
-        from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
-
-        root = get_assets_root_path()
-        if root is None:
-            raise RuntimeError(
-                "Isaac assets root unreachable (cloud assets / cache) — cannot "
-                f"resolve {what} {usd_path!r}; check network or asset cache "
-                "mounts (M5 cache seam)"
-            )
-        return root + usd_path
-
     def _make_obstacle_static(self, prim_path: str) -> str:  # pragma: no cover - GPU path
         """Give a REFERENCED prop colliders and refuse one that brings its own
         dynamics. Returns the one-line audit string the caller prints.
@@ -1232,7 +1234,7 @@ class SimRuntime:
                     )
                 else:
                     add_reference_to_stage(
-                        usd_path=self._asset_url(asset.usd_path, "obstacle asset"),
+                        usd_path=_asset_url(asset.usd_path, "obstacle asset"),
                         prim_path=prim_path,
                     )
                     # W0 recipe: pump the app once so the reference composes before

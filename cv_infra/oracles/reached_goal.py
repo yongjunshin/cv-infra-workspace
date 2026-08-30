@@ -133,6 +133,23 @@ def angle_diff(a: float, b: float) -> float:
     return math.atan2(math.sin(a - b), math.cos(a - b))
 
 
+def _yaw_out_of_tolerance(sample, criteria: object) -> bool:
+    """Did the reached sample miss a DECLARED goal orientation?
+
+    False when no ``goal_orientation_wxyz`` is declared — position-only goals are
+    the norm, and "not declared" must read as "not judged", never as a failure.
+    Split out of the verdict ladder so the quaternion math sits next to its own
+    name instead of inside the last decision of ``evaluate``.
+    """
+    goal_orient = read_field(criteria, "goal_orientation_wxyz")
+    if goal_orient is None:
+        return False
+    yaw_tol = float(read_field(criteria, "yaw_tolerance_rad", DEFAULT_YAW_TOL_RAD))
+    got_yaw = yaw_from_quat_wxyz(sample.orientation_wxyz)
+    want_yaw = yaw_from_quat_wxyz(tuple(float(v) for v in goal_orient))
+    return abs(angle_diff(got_yaw, want_yaw)) > yaw_tol
+
+
 class ReachedGoalOracle(OracleBase):
     name = "reached_goal"
     version = "0.1.0"
@@ -186,18 +203,13 @@ class ReachedGoalOracle(OracleBase):
                 detail=f"reached at {reach_time:.2f}s > budget {timeout_s}s ({tolerance.audit})",
             )
 
-        goal_orient = read_field(criteria, "goal_orientation_wxyz")
-        if goal_orient is not None:
-            yaw_tol = float(read_field(criteria, "yaw_tolerance_rad", DEFAULT_YAW_TOL_RAD))
-            got_yaw = yaw_from_quat_wxyz(samples[idx].orientation_wxyz)
-            want_yaw = yaw_from_quat_wxyz(tuple(float(v) for v in goal_orient))
-            if abs(angle_diff(got_yaw, want_yaw)) > yaw_tol:
-                return OracleOutcome(
-                    self.name,
-                    passed=False,
-                    reason="orientation",
-                    detail="reached position but yaw out of tolerance",
-                )
+        if _yaw_out_of_tolerance(samples[idx], criteria):
+            return OracleOutcome(
+                self.name,
+                passed=False,
+                reason="orientation",
+                detail="reached position but yaw out of tolerance",
+            )
 
         return OracleOutcome(
             self.name, passed=True, detail=f"reached at {reach_time:.2f}s within {tolerance.audit}"

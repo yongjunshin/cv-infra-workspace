@@ -15,6 +15,7 @@ bundle-independent code path; numpy is legal only after ``SimulationApp`` boots)
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass, field
 
@@ -61,7 +62,7 @@ class TelemetryRecord:
 def path_length_m(samples: list[PoseSample]) -> float:
     """Total travelled distance = sum of 3D distances between consecutive samples."""
     total = 0.0
-    for prev, cur in zip(samples, samples[1:]):
+    for prev, cur in zip(samples, samples[1:], strict=False):
         total += math.dist(prev.position, cur.position)
     return total
 
@@ -170,8 +171,9 @@ def min_clearance_m() -> None:
     Reserved for post-MVP. Pre-registered re-open trigger: a consumer actually asks for
     a clearance-based acceptance criterion. See
     ``agent-comms/decisions/2026-08-04-p5c10-scope-and-req-exec-rulings.md`` §D-3.
+
+    Returns ``None`` — unconditionally, by decision (the body is the docstring).
     """
-    return None
 
 
 class PhysicsTelemetrySampler:
@@ -281,10 +283,8 @@ class PhysicsTelemetrySampler:
     def detach(self) -> None:
         """Stop sampling (drop callback + contact subscription). CPU-safe no-op."""
         if self._world is not None:  # pragma: no cover - GPU path
-            try:
+            with contextlib.suppress(Exception):  # a torn-down world has nothing to remove
                 self._world.remove_physics_callback(self._CALLBACK_NAME)
-            except Exception:
-                pass
             self._world = None
         self._contact_sub = None  # releasing the ref ends the subscription
         self._chassis_prim = None

@@ -522,6 +522,119 @@ def test_summary_is_written_before_isaac_is_touched(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# The seams the carrier loop was decomposed into (p8c1) — the pre-boot half of
+# ``run`` is CPU-reachable now, so it is tested rather than only AST-guarded.
+# --------------------------------------------------------------------------- #
+def test_admit_reads_the_wire_admits_every_spec_and_beats_before_any_gpu_second(tmp_path, capsys):
+    admitted = batch._admit(_env(tmp_path))
+    assert [p.index for p in admitted.specs] == [0, 1]
+    assert admitted.out_root == tmp_path / "out"
+    assert admitted.settle_s == batch.DEFAULT_REALIGN_SETTLE_S
+    assert admitted.identity_key is None  # absent stays absent, never invented
+    assert "batch admitted: 2 sample(s)" in capsys.readouterr().out
+    # The heartbeat is on disk BEFORE Isaac is touched (P5-13: M3 can tell "the
+    # container started and admitted n" from "it never got that far").
+    doc = json.loads((tmp_path / "out" / batch.BATCH_SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert doc["schema"] == BATCH_SUMMARY_SCHEMA and doc["n"] == 2
+    assert doc["iterations"] == []
+
+
+def test_admit_carries_the_injected_identity_key_and_settle_override(tmp_path):
+    env = dict(_env(tmp_path))
+    env[main.REQUEST_IDENTITY_KEY_ENV] = "sha256:cb39be9a"
+    env[batch.REALIGN_SETTLE_ENV] = "1.25"
+    admitted = batch._admit(env)
+    assert admitted.identity_key == "sha256:cb39be9a"  # VERBATIM (M4 owns the key)
+    assert admitted.settle_s == 1.25
+
+
+def test_admit_rejects_a_bad_wire_before_it_admits_anything(tmp_path):
+    with pytest.raises(batch.BadJobSpec, match="RESULT_OUT"):
+        batch._admit({JOB_SPEC_BATCH_ENV: str(_batch_file(tmp_path, _batch_doc()))})
+
+
+def test_plan_staging_pools_the_union_over_every_spec_and_stages_sample_zero():
+    doc = _batch_doc(3)
+    for index, spec in enumerate(doc["specs"]):
+        _with_obstacles(spec, [{"asset": "chair", "x": 1.0 + index, "y": 2.0}] * index)
+    for spec in doc["specs"]:  # the wiring is done ONCE, so every spec declares it
+        spec["interface"]["adapter_config"] = {
+            "sensors": [{"topic": "/front_2d_lidar/scan", "type": "sensor_msgs/msg/LaserScan"}]
+        }
+    specs = batch.admit_specs(JobSpecBatch.model_validate(doc))
+    staging = batch._plan_staging(specs, specs[0].adapter_config)
+    # The pool is the per-sample MAXIMUM over EVERY spec (sample 2 wants 2), not
+    # spec 0's (which wants none) — a spec-0-sized pool leaves sample 2 nothing.
+    assert staging.pool_plan == {("chair", None): 2} and staging.pool_total == 2
+    assert staging.head_obstacles == []  # sample 0 declares none: it parks the pool
+    assert staging.sensor_topics == ["/front_2d_lidar/scan"]
+    assert staging.debug_obstacle is None  # _with_obstacles dropped the legacy box
+
+
+def test_plan_staging_dumps_sample_zeros_legacy_box_and_leaves_the_pool_empty():
+    specs = batch.admit_specs(JobSpecBatch.model_validate(_batch_doc(2)))
+    staging = batch._plan_staging(specs, specs[0].adapter_config)
+    assert staging.debug_obstacle == {"x": 1.0, "y": 0.5}  # exclude_none: no invented dims
+    assert staging.pool_plan == {} and staging.pool_total == 0
+    assert staging.sensor_topics == []
+
+
+def test_dumped_keeps_an_undeclared_block_absent():
+    from cv_infra.contract.schema import DebugObstacle, InitialPose
+
+    assert batch._dumped(None) is None
+    assert batch._dumped(InitialPose(x=1.0, y=2.0, yaw=0.5)) == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    # exclude_none is what lets the RUNNER's own dimension defaults apply — a
+    # dumped ``height: None`` would arrive as a declared value (float(None)).
+    assert batch._dumped(DebugObstacle(x=1.0, y=0.5), exclude_none=True) == {"x": 1.0, "y": 0.5}
+
+
+def test_boot_total_s_sums_the_span_keys_only():
+    boot = {"bootstrap_s": 0.0054, "simulation_app_init_s": 20.5, "robot_prim": "/World/Carter"}
+    assert batch.boot_total_s(boot) == 20.5054
+
+
+def test_summary_verdicts_report_every_sample_side_by_side(tmp_path):
+    summary = batch.BatchSummary(tmp_path, "req-0001", 3)
+    assert summary.verdicts() == []
+    for index, verdict in enumerate(("pass", "fail", "timeout")):
+        summary.add_iteration({"index": index, "verdict": verdict})
+    # A list, never a fold: the carrier does not collapse n verdicts into one.
+    assert summary.verdicts() == ["pass", "fail", "timeout"]
+
+
+class _SettleAdapter:
+    """Minimal stand-in for the ROS adapter's pump: stepping advances sim time."""
+
+    def __init__(self, dt: float) -> None:
+        self.sim_time_s = 0.0
+        self.dt = dt
+        self.steps = 0
+
+    def step_and_spin(self) -> None:
+        self.steps += 1
+        self.sim_time_s += self.dt
+
+
+def test_settle_world_pumps_until_the_sim_budget_is_spent():
+    adapter = _SettleAdapter(dt=0.1)
+    assert batch._settle_world(adapter, 0.5) == pytest.approx(0.5)
+    assert adapter.steps == 5  # sim-time budget (D-F), not a wall sleep
+
+
+def test_settle_world_gives_up_on_a_stopped_clock_instead_of_hanging(monkeypatch):
+    """The wall cap exists for a sim whose /clock stopped: the loop must END.
+
+    Without it the carrier hangs here forever; with it the readiness barrier
+    below reports the dead sim normally and the batch exits 3.
+    """
+    monkeypatch.setattr(batch, "SETTLE_WALL_BUDGET_S", 0.05)
+    adapter = _SettleAdapter(dt=0.0)  # /clock is not moving
+    assert batch._settle_world(adapter, 3.0) == 0.0
+    assert adapter.steps > 0  # it really did try to pump the world
+
+
+# --------------------------------------------------------------------------- #
 # Structure: the two things a unit test cannot run must still be guarded.
 # --------------------------------------------------------------------------- #
 def _method(source: str, class_name: str, method_name: str) -> ast.FunctionDef:
@@ -753,7 +866,22 @@ def test_telemetry_accumulator_is_swapped_at_mission_start_not_at_restage():
 #: Calls inside the sample loop that ADVANCE sim time (and therefore let PhysX
 #: deliver contact reports). ``drive_mission`` is deliberately absent: it IS the
 #: boundary the guard below measures against.
-_SIM_ADVANCING_CALLS = ("step", "step_and_spin", "restage", "realign", "await_ready")
+#:
+#: ``_settle_world`` joined at p8c1: the settle pump used to be an inline
+#: ``while ... adapter.step_and_spin()`` in the loop and was covered by
+#: ``step_and_spin``; as a named helper its call site spells neither name.
+#: MEASURED before adding it — with the pump moved below the record swap this
+#: guard stayed GREEN, i.e. the extraction had put the very regression it exists
+#: to catch outside its field of view (§3-4 / G-106). Any future extraction of a
+#: sim-advancing wait belongs in this tuple for the same reason.
+_SIM_ADVANCING_CALLS = (
+    "step",
+    "step_and_spin",
+    "restage",
+    "realign",
+    "await_ready",
+    "_settle_world",
+)
 
 
 def test_nothing_advances_the_sim_between_the_record_swap_and_the_mission():
