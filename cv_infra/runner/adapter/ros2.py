@@ -23,6 +23,7 @@ of them, so a thin rclpy relay fans it out to the publisher-less rest).
 
 from __future__ import annotations
 
+import contextlib
 import math
 import sys
 import time
@@ -379,17 +380,15 @@ class Ros2Adapter(SimAdapter):
                 flush=True,
             )
         self._odom_relay = None
+        # Teardown runs on EVERY path (main/batch call it from ``finally``), so a
+        # vendor object that is already gone must not become the job's exception.
         if node is not None:  # pragma: no cover - ROS path
-            try:
+            with contextlib.suppress(Exception):
                 node.destroy_node()
-            except Exception:
-                pass
         if rclpy is not None:  # pragma: no cover - ROS path
-            try:
+            with contextlib.suppress(Exception):
                 if rclpy.ok():
                     rclpy.shutdown()
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------ #
     # ROS-body helpers (bundled rclpy; not CPU-reachable).

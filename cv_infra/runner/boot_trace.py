@@ -47,6 +47,7 @@ mid-phase and the streamed ``event=begin`` line still names the blocking phase (
 
 from __future__ import annotations
 
+import contextlib
 import errno as errno_mod
 import logging
 import os
@@ -247,14 +248,12 @@ class BootTrace:
         print(line, file=self._stream, flush=True)
 
     def _loud(self, label: str, exc: Exception) -> None:
-        try:
+        with contextlib.suppress(Exception):  # the stream itself is gone — stay silent, stay alive
             print(
                 f"{LOG_PREFIX} instrumentation error: {label}: {exc!r}",
                 file=self._stream,
                 flush=True,
             )
-        except Exception:  # the stream itself is gone — stay silent, stay alive
-            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -300,10 +299,8 @@ def probe_writable(path, opener=None) -> tuple[bool | None, int | None]:
     except OSError as exc:
         return False, exc.errno
     finally:
-        try:
+        with contextlib.suppress(OSError):  # never created, or already gone
             probe.unlink()
-        except OSError:
-            pass
     return True, None
 
 

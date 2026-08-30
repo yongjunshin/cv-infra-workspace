@@ -94,9 +94,7 @@ class EvaluationEngine:
         self.oracles = list(oracles)
 
     def evaluate(self, telemetry: TelemetryRecord, criteria: object) -> tuple[str, list]:
-        outcomes: list[OracleOutcome] = []
-        for oracle in self.oracles:
-            outcomes.append(oracle.evaluate(telemetry, criteria))
+        outcomes: list[OracleOutcome] = [o.evaluate(telemetry, criteria) for o in self.oracles]
         return fold_verdict(outcomes), outcomes
 
 
