@@ -200,6 +200,18 @@ def _number(environ: Mapping[str, str], name: str, parse: Callable[[str], Any]) 
         raise ValueError(f"{name}={raw!r} is not a valid number") from exc
 
 
+def _number_or(
+    environ: Mapping[str, str], name: str, parse: Callable[[str], Any], default: Any
+) -> Any:
+    """``_number`` with a documented default: unset -> ``default`` (T1 관례).
+
+    Set-but-empty / non-numeric stay LOUD (``_get``/``_number``) — only ABSENCE is
+    given a default, and the default is always the module constant the docstring names.
+    """
+    value = _number(environ, name, parse)
+    return default if value is None else value
+
+
 def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
     """Read the module env contract into a ``ServeConfig`` — all-or-nothing loud.
 
@@ -214,11 +226,17 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
             " needs the full boot contract (module docstring); refusing defaults"
             " for store/artifacts/image/budget"
         )
-    port = _number(environ, BIND_PORT_ENV, int)
-    outer_wallclock_s = _number(environ, OUTER_WALLCLOCK_ENV, float)
-    batch_wall_factor = _number(environ, BATCH_WALL_FACTOR_ENV, float)
-    batch_iter_overhead_s = _number(environ, BATCH_ITER_OVERHEAD_ENV, float)
-    batch_boot_allowance_s = _number(environ, BATCH_BOOT_ALLOWANCE_ENV, float)
+    # unset optional = documented default (T1 관례); set-but-empty/non-numeric = loud.
+    # Read in this order so a multi-invalid env reports the same one it always did.
+    port = _number_or(environ, BIND_PORT_ENV, int, _DEFAULT_BIND_PORT)
+    outer_wallclock_s = _number_or(environ, OUTER_WALLCLOCK_ENV, float, DEFAULT_OUTER_WALLCLOCK_S)
+    batch_wall_factor = _number_or(environ, BATCH_WALL_FACTOR_ENV, float, DEFAULT_BATCH_WALL_FACTOR)
+    batch_iter_overhead_s = _number_or(
+        environ, BATCH_ITER_OVERHEAD_ENV, float, DEFAULT_BATCH_ITER_OVERHEAD_S
+    )
+    batch_boot_allowance_s = _number_or(
+        environ, BATCH_BOOT_ALLOWANCE_ENV, float, DEFAULT_BATCH_BOOT_ALLOWANCE_S
+    )
     return ServeConfig(
         store_path=required[STORE_PATH_ENV],
         out_dir=required[OUT_DIR_ENV],
@@ -229,25 +247,12 @@ def config_from_env(environ: Mapping[str, str]) -> ServeConfig:
         cache_scratch_root=_get(environ, CACHE_SCRATCH_ROOT_ENV),
         consent_env={k: environ[k] for k in CONSENT_ENV_KEYS if k in environ},
         host=_get(environ, BIND_HOST_ENV) or _DEFAULT_BIND_HOST,
-        port=port if port is not None else _DEFAULT_BIND_PORT,
-        # unset optional = documented default (T1 관례); set-but-empty/non-numeric = loud above.
-        outer_wallclock_s=(
-            outer_wallclock_s if outer_wallclock_s is not None else DEFAULT_OUTER_WALLCLOCK_S
-        ),
+        port=port,
+        outer_wallclock_s=outer_wallclock_s,
         runner_shm_size=_get(environ, RUNNER_SHM_SIZE_ENV) or DEFAULT_RUNNER_SHM_SIZE,
-        batch_wall_factor=(
-            batch_wall_factor if batch_wall_factor is not None else DEFAULT_BATCH_WALL_FACTOR
-        ),
-        batch_iter_overhead_s=(
-            batch_iter_overhead_s
-            if batch_iter_overhead_s is not None
-            else DEFAULT_BATCH_ITER_OVERHEAD_S
-        ),
-        batch_boot_allowance_s=(
-            batch_boot_allowance_s
-            if batch_boot_allowance_s is not None
-            else DEFAULT_BATCH_BOOT_ALLOWANCE_S
-        ),
+        batch_wall_factor=batch_wall_factor,
+        batch_iter_overhead_s=batch_iter_overhead_s,
+        batch_boot_allowance_s=batch_boot_allowance_s,
     )
 
 
