@@ -128,6 +128,7 @@ from cv_infra.cli.main import _one_line
 from cv_infra.contract.errors import ANNOTATION_KEYS, ContractError
 from cv_infra.orchestrator.api import REPORT_OUTCOME_ERRORED
 from cv_infra.orchestrator.selftest import SelfTestNotConfigured, build_self_test_submission
+from cv_infra.orchestrator.store import ENVELOPE_COMPLETED
 
 #: Default orchestrator base URL (MVP topology: CLI and orchestrator share the
 #: host — M8 §8 cicd-g5). Overridden by ``CV_INFRA_API`` env or ``--api``.
@@ -546,7 +547,7 @@ async def _poll_until_terminal(
         body = _body_json(response)
         if not isinstance(body, dict):
             return _infra(command, "orchestrator returned a non-JSON status body")
-        if body.get("status") == "completed":
+        if body.get("status") == ENVELOPE_COMPLETED:
             return _terminal_outcome_exit(command, envelope_id, body)
         if deadline is not None and time.monotonic() >= deadline:
             return _infra(

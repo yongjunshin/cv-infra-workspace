@@ -138,7 +138,7 @@ from cv_infra.orchestrator.monitor import register as register_monitor
 from cv_infra.orchestrator.queue import JobQueue
 from cv_infra.orchestrator.rollup import roll_up
 from cv_infra.orchestrator.scheduler import SlotAccountant
-from cv_infra.orchestrator.store import Store, job_key
+from cv_infra.orchestrator.store import ENVELOPE_COMPLETED, ENVELOPE_RUNNING, Store, job_key
 from cv_infra.orchestrator.supervisor import ParallelSupervisor
 from cv_infra.report.aggregate import RequestReportInput, build_report
 from cv_infra.report.baseline import update_baseline
@@ -755,7 +755,7 @@ async def _envelope_status(state: _AppState, envelope_id: str) -> dict[str, Any]
     ]
     return _status_body(
         envelope_id,
-        status="completed" if record.done else "running",
+        status=ENVELOPE_COMPLETED if record.done else ENVELOPE_RUNNING,
         jobs=record.jobs,
         rollups=rollups,
         # Same instances the response body carries (no second aggregation).
