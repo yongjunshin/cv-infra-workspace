@@ -534,6 +534,28 @@ def test_no_collision_positive_obstacle_fails():
     assert out.passed is False and out.reason == "collision"
 
 
+def test_reached_goal_orientation_gate_is_only_armed_by_a_declared_yaw():
+    """The declared-orientation arm of the verdict ladder (p8c1 ``_yaw_out_of_tolerance``).
+
+    Both directions matter: an UNDECLARED goal orientation must read as "not
+    judged" (position-only goals are the norm — reading it as a failure would
+    fail every shipped scenario), and a declared one must actually be able to
+    fail a run that arrived at the right place facing the wrong way.
+    """
+    from cv_infra.oracles.reached_goal import ReachedGoalOracle, _yaw_out_of_tolerance
+
+    rec = _record(samples=_line(4))  # every sample faces +X (yaw 0)
+    criteria = {"goal_position": [3.0, 0.0, 0.0], "position_tolerance_m": 0.1, "timeout_s": 10}
+    assert _yaw_out_of_tolerance(rec.gt_pose_samples[-1], criteria) is False
+
+    quarter_turn = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))  # 90deg about +Z
+    out = ReachedGoalOracle().evaluate(rec, dict(criteria, goal_orientation_wxyz=quarter_turn))
+    assert out.passed is False and out.reason == "orientation"
+    # ...and a yaw tolerance wide enough to cover it passes the same trajectory.
+    wide = dict(criteria, goal_orientation_wxyz=quarter_turn, yaw_tolerance_rad=math.pi)
+    assert ReachedGoalOracle().evaluate(rec, wide).passed is True
+
+
 def test_reached_goal_yaw_helpers():
     from cv_infra.oracles.reached_goal import angle_diff, yaw_from_quat_wxyz
 
