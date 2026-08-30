@@ -226,6 +226,31 @@ def is_direct_usd_ref(scene_usd: str) -> bool:
     )
 
 
+def _asset_url(usd_path: str, what: str) -> str:  # pragma: no cover - GPU path
+    """Registry path -> assets-root-prefixed URL; a direct ref passes through.
+
+    ONE home for the join (p8c1). ``load_scene`` spelled it for the SCENE and
+    ``spawn_obstacle_pool`` for a prop, so the unreachable-root failure — the one
+    an operator actually meets when the cache mount is wrong — was authored
+    twice. ``what`` names the thing in that message, which is the only part that
+    ever differed between the two copies: with ``what="sample scene"`` this
+    raises the scene message character for character (asserted before the swap,
+    G-17). The direct-ref arm stays CPU-testable; the join needs isaacsim.
+    """
+    if is_direct_usd_ref(usd_path):
+        return usd_path
+    from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
+
+    root = get_assets_root_path()
+    if root is None:
+        raise RuntimeError(
+            "Isaac assets root unreachable (cloud assets / cache) — cannot "
+            f"resolve {what} {usd_path!r}; check network or asset cache "
+            "mounts (M5 cache seam)"
+        )
+    return root + usd_path
+
+
 # --------------------------------------------------------------------------- #
 # FU-17: declared-sensor render-product activation (pre-play) — CPU-testable.
 # --------------------------------------------------------------------------- #
@@ -894,18 +919,7 @@ class SimRuntime:
         from isaacsim.core.api import World  # noqa: PLC0415
 
         asset = resolve_scene(self.config.scene_ref)
-        scene_path = asset.scene_usd
-        if not is_direct_usd_ref(scene_path):
-            from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
-
-            root = get_assets_root_path()
-            if root is None:
-                raise RuntimeError(
-                    "Isaac assets root unreachable (cloud assets / cache) — cannot "
-                    f"resolve sample scene {scene_path!r}; check network or asset cache "
-                    "mounts (M5 cache seam)"
-                )
-            scene_path = root + scene_path
+        scene_path = _asset_url(asset.scene_usd, "sample scene")
 
         self._phase_begin(PHASE_SCENE_LOAD)
         t0 = time.monotonic()
@@ -1100,27 +1114,6 @@ class SimRuntime:
         SingleXFormPrim(DEBUG_OBSTACLE_PRIM).set_world_pose(position=position)
         print(f"[cv-runner] debug obstacle moved: {DEBUG_OBSTACLE_PRIM} -> {position}", flush=True)
 
-    def _asset_url(self, usd_path: str, what: str) -> str:  # pragma: no cover - GPU path
-        """Assets-root-prefixed URL for a registry path; a direct ref passes through.
-
-        ``load_scene`` spells this same join for the SCENE. Folding the two would
-        touch the one code path every job boots through, which this obstacle task
-        deliberately leaves alone; the shared half is ``is_direct_usd_ref``, which
-        already has one home.
-        """
-        if is_direct_usd_ref(usd_path):
-            return usd_path
-        from isaacsim.storage.native import get_assets_root_path  # noqa: PLC0415
-
-        root = get_assets_root_path()
-        if root is None:
-            raise RuntimeError(
-                "Isaac assets root unreachable (cloud assets / cache) — cannot "
-                f"resolve {what} {usd_path!r}; check network or asset cache "
-                "mounts (M5 cache seam)"
-            )
-        return root + usd_path
-
     def _make_obstacle_static(self, prim_path: str) -> str:  # pragma: no cover - GPU path
         """Give a REFERENCED prop colliders and refuse one that brings its own
         dynamics. Returns the one-line audit string the caller prints.
@@ -1232,7 +1225,7 @@ class SimRuntime:
                     )
                 else:
                     add_reference_to_stage(
-                        usd_path=self._asset_url(asset.usd_path, "obstacle asset"),
+                        usd_path=_asset_url(asset.usd_path, "obstacle asset"),
                         prim_path=prim_path,
                     )
                     # W0 recipe: pump the app once so the reference composes before
