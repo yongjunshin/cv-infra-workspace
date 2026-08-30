@@ -28,9 +28,9 @@ from cv_infra.cli.main import EXIT_CONTRACT, EXIT_FAIL, EXIT_INFRA, EXIT_PASS, m
 from cv_infra.contract.schema import Result, VerificationRequest
 from cv_infra.orchestrator.models import RequestRollup, Verdict
 from cv_infra.orchestrator.store import Store
+from cv_infra.report import regression
 from cv_infra.report.aggregate import RequestReportInput, build_report
 from cv_infra.report.baseline import update_baseline
-from cv_infra.report import regression
 from cv_infra.report.regression import identity_key
 
 # --- canonical report builders (verbatim-anchored to test_report_verification_report) --
