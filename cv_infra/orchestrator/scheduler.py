@@ -231,7 +231,12 @@ class SlotAccountant:
             return False
         self.in_use += 1
         self.acquired_total += 1
-        if self.in_use > self.k:  # unreachable with the gate above — observed, not assumed
+        # Unreachable with the gate above (in_use < k BEFORE the increment, so the
+        # post-increment value is at most k, and the accountant is single-threaded) —
+        # kept as the loud observer an admission regression would trip. `Scheduler._admit`'s
+        # twin below IS reachable (a caller can hand it an over-filled `running` list) and
+        # carries the positive control instead (tests/test_orchestrator_edge_paths.py).
+        if self.in_use > self.k:  # pragma: no cover - unreachable: gate above bounds in_use
             self.over_launch_count += 1
         self.max_concurrent_observed = max(self.max_concurrent_observed, self.in_use)
         return True
