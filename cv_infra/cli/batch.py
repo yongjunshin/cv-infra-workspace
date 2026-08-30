@@ -105,6 +105,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -407,10 +408,8 @@ def _render_rejection(command: str, response: httpx.Response) -> list[dict[str, 
     the SAME list the prose rendered (one parse, two views).
     """
     entries: Any = None
-    try:
+    with contextlib.suppress(ValueError, AttributeError):
         entries = response.json().get("detail", {}).get("errors")
-    except (ValueError, AttributeError):
-        pass
     if not isinstance(entries, list) or not entries:
         print(f"cv-infra {command}: envelope rejected (422): {response.text}", file=sys.stderr)
         return []
@@ -438,10 +437,8 @@ def _clear_stale_errors_json(path: Path | None) -> None:
     changes the verdict)."""
     if path is None:
         return
-    try:
+    with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _emit_errors_json(path: Path | None, entries: list[dict[str, Any]]) -> None:
@@ -482,6 +479,50 @@ def _body_json(response: httpx.Response) -> Any:
 # --- command bodies -------------------------------------------------------------
 
 
+def _status_lookup_exit(command: str, envelope_id: str, response: httpx.Response) -> int | None:
+    """Fold a NON-200 ``GET /envelopes/{id}`` response into the exit-code contract.
+
+    The ONE place the status endpoint's HTTP codes are read — ``status`` and the
+    ``wait``/``submit --wait`` poll loop hit the same endpoint, so they must agree
+    on what each code means: 404 is a usage/contract error (2 — the id does not
+    exist on THIS orchestrator, so the message names how to get a real one); 500
+    (supervision crashed) and anything else are infra (3).
+    ``None`` = a 200 arrived; the caller reads the body (their body contracts differ).
+    """
+    if response.status_code == 404:
+        print(
+            f"cv-infra {command}: unknown envelope id {envelope_id!r} — use the id "
+            "printed by 'cv-infra submit' against the same orchestrator (--api)",
+            file=sys.stderr,
+        )
+        return EXIT_CONTRACT
+    if response.status_code == 500:
+        return _infra(command, f"envelope supervision crashed: {response.text}")
+    if response.status_code != 200:
+        return _infra(command, f"unexpected orchestrator response {response.status_code}")
+    return None
+
+
+def _terminal_outcome_exit(command: str, envelope_id: str, body: dict[str, Any]) -> int:
+    """Fold a COMPLETED envelope's ``report_outcome`` to the exit code + report it.
+
+    The fold itself is ``exit_codes.exit_code_for_report_outcome`` (single source,
+    LOCKED §9 / D-I — never re-declared here). An outcome the table does not know
+    lands on 3 with a loud stderr line; a KNOWN ``errored`` is 3 without one (it is
+    not a surprise, it is the infra verdict).
+    """
+    outcome = body.get("report_outcome")
+    code = exit_code_for_report_outcome(outcome)
+    if code == EXIT_INFRA and outcome != REPORT_OUTCOME_ERRORED:
+        print(
+            f"cv-infra {command}: unknown report_outcome {outcome!r} — "
+            "treating as infrastructure error",
+            file=sys.stderr,
+        )
+    print(f"cv-infra {command}: envelope {envelope_id} report_outcome={outcome} exit={code}")
+    return code
+
+
 async def _poll_until_terminal(
     client: httpx.AsyncClient, command: str, envelope_id: str, timeout_s: float | None
 ) -> int:
@@ -489,8 +530,9 @@ async def _poll_until_terminal(
 
     Shared by ``wait`` and ``submit --wait`` (identical semantics — M8-D11).
     ``--timeout`` exceeded = the envelope is NOT terminal within budget = an
-    infrastructure condition (3); at least one poll always happens. 404 is a
-    usage/contract error (2): the id does not exist on this orchestrator.
+    infrastructure condition (3); at least one poll always happens. The HTTP-code
+    and the terminal-outcome folds live in the two helpers above (``status``
+    shares the first one).
     """
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while True:
@@ -498,34 +540,14 @@ async def _poll_until_terminal(
             response = await client.get(f"/envelopes/{envelope_id}")
         except httpx.HTTPError as exc:
             return _infra(command, f"orchestrator unreachable: {_one_line(exc)}")
-        if response.status_code == 404:
-            print(
-                f"cv-infra {command}: unknown envelope id {envelope_id!r} — use the id "
-                "printed by 'cv-infra submit' against the same orchestrator (--api)",
-                file=sys.stderr,
-            )
-            return EXIT_CONTRACT
-        if response.status_code == 500:
-            return _infra(command, f"envelope supervision crashed: {response.text}")
-        if response.status_code != 200:
-            return _infra(command, f"unexpected orchestrator response {response.status_code}")
+        lookup_exit = _status_lookup_exit(command, envelope_id, response)
+        if lookup_exit is not None:
+            return lookup_exit
         body = _body_json(response)
         if not isinstance(body, dict):
             return _infra(command, "orchestrator returned a non-JSON status body")
         if body.get("status") == "completed":
-            outcome = body.get("report_outcome")
-            code = exit_code_for_report_outcome(outcome)
-            if code == EXIT_INFRA and outcome != REPORT_OUTCOME_ERRORED:
-                print(
-                    f"cv-infra {command}: unknown report_outcome {outcome!r} — "
-                    "treating as infrastructure error",
-                    file=sys.stderr,
-                )
-            print(
-                f"cv-infra {command}: envelope {envelope_id} "
-                f"report_outcome={outcome} exit={code}"
-            )
-            return code
+            return _terminal_outcome_exit(command, envelope_id, body)
         if deadline is not None and time.monotonic() >= deadline:
             return _infra(
                 command,
@@ -598,17 +620,12 @@ async def _status_async(args: argparse.Namespace) -> int:
             response = await client.get(f"/envelopes/{args.envelope_id}")
         except httpx.HTTPError as exc:
             return _infra("status", f"orchestrator unreachable: {_one_line(exc)}")
-        if response.status_code == 404:
-            print(
-                f"cv-infra status: unknown envelope id {args.envelope_id!r} — use the id "
-                "printed by 'cv-infra submit' against the same orchestrator (--api)",
-                file=sys.stderr,
-            )
-            return EXIT_CONTRACT
-        if response.status_code == 500:
-            return _infra("status", f"envelope supervision crashed: {response.text}")
-        if response.status_code != 200:
-            return _infra("status", f"unexpected orchestrator response {response.status_code}")
+        lookup_exit = _status_lookup_exit("status", args.envelope_id, response)
+        if lookup_exit is not None:
+            return lookup_exit
+        # Body contract differs from the poll loop's on purpose: ``status`` dumps
+        # whatever JSON the server served (ANY shape) and never inspects a field,
+        # so only a non-JSON body is an infra condition here.
         body = _body_json(response)
         if body is None:
             return _infra("status", "orchestrator returned a non-JSON status body")
@@ -772,8 +789,17 @@ def _render_baseline(report: dict[str, Any]) -> None:
     is never consulted (REQ-REPORT-006). Absent baseline = regression check
     *skip(정상)*, never a failure (REQ-REPORT-004); regressed = which request
     got worse against which SUT/date (NFR-REPORT-001).
+
+    The status vocabulary is M4's definition IMPORTED (G-56, 선례 ``1f62b49``),
+    never a literal: a rename at the definition must take this clause with it —
+    otherwise the header still prints and the rows underneath silently vanish.
     """
+    from cv_infra.report.regression import STATUS_REGRESSED
+
     bsum = report.get("baseline_summary") or {}
+    # NOTE: ``absent``/``regressed`` here are ``baseline_summary`` FIELD names
+    # (report JSON §3.4), not regression STATUS values — same spelling, different
+    # namespace, so they stay literals (the same pin ``report/github.py`` carries).
     absent = bsum.get("absent", 0)
     regressed = bsum.get("regressed", 0)
     if absent:
@@ -785,7 +811,7 @@ def _render_baseline(report: dict[str, Any]) -> None:
         print(f"baseline: {regressed} request(s) regressed vs baseline:")
         for row in report.get("matrix", []):
             reg = row.get("regression") or {}
-            if reg.get("status") == "regressed":
+            if reg.get("status") == STATUS_REGRESSED:
                 print(
                     f"  {reg.get('detail')} — vs SUT {reg.get('baseline_sut_ref')} "
                     f"(baseline established {reg.get('baseline_established_at')})"

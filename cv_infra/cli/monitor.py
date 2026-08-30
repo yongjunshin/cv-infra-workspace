@@ -112,25 +112,15 @@ _REQUEST_HEADERS = [
 ]
 
 
-def render_monitor(record: dict[str, Any]) -> str:
-    """Render the ``/monitor.json`` projection as an operator table (display only).
-
-    Reads ONLY the pinned ``OperationalRecord`` keys (G-17): a per-request rollup
-    table (envelope/request id · status · report_outcome · pass/fail/error counts ·
-    flakiness) plus the broken (error-categorised) jobs with their state /
-    category / runner exit code / infra_error. Counts are surfaced verbatim — the
-    server already aggregated them (M6 §3.3), this only lays them out.
-    ``concurrency_budget_k`` sits next to ``running_k`` (same order as the HTML
-    dashboard) so the operator can judge ``running_k > k`` inside one surface, and
-    the ``budget:`` line under it shows the Resource Budget that k was computed
-    FROM (p5c20 ④ — the JSON/HTML surfaces already carried it; only this renderer
-    was missing, so an SSH operator saw the derived cap without its inputs).
-    """
+def _render_header(record: dict[str, Any]) -> list[str]:
+    """The three fixed leading lines + the blank separator (generated_at/health/
+    resources/budget). ``concurrency_budget_k`` sits next to ``running_k`` (same
+    order as the HTML dashboard) so the operator can judge ``running_k > k``
+    inside one surface, and the ``budget:`` line under it shows the Resource
+    Budget that k was computed FROM (p5c20 ④)."""
     health = record.get("health") or {}
     resources = record.get("resources") or {}
-    requests = record.get("requests") or []
-
-    lines = [
+    return [
         f"cv-infra monitor (generated_at={_fmt(record.get('generated_at'))})",
         (
             "health:    "
@@ -152,10 +142,15 @@ def render_monitor(record: dict[str, Any]) -> str:
         "",
     ]
 
-    if not requests:
-        lines.append("requests: none")
-        return "\n".join(lines)
 
+def _request_rows(requests: list[Any]) -> tuple[list[list[str]], list[dict[str, Any]]]:
+    """One pass over the projection's requests -> ``(table rows, broken jobs)``.
+
+    Cell order IS ``_REQUEST_HEADERS``. A non-dict entry is skipped (lenient
+    parsing, G-17). A job is "broken" when the SERVER already categorised it
+    (``error_category`` non-null on FAILED/TIMEOUT states) — we display that
+    flag, never re-derive it.
+    """
     rows: list[list[str]] = []
     broken: list[dict[str, Any]] = []
     for req in requests:
@@ -174,21 +169,18 @@ def render_monitor(record: dict[str, Any]) -> str:
                 _fmt(req.get("flakiness")),
             ]
         )
-        for job in req.get("jobs") or []:
-            # A job is "broken" when the SERVER already categorised it (error_category
-            # non-null on FAILED/TIMEOUT states) — we display that flag, never re-derive.
-            if isinstance(job, dict) and job.get("error_category") is not None:
-                broken.append(job)
+        broken.extend(
+            job
+            for job in req.get("jobs") or []
+            if isinstance(job, dict) and job.get("error_category") is not None
+        )
+    return rows, broken
 
-    lines.append(f"requests ({len(rows)}):")
-    lines.extend(_render_table(_REQUEST_HEADERS, rows))
-    lines.append("")
 
-    if not broken:
-        lines.append("broken jobs: none")
-        return "\n".join(lines)
-
-    lines.append(f"broken jobs ({len(broken)}):")
+def _render_broken_jobs(broken: list[dict[str, Any]]) -> list[str]:
+    """One block per error-categorised job; ``infra_error`` gets its own indented
+    line when the server recorded one (absent = no line, never ``n/a`` noise)."""
+    lines: list[str] = []
     for job in broken:
         lines.append(
             f"  {_fmt(job.get('job_id'))}  "
@@ -199,6 +191,41 @@ def render_monitor(record: dict[str, Any]) -> str:
         infra_error = job.get("infra_error")
         if infra_error is not None:
             lines.append(f"      infra_error: {infra_error}")
+    return lines
+
+
+def render_monitor(record: dict[str, Any]) -> str:
+    """Render the ``/monitor.json`` projection as an operator table (display only).
+
+    Reads ONLY the pinned ``OperationalRecord`` keys (G-17): a per-request rollup
+    table (envelope/request id · status · report_outcome · pass/fail/error counts ·
+    flakiness) plus the broken (error-categorised) jobs with their state /
+    category / runner exit code / infra_error. Counts are surfaced verbatim — the
+    server already aggregated them (M6 §3.3), this only lays them out.
+
+    Three sections, two early exits: an empty projection stops after ``requests:
+    none``, and one with no broken job stops after ``broken jobs: none``. The
+    section bodies live in the ``_render_*``/``_request_rows`` helpers above;
+    this function owns only the ORDER and those exits.
+    """
+    requests = record.get("requests") or []
+    lines = _render_header(record)
+
+    if not requests:
+        lines.append("requests: none")
+        return "\n".join(lines)
+
+    rows, broken = _request_rows(requests)
+    lines.append(f"requests ({len(rows)}):")
+    lines.extend(_render_table(_REQUEST_HEADERS, rows))
+    lines.append("")
+
+    if not broken:
+        lines.append("broken jobs: none")
+        return "\n".join(lines)
+
+    lines.append(f"broken jobs ({len(broken)}):")
+    lines.extend(_render_broken_jobs(broken))
     return "\n".join(lines)
 
 
