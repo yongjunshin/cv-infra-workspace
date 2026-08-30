@@ -320,7 +320,7 @@ class _Locator:
     def __init__(self, text: str) -> None:
         try:
             self._root = yaml.compose(text, Loader=yaml.SafeLoader)
-        except yaml.YAMLError:  # pragma: no cover - stage 1 already rejected
+        except yaml.YAMLError:  # stage 1 already rejected such text — degrade, never raise
             self._root = None
 
     def __call__(self, loc: tuple[Any, ...]) -> tuple[int, int] | None:
