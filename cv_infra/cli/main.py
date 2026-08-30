@@ -639,5 +639,5 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_INFRA
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - process entrypoint (console script calls main())
     sys.exit(main())
