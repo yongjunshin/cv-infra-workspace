@@ -101,9 +101,12 @@ select = ["E", "F", "I", "W", "UP", "B", "SIM", "RET", "PIE", "PERF", "C901"]
 # ruff 15. So `> 15` re-admits three of the four EXACTLY at the boundary; only
 # `<= 14` blocks all of them (today's loudest surviving block is ruff 11 —
 # scripts/isaac_smoke/headless_smoke.py::run_handshake — so 14 is adoptable with a
-# margin of 3). 15 is the value CEO 결정 2026-08-30 ④ names; tightening it to 14 is
-# a decision, not a team edit (p8c1 T5 report에 근거·권고 기재).
-max-complexity = 15
+# margin of 3). 15 was the value CEO 결정 2026-08-30 ④ named — a PROPOSAL calibrated
+# on radon's scale before this ruff/radon divergence was measured. PM applied 14 at
+# the p8c1 merge gate to honor the ruling's stated INTENT ("E/D 재유입 차단");
+# recorded in decisions/2026-08-30-p8-quality-cycle-rulings.md ④-보정, CEO 추인
+# at gate #1. Do not raise without a ledger entry.
+max-complexity = 14
 
 [tool.ruff.lint.per-file-ignores]
 # §3-9 그물 보존 — 테스트 단언 바이트 동결(B017 등은 단언 의미를 바꾼다).
