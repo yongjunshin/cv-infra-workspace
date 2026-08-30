@@ -62,6 +62,14 @@ dev = [
     "pytest==9.1.1",
     "import-linter==2.12",
     # httpx moved to [project.dependencies] at p4c3 (CLI REST client).
+    # p8c2 T0 — branch-coverage instrumentation (CEO 결정 2026-08-30 ④). This is
+    # the EXACT version PM's 2026-08-30 baseline (branch 94.8%) was measured with,
+    # so the gate and the number it is calibrated against come from one tool.
+    # `[toml]` extra = coverage reads its config out of pyproject.toml below.
+    # pytest-cov is deliberately NOT added: `coverage run -m pytest` covers the
+    # whole need (도구 최소주의) and one fewer plugin is one fewer coupling to
+    # pytest's own version.
+    "coverage[toml]==7.16.0",
 ]
 
 [build-system]
@@ -122,3 +130,30 @@ max-complexity = 14
 [tool.black]
 line-length = 100
 target-version = ["py311"]
+
+# --------------------------------------------------------------------------- #
+# Branch coverage — p8c2 T0 (CEO 결정 2026-08-30 ④,
+# decisions/2026-08-30-p8-quality-cycle-rulings.md).
+#
+# Invoke it exactly the way CI does (.github/workflows/ci.yml tier 1):
+#   env -u PYTHONPATH uv run coverage run -m pytest -q   (G-84 — hermetic)
+#   env -u PYTHONPATH uv run coverage report
+# The flags live HERE and nowhere else, so a local run and the CI run cannot
+# diverge: CI passes no coverage options at all.
+[tool.coverage.run]
+branch = true          # 목표는 line 이 아니라 BRANCH — 미방문 분기가 총점 뒤에 숨지 않게.
+source = ["cv_infra"]  # 제품 코드만. tests/·scripts/ 는 계측 대상이 아니다.
+
+[tool.coverage.report]
+show_missing = true  # 빠진 줄·분기를 리포트가 직접 지목 — 웨이브 C/D 작업 목록이 곧 이 출력.
+precision = 1        # 베이스라인 표기(94.8%)와 같은 자릿수.
+
+# ⚠ fail_under 가 없는 것은 의도된 부재다. 지금 100 으로 켜면 웨이브 C/D 가 시작되기도
+# 전에 CI 가 red 가 되고, 커버리지 작업 전체가 red 위에서 진행된다(= red 가 신호를 잃는다).
+# 켜는 시점: 웨이브 C/D 가 100% 를 달성한 뒤 **PM 이** `fail_under = 100` 한 줄을 여기에
+# 추가한다 (CEO 결정 2026-08-30 ④ — 그 한 줄이 이 사이클의 래칫이다).
+#
+# exclude 정책 = coverage 기본 pragma 정규식만. 기존 관례 `# pragma: no cover - <사유>`
+# 48 건이 이미 그 기본 정규식에 걸리므로 추가 설정이 필요 없다. `exclude_also` 로
+# `if TYPE_CHECKING:` 같은 광역 패턴을 넣지 않는다 — 광역 제외는 공백을 조용히 지워
+# 총점만 올린다. 제외는 한 줄씩, 사유와 함께 (침묵 공백 0).
