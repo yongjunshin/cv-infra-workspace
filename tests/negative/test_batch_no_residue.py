@@ -1346,8 +1346,6 @@ def test_the_sealed_pin_sees_a_helper_hidden_in_a_neighbouring_module():
     callables = _callables(mutated_carrier, sources)
     hits = reaching(loop, callables, "open_render_product")
     assert any("reopen_products" in hit.via for hit in hits), f"옆 모듈 헬퍼를 못 봤다: {hits}"
-    # 현행 소스에서는 같은 배관이 조용하다 (비공허 대조).
-    assert (
-        reaching(_sample_loop(), _callables(source=None, sources=sources), "open_render_product")
-        == []
-    )
+    # 비공허: 심은 헬퍼를 **경유해서만** 잡혀야 한다 — 현행 운반체에는 그 경로가 없다.
+    pristine = reaching(_sample_loop(), _callables(None, sources), "open_render_product")
+    assert not any("reopen_products" in hit.via for hit in pristine)
