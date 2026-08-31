@@ -34,6 +34,7 @@ from cv_infra.contract.loader import load_request
 from cv_infra.contract.schema import EXAMPLE_POLICY_SHA256, VerificationRequest
 from cv_infra.report.regression import identity_key
 from cv_infra.runner import batch as runner_batch
+from cv_infra.runner import go2_wiring
 
 CARTER_FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
 
@@ -302,12 +303,16 @@ def test_the_job_spec_does_not_carry_the_policy_yet(tmp_path):
 # batch uniformity (runner/batch.py ``_UNIFORM_FIELDS`` — mirror of sut.image_ref)
 # --------------------------------------------------------------------------- #
 def _batch_spec(index: int, policy: dict | None) -> dict:
-    """One JOB_SPEC with a NESTED sut block (the flattened ``sut_image_ref`` has
-    no room for a second artifact; ``parse_request`` takes either, never both)."""
-    sut = {"image_ref": "go2-sut:c2a"}
-    if policy is not None:
-        sut["locomotion_policy"] = policy
-    return {
+    """One JOB_SPEC with the FLAT policy pin.
+
+    C2b chose the wire form M1's C2a report §6 left open (that report's "the row
+    only fires on a NESTED sut block" note): the runner is handed the RESOLVED
+    path + digest as two envelope keys, because the flattened ``sut_image_ref``
+    has no room for a second artifact and a relative ``file`` would make the
+    runner re-derive an anchor admit already resolved. ``runner/batch.py``'s
+    uniformity row reads that pin.
+    """
+    spec = {
         "job_id": f"req-go2:{index}",
         "scenario": {
             "scene": "go2_warehouse",
@@ -316,12 +321,16 @@ def _batch_spec(index: int, policy: dict | None) -> dict:
             "seed": 11,
             "timeout_s": 60.0,
         },
-        "sut": sut,
+        "sut_image_ref": "go2-sut:c2a",
         "interface": {"type": "ros2", "adapter_config": {}},
         "acceptance_criteria": [
             {"oracle": "reached_goal", "params": {"position_tolerance_m": 0.5}}
         ],
     }
+    if policy is not None:
+        spec[go2_wiring.POLICY_PATH_KEY] = policy["path"]
+        spec[go2_wiring.POLICY_SHA_KEY] = policy["sha256"]
+    return spec
 
 
 def test_a_carrier_rejects_samples_that_disagree_on_the_policy():
@@ -329,8 +338,8 @@ def test_a_carrier_rejects_samples_that_disagree_on_the_policy():
     sample 0 would run sample 0's world and wear its own verdict (pre-boot, 0 GPU s)."""
     doc = {
         "specs": [
-            _batch_spec(0, {"file": "policy.pt", "sha256": POLICY_SHA}),
-            _batch_spec(1, {"file": "policy.pt", "sha256": "c" * 64}),
+            _batch_spec(0, {"path": "/scn/policy.pt", "sha256": POLICY_SHA}),
+            _batch_spec(1, {"path": "/scn/policy.pt", "sha256": "c" * 64}),
         ]
     }
     with pytest.raises(runner_batch.BadJobSpec) as excinfo:
@@ -341,10 +350,10 @@ def test_a_carrier_rejects_samples_that_disagree_on_the_policy():
 
 def test_a_carrier_accepts_samples_that_agree_on_the_policy():
     """Positive control (a row that rejects everything would pass the test above)."""
-    policy = {"file": "policy.pt", "sha256": POLICY_SHA}
+    policy = {"path": "/scn/policy.pt", "sha256": POLICY_SHA}
     doc = {"specs": [_batch_spec(i, policy) for i in range(3)]}
     parsed = runner_batch.admit_specs(JobSpecBatch.model_validate(doc))
-    assert [p.request.sut.locomotion_policy.sha256 for p in parsed] == [POLICY_SHA] * 3
+    assert [p.policy.sha256 for p in parsed] == [POLICY_SHA] * 3
 
 
 # --------------------------------------------------------------------------- #

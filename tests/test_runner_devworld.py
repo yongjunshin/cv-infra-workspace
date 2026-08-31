@@ -22,7 +22,7 @@ from cv_infra.runner.devworld import (
     banner,
     main,
     parse_args,
-    policy_slot,
+    policy_pin_for,
     should_stop,
 )
 from cv_infra.runner.main import EXIT_PLATFORM, EXIT_USAGE
@@ -145,16 +145,30 @@ def test_a_policy_whose_digest_does_not_match_is_rejected_at_admission(tmp_path)
 # --------------------------------------------------------------------------- #
 # Policy slot.
 # --------------------------------------------------------------------------- #
-def test_the_policy_slot_is_the_loaders_resolved_path_and_declared_digest(tmp_path):
-    admitted = admit(str(_scenario(tmp_path)))
-    slot = policy_slot(admitted)
-    assert slot == (str(tmp_path / "policy.pt"), POLICY_SHA)
+def test_the_policy_pin_is_the_loaders_resolved_path_and_declared_digest(tmp_path):
+    pin = policy_pin_for(admit(str(_scenario(tmp_path))))
+    assert (pin.path, pin.sha256) == (str(tmp_path / "policy.pt"), POLICY_SHA)
 
 
-def test_a_scenario_without_a_policy_slot_runs_the_world_without_one(tmp_path):
-    """carter-shaped scenarios (and a go2 world someone wants to look at before
-    the policy exists) still boot — they just do not walk."""
-    assert policy_slot(admit(str(_scenario(tmp_path, with_policy=False)))) is None
+def test_a_go2_scenario_without_a_policy_is_refused_by_the_slot_check(tmp_path):
+    """C2b's cross-check, reused: the go2 registry row declares a
+    locomotion_policy slot, and a world booted without one stands up a robot
+    whose drive gains are 0 — it lies down and every criterion then measures a
+    heap on the floor (C1 §6-3)."""
+    with pytest.raises(DevWorldUsage, match="locomotion_policy"):
+        policy_pin_for(admit(str(_scenario(tmp_path, with_policy=False))))
+
+
+def test_a_scene_that_declares_no_slot_runs_the_world_without_a_policy(tmp_path):
+    """carter-shaped scenarios still boot the dev world — they just do not walk."""
+    path = tmp_path / "carter.yaml"
+    path.write_text(
+        GO2_DOC.format(digest="a" * 64, policy="").replace(
+            "scene: go2_warehouse", "scene: nova_carter_warehouse"
+        ),
+        encoding="utf-8",
+    )
+    assert policy_pin_for(admit(str(path))) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +191,7 @@ def test_the_loop_stops_on_ctrl_c_or_the_step_bound(steps, max_steps, stop_reque
 
 def test_the_banner_names_the_world_the_policy_and_how_to_drive_it(tmp_path):
     admitted = admit(str(_scenario(tmp_path)))
-    lines = banner(admitted, policy_slot(admitted))
+    lines = banner(admitted, policy_pin_for(admitted))
     text = "\n".join(lines)
     assert "no mission, no oracle, no recording" in text
     assert "scene=go2_warehouse" in text
@@ -206,18 +220,23 @@ def test_main_maps_a_bad_command_line_to_exit_2(capsys):
 def test_main_hands_the_admitted_request_and_the_step_bound_to_the_run(tmp_path, monkeypatch):
     seen = {}
 
-    def _fake_run(admitted, max_steps):
+    def _fake_run(admitted, pin, max_steps):
         seen["scene"] = admitted.request.scenario.scene
+        seen["policy"] = pin.path
         seen["max_steps"] = max_steps
         return 0
 
     monkeypatch.setattr(devworld, "run", _fake_run)
     assert main([str(_scenario(tmp_path)), "--max-steps", "7"]) == 0
-    assert seen == {"scene": "go2_warehouse", "max_steps": 7}
+    assert seen == {
+        "scene": "go2_warehouse",
+        "policy": str(tmp_path / "policy.pt"),
+        "max_steps": 7,
+    }
 
 
 def test_main_reads_sys_argv_when_called_with_no_arguments(tmp_path, monkeypatch):
-    monkeypatch.setattr(devworld, "run", lambda _admitted, _max_steps: 0)
+    monkeypatch.setattr(devworld, "run", lambda _admitted, _pin, _max_steps: 0)
     monkeypatch.setattr("sys.argv", ["devworld", str(_scenario(tmp_path))])
     assert main() == 0
 
@@ -226,7 +245,7 @@ def test_a_world_booted_without_operator_consent_exits_3(tmp_path, monkeypatch, 
     """NEG-2: the EULA gate is the one platform failure the dev world translates
     instead of letting the traceback through — an operator meets it constantly."""
 
-    def _no_consent(_admitted, _max_steps):
+    def _no_consent(_admitted, _pin, _max_steps):
         raise EulaNotAcceptedError("EULA not accepted for this run")
 
     monkeypatch.setattr(devworld, "run", _no_consent)

@@ -167,16 +167,53 @@ def test_collision_filter_empty_is_zero():
     assert telemetry.count_real_collisions([], CHASSIS, ["/World/ground"]) == 0
 
 
-def test_collision_filter_skips_non_chassis_pairs_articulation_aggregation():
+def test_collision_filter_keeps_carter_meaning_when_the_scenario_declares_its_exclusions():
     # Measured p2c5 run1: ContactReportAPI on the chassis (an articulation root)
-    # aggregates WHOLE-robot reports — wheel<->ground pairs (chassis not an
-    # actor) arrived 7344x on a clean run and must not count (D-E surface).
+    # aggregates WHOLE-robot reports — wheel<->ground pairs arrived 7344x on a
+    # clean run. AR-12 widened the reduction from "the chassis prim" to "the
+    # robot subtree", so what keeps those off the count is now the DECLARED
+    # exclusion list — which every carter scenario ships (measured, e.g.
+    # cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml: the robot subtree
+    # + the warehouse ground plane).
+    excluded = ["/World/carter", "/World/GroundPlane"]
     events = [
         ContactEvent(0.1, "/World/carter/wheel_left", "/World/GroundPlane/collisionPlane"),
         ContactEvent(0.2, "/World/GroundPlane/collisionPlane", "/World/carter/caster_wheel_right"),
         ContactEvent(0.3, CHASSIS, "/World/obstacle_box"),  # real chassis hit still counts
     ]
-    assert telemetry.count_real_collisions(events, CHASSIS, []) == 1
+    assert telemetry.count_real_collisions(events, CHASSIS, excluded) == 1
+
+
+def test_ar12_counts_a_leg_hitting_an_obstacle_the_chassis_never_touched():
+    # C1 MEASURED the defect this closes: a go2 dropped onto a 0.10 m box logged
+    # 263 leg<->box contacts and ended upside down (roll 3.14), and the
+    # pre-AR-12 reduction reported collision_count == 0 — every actor was a foot
+    # or a calf, never ``/World/Go2/base``. The grounds are excluded exactly as
+    # C1's measured canon declares them (two floor prims, differing case).
+    grounds = [
+        "/World/GroundPlane/collisionPlane",
+        "/World/Warehouse_Empty_small_realtime/GroundPlane/CollisionPlane",
+    ]
+    events = [
+        ContactEvent(0.1, "/World/Go2/FL_foot", grounds[0]),  # walking -> excluded
+        ContactEvent(0.2, grounds[1], "/World/Go2/RR_calf"),  # walking -> excluded
+        ContactEvent(0.3, "/World/Go2/FL_calf", "/World/cv_obstacles/box_0"),  # counted
+        ContactEvent(0.4, "/World/Go2/base", "/World/cv_obstacles/box_0"),  # counted
+    ]
+    assert telemetry.count_real_collisions(events, "/World/Go2/base", grounds) == 2
+
+
+def test_the_robot_subtree_is_the_chassis_parent_and_never_the_whole_world():
+    # The widening is ONE level (the chassis prim's parent). A chassis declared
+    # directly under the stage root keeps the exact-prim meaning — widening it
+    # would make every warehouse shelf part of the robot.
+    assert telemetry.robot_subtree("/World/Go2/base") == "/World/Go2"
+    carter = "/World/Nova_Carter_ROS"
+    assert telemetry.robot_subtree(f"{carter}/chassis_link") == carter
+    assert telemetry.robot_subtree("/World/Go2") == "/World/Go2"
+    assert telemetry.robot_subtree("/Go2") == "/Go2"
+    shelf_hit = [ContactEvent(0.1, "/World/shelf_a", "/World/forklift")]
+    assert telemetry.count_real_collisions(shelf_hit, "/World/Go2", []) == 0
 
 
 # --------------------------------------------------------------------------- #

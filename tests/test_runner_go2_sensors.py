@@ -841,3 +841,33 @@ def test_the_runner_prints_every_line_a_collaborator_reports(capsys):
 
     _emit(["one", "two"])
     assert capsys.readouterr().out == "one\ntwo\n"
+
+
+def test_the_prereset_hook_is_the_graph_walk_or_the_runner_suite_never_both():
+    """A composed scene has no publish graph to enable, so running FU-17's walk on
+    it would warn about every declared topic — on a world where the runner IS the
+    publisher. The two paths are mutually exclusive and this is the one place that
+    says so."""
+    from cv_infra.runner.main import register_sensor_hooks
+
+    class _Sim:
+        def __init__(self):
+            self.pre_reset = []
+            self.enabled = []
+
+        def enable_declared_sensors(self, topics):
+            self.enabled.append(topics)
+
+    composed, suite = _Sim(), _suite()[0]
+    register_sensor_hooks(composed, suite, ["/scan"])
+    assert composed.pre_reset == [suite.bind]
+
+    prewired = _Sim()
+    register_sensor_hooks(prewired, None, ["/front_2d_lidar/scan"])
+    assert len(prewired.pre_reset) == 1
+    prewired.pre_reset[0](object())
+    assert prewired.enabled == [["/front_2d_lidar/scan"]]
+
+    nothing = _Sim()
+    register_sensor_hooks(nothing, None, [])
+    assert nothing.pre_reset == []

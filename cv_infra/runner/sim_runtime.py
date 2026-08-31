@@ -1230,6 +1230,34 @@ class SimRuntime:
             flush=True,
         )
 
+    def robot_articulation(self) -> object:  # pragma: no cover - GPU path (C2b measured)
+        """The ``SingleArticulation`` view over the resolved robot prim, created ONCE.
+
+        Creation and initialization are SPLIT because the CALLER owns the timing,
+        and C2b MEASURED what that timing may be (workstation, go2_warehouse):
+
+        * pre-reset — ``dof_names`` answers ``None``, ``initialize()`` raises
+          ``AttributeError: 'NoneType' object has no attribute
+          'create_articulation_view'``, and ``set_gains`` returns without doing
+          anything (a SILENT no-op, i.e. the worst of the three);
+        * post-reset — ``initialize()`` then ``dof_names`` (12), ``num_dof``,
+          ``set_gains``, ``get_world_pose``, velocities: all answer.
+
+        So the policy binds AFTER ``world.reset()``. Unlike the telemetry tensor
+        view (``SingleRigidPrim``, probe-02/03: invalid when created post-reset),
+        an articulation view created post-reset was measured to work — the same
+        window ``repose_robot`` has always created its view in.
+
+        Shared with ``repose_robot`` (which creates+initializes it when it is the
+        first user): one view per robot, because two wrappers over one
+        articulation would each re-run the physics-view handshake for nothing.
+        """
+        if self._articulation is None:
+            from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
+
+            self._articulation = SingleArticulation(self.robot_prim_path)
+        return self._articulation
+
     def enable_declared_sensors(self, topics) -> list[str]:  # pragma: no cover - GPU path
         """FU-17 GPU wrapper: pre_reset hook body over the LIVE stage.
 

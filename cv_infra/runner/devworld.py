@@ -27,6 +27,8 @@ from dataclasses import dataclass
 
 from cv_infra.contract.errors import ContractError
 from cv_infra.contract.loader import AdmittedRequest, load_request
+from cv_infra.runner.go2_policy import PolicyContractError
+from cv_infra.runner.go2_wiring import PolicyPin, check_firmware_slot
 from cv_infra.runner.main import (
     EXIT_PASS,
     EXIT_PLATFORM,
@@ -40,11 +42,6 @@ from cv_infra.runner.main import (
 from cv_infra.runner.sim_runtime import EulaNotAcceptedError, resolve_scene
 
 USAGE = "usage: ./python.sh -m cv_infra.runner.devworld <scenario.yaml> [--max-steps N]"
-
-#: Physics-callback name for the locomotion policy. Distinct from a job's, on
-#: purpose: the two never run in one process, and a shared literal would be a
-#: false hint that they do.
-POLICY_CALLBACK_NAME = "cv_infra_devworld_policy"
 
 
 class DevWorldUsage(Exception):
@@ -103,16 +100,28 @@ def admit(scenario_path: str) -> AdmittedRequest:
         raise DevWorldUsage(str(exc)) from exc
 
 
-def policy_slot(admitted: AdmittedRequest) -> tuple[str, str] | None:
-    """``(file, sha256)`` of the declared locomotion policy, or None.
+def policy_pin_for(admitted: AdmittedRequest) -> PolicyPin | None:
+    """The admitted locomotion-policy pin, cross-checked against the scene's slot.
 
-    The path is the loader's — resolved once, at the only place that knows the
-    scenario's directory (blueprint §8) — never re-derived here.
+    The path is the LOADER's — resolved once, at the only place that knows the
+    scenario's directory (blueprint §8) — so the dev world and a submitted job
+    address the same file. The slot cross-check is C2b's
+    (``go2_wiring.check_firmware_slot``): a go2 world with no policy stands up a
+    robot with zero drive gains that simply lies down, and a policy declared for
+    a robot that runs none is a request nobody can honour. Both are bad input
+    here for the same reason they are in a job — exit 2, before the boot.
     """
     declared = admitted.request.sut.locomotion_policy
-    if declared is None or admitted.locomotion_policy_path is None:
-        return None
-    return admitted.locomotion_policy_path, declared.sha256
+    pin = (
+        None
+        if declared is None or admitted.locomotion_policy_path is None
+        else PolicyPin(admitted.locomotion_policy_path, declared.sha256)
+    )
+    try:
+        check_firmware_slot(admitted.request, pin)
+    except PolicyContractError as exc:
+        raise DevWorldUsage(str(exc)) from exc
+    return pin
 
 
 def should_stop(steps: int, max_steps: int, stop_requested: bool) -> bool:
@@ -120,14 +129,14 @@ def should_stop(steps: int, max_steps: int, stop_requested: bool) -> bool:
     return stop_requested or (max_steps > 0 and steps >= max_steps)
 
 
-def banner(admitted: AdmittedRequest, policy: tuple[str, str] | None) -> list[str]:
+def banner(admitted: AdmittedRequest, policy: PolicyPin | None) -> list[str]:
     """What this world is, printed before the loop (there is no other UI)."""
     scenario = admitted.request.scenario
     return [
         "[cv-devworld] ready — the world is running; no mission, no oracle, no recording",
         f"[cv-devworld] scenario={admitted.source_path} scene={scenario.scene} "
         f"seed={scenario.seed}",
-        f"[cv-devworld] locomotion_policy={'none' if policy is None else policy[0]}",
+        f"[cv-devworld] locomotion_policy={'none' if policy is None else policy.path}",
         "[cv-devworld] drive it: ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "
         '"{linear: {x: 0.4}}"',
         "[cv-devworld] stop it: Ctrl-C",
@@ -145,17 +154,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(sys.argv[1:] if argv is None else argv)
         admitted = admit(args.scenario)
+        pin = policy_pin_for(admitted)
     except DevWorldUsage as exc:
         print(f"[cv-devworld] {exc}", file=sys.stderr, flush=True)
         return EXIT_USAGE
     try:
-        return run(admitted, args.max_steps)
+        return run(admitted, pin, args.max_steps)
     except EulaNotAcceptedError as exc:
         print(f"[cv-devworld] {exc}", file=sys.stderr, flush=True)
         return EXIT_PLATFORM
 
 
-def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cover - GPU path
+def run(
+    admitted: AdmittedRequest, pin: PolicyPin | None = None, max_steps: int = 0
+) -> int:  # pragma: no cover - GPU path
     """Boot the world and step it until Ctrl-C (or ``max_steps``).
 
     The order is ``main.run``'s, minus everything that belongs to judging a
@@ -165,8 +177,8 @@ def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cov
     the developer's app is expected to come and go while the world stays up.
     """
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
-    from cv_infra.runner.go2_policy import Go2PolicyLoop
     from cv_infra.runner.go2_sensors import sensor_suite_for
+    from cv_infra.runner.go2_wiring import attach_policy_loop, load_policy, subscribe_cmd_vel
     from cv_infra.runner.ros_bridge import (
         bootstrap_bridge_env,
         enable_bridge,
@@ -191,8 +203,7 @@ def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cov
     sim = SimRuntime(sim_config_for(request))
     adapter = Ros2Adapter(adapter_config, stepper=sim.step)
     sensors = sensor_suite_for(resolve_scene(request.scenario.scene), adapter_config, chassis_path)
-    slot = policy_slot(admitted)
-    policy = None if slot is None else Go2PolicyLoop(*slot)
+    policy = load_policy(pin)  # digest re-verified before the GPU is paid
     stop = {"requested": False}
 
     def request_stop(_signum, _frame) -> None:
@@ -202,8 +213,6 @@ def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cov
     try:
         sim.boot()
         enable_bridge(sim.simulation_app)
-        if policy is not None:
-            policy.load()  # digest re-verified before the GPU is paid
         if pool:
             sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(pool))
             sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(obstacles))
@@ -215,8 +224,11 @@ def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cov
             for line in sensors.attach(adapter.node, sim.on_step):
                 print(line, flush=True)
         if policy is not None:
-            _attach_policy(sim, adapter, policy, chassis_path, adapter_config.cmd_vel.topic)
-        for line in banner(admitted, slot):
+            # C2b's wiring, called not copied: same bind timing, same callback
+            # name, same /cmd_vel semantics a judged job gets.
+            attach_policy_loop(policy, sim)
+            subscribe_cmd_vel(adapter.node, adapter_config.cmd_vel, policy.set_command)
+        for line in banner(admitted, pin):
             print(line, flush=True)
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
@@ -233,31 +245,6 @@ def run(admitted: AdmittedRequest, max_steps: int = 0) -> int:  # pragma: no cov
         adapter.teardown()
         # Same G-62 deal as a job: the sim is NOT closed here (close() never
         # returns), so the exit code is delivered by process death in __main__.
-
-
-def _attach_policy(
-    sim: object, adapter: object, policy: object, chassis_path: str, cmd_vel_topic: str
-) -> None:  # pragma: no cover - GPU path
-    """Bind the locomotion policy to the articulation and to ``/cmd_vel``.
-
-    The subscription lands on the ADAPTER's node (``adapter.node``, the public
-    seam) so the process keeps exactly one DDS participant in the domain, and the
-    policy runs from a physics callback so it steps at the physics rate, not at
-    the render rate.
-    """
-    from geometry_msgs.msg import Twist  # noqa: PLC0415 (bundled jazzy)
-    from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
-
-    articulation = SingleArticulation(chassis_path)
-    articulation.initialize()
-    policy.bind(articulation)
-    sim.world.add_physics_callback(POLICY_CALLBACK_NAME, lambda _dt: policy.on_physics_step())
-
-    def on_cmd_vel(msg: Twist) -> None:
-        policy.set_command(msg.linear.x, msg.linear.y, msg.angular.z)
-
-    adapter.node.create_subscription(Twist, cmd_vel_topic, on_cmd_vel, 10)
-    print(f"[cv-devworld] locomotion policy driving from {cmd_vel_topic}", flush=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

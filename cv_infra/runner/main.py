@@ -50,6 +50,15 @@ from cv_infra.runner.evaluate import (
     build_result_dict,
     read_field,
 )
+from cv_infra.runner.go2_policy import PolicyContractError
+from cv_infra.runner.go2_wiring import (
+    POLICY_PATH_KEY,
+    POLICY_SHA_KEY,
+    admit_policy_pin,
+    attach_policy_loop,
+    load_policy,
+    subscribe_cmd_vel,
+)
 from cv_infra.runner.sim_runtime import (
     EulaNotAcceptedError,
     SimConfig,
@@ -206,6 +215,13 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
     """
     wire = dict(spec)
     wire.pop("job_id", None)
+    # C2b (D-3): the 2nd SUT artifact rides as two runner-envelope keys, peeled
+    # off here for the same reason ``job_id`` is — they are addressed to the
+    # RUNNER, not part of the canonical request document, and ``extra="forbid"``
+    # would reject the spec otherwise. Their VALUES are read (and cross-checked
+    # against the scene's firmware slots) by ``go2_wiring.admit_policy``.
+    wire.pop(POLICY_PATH_KEY, None)
+    wire.pop(POLICY_SHA_KEY, None)
     if "sut_image_ref" in wire:
         if "sut" in wire:
             raise BadJobSpec("JOB_SPEC carries both 'sut_image_ref' and 'sut' — ambiguous SUT pin")
@@ -409,6 +425,50 @@ def build_sensor_suite(request: VerificationRequest, criteria: dict) -> object |
         raise BadJobSpec(f"scenario.scene / interface.sensors: {exc}") from exc
 
 
+def admit_firmware_slot(spec: dict, request: VerificationRequest):
+    """Pre-boot firmware-slot admission (D-3) folded onto the bad-input path.
+
+    Same family as ``plan_obstacle_pool``: a scene whose robot declares no such
+    slot, a go2 world with no policy, or a ``cmd_vel`` type this runner cannot
+    subscribe as must cost 0 GPU seconds and read as exit 2 (usage), never as a
+    platform failure after the boot is paid. Returns the ``PolicyPin``, or None
+    when nothing declares a slot (every carter job).
+    """
+    try:
+        return admit_policy_pin(spec, request)
+    except PolicyContractError as exc:
+        raise BadJobSpec(str(exc)) from exc
+
+
+def load_firmware_slot(pin: object):
+    """Read the pinned policy bytes pre-boot (digest re-verified) — exit 2 on refusal.
+
+    Separate from the admission above because a CARRIER admits n specs and loads
+    ONE policy. A missing file or a digest mismatch is bad input, not a platform
+    failure: the platform holds no policy and substitutes none (plan §1-1).
+    """
+    try:
+        return load_policy(pin)
+    except PolicyContractError as exc:
+        raise BadJobSpec(str(exc)) from exc
+
+
+def register_sensor_hooks(sim: object, sensors: object, sensor_topics: list[str]) -> None:
+    """Register the ONE pre-reset sensor hook this run needs — graph or runner.
+
+    The two are mutually exclusive and saying so in one place is the point: a
+    pre-wired scene has publish graphs to enable (FU-17) and no runner-published
+    streams, a COMPOSED scene has runner-published streams and no graph at all.
+    Running the FU-17 walk on a composed scene would find no publish node for any
+    declared topic and warn about every one of them — the "declared but
+    publisher-less" alarm firing on a world where the runner IS the publisher.
+    """
+    if sensors is not None:
+        sim.pre_reset.append(sensors.bind)  # authors the camera/lidar prims
+    elif sensor_topics:
+        sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
+
+
 def artifact_paths(mcap_path: object, mp4_path: object) -> dict[str, str | None]:
     """``{mcap, mp4}`` as strings, or None where the recorder produced nothing.
 
@@ -561,6 +621,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # /clock — so the runner publishes the SUT-facing streams itself. None for a
     # pre-wired sample scene (carter), whose OmniGraphs already do it.
     sensors = build_sensor_suite(request, criteria)
+    # C2b (D-3): the firmware slot is admitted pre-boot — the policy bytes are
+    # hashed and TorchScript-loaded here, so a missing/tampered artifact is exit 2
+    # at 0 GPU seconds. None = no slot declared (every carter job).
+    policy = load_firmware_slot(admit_firmware_slot(spec, request))
     # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
     # engine composes uniformly via the M1 loader — still PRE-sim, so a load
     # failure (defence-in-depth; admit already rejected it once) is
@@ -628,17 +692,16 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # FU-17: declared-sensor render products must be enabled PRE-play
         # (BEFORE world.reset() — mid-play toggling is a measured no-op), so
         # this rides the same pre_reset seam as the telemetry bind.
-        # ...for a scene whose GRAPH publishes them. A composed scene has no
-        # graph to enable and would only collect false "declared but
-        # publisher-less" warnings, so the runner-published path owns it instead.
-        sensor_topics = [s.topic for s in adapter_config.sensors]
-        if sensor_topics and sensors is None:
-            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
-        if sensors is not None:
-            sim.pre_reset.append(sensors.bind)  # authors the camera/lidar prims
+        # ...for a scene whose GRAPH publishes them; a COMPOSED scene gets the
+        # runner-published suite instead (one home for that choice).
+        register_sensor_hooks(sim, sensors, [s.topic for s in adapter_config.sensors])
         # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
         # key rides along so the applied-settings line names its request.
         sim.load_scene(identity_key)
+        # C2b: post-reset (measured) and BEFORE the barrier — an unattached
+        # legged robot spends the whole readiness wait lying on the floor (C1 §6-3).
+        if policy is not None:
+            attach_policy_loop(policy, sim)
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)
@@ -647,6 +710,8 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # would deadlock the job against a clock nobody is publishing.
         if sensors is not None:
             _emit(sensors.attach(adapter.node, sim.on_step))
+        if policy is not None:  # the SUT drives the policy over its own /cmd_vel
+            subscribe_cmd_vel(adapter.node, adapter_config.cmd_vel, policy.set_command)
         # The barrier is where k=4 died 8/8 (p4c4 발견 ①). Its begin line is streamed
         # BEFORE the wait, so even a job killed mid-wait names the phase it hung in;
         # the end line carries the same phase/clock_count vocabulary the timeout log
