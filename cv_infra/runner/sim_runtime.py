@@ -954,6 +954,21 @@ def initial_pose_world_transform(
 REPOSE_LOG_MARKER = "repose_applied="
 
 
+def repose_height(current_z: float, asset: SceneAsset) -> float:
+    """The z a repose puts the robot back at — the row's drop height, or today's.
+
+    MEASURED (C5, workstation, 2-sample go2 batch): a robot the scene COMPOSES
+    arrives at a per-robot drop height (``robot_spawn_z`` = 0.32 for go2) and
+    sample 0 starts from exactly that, but sample 1's repose read the CURRENT
+    base z — 0.1795 m, wherever the last gait cycle of sample 0 happened to leave
+    it. Every later sample would then get a different drop than the first, which
+    is the sample-to-sample coupling the velocity/stance zeroing exists to
+    remove. A row that composes no robot (carter) declares no height, and then
+    the asset's own z stands exactly as it did before C5.
+    """
+    return asset.robot_spawn_z or current_z
+
+
 def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz, stance=()) -> str:
     """One structured line per repose — what was DECLARED and what was WRITTEN.
 
@@ -1612,6 +1627,10 @@ class SimRuntime:
         VALUES are not this layer's: they come from the registry row, which took
         them from the measured training contract (``go2_constants``), so the pose
         this restores is the same one the policy offsets its actions from.
+
+        The HEIGHT comes from the row too when it declares one (``repose_height``
+        — measured: keeping today's z handed sample i+1 whatever base height
+        sample i ended at). x/y/yaw stay the scenario's, as always.
         """
         import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
         from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
@@ -1623,12 +1642,14 @@ class SimRuntime:
             self._articulation = SingleArticulation(target)
             self._articulation.initialize()
         robot = self._articulation
+        row = scene_row(self.config.scene_ref)
         current_position, _ = robot.get_world_pose()
         position, orientation = initial_pose_world_transform(pose, current_position)
+        position = (position[0], position[1], repose_height(position[2], row))
         robot.set_world_pose(position=np.array(position), orientation=np.array(orientation))
         robot.set_linear_velocity(np.zeros(3))
         robot.set_angular_velocity(np.zeros(3))
-        stance = scene_row(self.config.scene_ref).default_joint_pos
+        stance = row.default_joint_pos
         if stance:
             robot.set_joint_positions(np.array(stance))
         dof = robot.num_dof

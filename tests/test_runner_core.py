@@ -941,6 +941,18 @@ def test_repose_log_line_states_both_the_declared_pose_and_the_written_one():
     assert "joint POSITIONS untouched" in line  # the scope this repose does NOT claim
 
 
+def test_repose_puts_a_composed_robot_back_at_its_own_drop_height():
+    """C5 measured the coupling this closes: sample 0 starts at the row's drop
+    height (go2: 0.32) but sample 1's repose read the LIVE base z — 0.1795 m,
+    wherever the last gait cycle left it — so every sample would get a different
+    drop. A row that composes no robot keeps the asset's own z, i.e. carter's
+    pre-C5 behaviour."""
+    go2 = sim_runtime.SCENE_ASSETS["go2_warehouse"]
+    carter = sim_runtime.SCENE_ASSETS["nova_carter_warehouse"]
+    assert sim_runtime.repose_height(0.1795, go2) == go2.robot_spawn_z == 0.32
+    assert sim_runtime.repose_height(0.24, carter) == 0.24  # nothing declared -> unchanged
+
+
 def test_repose_log_line_says_when_it_restored_a_stance():
     """C5: "restored 12 joints" and "left the joints alone" are BOTH correct
     answers depending on the robot, and a reader of a legged sample's log has no

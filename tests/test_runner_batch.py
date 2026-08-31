@@ -1018,6 +1018,7 @@ def test_repose_restores_the_stance_the_registry_row_declares():
     called = _called_names(_method(source, "SimRuntime", "repose_robot"))
     assert "set_joint_positions" in called, "the repose leaves a quadruped mid-stride"
     assert "scene_row" in called, "the stance was written from somewhere other than the row"
+    assert "repose_height" in called, "sample i+1 inherits sample i's end base height"
 
 
 def test_the_policy_episode_state_is_dropped_before_the_restage_not_after():

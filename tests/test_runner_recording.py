@@ -371,6 +371,31 @@ def test_rosbag_start_spawns_the_sourced_child_and_says_what_it_records(
     assert child.stdout is not None
 
 
+#: VERBATIM from a C5 workstation run (``results/0/rosbag2.log``) — the parser
+#: below is pinned to the text rosbag2 actually prints, not to a paraphrase.
+_MEASURED_RECORDER_LOG = """\
+[INFO] [1788200682.885971781] [rosbag2_recorder]: Starting recording to '/out/b/bag'
+[INFO] [1788200682.987077292] [rosbag2_recorder]: Subscribed to topic '/clock'
+[WARN] [1788200682.987310003] [ROSBAG2_TRANSPORT]: Topic '/tf' has unknown type \
+'tf2_msgs/msg/TFMessage' . Only topics with known type are supported. Reason: \
+'package 'tf2_msgs' not found, searching: [/opt/ros/jazzy]
+[INFO] [1788200682.990022644] [rosbag2_recorder]: Subscribed to topic '/odom'
+[INFO] [1788200699.043519820] [rosbag2_recorder]: Recording stopped
+"""
+
+
+def test_skipped_topics_reads_back_what_rosbag2_refused_to_record():
+    """C5 measured the silence this closes: ``/tf`` was REQUESTED, the image's
+    rosbag2 layer had no ``tf2_msgs`` typesupport, and the bag came out without
+    transforms — the only trace being one WARN line in a file nobody opens. The
+    runner reads its own recorder's log back so the artifact's incompleteness is
+    stated where the job's other evidence is (G-26)."""
+    assert recording.skipped_topics(_MEASURED_RECORDER_LOG) == ["/tf"]
+    # A clean run says nothing (the warning must not fire on every recording).
+    assert recording.skipped_topics("[INFO] Subscribed to topic '/clock'\n") == []
+    assert recording.skipped_topics("") == []
+
+
 def test_rosbag_start_refuses_an_existing_bag_dir_instead_of_returning_a_stale_one(
     tmp_path, monkeypatch
 ):

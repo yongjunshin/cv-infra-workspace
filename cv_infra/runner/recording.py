@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,6 +145,34 @@ def bag_record_shell_cmd(bag_dir: Path, topics: list[str], setup: Path) -> list[
 _RECORDER_ENV_DROP = ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "PYTHONEXE")
 
 
+#: What rosbag2 prints when it cannot resolve a requested topic's message type.
+#: MEASURED (C5 workstation, ``rosbag2.log``)::
+#:
+#:   [WARN] [ROSBAG2_TRANSPORT]: Topic '/tf' has unknown type 'tf2_msgs/msg/
+#:   TFMessage' . Only topics with known type are supported. Reason: 'package
+#:   'tf2_msgs' not found, searching: [/opt/ros/jazzy]
+_UNKNOWN_TYPE_MARKER = "has unknown type"
+
+
+def skipped_topics(recorder_log: str) -> list[str]:
+    """Topics rosbag2 REFUSED to record, read back from its own log.
+
+    The recorder does not fail on an unrecordable topic: it warns once into its
+    own log file and records everything else, so the bag is quietly INCOMPLETE —
+    measured C5: ``/tf`` and ``/tf_static`` are asked for and absent, because
+    the image's rosbag2 apt layer carries no ``tf2_msgs`` typesupport, and the
+    only trace was a line in a file nobody opens. Reading it back turns that into
+    the runner's own loud line next to the artifact it describes (G-26: a feature
+    that did not engage must not read as an empty channel).
+    """
+    skipped = []
+    for line in recorder_log.splitlines():
+        head, marker, _ = line.partition(_UNKNOWN_TYPE_MARKER)
+        if marker and head.count("'") >= 2:
+            skipped.append(head.rsplit("'", 2)[-2])
+    return skipped
+
+
 def recorder_subprocess_env(base_env: dict | None = None) -> dict:
     """Child env for the rosbag2 subprocess: inherit all but the bundled-interpreter
     coupling keys (the sourced setup.bash rebuilds its own paths)."""
@@ -203,6 +232,7 @@ class RosbagRecorder:
         )
         self._proc: subprocess.Popen | None = None
         self._log_file = None
+        self._log_path = self.paths.bag_dir.parent / "rosbag2.log"
 
     def start(self) -> None:
         setup = ros_setup_script(self.config.ros_distro)
@@ -232,9 +262,10 @@ class RosbagRecorder:
         # G-26 feature-on gate: the opt-in must be observable, or a knob that
         # silently did not engage reads as "the channel is empty".
         print(f"[cv-runner] bag topics ({len(topics)}): {topics}", flush=True)
-        # G-18 evidence culture: keep the recorder's own output as a file.
+        # G-18 evidence culture: keep the recorder's own output as a file (and
+        # read it back at stop — see ``skipped_topics``).
         self._log_file = open(  # noqa: SIM115 (lifetime spans the recording)
-            self.paths.bag_dir.parent / "rosbag2.log", "w", encoding="utf-8"
+            self._log_path, "w", encoding="utf-8"
         )
         self._proc = subprocess.Popen(  # pragma: no cover - needs the backend
             bag_record_shell_cmd(self.paths.bag_dir, topics, setup),
@@ -263,10 +294,26 @@ class RosbagRecorder:
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
+        self._report_skipped_topics()
         mcaps = sorted(self.paths.bag_dir.glob("*.mcap"))
         if not mcaps:
             raise RuntimeError(f"rosbag2 produced no .mcap under {self.paths.bag_dir}")
         return mcaps[0]
+
+    def _report_skipped_topics(self) -> None:  # pragma: no cover - needs the backend
+        """Say out loud which requested topics are NOT in the bag (C5 measured)."""
+        if not self._log_path.is_file():
+            return
+        skipped = skipped_topics(self._log_path.read_text(encoding="utf-8", errors="replace"))
+        if skipped:
+            print(
+                f"[cv-runner] WARNING: rosbag2 could not record {skipped} — the runner "
+                "image's rosbag2 layer has no typesupport for their message type, so the "
+                f"bag under {self.paths.bag_dir} is INCOMPLETE (see rosbag2.log next to it; "
+                "the fix is an image layer, not a scenario)",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def abort(self) -> None:
         """Failure-path cleanup (idempotent): never leak the child process."""
