@@ -424,7 +424,11 @@ def _run_job_kwargs(admitted: Any, scenario_path: Path) -> dict[str, Any]:
       next to the scenario YAML, so that directory (resolved absolute) goes to the
       supervisor, which ro-mounts it into the runner at the SAME path + announces
       ``CV_ORACLE_PLUGIN_DIR`` (contract #3). Detection is ``isinstance`` on the
-      ADMITTED model, never a string heuristic.
+      ADMITTED model, never a string heuristic. A declared ``sut.locomotion_policy``
+      (D2 2026-08-31) rides the SAME mount: the policy file is a ride-along
+      artifact of the same directory, admit already resolved it against that
+      anchor, and without the mount the runner would be handed a path that does
+      not exist inside its container.
     * ``request_identity_key`` — p5c20 ③ (DoD-P2-06 ① / REQ-REPORT-002),
       UNCONDITIONAL: the single-run entrypoint hands the runner the SAME key the
       envelope/REST entrypoint does, so a ``result.json`` produced by ``cv-infra
@@ -443,7 +447,10 @@ def _run_job_kwargs(admitted: Any, scenario_path: Path) -> dict[str, Any]:
     if BAG_SENSORS_ENV in os.environ:
         runner_env[BAG_SENSORS_ENV] = os.environ[BAG_SENSORS_ENV]
     kwargs: dict[str, Any] = {"runner_env": runner_env} if runner_env else {}
-    if any(isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria):
+    needs_scenario_dir = any(
+        isinstance(c, CustomCriterion) for c in admitted.request.acceptance_criteria
+    ) or (admitted.request.sut.locomotion_policy is not None)
+    if needs_scenario_dir:
         kwargs["oracle_plugin_dir"] = str(scenario_path.parent.resolve())
     kwargs["request_identity_key"] = identity_key(
         admitted.request.model_dump(mode="json", by_alias=True)

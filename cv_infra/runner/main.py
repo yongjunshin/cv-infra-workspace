@@ -50,6 +50,15 @@ from cv_infra.runner.evaluate import (
     build_result_dict,
     read_field,
 )
+from cv_infra.runner.go2_policy import PolicyContractError
+from cv_infra.runner.go2_wiring import (
+    POLICY_PATH_KEY,
+    POLICY_SHA_KEY,
+    admit_policy_pin,
+    attach_policy_loop,
+    load_policy,
+    subscribe_cmd_vel,
+)
 from cv_infra.runner.sim_runtime import (
     EulaNotAcceptedError,
     SimConfig,
@@ -205,6 +214,13 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
     """
     wire = dict(spec)
     wire.pop("job_id", None)
+    # C2b (D-3): the 2nd SUT artifact rides as two runner-envelope keys, peeled
+    # off here for the same reason ``job_id`` is — they are addressed to the
+    # RUNNER, not part of the canonical request document, and ``extra="forbid"``
+    # would reject the spec otherwise. Their VALUES are read (and cross-checked
+    # against the scene's firmware slots) by ``go2_wiring.admit_policy``.
+    wire.pop(POLICY_PATH_KEY, None)
+    wire.pop(POLICY_SHA_KEY, None)
     if "sut_image_ref" in wire:
         if "sut" in wire:
             raise BadJobSpec("JOB_SPEC carries both 'sut_image_ref' and 'sut' — ambiguous SUT pin")
@@ -383,6 +399,34 @@ def plan_obstacle_pool(obstacles: list[dict]) -> dict:
         raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
 
 
+def admit_firmware_slot(spec: dict, request: VerificationRequest):
+    """Pre-boot firmware-slot admission (D-3) folded onto the bad-input path.
+
+    Same family as ``plan_obstacle_pool``: a scene whose robot declares no such
+    slot, a go2 world with no policy, or a ``cmd_vel`` type this runner cannot
+    subscribe as must cost 0 GPU seconds and read as exit 2 (usage), never as a
+    platform failure after the boot is paid. Returns the ``PolicyPin``, or None
+    when nothing declares a slot (every carter job).
+    """
+    try:
+        return admit_policy_pin(spec, request)
+    except PolicyContractError as exc:
+        raise BadJobSpec(str(exc)) from exc
+
+
+def load_firmware_slot(pin: object):
+    """Read the pinned policy bytes pre-boot (digest re-verified) — exit 2 on refusal.
+
+    Separate from the admission above because a CARRIER admits n specs and loads
+    ONE policy. A missing file or a digest mismatch is bad input, not a platform
+    failure: the platform holds no policy and substitutes none (plan §1-1).
+    """
+    try:
+        return load_policy(pin)
+    except PolicyContractError as exc:
+        raise BadJobSpec(str(exc)) from exc
+
+
 def artifact_paths(mcap_path: object, mp4_path: object) -> dict[str, str | None]:
     """``{mcap, mp4}`` as strings, or None where the recorder produced nothing.
 
@@ -531,6 +575,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # is pure; the pre-reset hooks below only execute it.
     obstacles = obstacle_specs(request)
     obstacle_pool = plan_obstacle_pool(obstacles)
+    # C2b (D-3): the firmware slot is admitted pre-boot — the policy bytes are
+    # hashed and TorchScript-loaded here, so a missing/tampered artifact is exit 2
+    # at 0 GPU seconds. None = no slot declared (every carter job).
+    policy = load_firmware_slot(admit_firmware_slot(spec, request))
     # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
     # engine composes uniformly via the M1 loader — still PRE-sim, so a load
     # failure (defence-in-depth; admit already rejected it once) is
@@ -601,12 +649,22 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         sensor_topics = [s.topic for s in adapter_config.sensors]
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
+        # C2b (D-3): the articulation VIEW rides the same pre-reset seam as the
+        # telemetry one (probe-02/03); bind/initialize happen after the reset.
+        if policy is not None:
+            sim.pre_reset.append(lambda _world: sim.robot_articulation())
         # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
         # key rides along so the applied-settings line names its request.
         sim.load_scene(identity_key)
+        # C2b: attach BEFORE the barrier — an unattached legged robot spends the
+        # whole readiness wait lying on the floor (C1 §6-3).
+        if policy is not None:
+            attach_policy_loop(policy, sim)
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)
+        if policy is not None:  # the SUT drives the policy over its own /cmd_vel
+            subscribe_cmd_vel(adapter.node, adapter_config.cmd_vel, policy.set_command)
         # The barrier is where k=4 died 8/8 (p4c4 발견 ①). Its begin line is streamed
         # BEFORE the wait, so even a job killed mid-wait names the phase it hung in;
         # the end line carries the same phase/clock_count vocabulary the timeout log

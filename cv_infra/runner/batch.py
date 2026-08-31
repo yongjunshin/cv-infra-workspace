@@ -69,11 +69,13 @@ from cv_infra.runner.main import (
     _print_contact_partners,
     _start_quiet,
     _stop_quiet,
+    admit_firmware_slot,
     announce_oracle_plugin_dir,
     artifact_paths,
     build_oracles,
     criteria_view,
     hard_exit,
+    load_firmware_slot,
     obstacle_specs,
     parse_request,
     read_request_identity_key,
@@ -199,6 +201,7 @@ class ParsedSpec:
     adapter_config: object  # Ros2AdapterConfig
     criteria: dict
     oracles: list
+    policy: object = None  # go2_wiring.PolicyPin | None (the firmware slot, D-3)
 
 
 #: What the CARRIER does exactly once, so every spec must agree on it — label ->
@@ -211,7 +214,11 @@ _UNIFORM_FIELDS: tuple[tuple[str, object], ...] = (
     # The 2nd SUT artifact (D2 2026-08-31), same treatment as the image it rides
     # with: one carrier holds ONE SUT, and a sample judged against a different
     # policy than sample 0 is a different SUT wearing sample 0's verdict.
-    ("sut.locomotion_policy", lambda p: p.request.sut.locomotion_policy),
+    # C2b resolved M1's open question (C2a report §6): the policy reaches the
+    # runner as the FLAT pin (``locomotion_policy_path``/``_sha256``), never as a
+    # nested ``sut`` block, so the row reads the admitted pin — reading
+    # ``request.sut.locomotion_policy`` here would compare None to None forever.
+    ("sut.locomotion_policy", lambda p: p.policy),
     ("scenario.scene", lambda p: p.request.scenario.scene),
     ("scenario.robot", lambda p: p.request.scenario.robot),
     ("execution_settings.fixed_dt", lambda p: p.request.execution_settings.fixed_dt),
@@ -253,9 +260,13 @@ def admit_specs(batch: JobSpecBatch) -> list[ParsedSpec]:
             criteria = criteria_view(request)
             oracles = build_oracles(request)
             validate_oracle_params(oracles, criteria)
+            # D-3 firmware slot: the PIN only (path/digest/slot agreement). The
+            # policy BYTES are loaded once by the carrier's boot, not n times —
+            # the uniformity row below is what makes "once" correct.
+            policy = admit_firmware_slot(spec, request)
         except BadJobSpec as exc:
             raise BadJobSpec(f"batch spec {index}: {exc}") from exc
-        parsed.append(ParsedSpec(index, job_id, request, adapter_config, criteria, oracles))
+        parsed.append(ParsedSpec(index, job_id, request, adapter_config, criteria, oracles, policy))
 
     seen: dict[str, int] = {}
     for item in parsed:
@@ -517,6 +528,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         install_readonly_error_counter,
         observe,
     )
+    from cv_infra.runner.go2_wiring import attach_policy_loop, subscribe_cmd_vel  # noqa: PLC0415
     from cv_infra.runner.realign import SutRealigner  # noqa: PLC0415
     from cv_infra.runner.recording import (  # noqa: PLC0415
         LoopVideoRecorder,
@@ -549,6 +561,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     chassis_path = read_field(head.criteria, "chassis_path", "")
     excluded_paths = read_field(head.criteria, "collision_excluded_paths", []) or []
     staging = _plan_staging(specs, base_config)
+    # D-3: ONE policy for the carrier — ``_UNIFORM_FIELDS`` already refused a
+    # batch whose samples pin different ones, so loading sample 0's bytes here is
+    # loading every sample's. Still pre-boot: a digest mismatch is exit 2.
+    policy = load_firmware_slot(head.policy)
 
     trace = BootTrace()
     sim = SimRuntime(sim_config_for(head.request), trace=trace)
@@ -598,14 +614,20 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(staging.head_obstacles))
         if staging.sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(staging.sensor_topics))
+        if policy is not None:  # C2b: articulation view pre-reset (probe-02/03)
+            sim.pre_reset.append(lambda _world: sim.robot_articulation())
         sim.load_scene(identity_key)  # emits sample 0's sim_config line
         sampler.attach(sim.world)
+        if policy is not None:  # bind + physics callback, before anything pumps
+            attach_policy_loop(policy, sim)
         summary.doc["boot"]["scene_load_s"] = round(watch.end("scene_load"), 4)
 
         watch.begin("adapter_wire")
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, base_config)
         trace.end(PHASE_ADAPTER_WIRE)
+        if policy is not None:
+            subscribe_cmd_vel(adapter.node, base_config.cmd_vel, policy.set_command)
         summary.doc["boot"]["adapter_wire_s"] = round(watch.end("adapter_wire"), 4)
 
         # ONE render product + ONE realigner for the whole carrier: a per-sample
@@ -649,6 +671,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             if position:  # sample 0's world is the one load_scene just staged
                 sim.restage(pose, obstacle, obstacle_set=obstacle_set)
                 sim.emit_sim_config(identity_key)  # per-sample applied-settings line
+                if policy is not None:
+                    # D-5: the loop's carried state IS episode state (last raw
+                    # action feeds the next observation, the command is the
+                    # previous mission's last twitch). Restoring the STANCE joint
+                    # positions after a teleport is C5's (repose), measured there.
+                    policy.reset()
             iter_watch.end("restage")
 
             iter_watch.begin("realign")

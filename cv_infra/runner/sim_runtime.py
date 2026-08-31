@@ -1230,6 +1230,26 @@ class SimRuntime:
             flush=True,
         )
 
+    def robot_articulation(self) -> object:  # pragma: no cover - GPU path (C2b measured)
+        """The ``SingleArticulation`` view over the resolved robot prim, created ONCE.
+
+        Creation and initialization are SPLIT on purpose (C2b): the wrapper must
+        be constructed BEFORE ``world.reset()`` — the same probe-02/03 constraint
+        the telemetry tensor view lives under — while the physics handshake
+        (``initialize()``) only answers once the timeline plays. So this is a
+        ``pre_reset`` hook body for the policy path, and the CALLER initializes
+        after the reset.
+
+        Shared with ``repose_robot`` (which creates+initializes it when it is the
+        first user): one view per robot, because two wrappers over one
+        articulation would each re-run the physics-view handshake for nothing.
+        """
+        if self._articulation is None:
+            from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
+
+            self._articulation = SingleArticulation(self.robot_prim_path)
+        return self._articulation
+
     def enable_declared_sensors(self, topics) -> list[str]:  # pragma: no cover - GPU path
         """FU-17 GPU wrapper: pre_reset hook body over the LIVE stage.
 

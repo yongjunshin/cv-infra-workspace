@@ -94,32 +94,65 @@ def _matches(actor_path: str, excluded: str) -> bool:
     return actor_path == excluded or actor_path.startswith(excluded.rstrip("/") + "/")
 
 
+def robot_subtree(chassis_path: str) -> str:
+    """The ROBOT's prim subtree, derived from the declared chassis prim (AR-12).
+
+    ``/World/Go2/base`` -> ``/World/Go2``; ``/World/Nova_Carter_ROS/chassis_link``
+    -> ``/World/Nova_Carter_ROS``. The chassis prim's PARENT is the robot, which
+    is what makes "did the ROBOT hit something" answerable for a legged robot
+    whose contact actors are always end links (feet/calves), never the base.
+
+    A chassis declared directly under the stage root (``/World/X``, or a
+    root-level prim) is NOT widened: the parent would be ``/World`` — the whole
+    scene — and every warehouse shelf would become part of the robot. That
+    degenerate case keeps the pre-AR-12 exact-prim meaning instead.
+    """
+    parts = chassis_path.strip("/").split("/")
+    if len(parts) < 3:
+        return chassis_path
+    return "/" + "/".join(parts[:-1])
+
+
 def count_real_collisions(
     events: list[ContactEvent], chassis_path: str, excluded_paths: list[str]
 ) -> int:
-    """Chassis-only collision count with ground/self filtered out (D-E).
+    """Robot-vs-world collision count with ground/self filtered out (D-E, AR-12).
 
     Measured (p2c5 run1): the ContactReportAPI Applied to the chassis body — an
     ARTICULATION ROOT on the carter — aggregates contact reports of the WHOLE
     articulation, so wheel/caster<->ground pairs arrive too (7344 events on a
-    clean run, neither actor the chassis). Those are not the D-E surface: an
-    event counts only when the chassis IS one of the actors AND the other actor
-    does not match any ``excluded_paths`` entry (ground plane / designated
-    floor / robot self-bodies). Matching is by exact path or prim-subtree
-    prefix so a whole floor/robot subtree excludes. Prevents the false FAIL
-    where wheel-on-floor contact reads as a collision.
+    clean run, neither actor the chassis).
+
+    An event counts when SOME prim of the robot subtree (``robot_subtree``) is an
+    actor AND its partner does not match any ``excluded_paths`` entry (ground
+    plane / designated floor / robot self-bodies). Matching is by exact path or
+    prim-subtree prefix, so a whole floor/robot subtree excludes with one entry —
+    which is what keeps wheel-on-floor contact from reading as a collision.
+
+    AR-12 (2026-09-01) widened "the robot" from the chassis prim alone to its
+    subtree, because the narrow form was measured to answer FALSE for a whole
+    class of real collisions: C1 dropped a go2 onto a box, it tripped and ended
+    upside down (roll 3.14) after 263 leg<->box contacts, and ``collision_count``
+    was **0** — every actor was a foot or a calf, never ``/World/Go2/base``. The
+    carter meaning is preserved by its own declaration: its scenarios exclude
+    ``/World/Nova_Carter_ROS`` (self) and the ground plane, so wheel<->floor and
+    wheel<->self stay filtered while wheel<->obstacle now counts, which is what
+    "the robot collided" always meant.
     """
+    robot = robot_subtree(chassis_path)
     count = 0
     for e in events:
-        actors = {e.actor0_path, e.actor1_path}
-        if chassis_path not in actors:
-            continue  # other-link contact (articulation aggregation artifact)
+        actors = (e.actor0_path, e.actor1_path)
+        if not any(_matches(actor, robot) for actor in actors):
+            continue  # neither actor belongs to the robot (foreign-pair report)
         # Determinate by construction (unlike contact_partners' pre-G-72 form):
-        # the guard above proved the chassis IS an actor, so this set holds at
-        # most one path and the pick cannot depend on set-iteration order.
-        others = actors - {chassis_path}
-        other = next(iter(others)) if others else chassis_path
-        if any(_matches(other, ex) for ex in excluded_paths):
+        # the partner is picked POSITIONALLY, never by set-iteration order. A
+        # robot-INTERNAL pair (self-contact) has no outside partner, so BOTH its
+        # actors are weighed against the exclusions — that is how "do not count
+        # my own wheels touching my own chassis" is spelled today (the scenario
+        # excludes the robot's own subtree).
+        outside = [actor for actor in actors if not _matches(actor, robot)]
+        if any(_matches(actor, ex) for actor in (outside or actors) for ex in excluded_paths):
             continue
         count += 1
     return count
@@ -186,9 +219,10 @@ class PhysicsTelemetrySampler:
     ``PhysxContactReportAPI`` Applied to the CHASSIS BODY ONLY (D-E).
 
     P2-13 false-FAIL-zero design point (explicit): collisions are filtered in
-    TWO stages — (1) acquisition: the ContactReportAPI Apply is chassis-limited,
-    so wheel-on-floor contacts of other bodies never even report; (2) reduction:
-    ``count_real_collisions`` drops events whose other actor matches
+    TWO stages — (1) acquisition: the ContactReportAPI Apply is chassis-limited
+    (measured: on an articulation ROOT that still reports the whole articulation,
+    C0 probe §6-1); (2) reduction: ``count_real_collisions`` keeps events where
+    the ROBOT SUBTREE is an actor and drops those whose partner matches
     ``excluded_paths`` (ground plane / designated floor / robot self-bodies).
     Both the chassis prim and the exclusion list travel via adapter_config /
     criteria — never scene-path hardcoded (R7).
