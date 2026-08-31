@@ -314,6 +314,27 @@ class PhysicsTelemetrySampler:
             on_contact
         )
 
+    def latest_pose(self) -> PoseSample | None:
+        """The most recently sampled GT pose, or ``None`` if nothing was sampled yet.
+
+        The batch carrier reads this right after its settle pump to seed the SUT's
+        ``/initialpose`` with where the robot ACTUALLY ended up (AR-19,
+        ``realign.realign_seed``) instead of the coordinate the scenario declared.
+
+        It reads the accumulator rather than calling ``get_world_pose()`` a second
+        time, for two reasons: the newest sample is at most one physics step old
+        (the callback wrote it during the settle), and "GT" then has exactly ONE
+        acquisition path in this process (LOCKED §7) — a second reader would be a
+        second thing to keep bound, invalidated and correct.
+
+        Which record it reads is deliberately whatever ``self.record`` is at the
+        time: at the carrier's realign that is still the RETIRED accumulator (the
+        swap happens later, at mission start — see ``batch.run``), and the settle
+        steps have just appended this sample's post-settle poses to it.
+        """
+        samples = self.record.gt_pose_samples
+        return samples[-1] if samples else None
+
     def detach(self) -> None:
         """Stop sampling (drop callback + contact subscription). CPU-safe no-op."""
         if self._world is not None:  # pragma: no cover - GPU path

@@ -1055,8 +1055,14 @@ def test_every_sample_hands_its_own_obstacle_set_to_the_restage():
 #: 게이트별 "이 표본의 값" 이음매: (이음매, 루프가 부르는 이름, 그 값이 서는 자리,
 #: 거기 서야 하는 이름, 그 이름을 이 표본에서 길어 오는 식). 자리 = 위치 인자 색인(int)
 #: 또는 키워드 이름(str).
+#:
+#: 게이트 1 행은 C5b(AR-19)에서 **재조준**됐다: 재정렬이 받아야 하는 "이 표본의 값"이
+#: 선언 포즈(``pose``)에서 **정착 후 GT로 시딩된 포즈**(``seed``)로 바뀌었기 때문이다.
+#: 겨냥하는 잔존은 그대로다 — "표본 i가 표본 i-1의 AMCL 믿음 위에서 돈다" — 이고,
+#: 오히려 한 겹 더 좁아졌다: 이제 GT를 읽는 식까지 원천에 들어가므로
+#: ``realign_seed(pose, None)``(= 항상 선언 좌표로 시딩) 변이도 여기서 운다.
 _PER_SAMPLE_PAYLOADS = (
-    ("realign", "realign", 0, "pose", "request.scenario.initial_pose"),
+    ("realign", "realign", 0, "seed", "realign_seed(pose, sampler.latest_pose())"),
     ("plan_artifacts", "plan_artifacts", 0, "out_dir", "iteration_dir(out_root, index)"),
     ("restage", "restage", "obstacle_set", "obstacle_set", "obstacle_specs(request)"),
 )
@@ -1081,8 +1087,10 @@ def per_sample_payload_residue(loop: ast.For) -> list[str]:
     그래서 인자를 운반체 상수로 바꾸는 편측 변이가 전부 초록이었다 (실측 2026-08-28,
     전 스위트 1543/1543 통과):
 
-    * ``realigner.realign(pose)`` -> ``realign(None)`` — 표본마다 "시도 안 함"이
+    * ``realigner.realign(seed)`` -> ``realign(None)`` — 표본마다 "시도 안 함"이
       찍히고 표본 i는 표본 i-1의 AMCL 믿음 위에서 돈다 (게이트 1이 겨냥한 그 잔존).
+      C5b 이후 같은 행이 ``realign_seed(pose, None)``(GT를 안 읽는다 = 언제나 선언
+      좌표로 시딩)도 잡는다 — 원천 식에 GT 읽기가 들어 있기 때문이다.
     * ``plan_artifacts(out_dir)`` -> ``plan_artifacts(iteration_dir(out_root, 0))``
       — 전 표본의 녹화가 ``results/0/``에 겹쳐 쌓인다 (게이트 2).
     * ``obstacle_set=obstacle_set`` -> ``head_obstacles`` — 표본 1..n-1이 표본 0의
@@ -1109,10 +1117,16 @@ def per_sample_payload_residue(loop: ast.For) -> list[str]:
                 "in this file would look any different"
             )
             continue
+        # 대입 대상의 **이름 집합**으로 찾는다(단일 이름 대입에서는 이전 규칙과 동일).
+        # C5b가 튜플 언팩(``seed, seed_source = realign_seed(...)``)을 도입했고,
+        # ``ast.unparse(targets[0])``는 그 경우 ``"(seed, seed_source)"``라 이름을
+        # 영영 못 찾는다 = 규칙이 조용히 "바인딩 0개"로 울게 된다. 일반화일 뿐 완화가
+        # 아니다: ``len(bound) != 1``과 ``origin`` 포함 검사는 그대로다.
         bound = [
             node
             for node in ast.walk(loop)
-            if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == name
+            if isinstance(node, ast.Assign)
+            and name in {n.id for n in ast.walk(node.targets[0]) if isinstance(n, ast.Name)}
         ]
         if len(bound) != 1 or origin not in ast.unparse(bound[0].value):
             complaints.append(
@@ -1143,8 +1157,16 @@ def test_every_per_sample_call_is_handed_this_samples_value():
 _MEASURED_MUTATIONS = (
     (
         "게이트 1 — 이 표본의 포즈로 재정렬하지 않는다",
-        "realigner.realign(pose)",
+        "realigner.realign(seed)",
         "realigner.realign(None)",
+        "realign",
+    ),
+    (
+        # C5b/AR-19 신설 팔. 순서(정착→재정렬)만 맞고 씨앗이 여전히 선언 좌표면
+        # 수리는 없던 일이 된다 — 그리고 카운터·요약·로그 어느 것도 달라지지 않는다.
+        "게이트 1 — 정착 후 GT를 읽지 않고 선언 좌표로 시딩한다",
+        "realign_seed(pose, sampler.latest_pose())",
+        "realign_seed(pose, None)",
         "realign",
     ),
     (

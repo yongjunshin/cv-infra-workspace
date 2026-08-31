@@ -17,8 +17,9 @@ Sequence — boot ONCE, then per sample i:
     ros2 bridge -> scene/robot/telemetry/sensors (sample 0's staging) ->
     adapter wire (+ sensor & /cmd_vel publishers) -> render product
       | i: re-pin seed -> restage (obstacle move + set, soft reset, repose) ->
-      |    sim_config line -> SUT realign + settle -> readiness -> cycle telemetry
-      |    accumulator -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
+      |    sim_config line -> settle -> SUT realign (seeded from the post-settle
+      |    GT pose) -> readiness -> cycle telemetry accumulator -> bag/mp4 ->
+      |    mission -> evaluate -> results/<i>/result.json
       |    -> batch_summary.json (atomic flush = the carrier's heartbeat)
 
 Exit contract (CARRIER level — the sample verdicts live in their own result.json):
@@ -98,11 +99,13 @@ BATCH_RESULTS_DIRNAME = "results"
 #: (it would re-exec ``-m __main__``). Pinned to the real name by CPU test.
 BATCH_MODULE = "cv_infra.runner.batch"
 
-#: Sim-seconds to let the world settle after a realign, before the readiness
-#: barrier and the mission. Runner runtime policy, NOT consumer contract (same
-#: stance as ``READINESS_TIMEOUT_S``): it covers the physics settling of a
-#: teleported robot plus AMCL's first re-convergence. Env-overridable so W1/W2 can
-#: measure a different value without a rebuild.
+#: Sim-seconds to let the world settle after a RESTAGE, before the realign, the
+#: readiness barrier and the mission. Runner runtime policy, NOT consumer contract
+#: (same stance as ``READINESS_TIMEOUT_S``): it covers the physics settling of a
+#: teleported robot — and, on a legged one, its policy's spawn lunge — so that the
+#: realign that follows can seed AMCL with a pose that has stopped moving (AR-19).
+#: Env name unchanged (an operator knob W1/W2 already measure with), so a different
+#: budget still needs no rebuild.
 REALIGN_SETTLE_ENV = "CV_REALIGN_SETTLE_S"
 DEFAULT_REALIGN_SETTLE_S = 3.0
 
@@ -505,7 +508,10 @@ def _attach_optional_streams(
 
 
 def _settle_world(adapter: object, settle_s: float) -> float:
-    """Pump the sim ``settle_s`` SIM-seconds after a realign; return the time reached.
+    """Pump the sim ``settle_s`` SIM-seconds after a restage; return the time reached.
+
+    Runs BEFORE the realign (AR-19), because what the realign has to tell the SUT
+    is where the robot came to rest — not where it was put down.
 
     SIM seconds (D-F) because that is what the teleported robot's physics and
     AMCL's first re-convergence actually run on. The wall cap is the escape
@@ -556,7 +562,11 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         observe,
     )
     from cv_infra.runner.go2_wiring import attach_policy_loop  # noqa: PLC0415
-    from cv_infra.runner.realign import SutRealigner  # noqa: PLC0415
+    from cv_infra.runner.realign import (  # noqa: PLC0415
+        SutRealigner,
+        realign_seed,
+        realign_seed_log,
+    )
     from cv_infra.runner.recording import (  # noqa: PLC0415
         LoopVideoRecorder,
         RosbagRecorder,
@@ -721,11 +731,29 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 sim.emit_sim_config(identity_key)  # per-sample applied-settings line
             iter_watch.end("restage")
 
-            iter_watch.begin("realign")
             sim_time_start_s = adapter.sim_time_s
-            realign = realigner.realign(pose)
-            print(f"[cv-runner] sut realign: {realign}", flush=True)
+            # SETTLE FIRST, THEN REALIGN (AR-19). The reverse order — the one this
+            # carrier shipped through W3 — seeds AMCL and only then lets the world
+            # move, so a robot that settles somewhere else (a legged one walks:
+            # measured 0.97 m, U1 §6-1) starts every mission believing it is a
+            # metre behind itself. Nothing else changes: both steps already pumped
+            # the sim, and both still run before the record swap below, so the
+            # boundary's contact reports stay charged to the retired sample.
+            iter_watch.begin("settle")
             _settle_world(adapter, settle_s)
+            iter_watch.end("settle")
+
+            iter_watch.begin("realign")
+            # The seed is the pose the sampler JUST wrote (the settle's last
+            # physics step), not the declared coordinate — ``sampler.record`` is
+            # still the retired accumulator here, which is exactly the one those
+            # steps appended to.
+            seed, seed_source = realign_seed(pose, sampler.latest_pose())
+            realign = realigner.realign(seed)
+            print(
+                f"[cv-runner] sut realign: {realign} {realign_seed_log(seed, seed_source)}",
+                flush=True,
+            )
             iter_watch.end("realign")
 
             iter_watch.begin("readiness")

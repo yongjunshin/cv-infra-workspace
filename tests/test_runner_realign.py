@@ -2,6 +2,10 @@
 
 Two surfaces, both of which fail SILENTLY in production if they are wrong:
 
+* ``realign_seed`` — WHICH pose the burst carries (AR-19). Seeding the declared
+  spawn coordinate instead of the pose the robot settled at is the failure U1
+  measured in the field: it does not raise, it just starts every sample's mission
+  with a belief ~1 m behind the robot.
 * ``initialpose_fields`` — the AMCL seed's arithmetic (planar yaw -> quaternion,
   SIM-time stamp split, nav2's covariance literals). A wrong stamp or a wrong
   quaternion does not raise; it just re-seeds AMCL somewhere else and the next
@@ -30,12 +34,27 @@ from cv_infra.runner.realign import (
     INITIALPOSE_TOPIC,
     REALIGN_OBSERVATION_KEYS,
     REALIGN_PUBLISH_COUNT,
+    SEED_SOURCE_DECLARED,
+    SEED_SOURCE_GT,
+    SEED_SOURCE_NONE,
     SutRealigner,
     apply_initialpose_fields,
     initialpose_fields,
+    realign_seed,
+    realign_seed_log,
 )
+from cv_infra.runner.telemetry import PoseSample
 
 POSE = {"x": -6.0, "y": -1.5, "yaw": math.pi / 2}
+
+
+def _gt(x: float, y: float, yaw: float, z: float = 0.23) -> PoseSample:
+    """A GT sample the sim's physics callback would have written (w-first quat)."""
+    return PoseSample(
+        sim_time_s=41.72,
+        position=(x, y, z),
+        orientation_wxyz=(math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +167,77 @@ def _realigner(node, steps: list) -> SutRealigner:
         pose_msg_type=_pose_msg_type,
         clear_srv_type=_FakeClearSrv,
     )
+
+
+# --------------------------------------------------------------------------- #
+# realign_seed — WHICH pose is seeded (AR-19). The failure it fixes is silent.
+# --------------------------------------------------------------------------- #
+def test_the_seed_is_the_pose_the_robot_settled_at_not_the_declared_one():
+    """U1 §6-1/§10-2: the sim PUT the go2 at (-6.0, -1.0, pi/2), its policy then
+    lunged it to (-6.048, -0.029, 1.574) before AMCL could see the motion. The
+    seed must be the second pair of numbers — that is the whole repair."""
+    seed, source = realign_seed(
+        {"x": -6.0, "y": -1.0, "yaw": math.pi / 2}, _gt(-6.048, -0.029, 1.574)
+    )
+    assert source == SEED_SOURCE_GT == "post-settle-GT"
+    assert seed == {
+        "x": pytest.approx(-6.048),
+        "y": pytest.approx(-0.029),
+        "yaw": pytest.approx(1.574),
+    }
+
+
+def test_the_seed_carries_the_settled_orientation_too():
+    """A lunge turns the robot as well as moving it, and an AMCL seeded with the
+    right position and the wrong heading re-converges no better than one seeded
+    with neither. Half a radian off the declared yaw, read out of the QUATERNION."""
+    seed, _ = realign_seed(POSE, _gt(-6.0, -1.5, math.pi / 2 - 0.5))
+    assert seed["yaw"] == pytest.approx(math.pi / 2 - 0.5)
+
+
+def test_a_settled_carter_seeds_exactly_what_it_declared():
+    """Equivalence arm (the reason this change is safe for the wheeled fixture).
+
+    A carter is reposed to its declared pose and does not move during the settle
+    (no onboard policy, joints pre-set), so its GT sample IS the declared pose and
+    the seed is unchanged. Asserted on the WIRE fields, not just the dict: what
+    must be identical is the message AMCL receives.
+    """
+    seed, source = realign_seed(POSE, _gt(POSE["x"], POSE["y"], POSE["yaw"]))
+    assert source == SEED_SOURCE_GT  # the source is honest even when the values match
+    from_gt = initialpose_fields(seed, 12.25)
+    from_declared = initialpose_fields(POSE, 12.25)
+    assert set(from_gt) == set(from_declared)
+    for key in ("position_x", "position_y", "orientation_z", "orientation_w"):
+        assert from_gt[key] == pytest.approx(from_declared[key]), key
+    for key in ("frame_id", "stamp_sec", "stamp_nanosec", "covariance"):
+        assert from_gt[key] == from_declared[key], key
+
+
+def test_the_seed_falls_back_to_the_declared_pose_when_nothing_was_sampled():
+    """No GT sample = the sampler never bound / the sim never stepped. Falling back
+    to the declaration keeps the old behaviour exactly; inventing a pose (or
+    seeding the origin) would be worse than the bug this replaces."""
+    seed, source = realign_seed(POSE, None)
+    assert (seed, source) == (POSE, SEED_SOURCE_DECLARED)
+    assert seed is not POSE  # a copy: the caller's declared pose stays untouched
+
+
+def test_an_undeclared_pose_is_still_not_seeded_from_gt():
+    """Whether AMCL is re-seeded at all stays the SCENARIO's call. A carrier that
+    started seeding pose-less batches would change the meaning of every scenario
+    that deliberately declares none (``initialpose_subscribers = None``)."""
+    assert realign_seed(None, _gt(1.0, 2.0, 0.0)) == (None, SEED_SOURCE_NONE)
+
+
+def test_the_seed_log_names_the_values_and_their_source():
+    """The audit fragment AR-19 asks for: counters prove a burst was PUBLISHED,
+    never what it said (p6c3 T3 §9-2: 12/12 counters, 1/12 correct belief)."""
+    seed, source = realign_seed(POSE, _gt(-6.048, -0.029, 1.574))
+    assert realign_seed_log(seed, source) == (
+        "realign_seed=(-6.0480,-0.0290,1.5740) source=post-settle-GT"
+    )
+    assert realign_seed_log(None, SEED_SOURCE_NONE) == "realign_seed=none source=not-declared"
 
 
 # --------------------------------------------------------------------------- #
