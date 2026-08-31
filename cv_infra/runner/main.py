@@ -43,6 +43,7 @@ from cv_infra.oracles.base import ENTRY_POINT_GROUP, load_oracle
 # NOT oracle composition (that stays loader-mediated, D-1 (4)): this is the single
 # home of the position-tolerance decision, which the ``time_to_goal_s`` metric must
 # share with the reached_goal verdict (G-25 — two read sites drifted before).
+from cv_infra.oracles.no_collision import resolve_collision_scope
 from cv_infra.oracles.reached_goal import resolve_position_tolerance
 from cv_infra.runner.evaluate import (
     VERDICT_ERROR,
@@ -772,12 +773,18 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # the runner log as well as from result.json's criterion detail.
         tolerance = resolve_position_tolerance(criteria)
         print(f"[cv-runner] reached_goal {tolerance.audit}", flush=True)
+        # Same one-home rule for the collision meaning (AR-25): the metric below
+        # and the oracle verdict must be taken with the SAME scope, so both call
+        # the oracle's resolver. Printed for the same reason as the tolerance —
+        # which meaning judged this run is auditable from the runner log.
+        collision_scope = resolve_collision_scope(criteria)
+        print(f"[cv-runner] no_collision scope={collision_scope}", flush=True)
         goal_xyz = (float(goal[0]), float(goal[1]), float(goal[2]))
         metrics = {
             "time_to_goal_s": time_to_goal_s(record.gt_pose_samples, goal_xyz, tolerance.value_m),
             "min_clearance_m": min_clearance_m(),
             "collision_count": count_real_collisions(
-                record.contact_events, chassis_path, excluded_paths
+                record.contact_events, chassis_path, excluded_paths, collision_scope
             ),
             "path_len_m": path_length_m(record.gt_pose_samples),
         }

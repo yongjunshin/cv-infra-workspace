@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # 3-vector / quaternion aliases keep the pure math readable without numpy.
@@ -94,8 +95,44 @@ def _matches(actor_path: str, excluded: str) -> bool:
     return actor_path == excluded or actor_path.startswith(excluded.rstrip("/") + "/")
 
 
+#: ``collision_scope`` values (M1 ``NoCollisionParams``) — WHAT counts as "the
+#: robot" in the reduction below. The default lives with the oracle
+#: (``oracles/no_collision.DEFAULT_COLLISION_SCOPE``), the meanings live here.
+SCOPE_CHASSIS = "chassis"
+SCOPE_ROBOT = "robot"
+COLLISION_SCOPES = (SCOPE_CHASSIS, SCOPE_ROBOT)
+
+
+def collision_scope_matcher(chassis_path: str, scope: str) -> Callable[[str], bool]:
+    """ "Is this actor prim the robot?" — the ONE predicate the two scopes differ in.
+
+    * ``"chassis"`` — the actor IS the declared chassis prim, matched EXACTLY.
+      This is the pre-AR-12 reduction, kept verbatim (not "prefix match against
+      the chassis"): a wheeled robot's scenarios were written against it, and
+      widening it even by one prim level re-admits the wheel<->floor pairs the
+      articulation aggregation delivers.
+    * ``"robot"`` — the actor is anywhere in the chassis prim's SUBTREE
+      (``robot_subtree``), which is the only way a legged robot's foot/calf
+      contacts are attributable to the robot at all (AR-12).
+
+    An unknown scope raises rather than silently falling back to a default: the
+    contract's ``Literal`` already rejects a typo at admit time, and a value
+    arriving through some other path (a hand-built criteria dict) must not
+    quietly change what "collision" means.
+    """
+    if scope == SCOPE_ROBOT:
+        robot = robot_subtree(chassis_path)
+        return lambda actor: _matches(actor, robot)
+    if scope != SCOPE_CHASSIS:
+        raise ValueError(f"collision_scope must be one of {list(COLLISION_SCOPES)} (got {scope!r})")
+    return lambda actor: actor == chassis_path
+
+
 def robot_subtree(chassis_path: str) -> str:
     """The ROBOT's prim subtree, derived from the declared chassis prim (AR-12).
+
+    Reached only under ``collision_scope: robot`` (AR-25) — the default scope
+    matches the chassis prim exactly and never widens.
 
     ``/World/Go2/base`` -> ``/World/Go2``; ``/World/Nova_Carter_ROS/chassis_link``
     -> ``/World/Nova_Carter_ROS``. The chassis prim's PARENT is the robot, which
@@ -114,36 +151,50 @@ def robot_subtree(chassis_path: str) -> str:
 
 
 def count_real_collisions(
-    events: list[ContactEvent], chassis_path: str, excluded_paths: list[str]
+    events: list[ContactEvent],
+    chassis_path: str,
+    excluded_paths: list[str],
+    scope: str = SCOPE_CHASSIS,
 ) -> int:
-    """Robot-vs-world collision count with ground/self filtered out (D-E, AR-12).
+    """Robot-vs-world collision count with ground/self filtered out (D-E, AR-25).
 
     Measured (p2c5 run1): the ContactReportAPI Applied to the chassis body — an
     ARTICULATION ROOT on the carter — aggregates contact reports of the WHOLE
     articulation, so wheel/caster<->ground pairs arrive too (7344 events on a
     clean run, neither actor the chassis).
 
-    An event counts when SOME prim of the robot subtree (``robot_subtree``) is an
-    actor AND its partner does not match any ``excluded_paths`` entry (ground
-    plane / designated floor / robot self-bodies). Matching is by exact path or
-    prim-subtree prefix, so a whole floor/robot subtree excludes with one entry —
-    which is what keeps wheel-on-floor contact from reading as a collision.
+    An event counts when SOME prim the ``scope`` calls the robot
+    (``collision_scope_matcher``) is an actor AND its partner does not match any
+    ``excluded_paths`` entry (ground plane / designated floor / robot
+    self-bodies). Exclusion matching is by exact path or prim-subtree prefix
+    (unchanged in both scopes), so a whole floor/robot subtree excludes with one
+    entry.
 
-    AR-12 (2026-09-01) widened "the robot" from the chassis prim alone to its
-    subtree, because the narrow form was measured to answer FALSE for a whole
-    class of real collisions: C1 dropped a go2 onto a box, it tripped and ended
-    upside down (roll 3.14) after 263 leg<->box contacts, and ``collision_count``
-    was **0** — every actor was a foot or a calf, never ``/World/Go2/base``. The
-    carter meaning is preserved by its own declaration: its scenarios exclude
-    ``/World/Nova_Carter_ROS`` (self) and the ground plane, so wheel<->floor and
-    wheel<->self stay filtered while wheel<->obstacle now counts, which is what
-    "the robot collided" always meant.
+    WHY THE SCOPE IS AN INPUT (AR-25, 2026-09-01), i.e. why neither meaning is
+    "the" meaning:
+
+    * AR-12 widened "the robot" from the chassis prim to its subtree because the
+      narrow form was measured to answer FALSE for a whole class of real
+      collisions: C1 dropped a go2 onto a box, it tripped and ended upside down
+      (roll 3.14) after 263 leg<->box contacts, and ``collision_count`` was
+      **0** — every actor was a foot or a calf, never ``/World/Go2/base``.
+    * That widening was then measured to BREAK the wheeled robot in the opposite
+      direction (C4 A/B, same host/scenario/cache, runner image the only
+      variable): carter's wheel<->floor pairs became robot-vs-world candidates
+      that its declared exclusions do not name by prim path, so a clean run went
+      pass/0 -> fail/3,780 and the built-in self-test failed with 12 collisions
+      on a PARKED robot.
+
+    So the scope is DECLARED per scenario (``no_collision.collision_scope``) and
+    defaults to ``"chassis"`` — the pre-AR-12 meaning, byte-identical, which is
+    what every wheeled scenario and the self-test stub were written against.
+    A legged scenario opts into ``"robot"`` and declares its floor prims.
     """
-    robot = robot_subtree(chassis_path)
+    belongs = collision_scope_matcher(chassis_path, scope)
     count = 0
     for e in events:
         actors = (e.actor0_path, e.actor1_path)
-        if not any(_matches(actor, robot) for actor in actors):
+        if not any(belongs(actor) for actor in actors):
             continue  # neither actor belongs to the robot (foreign-pair report)
         # Determinate by construction (unlike contact_partners' pre-G-72 form):
         # the partner is picked POSITIONALLY, never by set-iteration order. A
@@ -151,7 +202,7 @@ def count_real_collisions(
         # actors are weighed against the exclusions — that is how "do not count
         # my own wheels touching my own chassis" is spelled today (the scenario
         # excludes the robot's own subtree).
-        outside = [actor for actor in actors if not _matches(actor, robot)]
+        outside = [actor for actor in actors if not belongs(actor)]
         if any(_matches(actor, ex) for actor in (outside or actors) for ex in excluded_paths):
             continue
         count += 1
