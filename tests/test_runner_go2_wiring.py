@@ -200,16 +200,35 @@ def test_a_policy_for_a_scene_with_no_such_slot_is_refused():
     assert "declares no 'locomotion_policy' slot" in str(excinfo.value)
 
 
-def test_a_declaration_the_wire_dropped_is_named_as_plane_skew():
-    """The request declares a policy but the JOB_SPEC carries no resolved path:
-    the honest report names the PLANE (the producer), not "you declared none" —
-    and refusing is what stops the job from silently running no policy at all."""
+def test_the_one_slot_rejection_names_both_causes_including_the_plane_that_drops_it():
+    """C2c §6-1 (their finding, C5's repair): a runner CANNOT see "the document
+    declared a policy the wire dropped" — see the measurement below — so the
+    branch that used to test ``request.sut.locomotion_policy`` could never fire.
+    Its information (name the PLANE, not the symptom — G-74) now lives in the one
+    rejection that does fire, which must therefore read correctly for BOTH a
+    request that declares nothing and one whose declaration never reached us."""
     declared = {"file": "policy.pt", "sha256": POLICY_SHA}
-    with pytest.raises(PolicyContractError) as excinfo:
-        go2_wiring.check_firmware_slot(_request(policy=declared), None)
-    message = str(excinfo.value)
-    assert go2_wiring.POLICY_PATH_KEY in message
-    assert "build_job_spec" in message
+    for request in (_request(), _request(policy=declared)):
+        with pytest.raises(PolicyContractError) as excinfo:
+            go2_wiring.check_firmware_slot(request, None)
+        message = str(excinfo.value)
+        assert "declares the 'locomotion_policy' firmware slot" in message
+        assert go2_wiring.POLICY_PATH_KEY in message  # what the wire is missing
+        assert "build_job_spec" in message  # ...and who puts it there
+        assert "sut.locomotion_policy" in message  # ...or what the document is missing
+
+
+def test_the_runner_never_sees_a_declaration_only_the_wire_pin():
+    """THE measurement the branch removal rests on (G-107: measure, do not
+    assert): ``parse_request`` re-nests ``sut_image_ref`` and nothing else, so the
+    restored model's ``sut.locomotion_policy`` is None even for a spec that
+    carries the full pin. The pin is the runner's only evidence a policy exists."""
+    from cv_infra.runner import main
+
+    spec = {**_wire_document(), **_spec()}
+    request, _ = main.parse_request(spec)
+    assert request.sut.locomotion_policy is None
+    assert go2_wiring.policy_pin(spec) == go2_wiring.PolicyPin("/scn/policy.pt", POLICY_SHA)
 
 
 def test_a_carter_request_passes_the_cross_check_untouched():

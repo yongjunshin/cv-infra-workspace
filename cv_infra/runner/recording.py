@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,15 @@ VIDEO_NAME = "recording.mp4"
 # adapter_config field: what an operator records for a diagnostic run is not
 # scenario wiring (same reasoning as the mp4 camera below).
 BAG_SENSORS_ENV = "CV_BAG_SENSOR_TOPICS"
+
+# The transform tree. These two names are NOT configurable: tf2 fixes them, and
+# every ROS consumer (rviz replay, costmap reconstruction, "where was the robot
+# when the camera saw this") reads them by those names. They are recorded for
+# EVERY robot — carter's come from the sample scene's OmniGraph, go2's from the
+# runner's own publishers (``go2_sensors.TF_TOPIC`` / ``TF_STATIC_TOPIC``, whose
+# spelling a test pins against this copy: G-25 ② mechanical guard on a
+# deliberate duplicate, since a recorder must not depend on one robot's module).
+TF_TOPICS = ("/tf", "/tf_static")
 
 # mp4 capture defaults (module policy, not consumer contract — the camera an
 # operator reviews is not scenario wiring; revisit at the P3 recording
@@ -73,16 +83,22 @@ def plan_artifacts(out_dir: str | Path) -> ArtifactPaths:
 # Pure planning helpers — CPU unit-test surface.
 # --------------------------------------------------------------------------- #
 def bag_topics(config: Ros2AdapterConfig, include_sensors: bool = False) -> list[str]:
-    """Topics the MCAP bag records: /clock (always — sim-time keying) + the nav
-    streams (odom fan-out + cmd_vel), and — opt-in only — the DECLARED sensor
-    streams.
+    """Topics the MCAP bag records: /clock (always — sim-time keying), the TF
+    tree, the nav streams (odom fan-out + cmd_vel), and — opt-in only — the
+    DECLARED sensor streams.
 
-    The default is unchanged: sensor topics stay out (artifact size; R12). With
-    ``include_sensors`` the topics come from ``adapter_config.sensors`` — the
+    ``/tf`` + ``/tf_static`` are in the DEFAULT set (C3 §7-2 found them missing):
+    without them the bag cannot be replayed in rviz, no costmap can be
+    reconstructed, and — on a composed scene — every sensor frame in the bag
+    names a frame nothing in the bag defines. They cost a few hundred bytes per
+    message against the /odom already in the set.
+
+    Sensor topics stay out by default (artifact size; R12). With
+    ``include_sensors`` they come from ``adapter_config.sensors`` — the
     scenario's own declaration, so a scenario that names a different lidar gets
-    that one and no topic literal lives here (R7).
+    that one and no SENSOR topic literal lives here (R7).
     """
-    topics = [config.clock_topic, *config.odom_topics, config.cmd_vel.topic]
+    topics = [config.clock_topic, *TF_TOPICS, *config.odom_topics, config.cmd_vel.topic]
     if include_sensors:
         topics += [sensor.topic for sensor in config.sensors]
     return list(dict.fromkeys(topics))  # dedupe, order-preserving
@@ -129,6 +145,34 @@ def bag_record_shell_cmd(bag_dir: Path, topics: list[str], setup: Path) -> list[
 _RECORDER_ENV_DROP = ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "PYTHONEXE")
 
 
+#: What rosbag2 prints when it cannot resolve a requested topic's message type.
+#: MEASURED (C5 workstation, ``rosbag2.log``)::
+#:
+#:   [WARN] [ROSBAG2_TRANSPORT]: Topic '/tf' has unknown type 'tf2_msgs/msg/
+#:   TFMessage' . Only topics with known type are supported. Reason: 'package
+#:   'tf2_msgs' not found, searching: [/opt/ros/jazzy]
+_UNKNOWN_TYPE_MARKER = "has unknown type"
+
+
+def skipped_topics(recorder_log: str) -> list[str]:
+    """Topics rosbag2 REFUSED to record, read back from its own log.
+
+    The recorder does not fail on an unrecordable topic: it warns once into its
+    own log file and records everything else, so the bag is quietly INCOMPLETE —
+    measured C5: ``/tf`` and ``/tf_static`` are asked for and absent, because
+    the image's rosbag2 apt layer carries no ``tf2_msgs`` typesupport, and the
+    only trace was a line in a file nobody opens. Reading it back turns that into
+    the runner's own loud line next to the artifact it describes (G-26: a feature
+    that did not engage must not read as an empty channel).
+    """
+    skipped = []
+    for line in recorder_log.splitlines():
+        head, marker, _ = line.partition(_UNKNOWN_TYPE_MARKER)
+        if marker and head.count("'") >= 2:
+            skipped.append(head.rsplit("'", 2)[-2])
+    return skipped
+
+
 def recorder_subprocess_env(base_env: dict | None = None) -> dict:
     """Child env for the rosbag2 subprocess: inherit all but the bundled-interpreter
     coupling keys (the sourced setup.bash rebuilds its own paths)."""
@@ -143,6 +187,25 @@ def capture_stride(sim_fps: float, video_fps: float) -> int:
     if video_fps <= 0:
         raise ValueError("video_fps must be > 0")
     return max(1, round(sim_fps / video_fps))
+
+
+def step_rate_hz(rendering_dt: float) -> float:
+    """How many times a second (SIM time) the step listeners fire.
+
+    ``SimRuntime.step()`` is ONE ``World.step(render=True)``, which advances the
+    world by ``rendering_dt`` (substepping physics at ``physics_dt`` inside it)
+    and calls ``on_step`` once. So the frame recorder's cadence is set by the
+    RENDER step, not by the physics step — the two stopped being the same number
+    when the go2 row started decimating the render (B-5).
+
+    This is the ``sim_fps`` the video recorders want: at 1/60 it returns the 60
+    they already defaulted to, and it is why a 200 Hz plant with a 4x render
+    decimation still produces a 10 fps mp4 that plays back in sim real time
+    instead of a 3.3x slow-motion one.
+    """
+    if rendering_dt <= 0:
+        raise ValueError("rendering_dt must be > 0")
+    return 1.0 / rendering_dt
 
 
 class RosbagRecorder:
@@ -169,6 +232,7 @@ class RosbagRecorder:
         )
         self._proc: subprocess.Popen | None = None
         self._log_file = None
+        self._log_path = self.paths.bag_dir.parent / "rosbag2.log"
 
     def start(self) -> None:
         setup = ros_setup_script(self.config.ros_distro)
@@ -178,14 +242,30 @@ class RosbagRecorder:
                 "MCAP backend is the M5 option-A layer (ros-jazzy-ros2bag + "
                 "rosbag2-storage-mcap; report deployment-2026-07-08-p2c5-rosbag2-layer)"
             )
+        # C3 §7-3, the SILENT half of this bug: ``ros2 bag record`` REFUSES an
+        # existing output folder ("Output folder already exists") and dies at
+        # once, but ``stop()`` then globs ``*.mcap`` and hands back the PREVIOUS
+        # run's file as this run's artifact — a stale bag wearing a fresh
+        # result's name. Refusing here is what makes that impossible: the dir is
+        # created by rosbag2 itself, so its existence always means somebody
+        # else's bag is in it. Loud + non-fatal (``_start_quiet`` degrades the
+        # artifact to None, P2-02) — a recording problem never poisons a verdict.
+        if self.paths.bag_dir.exists():
+            raise RecorderUnavailable(
+                f"rosbag2 output dir {self.paths.bag_dir} already exists — rosbag2 refuses "
+                "to write into an existing folder, and anything already in there belongs "
+                "to a PREVIOUS run (this job would have reported that stale .mcap as its "
+                "own artifact). Point RESULT_OUT at a fresh dir, or remove it"
+            )
         self.paths.bag_dir.parent.mkdir(parents=True, exist_ok=True)
         topics = bag_topics(self.config, self.include_sensors)
         # G-26 feature-on gate: the opt-in must be observable, or a knob that
         # silently did not engage reads as "the channel is empty".
         print(f"[cv-runner] bag topics ({len(topics)}): {topics}", flush=True)
-        # G-18 evidence culture: keep the recorder's own output as a file.
+        # G-18 evidence culture: keep the recorder's own output as a file (and
+        # read it back at stop — see ``skipped_topics``).
         self._log_file = open(  # noqa: SIM115 (lifetime spans the recording)
-            self.paths.bag_dir.parent / "rosbag2.log", "w", encoding="utf-8"
+            self._log_path, "w", encoding="utf-8"
         )
         self._proc = subprocess.Popen(  # pragma: no cover - needs the backend
             bag_record_shell_cmd(self.paths.bag_dir, topics, setup),
@@ -195,7 +275,13 @@ class RosbagRecorder:
         )
 
     def stop(self) -> Path:  # pragma: no cover - needs the backend
-        """SIGINT for a clean rosbag2 close; return the produced .mcap path."""
+        """SIGINT for a clean rosbag2 close; return the produced .mcap path.
+
+        The glob below can only ever see THIS run's files: ``start`` refused to
+        proceed if the dir already existed, so an .mcap under it was written by
+        the child that just closed (C3 §7-3). No .mcap at all stays a loud
+        RuntimeError — ``_stop_quiet`` turns it into a warning + a null artifact.
+        """
         if self._proc is not None:
             import signal  # noqa: PLC0415
 
@@ -208,10 +294,26 @@ class RosbagRecorder:
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
+        self._report_skipped_topics()
         mcaps = sorted(self.paths.bag_dir.glob("*.mcap"))
         if not mcaps:
             raise RuntimeError(f"rosbag2 produced no .mcap under {self.paths.bag_dir}")
         return mcaps[0]
+
+    def _report_skipped_topics(self) -> None:  # pragma: no cover - needs the backend
+        """Say out loud which requested topics are NOT in the bag (C5 measured)."""
+        if not self._log_path.is_file():
+            return
+        skipped = skipped_topics(self._log_path.read_text(encoding="utf-8", errors="replace"))
+        if skipped:
+            print(
+                f"[cv-runner] WARNING: rosbag2 could not record {skipped} — the runner "
+                "image's rosbag2 layer has no typesupport for their message type, so the "
+                f"bag under {self.paths.bag_dir} is INCOMPLETE (see rosbag2.log next to it; "
+                "the fix is an image layer, not a scenario)",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def abort(self) -> None:
         """Failure-path cleanup (idempotent): never leak the child process."""

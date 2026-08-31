@@ -65,6 +65,7 @@ from cv_infra.runner.sim_runtime import (
     obstacle_pool_plan,
     resolve_obstacle_asset,
     resolve_scene,
+    scene_row,
 )
 
 EXIT_PASS = 0
@@ -334,9 +335,15 @@ def sim_config_for(request: VerificationRequest) -> SimConfig:
       block is handed over as a plain dict, exactly like ``debug_obstacle``.
     * ``execution_settings.fixed_dt`` absent/None -> the 1/60 ``SimConfig``
       defaults stand (M3's wire contract: an undeclared knob leaves behaviour
-      unchanged); declared -> it drives physics AND rendering dt. This is an
+      unchanged); declared -> it drives the physics step. This is an
       HONESTY fix — the knob was riding ``identity_key`` while nothing read it
       — NOT a determinism improvement (D-8: the step was already fixed at 1/60).
+    * ``rendering_dt`` = the physics step times the SCENE's ``render_interval``
+      (B-5/AR-17). It is a property of the ROBOT/scene, not a consumer knob:
+      go2's 4 is the training cfg's own ``sim.render_interval``, and every other
+      scene declares 1, which reproduces the previous ``rendering_dt = fixed_dt``
+      exactly. Decoupling the two is what stops a 200 Hz plant from also being a
+      200 Hz RENDER (measured C3: RTF 0.318 with sensors; C2b: 1.72 at 4x).
     """
     pose = request.scenario.initial_pose
     config = SimConfig(
@@ -348,7 +355,7 @@ def sim_config_for(request: VerificationRequest) -> SimConfig:
     fixed_dt = request.execution_settings.fixed_dt
     if fixed_dt is not None:
         config.physics_dt = fixed_dt
-        config.rendering_dt = fixed_dt
+    config.rendering_dt = config.physics_dt * scene_row(request.scenario.scene).render_interval
     return config
 
 
@@ -587,7 +594,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         install_readonly_error_counter,
         observe,
     )
-    from cv_infra.runner.recording import RosbagRecorder, VideoRecorder, plan_artifacts
+    from cv_infra.runner.recording import (
+        RosbagRecorder,
+        VideoRecorder,
+        plan_artifacts,
+        step_rate_hz,
+    )
     from cv_infra.runner.ros_bridge import (
         bootstrap_bridge_env,
         enable_bridge,
@@ -730,7 +742,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         artifact_plan = plan_artifacts(result_path.parent)
         sampler.attach(sim.world)  # step 6: telemetry (callbacks only; bound above)
         rosbag = _start_quiet(RosbagRecorder(artifact_plan, adapter_config))  # step 6: MCAP
-        video = _start_quiet(VideoRecorder(artifact_plan))  # step 7: mp4
+        # step 7: mp4. The capture cadence follows the RENDER step (B-5: a
+        # decimated scene calls the step listeners less often), so the mp4 is
+        # 10 fps of sim time on every scene instead of only on a 60 Hz one.
+        video = _start_quiet(
+            VideoRecorder(artifact_plan, sim_fps=step_rate_hz(sim.config.rendering_dt))
+        )
         if video is not None:
             sim.on_step.append(video.capture_frame)
         trace.end(PHASE_MISSION_START)  # its elapsed_s IS the boot->mission wall

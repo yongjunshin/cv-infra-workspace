@@ -70,6 +70,36 @@ def test_go2_warehouse_declares_the_trained_robot_asset_and_its_slot():
     assert go2.firmware_slots == ("locomotion_policy",)
 
 
+def test_the_go2_row_carries_the_trained_stance_and_the_trained_render_interval():
+    """C5: both new fields are ROBOT properties taken from the measured training
+    contract, not numbers this layer invented — and both are absent from the
+    carter row, which is what keeps its meaning byte-identical."""
+    from cv_infra.runner.go2_constants import DEFAULT_JOINT_POS, RENDER_INTERVAL
+
+    go2 = sim_runtime.resolve_scene("go2_warehouse")
+    carter = sim_runtime.resolve_scene("nova_carter_warehouse")
+    # The stance a repose restores IS the offset the policy adds its actions to.
+    assert go2.default_joint_pos == DEFAULT_JOINT_POS
+    assert len(go2.default_joint_pos) == 12
+    # B-5/AR-17: the training cfg's own sim.render_interval, mirrored not chosen.
+    assert go2.render_interval == RENDER_INTERVAL == 4
+    # carter: wheels are not a stance, and it renders every step exactly as before.
+    assert carter.default_joint_pos == ()
+    assert carter.render_interval == 1
+
+
+def test_scene_row_answers_with_defaults_for_a_scene_it_cannot_resolve():
+    """A caller after one ROBOT PROPERTY must not pre-empt ``load_scene``'s
+    "unknown scene" error (the one that lists the known scenes where an operator
+    can act on it) — so an unknown name answers like a consumer's direct .usd
+    ref: this scene declares nothing special."""
+    assert sim_runtime.scene_row("go2_warehouse") is sim_runtime.SCENE_ASSETS["go2_warehouse"]
+    for ref in ("no_such_scene", "omniverse://assets/whatever.usd"):
+        row = sim_runtime.scene_row(ref)
+        assert row.render_interval == 1
+        assert row.default_joint_pos == ()
+
+
 def test_every_scene_row_is_internally_coherent():
     """Registry drift guard, held on CPU because every failure mode below only
     shows up mid-boot on the workstation, after the Isaac boot was paid."""
