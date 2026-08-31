@@ -208,6 +208,10 @@ class ParsedSpec:
 _UNIFORM_FIELDS: tuple[tuple[str, object], ...] = (
     ("interface.adapter_config", lambda p: p.adapter_config),
     ("sut.image_ref", lambda p: p.request.sut.image_ref),
+    # The 2nd SUT artifact (D2 2026-08-31), same treatment as the image it rides
+    # with: one carrier holds ONE SUT, and a sample judged against a different
+    # policy than sample 0 is a different SUT wearing sample 0's verdict.
+    ("sut.locomotion_policy", lambda p: p.request.sut.locomotion_policy),
     ("scenario.scene", lambda p: p.request.scenario.scene),
     ("scenario.robot", lambda p: p.request.scenario.robot),
     ("execution_settings.fixed_dt", lambda p: p.request.execution_settings.fixed_dt),
