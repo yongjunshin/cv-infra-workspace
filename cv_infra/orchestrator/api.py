@@ -646,9 +646,12 @@ def _materialize_envelope(
         # (derive.materialize_request) — a static document is returned
         # unchanged (same object), so this line is byte-identical for every
         # pre-p6 request; a randomized one yields sample `repeat_index`.
+        # go2 C2c: the admitted 2nd SUT artifact (resolved once at stage 5) rides
+        # along, so this plane's spec equals `cv-infra run`'s for the same document.
         job.job_spec = _job_spec_for(
             materialize_request(admitted_of[job.request_id].request, job.repeat_index),
             job_key(job),
+            locomotion_policy_path=admitted_of[job.request_id].locomotion_policy_path,
         )
         # p5c18 T4: the request identity key rides the job to the runner env, so the
         # job plane's own artifacts can name the request that produced them.

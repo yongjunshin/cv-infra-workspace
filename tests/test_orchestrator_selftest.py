@@ -414,9 +414,12 @@ def test_self_test_and_ordinary_submission_traverse_the_same_producers(tmp_path,
         fan_out_calls.append(tuple(pairs))
         return real_fan_out(pairs)
 
-    def spy_spec_for(request, job_id):
+    def spy_spec_for(request, job_id, **kwargs):
+        # ``**kwargs`` = the submit plane's optional ride-alongs (go2 C2c:
+        # locomotion_policy_path). Forwarded verbatim — this spy observes the
+        # call site, it must not change what the producer receives.
         spec_calls.append(job_id)
-        return real_spec_for(request, job_id)
+        return real_spec_for(request, job_id, **kwargs)
 
     monkeypatch.setattr(api, "fan_out_requests", spy_fan_out)
     monkeypatch.setattr(api, "_job_spec_for", spy_spec_for)

@@ -24,7 +24,9 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_job_spec(request: Any, job_id: str) -> dict[str, Any]:
+def build_job_spec(
+    request: Any, job_id: str, *, locomotion_policy_path: str | None = None
+) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
     The wire shape is the frozen Phase-2 M3->M2 seam (supervisor JOB_SPEC file
@@ -58,9 +60,28 @@ def build_job_spec(request: Any, job_id: str) -> dict[str, Any]:
     — measured 2026-08-05, a top-level ``fixed_dt`` is rejected with exit 2.
     Consuming the value is M2's; this producer only stops swallowing it.
 
+    ``locomotion_policy_path`` (D2 2026-08-31, wired 2026-09-01) is the 2nd SUT
+    artifact's RESOLVED absolute path — the value stage 5 computed at the only
+    place that knows the ride-along anchor (``loader.AdmittedRequest``), passed
+    in because this function is handed a request MODEL, which carries only the
+    relative ``file`` the user wrote. Both halves come from that one admission,
+    so the pair rides only when BOTH are present: the declaration
+    (``sut.locomotion_policy``, which supplies the digest — the document is the
+    single definition of what is pinned) and the resolved path. A caller with no
+    path emits nothing and the runner then says so loudly rather than running a
+    declared artifact silently (``runner/go2_wiring.check_firmware_slot``);
+    an undeclared policy leaves the wire byte-identical (the carter plane).
+    Flat keys, not a nested ``sut`` block, for the same reason ``sut_image_ref``
+    is flat, and named verbatim after the consumer's constants
+    (``go2_wiring.POLICY_PATH_KEY`` / ``POLICY_SHA_KEY`` — pinned equal in
+    ``tests/test_contract_locomotion_policy.py``; the contract may not import a
+    sibling, so the two literals are tied by a test instead, G-25).
+
     Callers (both are thin aliases of this function, no second assembly):
     ``cli/main._job_spec_from_request`` (M8 ``cv-infra run``) and
-    ``orchestrator/api._job_spec_for`` (M3 REST submit). That they resolve to
+    ``orchestrator/api._job_spec_for`` (M3 REST submit) — both forward their
+    ``AdmittedRequest.locomotion_policy_path``, which is what makes the two
+    planes emit the same spec for the same document. That they resolve to
     THIS definition is pinned structurally by
     ``tests/test_contract_job_spec.py``; the behavioural parity guard over both
     handles stays in ``tests/test_orchestrator_rest_glue.py``.
@@ -74,6 +95,10 @@ def build_job_spec(request: Any, job_id: str) -> dict[str, Any]:
             criterion.model_dump(exclude_none=True) for criterion in request.acceptance_criteria
         ],
     }
+    policy = request.sut.locomotion_policy
+    if policy is not None and locomotion_policy_path:
+        spec["locomotion_policy_path"] = locomotion_policy_path
+        spec["locomotion_policy_sha256"] = policy.sha256
     runner_knobs = request.execution_settings.model_dump(
         exclude_none=True, exclude={"repeats", "min_pass_ratio"}
     )

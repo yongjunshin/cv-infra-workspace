@@ -305,7 +305,9 @@ def _default_job_id(scenario_path: Path) -> str:
     return f"{scenario_path.stem}-{stamp}"
 
 
-def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
+def _job_spec_from_request(
+    request: Any, job_id: str, *, locomotion_policy_path: str | None = None
+) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
     Thin alias of the M1 definition (``contract.job_spec.build_job_spec``, which
@@ -314,11 +316,13 @@ def _job_spec_from_request(request: Any, job_id: str) -> dict[str, Any]:
     became an alias of the same function). Kept as a module-level function so
     the run path's lazy-import discipline holds: the contract stays OFF this
     module's import surface (--help must not pull it), and call sites/tests keep
-    the handle they already have.
+    the handle they already have. ``locomotion_policy_path`` is forwarded
+    verbatim (the admission's resolved 2nd SUT artifact) — this wrapper decides
+    nothing about it, exactly like the rest of the alias.
     """
     from cv_infra.contract.job_spec import build_job_spec
 
-    return build_job_spec(request, job_id)
+    return build_job_spec(request, job_id, locomotion_policy_path=locomotion_policy_path)
 
 
 def _render_contract_errors(err: Any) -> None:
@@ -516,7 +520,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # same seed, same index, same bytes). A static document is returned unchanged.
     from cv_infra.contract.derive import materialize_request
 
-    job_spec = _job_spec_from_request(materialize_request(admitted.request, 0), job_id)
+    # The 2nd SUT artifact rides as the resolved path admit computed (D2): this
+    # plane holds the AdmittedRequest, so it forwards — it re-derives nothing.
+    job_spec = _job_spec_from_request(
+        materialize_request(admitted.request, 0),
+        job_id,
+        locomotion_policy_path=admitted.locomotion_policy_path,
+    )
 
     out_dir = Path(args.out_dir)
     try:

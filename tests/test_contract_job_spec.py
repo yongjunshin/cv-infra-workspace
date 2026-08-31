@@ -81,15 +81,16 @@ def test_the_cli_plane_handle_delegates_to_the_contract_function(monkeypatch, ad
     seen: list[tuple] = []
     sentinel = {"job_id": "sentinel-not-a-real-spec"}
 
-    def spy(request, job_id):
-        seen.append((request, job_id))
+    def spy(request, job_id, *, locomotion_policy_path=None):
+        seen.append((request, job_id, locomotion_policy_path))
         return sentinel
 
     monkeypatch.setattr(job_spec_mod, "build_job_spec", spy)
-    out = cli_main._job_spec_from_request(admitted, "jid-7")
+    out = cli_main._job_spec_from_request(admitted, "jid-7", locomotion_policy_path="/scn/p.pt")
 
     assert out is sentinel
-    assert seen == [(admitted, "jid-7")]
+    # The 2nd SUT artifact's resolved path is forwarded too, not dropped (go2 C2c).
+    assert seen == [(admitted, "jid-7", "/scn/p.pt")]
 
 
 # --------------------------------------------------------------------------- #
