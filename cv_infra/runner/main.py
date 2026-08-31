@@ -64,6 +64,7 @@ from cv_infra.runner.sim_runtime import (
     SimConfig,
     obstacle_pool_plan,
     resolve_obstacle_asset,
+    resolve_scene,
 )
 
 EXIT_PASS = 0
@@ -399,6 +400,31 @@ def plan_obstacle_pool(obstacles: list[dict]) -> dict:
         raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
 
 
+def build_sensor_suite(request: VerificationRequest, criteria: dict) -> object | None:
+    """The runner-published sensor suite for a COMPOSED scene, or None (D-2).
+
+    Pre-boot, like the obstacle-asset resolution above and for the same reason:
+    an unknown scene name and a sensor declaration this runner cannot serve are
+    both bad input, and here they still cost 0 GPU seconds (exit 2) instead of
+    surfacing mid-boot as a platform failure.
+
+    ``chassis_path`` is the mount point (the sensors are children of the chassis
+    body, so they follow the robot for free) and it comes from the criteria view
+    — the same measured value the telemetry binds to, never a hardcoded scene
+    path (R7).
+    """
+    from cv_infra.runner.go2_sensors import sensor_suite_for  # noqa: PLC0415
+
+    try:
+        return sensor_suite_for(
+            resolve_scene(request.scenario.scene),
+            request.interface.adapter_config,
+            read_field(criteria, "chassis_path", ""),
+        )
+    except ValueError as exc:
+        raise BadJobSpec(f"scenario.scene / interface.sensors: {exc}") from exc
+
+
 def admit_firmware_slot(spec: dict, request: VerificationRequest):
     """Pre-boot firmware-slot admission (D-3) folded onto the bad-input path.
 
@@ -425,6 +451,22 @@ def load_firmware_slot(pin: object):
         return load_policy(pin)
     except PolicyContractError as exc:
         raise BadJobSpec(str(exc)) from exc
+
+
+def register_sensor_hooks(sim: object, sensors: object, sensor_topics: list[str]) -> None:
+    """Register the ONE pre-reset sensor hook this run needs — graph or runner.
+
+    The two are mutually exclusive and saying so in one place is the point: a
+    pre-wired scene has publish graphs to enable (FU-17) and no runner-published
+    streams, a COMPOSED scene has runner-published streams and no graph at all.
+    Running the FU-17 walk on a composed scene would find no publish node for any
+    declared topic and warn about every one of them — the "declared but
+    publisher-less" alarm firing on a world where the runner IS the publisher.
+    """
+    if sensors is not None:
+        sim.pre_reset.append(sensors.bind)  # authors the camera/lidar prims
+    elif sensor_topics:
+        sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
 
 
 def artifact_paths(mcap_path: object, mp4_path: object) -> dict[str, str | None]:
@@ -575,6 +617,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # is pure; the pre-reset hooks below only execute it.
     obstacles = obstacle_specs(request)
     obstacle_pool = plan_obstacle_pool(obstacles)
+    # D-2: a scene the runner COMPOSES (go2) ships no vendor ROS graph — not even
+    # /clock — so the runner publishes the SUT-facing streams itself. None for a
+    # pre-wired sample scene (carter), whose OmniGraphs already do it.
+    sensors = build_sensor_suite(request, criteria)
     # C2b (D-3): the firmware slot is admitted pre-boot — the policy bytes are
     # hashed and TorchScript-loaded here, so a missing/tampered artifact is exit 2
     # at 0 GPU seconds. None = no slot declared (every carter job).
@@ -646,9 +692,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # FU-17: declared-sensor render products must be enabled PRE-play
         # (BEFORE world.reset() — mid-play toggling is a measured no-op), so
         # this rides the same pre_reset seam as the telemetry bind.
-        sensor_topics = [s.topic for s in adapter_config.sensors]
-        if sensor_topics:
-            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
+        # ...for a scene whose GRAPH publishes them; a COMPOSED scene gets the
+        # runner-published suite instead (one home for that choice).
+        register_sensor_hooks(sim, sensors, [s.topic for s in adapter_config.sensors])
         # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
         # key rides along so the applied-settings line names its request.
         sim.load_scene(identity_key)
@@ -659,6 +705,11 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)
+        # BEFORE the barrier, on purpose: in a composed world WE are the /clock
+        # source, and the barrier waits for clock FLOW (G-19) — attaching after it
+        # would deadlock the job against a clock nobody is publishing.
+        if sensors is not None:
+            _emit(sensors.attach(adapter.node, sim.on_step))
         if policy is not None:  # the SUT drives the policy over its own /cmd_vel
             subscribe_cmd_vel(adapter.node, adapter_config.cmd_vel, policy.set_command)
         # The barrier is where k=4 died 8/8 (p4c4 발견 ①). Its begin line is streamed
@@ -743,6 +794,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
         if sampler is not None:
             sampler.detach()
+        if sensors is not None:
+            # On EVERY path: "the camera never produced a frame" is exactly the
+            # kind of silence a failed run needs stated out loud (C0 §6-3).
+            _emit(sensors.detach())
         _abort_recorders(rosbag, video)  # failure paths: no child proc/writer leak
         adapter.teardown()  # step 11: clean shutdown (rclpy node + DDS domain leave)
         # step 12: the sim is deliberately NOT closed here (G-62). Isaac's
@@ -802,6 +857,18 @@ def _print_contact_partners(record, chassis_path: str) -> None:  # pragma: no co
         f"{len(partners)} distinct partner prim(s): {partners[:10]}",
         flush=True,
     )
+
+
+def _emit(lines) -> None:
+    """Print a collaborator's report lines — ONE home for the loop (G-25).
+
+    The sensor suite reports its topic inventory at attach and its per-stream
+    "did this ever carry data" verdict at detach; both are lists, both are
+    printed the same way, and neither belongs inline in ``run`` (which is at its
+    complexity ceiling).
+    """
+    for line in lines:
+        print(line, flush=True)
 
 
 def _abort_recorders(*recorders) -> None:
