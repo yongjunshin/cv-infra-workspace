@@ -104,6 +104,11 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 # T3.5 (PM ruling A): + nav-msgs/geometry-msgs typesupport — T3 bringup measured
 # `ros2 bag record` dropping /chassis/odom·/cmd_vel as "unknown type" without
 # them (T3 report §6-1; recommends-off keeps them typesupport-only).
+# go2 C4 (PM ruling A on questions/runner-2026-09-01-go2-c5-batch.md): + tf2-msgs,
+# same failure mode measured again on the workstation — the recorder logged
+# "Topic '/tf' has unknown type 'tf2_msgs/msg/TFMessage' … package 'tf2_msgs' not
+# found" and wrote a bag WITHOUT /tf·/tf_static while exiting 0. The runner already
+# requests both topics (M2 recording.py); only this layer was missing.
 #
 # ── apt VERSION PINS (CLAUDE §2-7; binding precondition of decision D-6) ──────
 # Shipping path = (C) REBUILD ON THE NEW HOST (decision 2026-08-14 D-6). Registry
@@ -114,7 +119,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 # is rolling, so the FU-10 image Id is the anchor") — with C there is no output
 # anchor left, so the apt versions must be pinned like every other input.
 #
-# WHAT IS PINNED: the 8 packages this layer NAMES. Their transitive closure is NOT
+# WHAT IS PINNED: the 9 packages this layer NAMES. Their transitive closure is NOT
 # pinned (247 more in the ROS install's manifest below + 15 in the keyring install).
 # Pinning the whole closure was rejected: those are mostly ubuntu-archive packages
 # whose superseded versions LEAVE the index on every security update, so a 270-pin
@@ -133,6 +138,19 @@ ENV NVIDIA_DRIVER_CAPABILITIES=all
 #     production cutover — docs/evidence-anchors.md); the measurement stands, the
 #     path to re-run it does not. All 7 were RE-CONFIRMED as still served by their
 #     archives on 2026-08-21 (per-pin dry-run, p5c20 F-7).
+#
+#   * ros-jazzy-tf2-msgs=0.36.21-1noble.20260615.112712 — measured 2026-09-01 (go2 C4)
+#     by ASKING THE ARCHIVE, because this package was NEVER installed here: reading a
+#     "last good image" (instrument A below) cannot answer for a package no image has.
+#     Query, verbatim (any image that already carries this layer's ros2.list works —
+#     the point is the fresh `apt-get update`, not the image):
+#       docker run --rm --user 0 --entrypoint bash cv-infra-runner:prod-b257ed3 -c \
+#         'apt-get update -qq && apt-cache policy ros-jazzy-tf2-msgs'
+#       -> Installed: (none); Candidate: 0.36.21-1noble.20260615.112712 (packages.ros.org
+#          noble/main amd64, the ONLY version in the table). Note the geometry2 stack
+#          carries its own version line (0.36.x), not the 5.3.8 of the *_msgs above.
+#     The same call re-confirmed ros-jazzy-geometry-msgs / ros-jazzy-ros2bag as still
+#     served at the pinned versions on this date.
 #
 #   * curl=8.5.0-2ubuntu10.13 — measured 2026-08-27 (p6c5) by ASKING THE ARCHIVE from
 #     this image's own stage-2 base, because the previous pin (8.5.0-2ubuntu10.12) had
@@ -228,6 +246,7 @@ RUN set -eu; \
         ros-jazzy-nav-msgs=5.3.8-1noble.20260615.112021 \
         ros-jazzy-geometry-msgs=5.3.8-1noble.20260615.110340 \
         ros-jazzy-sensor-msgs=5.3.8-1noble.20260615.112429 \
+        ros-jazzy-tf2-msgs=0.36.21-1noble.20260615.112712 \
     || { echo "ERROR: a pinned ros-jazzy version above is no longer served by" \
               "packages.ros.org (that repo is rolling and withdraws superseded" \
               "versions). RE-PIN: read the versions off the last good runner image" \
