@@ -556,6 +556,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     exit 3 — never a silently short batch.
     """
     from cv_infra.contract.schema import Artifacts  # noqa: PLC0415
+    from cv_infra.oracles.no_collision import resolve_collision_scope  # noqa: PLC0415
     from cv_infra.oracles.reached_goal import resolve_position_tolerance  # noqa: PLC0415
     from cv_infra.runner.adapter.ros2 import Ros2Adapter  # noqa: PLC0415
     from cv_infra.runner.boot_trace import (  # noqa: PLC0415
@@ -873,6 +874,12 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             goal = read_field(criteria, "goal_position")
             tolerance = resolve_position_tolerance(criteria)
             print(f"[cv-runner] reached_goal {tolerance.audit}", flush=True)
+            # Per SAMPLE, unlike the chassis/exclusions above (those are
+            # ``_UNIFORM_FIELDS`` because the sampler BINDS them once, pre-boot).
+            # The scope is reduction-only, so it is read where the reduction
+            # happens — from the same criteria the oracle is about to judge with.
+            collision_scope = resolve_collision_scope(criteria)
+            print(f"[cv-runner] no_collision scope={collision_scope}", flush=True)
             goal_xyz = (float(goal[0]), float(goal[1]), float(goal[2]))
             metrics = {
                 "time_to_goal_s": time_to_goal_s(
@@ -880,7 +887,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 ),
                 "min_clearance_m": min_clearance_m(),
                 "collision_count": count_real_collisions(
-                    telemetry.contact_events, chassis_path, excluded_paths
+                    telemetry.contact_events, chassis_path, excluded_paths, collision_scope
                 ),
                 "path_len_m": path_length_m(telemetry.gt_pose_samples),
             }

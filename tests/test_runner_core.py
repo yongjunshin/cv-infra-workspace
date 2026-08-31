@@ -170,11 +170,10 @@ def test_collision_filter_empty_is_zero():
 def test_collision_filter_keeps_carter_meaning_when_the_scenario_declares_its_exclusions():
     # Measured p2c5 run1: ContactReportAPI on the chassis (an articulation root)
     # aggregates WHOLE-robot reports — wheel<->ground pairs arrived 7344x on a
-    # clean run. AR-12 widened the reduction from "the chassis prim" to "the
-    # robot subtree", so what keeps those off the count is now the DECLARED
-    # exclusion list — which every carter scenario ships (measured, e.g.
-    # cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml: the robot subtree
-    # + the warehouse ground plane).
+    # clean run. Under the DEFAULT scope (AR-25) those are dropped because
+    # neither actor IS the chassis prim; the declared exclusions are the second
+    # line of defence (and the only one under ``scope: robot``, which is what C4
+    # measured going wrong — see tests/test_oracle_collision_scope.py).
     excluded = ["/World/carter", "/World/GroundPlane"]
     events = [
         ContactEvent(0.1, "/World/carter/wheel_left", "/World/GroundPlane/collisionPlane"),
@@ -182,14 +181,18 @@ def test_collision_filter_keeps_carter_meaning_when_the_scenario_declares_its_ex
         ContactEvent(0.3, CHASSIS, "/World/obstacle_box"),  # real chassis hit still counts
     ]
     assert telemetry.count_real_collisions(events, CHASSIS, excluded) == 1
+    assert telemetry.count_real_collisions(events, CHASSIS, []) == 1  # the scope did it
 
 
 def test_ar12_counts_a_leg_hitting_an_obstacle_the_chassis_never_touched():
     # C1 MEASURED the defect this closes: a go2 dropped onto a 0.10 m box logged
     # 263 leg<->box contacts and ended upside down (roll 3.14), and the
-    # pre-AR-12 reduction reported collision_count == 0 — every actor was a foot
-    # or a calf, never ``/World/Go2/base``. The grounds are excluded exactly as
-    # C1's measured canon declares them (two floor prims, differing case).
+    # chassis-only reduction reported collision_count == 0 — every actor was a
+    # foot or a calf, never ``/World/Go2/base``. The grounds are excluded exactly
+    # as C1's measured canon declares them (two floor prims, differing case).
+    # AR-25 made the widening OPT-IN (C4 measured it breaking wheeled robots the
+    # other way), so this is now what a legged scenario DECLARES; the default and
+    # the trade between the two live in tests/test_oracle_collision_scope.py.
     grounds = [
         "/World/GroundPlane/collisionPlane",
         "/World/Warehouse_Empty_small_realtime/GroundPlane/CollisionPlane",
@@ -200,7 +203,8 @@ def test_ar12_counts_a_leg_hitting_an_obstacle_the_chassis_never_touched():
         ContactEvent(0.3, "/World/Go2/FL_calf", "/World/cv_obstacles/box_0"),  # counted
         ContactEvent(0.4, "/World/Go2/base", "/World/cv_obstacles/box_0"),  # counted
     ]
-    assert telemetry.count_real_collisions(events, "/World/Go2/base", grounds) == 2
+    scope = telemetry.SCOPE_ROBOT
+    assert telemetry.count_real_collisions(events, "/World/Go2/base", grounds, scope) == 2
 
 
 def test_the_robot_subtree_is_the_chassis_parent_and_never_the_whole_world():
@@ -213,7 +217,8 @@ def test_the_robot_subtree_is_the_chassis_parent_and_never_the_whole_world():
     assert telemetry.robot_subtree("/World/Go2") == "/World/Go2"
     assert telemetry.robot_subtree("/Go2") == "/Go2"
     shelf_hit = [ContactEvent(0.1, "/World/shelf_a", "/World/forklift")]
-    assert telemetry.count_real_collisions(shelf_hit, "/World/Go2", []) == 0
+    scope = telemetry.SCOPE_ROBOT  # the degenerate case is only reachable here
+    assert telemetry.count_real_collisions(shelf_hit, "/World/Go2", [], scope) == 0
 
 
 # --------------------------------------------------------------------------- #

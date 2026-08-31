@@ -679,11 +679,33 @@ class NoCollisionParams(_ForbidExtra):
     ``chassis_path`` is REQUIRED at contract time — absent, the runner's
     ``telemetry.bind()`` raises mid-mission (P2-13 precondition); rejecting
     here keeps bad input out of the execution plane (NFR-INTAKE-003, D-E/R7).
+
+    ``collision_scope`` (AR-25) declares WHAT counts as "the robot" when the
+    contacts are reduced. ``None`` = "oracle default applies" (the
+    ``ReachedGoalParams`` convention: the default VALUE stays oracle-owned, M2 —
+    it is ``"chassis"``), and being null it is pruned out of the identity
+    projection, so growing this field moves NO existing request's
+    ``request_identity_key`` (the bar
+    ``tests/test_report_regression.py::CANONICAL_FIXTURE_KEY`` sets for an
+    optional field).
     """
 
     chassis_path: str = Field(min_length=1, examples=["/World/Nova_Carter_ROS/chassis_link"])
     collision_excluded_paths: list[str] = Field(
         default_factory=list, examples=[["/World/Nova_Carter_ROS"]]
+    )
+    collision_scope: Literal["chassis", "robot"] | None = Field(
+        default=None,
+        description=(
+            "Which prims are 'the robot': 'chassis' (default) counts contacts of "
+            "the declared chassis prim itself — what a wheeled robot's scenarios "
+            "are written against; 'robot' counts the chassis prim's whole subtree, "
+            "which a legged robot needs because its contact actors are feet/calves, "
+            "never the base (AR-12). 'robot' also makes wheel<->floor pairs "
+            "candidates, so a scenario declaring it must declare its floor prims in "
+            "collision_excluded_paths."
+        ),
+        examples=["robot"],
     )
 
 
