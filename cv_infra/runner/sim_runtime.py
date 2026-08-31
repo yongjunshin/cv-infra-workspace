@@ -1233,12 +1233,20 @@ class SimRuntime:
     def robot_articulation(self) -> object:  # pragma: no cover - GPU path (C2b measured)
         """The ``SingleArticulation`` view over the resolved robot prim, created ONCE.
 
-        Creation and initialization are SPLIT on purpose (C2b): the wrapper must
-        be constructed BEFORE ``world.reset()`` — the same probe-02/03 constraint
-        the telemetry tensor view lives under — while the physics handshake
-        (``initialize()``) only answers once the timeline plays. So this is a
-        ``pre_reset`` hook body for the policy path, and the CALLER initializes
-        after the reset.
+        Creation and initialization are SPLIT because the CALLER owns the timing,
+        and C2b MEASURED what that timing may be (workstation, go2_warehouse):
+
+        * pre-reset — ``dof_names`` answers ``None``, ``initialize()`` raises
+          ``AttributeError: 'NoneType' object has no attribute
+          'create_articulation_view'``, and ``set_gains`` returns without doing
+          anything (a SILENT no-op, i.e. the worst of the three);
+        * post-reset — ``initialize()`` then ``dof_names`` (12), ``num_dof``,
+          ``set_gains``, ``get_world_pose``, velocities: all answer.
+
+        So the policy binds AFTER ``world.reset()``. Unlike the telemetry tensor
+        view (``SingleRigidPrim``, probe-02/03: invalid when created post-reset),
+        an articulation view created post-reset was measured to work — the same
+        window ``repose_robot`` has always created its view in.
 
         Shared with ``repose_robot`` (which creates+initializes it when it is the
         first user): one view per robot, because two wrappers over one

@@ -614,11 +614,9 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(staging.head_obstacles))
         if staging.sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(staging.sensor_topics))
-        if policy is not None:  # C2b: articulation view pre-reset (probe-02/03)
-            sim.pre_reset.append(lambda _world: sim.robot_articulation())
         sim.load_scene(identity_key)  # emits sample 0's sim_config line
         sampler.attach(sim.world)
-        if policy is not None:  # bind + physics callback, before anything pumps
+        if policy is not None:  # C2b: post-reset bind + physics callback (measured)
             attach_policy_loop(policy, sim)
         summary.doc["boot"]["scene_load_s"] = round(watch.end("scene_load"), 4)
 

@@ -195,12 +195,13 @@ def load_policy(pin: PolicyPin | None) -> Go2PolicyLoop | None:
 def attach_policy_loop(loop: Go2PolicyLoop, sim: object) -> None:
     """Bind the loop to the robot and drive it from EVERY physics step.
 
-    Call order is the measured one (C2b workstation arms, report §bind):
-    the articulation VIEW is created pre-reset (``SimRuntime.robot_articulation``
-    as a pre_reset hook — a view created after the scene's reset-time prim churn
-    is invalidated, probe-02/03), then ``initialize()`` + ``bind()`` here, after
-    ``world.reset()``, because both ``dof_names`` and the drive-gain write need a
-    live physics view.
+    Call order is the MEASURED one (C2b workstation ``bind`` arm — AR-14 asked
+    for both sides and this is the answer): everything here runs AFTER
+    ``world.reset()``, because pre-reset the articulation view answers
+    ``dof_names = None``, ``initialize()`` raises (no physics sim view yet) and
+    — worst of the three — ``set_gains`` returns having done NOTHING, which
+    would leave the sim's own PD silently fighting the policy (the exact failure
+    AR-6 is ordered to avoid). Post-reset all of it answers.
 
     Attached BEFORE the readiness barrier on purpose: the barrier pumps the sim
     for up to 180 s of sim time, and an unattached go2 spends all of it lying on

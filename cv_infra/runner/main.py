@@ -649,15 +649,11 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         sensor_topics = [s.topic for s in adapter_config.sensors]
         if sensor_topics:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
-        # C2b (D-3): the articulation VIEW rides the same pre-reset seam as the
-        # telemetry one (probe-02/03); bind/initialize happen after the reset.
-        if policy is not None:
-            sim.pre_reset.append(lambda _world: sim.robot_articulation())
         # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
         # key rides along so the applied-settings line names its request.
         sim.load_scene(identity_key)
-        # C2b: attach BEFORE the barrier — an unattached legged robot spends the
-        # whole readiness wait lying on the floor (C1 §6-3).
+        # C2b: post-reset (measured) and BEFORE the barrier — an unattached
+        # legged robot spends the whole readiness wait lying on the floor (C1 §6-3).
         if policy is not None:
             attach_policy_loop(policy, sim)
         trace.begin(PHASE_ADAPTER_WIRE)
