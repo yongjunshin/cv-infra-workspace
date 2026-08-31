@@ -178,7 +178,7 @@ def sim_config_log_line(physics_dt, rendering_dt, seed, identity_key) -> str:
 @dataclass(frozen=True)
 class SceneAsset:
     """One resolvable scene: sample USD (relative to the Isaac assets root) plus
-    where the pre-wired robot lives in it.
+    where the robot lives in it — either pre-wired by the asset, or COMPOSED here.
 
     do-not-reinvent: Phase-2 scenes REUSE the official ``carter_warehouse_navigation``
     sample (warehouse + Nova Carter + ROS2 OmniGraph pre-wired — clock/TF/odom/
@@ -186,10 +186,39 @@ class SceneAsset:
     robot prim path inside the sample is NVIDIA's naming, so it is a candidate
     list resolved against the live stage (first existing wins) — a rename in a
     future asset rev degrades to a loud, listing error instead of a wrong pin.
+
+    The go2 rows (D-1) add the second shape: a ROBOT-FREE environment plus the
+    references that turn it into a world. Every field below defaults to "this
+    scene composes nothing", so the carter row keeps its exact meaning:
+
+    * ``extra_scene_usds`` — scene layers referenced at IDENTITY next to
+      ``scene_usd``. MEASURED reason (C0 probe A5/§4): the carter sample is
+      itself ``warehouse_with_forklifts.usd`` + ``Stage/warehouse_extras.usd``,
+      both at identity, so composing the SAME two layers keeps the carter
+      occupancy map (origin, resolution, extent) valid for a different robot.
+      Dropping the extras layer would leave the props out and silently skew the
+      map by exactly those props.
+    * ``robot_usd`` / ``robot_spawn_prim`` — the robot to reference and the prim
+      path it lands on, for a scene whose asset ships no robot. ``None`` means
+      the asset already placed one (carter).
+    * ``robot_spawn_z`` — drop height of that composed robot, MEASURED per robot
+      (see the go2 row). It exists because a referenced robot arrives at its own
+      origin, which for a legged asset is the standing base height, not the
+      floor; ``initial_pose`` cannot supply it (the contract is planar on
+      purpose — floor contact owns z).
+    * ``firmware_slots`` — DECLARATION ONLY (D-3): the named artifact slots this
+      robot runs onboard, e.g. go2's locomotion policy. The platform infers no
+      meaning from a slot here; it only lets the request's ``sut`` block be
+      checked against what the robot declares (consumed in C2, not in C1).
     """
 
     scene_usd: str
     robot_prim_candidates: tuple[str, ...] = ()
+    extra_scene_usds: tuple[str, ...] = ()
+    robot_usd: str | None = None
+    robot_spawn_prim: str | None = None
+    robot_spawn_z: float = 0.0
+    firmware_slots: tuple[str, ...] = ()
 
 
 SCENE_ASSETS: dict[str, SceneAsset] = {
@@ -198,7 +227,103 @@ SCENE_ASSETS: dict[str, SceneAsset] = {
         scene_usd="/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd",
         robot_prim_candidates=("/World/Nova_Carter_ROS", "/World/Carter_ROS"),
     ),
+    # go2 (D-1). Every path here is C0-probe MEASURED on the live 5.1.0 asset root
+    # (probe §4, all URLs HTTP 200) — never typed from memory, because a
+    # remembered path is a 404 at reference time, i.e. a boot failure after the
+    # GPU was already paid (G-28).
+    #
+    # ``scene_usd`` is the SAME warehouse the carter sample references, opened
+    # directly, and ``extra_scene_usds`` is the SAME extras layer: identity +
+    # identity, so the carter occupancy map transfers (probe A5).
+    #
+    # ``robot_usd`` is the IsaacLab-flavoured go2 — deliberately not the
+    # ``/Isaac/Robots/Unitree/Go2/go2.usd`` sibling: this is the asset the
+    # locomotion policy was TRAINED against (12 dof in the same order, 19 bodies),
+    # and the policy contract is what makes one of the two right (probe §3/§5).
+    "go2_warehouse": SceneAsset(
+        scene_usd="/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd",
+        extra_scene_usds=("/Isaac/Environments/Simple_Warehouse/Stage/warehouse_extras.usd",),
+        robot_usd="/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd",
+        robot_spawn_prim="/World/Go2",
+        robot_prim_candidates=("/World/Go2",),
+        # C1 MEASURED (this cycle, workstation, 3 s stance-hold settle from a
+        # standing drop, same seed/dt, one variable): the drop height decides how
+        # far the robot SLIDES before it is standing still, and that slide is
+        # error on every initial_pose the scenario declares.
+        #   z=0.40 (the training init height) -> slide 0.1170 m, pitch -0.069 rad
+        #   z=0.32                            -> slide 0.0197 m, pitch +0.013 rad
+        #   z=0.25                            -> slide 0.3373 m, pitch +0.378 rad
+        # 0.32 wins by 5.9x and is ADOPTED. It is not "lower is better": 0.25
+        # starts the feet already through their stance and the robot pitches.
+        # Settled base height is ~0.28 either way (C0 A7 measured 0.279~0.288).
+        robot_spawn_z=0.32,
+        # D-3: go2 runs its locomotion policy onboard -> one slot. carter = none.
+        firmware_slots=("locomotion_policy",),
+    ),
 }
+
+
+#: Scope every composed scene layer / robot lands under. It is ``/World`` because
+#: that is where the carter sample puts its own two warehouse layers (probe §4),
+#: and matching it is what keeps a composed stage readable next to the official one.
+SCENE_COMPOSE_ROOT = "/World"
+
+
+def extra_scene_prim_path(usd_path: str) -> str:
+    """``.../warehouse_extras.usd`` -> ``/World/warehouse_extras``. Pure.
+
+    The registry declares WHAT to compose, not where it lands: the prim name is
+    derived from the file stem so a composed stage reads like the official carter
+    sample, whose extras layer sits at exactly ``/World/warehouse_extras`` with an
+    identity xform. The stem is used VERBATIM — these names come from the registry
+    (a consumer's direct ``.usd`` ref composes nothing), so a stem that is not a
+    legal prim name fails loudly at reference time instead of being mangled into a
+    second, differently-named prim that no exclusion path would ever match.
+    """
+    return f"{SCENE_COMPOSE_ROOT}/{usd_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
+
+
+def robot_spawn_target(asset: SceneAsset) -> str:
+    """Prim path a DECLARED ``robot_usd`` is referenced onto — loud when incoherent.
+
+    Two registry-drift rejections, both pure and both here rather than on the GPU
+    path, because each one degrades into a confusing failure hours later:
+
+    * ``robot_usd`` without ``robot_spawn_prim`` — nothing to reference onto.
+    * a spawn prim absent from ``robot_prim_candidates`` — the composition would
+      succeed and then the robot RESOLVE (which only consults the candidates)
+      would fail with "sample asset naming changed?", pointing the reader at the
+      vendor asset instead of at the two registry fields that disagree.
+    """
+    if not asset.robot_spawn_prim:
+        raise ValueError(
+            f"scene registry row declares robot_usd={asset.robot_usd!r} but no "
+            "robot_spawn_prim — there is nowhere to reference the robot onto"
+        )
+    if asset.robot_spawn_prim not in asset.robot_prim_candidates:
+        raise ValueError(
+            f"scene registry row spawns the robot at {asset.robot_spawn_prim!r} but its "
+            f"robot_prim_candidates are {list(asset.robot_prim_candidates)} — the runner "
+            "would compose a robot it then refuses to find"
+        )
+    return asset.robot_spawn_prim
+
+
+#: Verbatim grep marker (G-26 prove-it-ran gate; pinned by a CPU test): a scene the
+#: runner ASSEMBLES has to say what it put on the stage. A missing extras layer is
+#: invisible in a screenshot and only surfaces as a map that no longer matches the
+#: world, which reads as "the SUT's localisation is bad" — the wrong suspect.
+SCENE_COMPOSE_LOG_MARKER = "scene_composed="
+
+
+def scene_compose_log_line(
+    extras: list[tuple[str, str]], robot: tuple[str, str, float] | None
+) -> str:
+    """One structured line naming every reference this run composed. Pure."""
+    return (
+        f"[cv-runner] {SCENE_COMPOSE_LOG_MARKER}{len(extras) + (robot is not None)} "
+        f"extras={extras} robot={robot}"
+    )
 
 
 def resolve_scene(scene_ref: str) -> SceneAsset:
@@ -458,6 +583,21 @@ OBSTACLE_ASSETS: dict[str, ObstacleAsset] = {
     # "car": the 5.1.0 asset root ships no passenger-car visual asset at all
     # (ruling ①, 5,529 non-thumbnail usd enumerated).
     "forklift": ObstacleAsset(usd_path="/Isaac/Props/Forklift/forklift.usd", z_offset=0.001907),
+    # _source C0 probe A13 (2026-09-01) — the go2 patrol TARGET, admitted by the
+    # same measured rule as the three above: bbox 1.765 x 0.441 x 1.732 m,
+    # bbox_min_z -0.1248 -> z_offset 0.1248 (adding it puts the feet exactly on
+    # 0.0, verified), collider C3 applies (5 Gprim / 5 Mesh), RigidBodyAPI and
+    # ArticulationRootAPI 0 -> the static-obstacle path accepts it. Live proof it
+    # is not a ghost: a dropped cube came to rest on its head at z=1.757 and a
+    # chest-height raycast hit.
+    # ⚠ It spawns in BIND POSE (arms out), so it is 1.76 m WIDE — a scenario
+    # placing one in an aisle must budget that, not a person's shoulder width.
+    # ⚠ Isaac People directory names and file names differ elsewhere in that tree
+    # (probe §6-8); this row is the pair that was actually fetched (HTTP 200).
+    "person": ObstacleAsset(
+        usd_path="/Isaac/People/Characters/F_Business_02/F_Business_02.usd",
+        z_offset=0.1248,
+    ),
 }
 
 
@@ -975,6 +1115,12 @@ class SimRuntime:
         # passed through VERBATIM; None keeps the honest ``identity_key=none``.
         self.emit_sim_config(identity_key)
 
+        # D-1: a robot-free environment becomes a world HERE — after the World
+        # exists (the window the p7 obstacle pool's identical recipe is measured
+        # in) and before the robot resolve below, which is what has to find it.
+        # A registry row that composes nothing (carter) makes this a no-op.
+        self._compose_scene(asset)
+
         if asset.robot_prim_candidates:
             stage = omni.usd.get_context().get_stage()
             for path in asset.robot_prim_candidates:
@@ -1000,6 +1146,53 @@ class SimRuntime:
             hook(self.world)
         self.world.reset()
         self._phase_end(PHASE_ROBOT_SPAWN, robot_prim=self.robot_prim_path)
+
+    def _compose_scene(self, asset: SceneAsset) -> None:  # pragma: no cover - GPU path
+        """Reference the DECLARED extra scene layers + robot onto the open stage (D-1).
+
+        do-not-reinvent, and not a new recipe either: this is the SAME
+        ``add_reference_to_stage`` + ``simulation_app.update()`` pump +
+        ``SingleXFormPrim.set_world_pose`` sequence ``spawn_obstacle_pool`` runs
+        (W0-measured — the pump is what makes the reference COMPOSE before
+        anything traverses it). Only the payload differs: a scene layer and a
+        robot instead of a prop.
+
+        The extras layers are written at NO transform on purpose. Identity is the
+        whole point (probe A5): the carter sample composes these same layers at
+        identity, so identity here is what keeps that occupancy map valid. The
+        robot is the one thing that gets a pose, and only its ``z`` — x/y/yaw
+        belong to ``initial_pose`` (planar contract), which runs right after this
+        and reads back exactly the z written here.
+        """
+        if not asset.extra_scene_usds and not asset.robot_usd:
+            return
+
+        import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
+        from isaacsim.core.prims import SingleXFormPrim  # noqa: PLC0415
+        from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: PLC0415
+
+        extras: list[tuple[str, str]] = []
+        for usd_path in asset.extra_scene_usds:
+            prim_path = extra_scene_prim_path(usd_path)
+            add_reference_to_stage(
+                usd_path=_asset_url(usd_path, "extra scene layer"), prim_path=prim_path
+            )
+            self.simulation_app.update()
+            extras.append((prim_path, usd_path))
+
+        robot = None
+        if asset.robot_usd:
+            prim_path = robot_spawn_target(asset)
+            add_reference_to_stage(
+                usd_path=_asset_url(asset.robot_usd, "robot asset"), prim_path=prim_path
+            )
+            self.simulation_app.update()
+            SingleXFormPrim(prim_path).set_world_pose(
+                position=np.array((0.0, 0.0, float(asset.robot_spawn_z)))
+            )
+            robot = (prim_path, asset.robot_usd, float(asset.robot_spawn_z))
+
+        print(scene_compose_log_line(extras, robot), flush=True)
 
     def apply_initial_pose(self, prim_path: str) -> None:  # pragma: no cover - GPU path
         """Move the asset-placed robot to the declared spawn pose (REQ-EXEC-002).
