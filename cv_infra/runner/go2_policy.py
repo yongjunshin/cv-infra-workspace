@@ -267,9 +267,15 @@ class Go2PolicyLoop:
     directions reversed — the sampler READS the articulation, this WRITES it:
 
     * ``load()`` — any time before the first step (no Isaac needed);
-    * ``bind(articulation)`` — a ``SimRuntime`` PRE-RESET hook: the dof-name
-      mapping and the drive-gain zeroing must be in place before physics parses
-      the articulation and before the first step applies a torque;
+    * ``bind(articulation)`` — after the articulation VIEW is initialized and
+      before the first step: it READS ``dof_names`` and WRITES the drive gains,
+      so it needs a live view, which places it at ``attach``'s position in the
+      sampler's shape, not ``bind``'s. The wrapper's CONSTRUCTION still belongs
+      pre-reset (probe-02/03: a view created after the scene's reset-time prim
+      churn is already invalidated) — that construction is the caller's, and
+      this class only asks for the object. If C2b measures that ``dof_names`` /
+      ``set_gains`` answer pre-reset too, the call can move earlier without any
+      change here (the loop keeps no reset-sensitive state);
     * ``on_physics_step()`` — from a ``world.add_physics_callback`` adapter.
       Deliberately argument-free: the callback's ``step_size`` is not used at
       all (the loop counts STEPS, not seconds — ``fixed_dt`` is the scenario's
@@ -291,6 +297,11 @@ class Go2PolicyLoop:
     ``set_gains`` (numpy backend ``expand_dims`` takes a sequence). If either
     turns out to need arrays, that is a one-line ``np.asarray`` at the call
     site — kept out of here so the loop stays numpy-free on the test plane.
+    (c) the drive-gain write is spelled
+    ``get_articulation_controller().set_gains(kps=, kds=)``. A wrong spelling
+    fails LOUDLY at bind (AttributeError) rather than leaving a second,
+    unmodelled PD controller fighting the policy — which is the failure this
+    ordering is chosen to avoid.
     """
 
     def __init__(self, policy_path: str | Path, expected_sha256: str) -> None:
@@ -336,7 +347,7 @@ class Go2PolicyLoop:
         self._policy.eval()
 
     def bind(self, articulation: object) -> None:
-        """PRE-reset hook: map dof names and force the sim drive gains to zero."""
+        """Map dof names and force the sim drive gains to zero (live view needed)."""
         names = tuple(str(n) for n in articulation.dof_names)
         if sorted(names) != sorted(JOINT_ORDER):
             raise RuntimeError(
@@ -394,7 +405,7 @@ class Go2PolicyLoop:
         instead of a 50 Hz staircase.
         """
         if self._articulation is None:
-            raise RuntimeError("bind(articulation) must run (pre-reset) before stepping")
+            raise RuntimeError("bind(articulation) must run before stepping")
         if self._policy is None:
             raise RuntimeError("load() must run before stepping — no policy is loaded")
 
