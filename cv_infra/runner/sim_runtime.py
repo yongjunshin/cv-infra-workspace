@@ -991,7 +991,8 @@ def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz, 
     return (
         f"[cv-runner] {REPOSE_LOG_MARKER}{prim_path} declared={declared} "
         f"position={position} orientation_wxyz={orientation_wxyz} "
-        f"(z from the scene asset; lin/ang + joint velocities zeroed, {joints})"
+        f"(z = the row's drop height when it declares one, else the asset's own; "
+        f"lin/ang + joint velocities zeroed, {joints})"
     )
 
 
