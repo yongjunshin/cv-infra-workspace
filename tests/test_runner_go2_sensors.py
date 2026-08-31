@@ -487,9 +487,12 @@ def test_the_inventory_names_every_topic_with_its_rate_frame_and_gating():
         "/scan",
     }
     assert by_topic["/clock"].gating == "always"
-    assert by_topic["/odom"].rate_hz == f"{ODOM_RATE_HZ:g}"
-    assert by_topic["/scan"].rate_hz == f"{SCAN_RATE_HZ:g}"
-    assert by_topic["/camera/image_raw"].rate_hz == f"{CAMERA_RATE_HZ:g}"
+    assert by_topic["/odom"].rate == f"{ODOM_RATE_HZ:g} Hz"
+    assert by_topic["/scan"].rate == f"{SCAN_RATE_HZ:g} Hz"
+    assert by_topic["/camera/image_raw"].rate == f"{CAMERA_RATE_HZ:g} Hz"
+    # three of the rates are not numbers, and the column says so in words
+    assert by_topic["/clock"].rate == "every step"
+    assert by_topic[TF_STATIC_TOPIC].rate == "latched"
     assert by_topic["/camera/image_raw"].gating == "declared"
     assert by_topic[TF_STATIC_TOPIC].frame == "base_link->go2_camera,base_link->go2_lidar"
     assert by_topic[TF_TOPIC].frame == "odom->base_link"

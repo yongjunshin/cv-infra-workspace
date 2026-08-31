@@ -589,7 +589,7 @@ class InventoryRow:
 
     topic: str
     type: str
-    rate_hz: str
+    rate: str  # "every step" | "latched" | "<n> Hz" — self-describing, see below
     frame: str
     gating: str  # "always" | "declared"
 
@@ -598,13 +598,17 @@ def topic_inventory(
     config: Ros2AdapterConfig, streams: dict[str, SensorStream], step_rate_hz: float | None = None
 ) -> list[InventoryRow]:
     """Every topic this suite publishes, in one table (log + report + U1 input)."""
-    clock_rate = "step" if step_rate_hz is None else f"{step_rate_hz:g}"
+    # The rate column is a STRING because three of its values are not numbers:
+    # /clock ticks once per sim step (whatever the scenario's fixed_dt makes
+    # that) and /tf_static is latched, not periodic. Rendering those as a number
+    # would invite a consumer to divide by it.
+    clock_rate = "every step" if step_rate_hz is None else f"{step_rate_hz:g} Hz"
     rows = [
         InventoryRow(config.clock_topic, "rosgraph_msgs/msg/Clock", clock_rate, "-", "always"),
         InventoryRow(
             TF_TOPIC,
             "tf2_msgs/msg/TFMessage",
-            f"{ODOM_RATE_HZ:g}",
+            f"{ODOM_RATE_HZ:g} Hz",
             f"{config.frames.odom}->{config.frames.base_link}",
             "always",
         ),
@@ -624,7 +628,7 @@ def topic_inventory(
         InventoryRow(
             topic,
             "nav_msgs/msg/Odometry",
-            f"{ODOM_RATE_HZ:g}",
+            f"{ODOM_RATE_HZ:g} Hz",
             f"{config.frames.odom}->{config.frames.base_link}",
             "always",
         )
@@ -637,7 +641,7 @@ def topic_inventory(
         STREAM_SCAN: (_LASER_SCAN_TYPE, SCAN_RATE_HZ),
     }
     rows.extend(
-        InventoryRow(stream.topic, types[key][0], f"{types[key][1]:g}", stream.frame, "declared")
+        InventoryRow(stream.topic, types[key][0], f"{types[key][1]:g} Hz", stream.frame, "declared")
         for key, stream in sorted(streams.items())
     )
     return rows
@@ -647,8 +651,7 @@ def inventory_lines(rows: list[InventoryRow]) -> list[str]:
     """The inventory as printable lines — one header, one per topic."""
     header = f"[cv-runner] {SENSOR_INVENTORY_LOG_MARKER}{len(rows)}"
     return [header] + [
-        f"[cv-runner]   {row.topic}  {row.type}  {row.rate_hz} Hz  frame={row.frame}"
-        f"  ({row.gating})"
+        f"[cv-runner]   {row.topic}  {row.type}  {row.rate}  frame={row.frame}" f"  ({row.gating})"
         for row in rows
     ]
 
