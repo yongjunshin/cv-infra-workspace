@@ -40,6 +40,94 @@ def test_scene_mapping_unknown_name_is_loud():
     assert "nova_carter_warehouse" in str(excinfo.value)  # lists known scenes
 
 
+# --------------------------------------------------------------------------- #
+# go2 (C1, D-1): a robot-free environment the runner COMPOSES into a world.
+# --------------------------------------------------------------------------- #
+def test_go2_warehouse_composes_the_same_two_layers_the_carter_sample_does():
+    """Probe A5 is the whole reason the go2 row looks like this: the carter sample
+    references ``warehouse_with_forklifts`` + ``Stage/warehouse_extras``, both at
+    identity, so composing the SAME pair keeps the carter occupancy map valid.
+    Dropping the extras layer is the silent failure this pins (a map skewed by
+    exactly the missing props reads as "the SUT localises badly")."""
+    carter = sim_runtime.resolve_scene("nova_carter_warehouse")
+    go2 = sim_runtime.resolve_scene("go2_warehouse")
+    assert go2.scene_usd.endswith("/Simple_Warehouse/warehouse_with_forklifts.usd")
+    assert go2.extra_scene_usds == (
+        "/Isaac/Environments/Simple_Warehouse/Stage/warehouse_extras.usd",
+    )
+    # The carter row must keep its exact pre-C1 meaning: it composes NOTHING.
+    assert carter.extra_scene_usds == () and carter.robot_usd is None
+    assert carter.robot_spawn_prim is None and carter.firmware_slots == ()
+
+
+def test_go2_warehouse_declares_the_trained_robot_asset_and_its_slot():
+    go2 = sim_runtime.resolve_scene("go2_warehouse")
+    # The IsaacLab-flavoured asset, i.e. the one the policy was trained against
+    # (probe §3/§5) — not the /Isaac/Robots/Unitree sibling.
+    assert go2.robot_usd == "/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd"
+    assert go2.robot_spawn_z > 0.0  # a legged robot is DROPPED, never floor-clipped
+    # D-3: the onboard artifact slot is DATA on the robot row (C2 consumes it).
+    assert go2.firmware_slots == ("locomotion_policy",)
+
+
+def test_every_scene_row_is_internally_coherent():
+    """Registry drift guard, held on CPU because every failure mode below only
+    shows up mid-boot on the workstation, after the Isaac boot was paid."""
+    for name, asset in sim_runtime.SCENE_ASSETS.items():
+        for usd_path in (asset.scene_usd, *asset.extra_scene_usds):
+            assert usd_path.startswith("/Isaac/"), name
+            assert usd_path.endswith((".usd", ".usda", ".usdz")), name
+        if asset.robot_usd is not None:
+            assert asset.robot_usd.startswith("/Isaac/"), name
+            # Composed onto a path the robot RESOLVE will actually try.
+            assert sim_runtime.robot_spawn_target(asset) in asset.robot_prim_candidates, name
+
+
+def test_extra_scene_prim_path_mirrors_the_carter_sample_naming():
+    # Probe §4: the official sample keeps its extras layer at exactly this path.
+    assert (
+        sim_runtime.extra_scene_prim_path(
+            "/Isaac/Environments/Simple_Warehouse/Stage/warehouse_extras.usd"
+        )
+        == "/World/warehouse_extras"
+    )
+
+
+def test_robot_spawn_target_is_loud_about_an_incoherent_row():
+    """Both rejections name the two registry fields that disagree — the composed
+    robot would otherwise be looked for under a name nothing put on the stage."""
+    no_prim = sim_runtime.SceneAsset(scene_usd="/Isaac/x.usd", robot_usd="/Isaac/r.usd")
+    with pytest.raises(ValueError) as excinfo:
+        sim_runtime.robot_spawn_target(no_prim)
+    assert "robot_spawn_prim" in str(excinfo.value)
+
+    mismatched = sim_runtime.SceneAsset(
+        scene_usd="/Isaac/x.usd",
+        robot_usd="/Isaac/r.usd",
+        robot_spawn_prim="/World/Go2",
+        robot_prim_candidates=("/World/Robot",),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        sim_runtime.robot_spawn_target(mismatched)
+    assert "/World/Go2" in str(excinfo.value) and "/World/Robot" in str(excinfo.value)
+
+
+def test_scene_compose_log_line_counts_what_it_put_on_the_stage():
+    # G-26: the marker is the grep gate, and the count covers BOTH shapes — a
+    # scene with a robot and one with layers only (a "0 composed" line is how a
+    # forgotten extras layer becomes visible instead of invisible).
+    with_robot = sim_runtime.scene_compose_log_line(
+        [("/World/warehouse_extras", "/Isaac/e.usd")], ("/World/Go2", "/Isaac/go2.usd", 0.4)
+    )
+    assert f"{sim_runtime.SCENE_COMPOSE_LOG_MARKER}2" in with_robot
+    assert "/World/warehouse_extras" in with_robot and "/World/Go2" in with_robot
+    layers_only = sim_runtime.scene_compose_log_line(
+        [("/World/warehouse_extras", "/Isaac/e.usd")], None
+    )
+    assert f"{sim_runtime.SCENE_COMPOSE_LOG_MARKER}1" in layers_only
+    assert "robot=None" in layers_only
+
+
 def test_is_direct_usd_ref():
     assert not sim_runtime.is_direct_usd_ref("/Isaac/Samples/ROS2/Scenario/x.usd")
     assert sim_runtime.is_direct_usd_ref("omniverse://assets/warehouse.usd")

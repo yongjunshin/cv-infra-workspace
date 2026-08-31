@@ -322,11 +322,15 @@ def test_resolve_obstacle_asset_is_loud_about_an_unknown_name():
 def test_every_registered_asset_carries_a_measured_offset_and_an_isaac_path():
     # The registry is the one place a REMEMBERED path would hide (G-25/G-28): a
     # relative /Isaac/... path is what gets joined onto the live assets root.
-    assert set(sim_runtime.OBSTACLE_ASSETS) == {"chair", "desk", "forklift"}
+    assert set(sim_runtime.OBSTACLE_ASSETS) == {"chair", "desk", "forklift", "person"}
     for name, asset in sim_runtime.OBSTACLE_ASSETS.items():
         assert asset.usd_path.startswith("/Isaac/"), name
         assert asset.usd_path.endswith((".usd", ".usda", ".usdz")), name
         assert asset.z_offset >= 0.0, name
+    # go2 C1: the patrol target entered by the same measured rule. Its offset is
+    # NOT 0 — the character's origin sits 0.1248 m above its own feet (C0 probe
+    # A13), and a 0 here would bury the feet in the floor.
+    assert sim_runtime.OBSTACLE_ASSETS["person"].z_offset == 0.1248
 
 
 def test_obstacle_pool_key_buckets_boxes_by_size_and_assets_verbatim():
