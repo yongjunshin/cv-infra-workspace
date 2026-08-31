@@ -55,6 +55,7 @@ from cv_infra.runner.sim_runtime import (
     SimConfig,
     obstacle_pool_plan,
     resolve_obstacle_asset,
+    resolve_scene,
 )
 
 EXIT_PASS = 0
@@ -383,6 +384,31 @@ def plan_obstacle_pool(obstacles: list[dict]) -> dict:
         raise BadJobSpec(f"scenario.obstacles: {exc}") from exc
 
 
+def build_sensor_suite(request: VerificationRequest, criteria: dict) -> object | None:
+    """The runner-published sensor suite for a COMPOSED scene, or None (D-2).
+
+    Pre-boot, like the obstacle-asset resolution above and for the same reason:
+    an unknown scene name and a sensor declaration this runner cannot serve are
+    both bad input, and here they still cost 0 GPU seconds (exit 2) instead of
+    surfacing mid-boot as a platform failure.
+
+    ``chassis_path`` is the mount point (the sensors are children of the chassis
+    body, so they follow the robot for free) and it comes from the criteria view
+    — the same measured value the telemetry binds to, never a hardcoded scene
+    path (R7).
+    """
+    from cv_infra.runner.go2_sensors import sensor_suite_for  # noqa: PLC0415
+
+    try:
+        return sensor_suite_for(
+            resolve_scene(request.scenario.scene),
+            request.interface.adapter_config,
+            read_field(criteria, "chassis_path", ""),
+        )
+    except ValueError as exc:
+        raise BadJobSpec(f"scenario.scene / interface.sensors: {exc}") from exc
+
+
 def artifact_paths(mcap_path: object, mp4_path: object) -> dict[str, str | None]:
     """``{mcap, mp4}`` as strings, or None where the recorder produced nothing.
 
@@ -531,6 +557,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
     # is pure; the pre-reset hooks below only execute it.
     obstacles = obstacle_specs(request)
     obstacle_pool = plan_obstacle_pool(obstacles)
+    # D-2: a scene the runner COMPOSES (go2) ships no vendor ROS graph — not even
+    # /clock — so the runner publishes the SUT-facing streams itself. None for a
+    # pre-wired sample scene (carter), whose OmniGraphs already do it.
+    sensors = build_sensor_suite(request, criteria)
     # D-1 (4): plugin dir on sys.path BEFORE the engine composes, then the
     # engine composes uniformly via the M1 loader — still PRE-sim, so a load
     # failure (defence-in-depth; admit already rejected it once) is
@@ -598,15 +628,25 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         # FU-17: declared-sensor render products must be enabled PRE-play
         # (BEFORE world.reset() — mid-play toggling is a measured no-op), so
         # this rides the same pre_reset seam as the telemetry bind.
+        # ...for a scene whose GRAPH publishes them. A composed scene has no
+        # graph to enable and would only collect false "declared but
+        # publisher-less" warnings, so the runner-published path owns it instead.
         sensor_topics = [s.topic for s in adapter_config.sensors]
-        if sensor_topics:
+        if sensor_topics and sensors is None:
             sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(sensor_topics))
+        if sensors is not None:
+            sim.pre_reset.append(sensors.bind)  # authors the camera/lidar prims
         # step 3: scene/initial pose/dt/seed (+ telemetry pre-bind); the identity
         # key rides along so the applied-settings line names its request.
         sim.load_scene(identity_key)
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, adapter_config)  # step 4: DDS wiring (no SUT spawn)
         trace.end(PHASE_ADAPTER_WIRE)
+        # BEFORE the barrier, on purpose: in a composed world WE are the /clock
+        # source, and the barrier waits for clock FLOW (G-19) — attaching after it
+        # would deadlock the job against a clock nobody is publishing.
+        if sensors is not None:
+            _emit(sensors.attach(adapter.node, sim.on_step))
         # The barrier is where k=4 died 8/8 (p4c4 발견 ①). Its begin line is streamed
         # BEFORE the wait, so even a job killed mid-wait names the phase it hung in;
         # the end line carries the same phase/clock_count vocabulary the timeout log
@@ -689,6 +729,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (T3 prov
         observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
         if sampler is not None:
             sampler.detach()
+        if sensors is not None:
+            # On EVERY path: "the camera never produced a frame" is exactly the
+            # kind of silence a failed run needs stated out loud (C0 §6-3).
+            _emit(sensors.detach())
         _abort_recorders(rosbag, video)  # failure paths: no child proc/writer leak
         adapter.teardown()  # step 11: clean shutdown (rclpy node + DDS domain leave)
         # step 12: the sim is deliberately NOT closed here (G-62). Isaac's
@@ -748,6 +792,18 @@ def _print_contact_partners(record, chassis_path: str) -> None:  # pragma: no co
         f"{len(partners)} distinct partner prim(s): {partners[:10]}",
         flush=True,
     )
+
+
+def _emit(lines) -> None:
+    """Print a collaborator's report lines — ONE home for the loop (G-25).
+
+    The sensor suite reports its topic inventory at attach and its per-stream
+    "did this ever carry data" verdict at detach; both are lists, both are
+    printed the same way, and neither belongs inline in ``run`` (which is at its
+    complexity ceiling).
+    """
+    for line in lines:
+        print(line, flush=True)
 
 
 def _abort_recorders(*recorders) -> None:
