@@ -1126,3 +1126,79 @@ def test_a_carter_carrier_attaches_neither_stream(monkeypatch, capsys):
         adapter, SimpleNamespace(on_step=[]), Ros2AdapterConfig(), None, None
     )
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- #
+# C5b / AR-19 — the settle runs BEFORE the realign, and the seed is the GT pose.
+# --------------------------------------------------------------------------- #
+def test_the_realign_is_settled_on_both_sides_and_then_the_mission_starts():
+    """ORDER pin (AR-19). Until C5b the carrier realigned and THEN settled, so the
+    world moved after AMCL had been told where the robot was.
+
+    On a legged robot that gap is not cosmetic: the locomotion policy lunges
+    ~0.97 m in its first steps and finishes before AMCL has seen ``update_min_d``
+    (0.25 m) of odometry, so the filter never corrects itself and the mission
+    starts on a belief a metre behind the robot (U1 §6-1: 6 recovery rounds,
+    +75 s sim on the single-job reproduction; every sample of a repeats=5 batch
+    would begin there).
+
+    TWO pumps, one on each side, and the second one is not symmetry for its own
+    sake — it was MEASURED into existence (WS run 1 of this very cycle): with the
+    settle moved up and nothing after the realign, the seed landed verbatim in
+    AMCL and the goal was still dispatched onto the previous sample's belief
+    (``Begin navigating from current location (-6.84, 5.89)``, plan of 0 poses,
+    aborted after 0.28 sim-seconds). So the pin is the whole sequence.
+    """
+    run = _batch_run_function()
+    called: dict[str, list[int]] = {}
+    for node in ast.walk(run):
+        if isinstance(node, ast.Call):
+            name = (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ast.unparse(node.func)
+            )
+            called.setdefault(name, []).append(node.lineno)
+    (restage,) = called["restage"]
+    settle, converge = sorted(called["_settle_world"])  # exactly two, in this order
+    (realign,) = called["realign"]
+    (readiness,) = called["await_ready"]
+    assert restage < settle < realign < converge < readiness, (
+        f"restage {restage} / settle {settle} / realign {realign} / converge {converge} / "
+        f"readiness {readiness} — the seed must be taken from a world that stopped moving "
+        "AND the SUT must be given time to act on it before the mission"
+    )
+
+
+def test_the_realign_is_handed_the_gt_seed_not_the_declared_pose():
+    """BINDING pin (AR-19, G-106 ③: the argument EXPRESSION and where it came from).
+
+    Order alone does not make the seed right: a carrier that settles first and
+    still publishes ``pose`` re-creates the whole bug with the calls in the new
+    order. So this reads the actual argument of ``realigner.realign(...)``, and
+    then where that name was bound — it must be ``realign_seed(...)`` fed by the
+    telemetry sampler's GT accessor, not by the scenario's declaration.
+    """
+    run = _batch_run_function()
+    (call,) = [
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "realign"
+    ]
+    (argument,) = [ast.unparse(arg) for arg in call.args]
+    assert argument != "pose", "the carrier still seeds the DECLARED pose (AR-19 not applied)"
+
+    (binding,) = [
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Assign)
+        and argument in {n.id for n in ast.walk(node.targets[0]) if isinstance(n, ast.Name)}
+        and isinstance(node.value, ast.Call)
+    ]
+    source = ast.unparse(binding.value)
+    assert source.startswith("realign_seed("), f"{argument} is bound by {source}"
+    assert "sampler.latest_pose()" in source, (
+        f"{source} does not read the GT pose the settle just produced — the seed would be "
+        "whatever the scenario declared"
+    )
+    assert binding.lineno < call.lineno

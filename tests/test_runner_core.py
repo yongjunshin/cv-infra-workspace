@@ -845,6 +845,28 @@ def test_time_to_goal_is_none_when_the_mission_produced_no_samples():
     assert telemetry.time_to_goal_s([], (3.0, 0.0, 0.0), 0.1) is None
 
 
+def test_latest_pose_reports_the_newest_gt_sample_and_none_before_any():
+    """The batch carrier's realign seed (AR-19) reads this right after its settle
+    pump: the NEWEST sample is where the robot came to rest, and it is the value
+    ``/initialpose`` must carry. ``None`` before anything was sampled is what makes
+    ``realign_seed`` fall back to the declared pose instead of seeding the origin.
+
+    Owned here (G-110): this accessor's two arms belong to the telemetry suite, not
+    to whatever other test happens to build a sampler.
+    """
+    sampler = telemetry.PhysicsTelemetrySampler(CHASSIS, ["/World/ground"])
+    assert sampler.latest_pose() is None  # nothing sampled yet
+
+    sampler.record.gt_pose_samples.extend(_line(3))
+    assert sampler.latest_pose() == _line(3)[-1]
+
+    # The accessor follows ``self.record``, which the carrier SWAPS per sample —
+    # a fresh accumulator must read as "nothing sampled", never as the retired
+    # sample's last pose.
+    sampler.record = telemetry.TelemetryRecord()
+    assert sampler.latest_pose() is None
+
+
 def test_telemetry_detach_is_cpu_safe_and_idempotent_before_any_bind():
     """``main.run``'s ``finally`` calls ``detach()`` on EVERY path, including the
     ones that died before ``bind`` ever ran on GPU. A raise here would replace the

@@ -30,12 +30,16 @@ the sim time it is published at, never with one time taken before the burst (see
 ``REALIGN_PUBLISH_COUNT`` for the measurement that says why). That is why the
 sim-time source is an injected CALLABLE — a float parameter is exactly how the
 stale-stamp bug was expressible.
+
+WHAT pose the burst carries is decided by ``realign_seed`` (AR-19): the pose the
+robot SETTLED at, not the coordinate the scenario declared.
 """
 
 from __future__ import annotations
 
 import time
 
+from cv_infra.oracles.reached_goal import yaw_from_quat_wxyz
 from cv_infra.runner.adapter.ros2 import quat_z_w_from_yaw
 
 #: The AMCL pose-seed topic (nav2's own; RViz publishes the same one).
@@ -89,6 +93,79 @@ REALIGN_OBSERVATION_KEYS = (
     "costmaps_cleared",
     "missing",
 )
+
+
+#: Where the ``/initialpose`` values came from — the tag the per-sample audit line
+#: carries (AR-19). Three, because "we seeded the measured pose", "we fell back to
+#: the declared one" and "we did not seed at all" are three different claims and a
+#: reader of the runner log must be able to tell them apart without diffing numbers.
+SEED_SOURCE_GT = "post-settle-GT"
+SEED_SOURCE_DECLARED = "declared"
+SEED_SOURCE_NONE = "not-declared"
+
+
+def realign_seed(declared: dict | None, gt_sample: object | None) -> tuple[dict | None, str]:
+    """The pose the ``/initialpose`` burst should carry, plus where it came from.
+
+    AR-19. The declared coordinate is where the sim PUT the robot; it is not
+    necessarily where the robot IS when the mission starts. Measured (U1 §6-1,
+    §10-2): a go2 whose locomotion policy has just been handed the world lunges
+    ~0.97 m in its first steps, and the lunge finishes BEFORE AMCL has seen enough
+    odometry (``update_min_d`` 0.25) to correct itself — so every sample seeded
+    with the declared pose began its mission believing it was ~1 m behind where
+    it actually stood, which cost 6 recovery rounds and +75 s sim on the single-job
+    reproduction. Seeding the post-settle GT pose is what an operator does with
+    RViz's "2D Pose Estimate" button when they can see the robot: it tells the
+    blackbox the truth, and it changes nothing INSIDE it (REQ-EXEC-005).
+
+    The GT pose is the sim's own ``get_world_pose()`` sample (LOCKED §7) — never
+    the SUT's ``/odom``, which is an INPUT to the very filter being seeded.
+
+    Three arms, in the order they matter:
+
+    * no declared pose -> ``(None, not-declared)``. The scenario asked for no
+      initial pose, so ``restage`` restored the asset's own placement and
+      ``SutRealigner.realign`` keeps its "not attempted" observation
+      (``initialpose_subscribers = None``). Deliberately NOT "seed it from GT
+      anyway": whether AMCL is re-seeded at all is the scenario's call, and a
+      carrier that started seeding un-seeded scenarios would change the meaning
+      of every batch that declares no pose.
+    * declared, but nothing sampled yet -> the DECLARED pose, tagged as such. A
+      sampler that produced no GT (telemetry never bound, a sim that never
+      stepped) must not silently seed the origin.
+    * declared + a GT sample -> the sampled x/y and its planar yaw.
+
+    Yaw comes from the sample's quaternion through the oracle's own
+    ``yaw_from_quat_wxyz`` (one spelling of "quaternion -> heading" in the
+    codebase); the +Z-only convention on the way back out is
+    ``initialpose_fields``'. Orientation is included because a legged robot's
+    lunge turns it as well as moves it, and an AMCL seeded with the right
+    position and the wrong heading re-converges no better than one seeded with
+    neither.
+    """
+    if declared is None:
+        return None, SEED_SOURCE_NONE
+    if gt_sample is None:
+        return dict(declared), SEED_SOURCE_DECLARED
+    x, y, _z = gt_sample.position
+    return (
+        {"x": float(x), "y": float(y), "yaw": yaw_from_quat_wxyz(gt_sample.orientation_wxyz)},
+        SEED_SOURCE_GT,
+    )
+
+
+def realign_seed_log(pose: dict | None, source: str) -> str:
+    """The per-sample audit fragment: WHICH pose was seeded and where it came from.
+
+    Appended to the carrier's ``sut realign:`` line so one grep answers "did this
+    sample seed the measured pose?" — the observation dict counts messages, and a
+    perfect count says nothing about the CONTENT (p6c3 T3 §9-2: counters 12/12
+    while the belief was right 1/12). Kept as a pure function so the format is
+    pinned by a CPU test instead of by an f-string nobody reads.
+    """
+    if pose is None:
+        return f"realign_seed=none source={source}"
+    return f"realign_seed=({pose['x']:.4f},{pose['y']:.4f},{pose['yaw']:.4f}) source={source}"
 
 
 def initialpose_fields(pose: dict, sim_time_s: float) -> dict:

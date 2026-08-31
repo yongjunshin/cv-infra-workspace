@@ -17,8 +17,9 @@ Sequence — boot ONCE, then per sample i:
     ros2 bridge -> scene/robot/telemetry/sensors (sample 0's staging) ->
     adapter wire (+ sensor & /cmd_vel publishers) -> render product
       | i: re-pin seed -> restage (obstacle move + set, soft reset, repose) ->
-      |    sim_config line -> SUT realign + settle -> readiness -> cycle telemetry
-      |    accumulator -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
+      |    sim_config line -> settle -> SUT realign (seeded from the post-settle
+      |    GT pose) -> converge -> readiness -> cycle telemetry accumulator ->
+      |    bag/mp4 -> mission -> evaluate -> results/<i>/result.json
       |    -> batch_summary.json (atomic flush = the carrier's heartbeat)
 
 Exit contract (CARRIER level — the sample verdicts live in their own result.json):
@@ -98,11 +99,20 @@ BATCH_RESULTS_DIRNAME = "results"
 #: (it would re-exec ``-m __main__``). Pinned to the real name by CPU test.
 BATCH_MODULE = "cv_infra.runner.batch"
 
-#: Sim-seconds to let the world settle after a realign, before the readiness
-#: barrier and the mission. Runner runtime policy, NOT consumer contract (same
-#: stance as ``READINESS_TIMEOUT_S``): it covers the physics settling of a
-#: teleported robot plus AMCL's first re-convergence. Env-overridable so W1/W2 can
-#: measure a different value without a rebuild.
+#: Sim-seconds pumped on EACH SIDE of the realign (AR-19). Runner runtime policy,
+#: NOT consumer contract (same stance as ``READINESS_TIMEOUT_S``). One budget, two
+#: windows, because the pre-C5b single window was silently doing two jobs:
+#:
+#: * BEFORE the realign — the physics settling of a teleported robot and, on a
+#:   legged one, its policy's spawn lunge, so the pose the seed carries is a pose
+#:   that has stopped moving;
+#: * AFTER it — the blackbox acting on that seed (AMCL's forced update on its next
+#:   scan, the TF chain, the just-cleared costmaps) before the mission is
+#:   dispatched. Measured: without this window the seed lands verbatim and the goal
+#:   still aborts on the previous sample's belief (see the call site).
+#:
+#: Env name unchanged (an operator knob W1/W2 already measure with), so a different
+#: budget still needs no rebuild.
 REALIGN_SETTLE_ENV = "CV_REALIGN_SETTLE_S"
 DEFAULT_REALIGN_SETTLE_S = 3.0
 
@@ -505,10 +515,14 @@ def _attach_optional_streams(
 
 
 def _settle_world(adapter: object, settle_s: float) -> float:
-    """Pump the sim ``settle_s`` SIM-seconds after a realign; return the time reached.
+    """Pump the sim ``settle_s`` SIM-seconds; return the sim time reached.
+
+    Called on BOTH sides of the realign (see ``REALIGN_SETTLE_ENV``): before it so
+    the seed carries a pose that has stopped moving (AR-19), after it so the SUT
+    has acted on that seed before the mission is dispatched.
 
     SIM seconds (D-F) because that is what the teleported robot's physics and
-    AMCL's first re-convergence actually run on. The wall cap is the escape
+    AMCL's re-convergence actually run on. The wall cap is the escape
     hatch: a sim whose ``/clock`` has stopped would spin here forever, and a
     hung carrier is strictly worse than a normal readiness failure — the loop
     ends, the barrier below reports it, and the batch exits 3.
@@ -556,7 +570,11 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         observe,
     )
     from cv_infra.runner.go2_wiring import attach_policy_loop  # noqa: PLC0415
-    from cv_infra.runner.realign import SutRealigner  # noqa: PLC0415
+    from cv_infra.runner.realign import (  # noqa: PLC0415
+        SutRealigner,
+        realign_seed,
+        realign_seed_log,
+    )
     from cv_infra.runner.recording import (  # noqa: PLC0415
         LoopVideoRecorder,
         RosbagRecorder,
@@ -721,12 +739,44 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                 sim.emit_sim_config(identity_key)  # per-sample applied-settings line
             iter_watch.end("restage")
 
-            iter_watch.begin("realign")
             sim_time_start_s = adapter.sim_time_s
-            realign = realigner.realign(pose)
-            print(f"[cv-runner] sut realign: {realign}", flush=True)
+            # SETTLE FIRST, THEN REALIGN (AR-19). The reverse order — the one this
+            # carrier shipped through W3 — seeds AMCL and only then lets the world
+            # move, so a robot that settles somewhere else (a legged one walks:
+            # measured 0.97 m, U1 §6-1) starts every mission believing it is a
+            # metre behind itself. Nothing else changes: both steps already pumped
+            # the sim, and both still run before the record swap below, so the
+            # boundary's contact reports stay charged to the retired sample.
+            iter_watch.begin("settle")
             _settle_world(adapter, settle_s)
+            iter_watch.end("settle")
+
+            iter_watch.begin("realign")
+            # The seed is the pose the sampler JUST wrote (the settle's last
+            # physics step), not the declared coordinate — ``sampler.record`` is
+            # still the retired accumulator here, which is exactly the one those
+            # steps appended to.
+            seed, seed_source = realign_seed(pose, sampler.latest_pose())
+            realign = realigner.realign(seed)
+            print(
+                f"[cv-runner] sut realign: {realign} {realign_seed_log(seed, seed_source)}",
+                flush=True,
+            )
             iter_watch.end("realign")
+
+            # ...and the SAME budget again, now for the SUT to ACT on the seed. The
+            # pre-C5b order gave the blackbox this window for free (it settled
+            # AFTER realigning); moving the settle up to make the seed truthful
+            # took it away, and the first measured run said so loudly: the seed
+            # landed verbatim (`amcl: Setting pose -5.975 -0.961 1.606`) yet the
+            # mission was dispatched 0.1 sim-seconds later, while nav2's TF chain
+            # still held the PREVIOUS sample's belief — `Begin navigating from
+            # current location (-6.84, 5.89)`, plan of 0 poses, goal aborted after
+            # 0.28 sim-seconds (WS run 1, sample 1). A seed nobody has acted on yet
+            # is not a realigned SUT.
+            iter_watch.begin("converge")
+            _settle_world(adapter, settle_s)
+            iter_watch.end("converge")
 
             iter_watch.begin("readiness")
             ready = adapter.await_ready(timeout_s=READINESS_TIMEOUT_S)
