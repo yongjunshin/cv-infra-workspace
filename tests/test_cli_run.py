@@ -19,6 +19,7 @@ tests must not reference the consumer repo at runtime (boundary rule).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -696,6 +697,35 @@ def test_mvp_only_criteria_pass_oracle_plugin_dir_none(
 
     assert _run_cli(scenario_file, tmp_path / "out") == EXIT_PASS
     assert _conditional_kwargs(stub) == [{}]  # no oracle_plugin_dir key -> default None
+
+
+def test_a_declared_locomotion_policy_rides_the_same_scenario_dir_mount(
+    monkeypatch, tmp_path, no_ambient_consent
+):
+    """C2b: ``sut.locomotion_policy`` is a ride-along artifact of the SAME
+    directory (admit resolves it against that anchor — M1 loader stage 5), so it
+    must trigger the mount even with MVP-only criteria. Without this the runner
+    is handed an absolute path that does not exist inside its container.
+
+    The CLI decides only the MOUNT: whether the robot has a slot for a policy is
+    the runner's pre-boot cross-check (``go2_wiring.check_firmware_slot``).
+    """
+    stub = ConsentRecordingSupervisor("pass")
+    _install_supervisor(monkeypatch, stub)
+    nested = tmp_path / "scenarios"
+    nested.mkdir()
+    payload = b"pretend-this-is-torchscript"
+    (nested / "policy.pt").write_bytes(payload)
+    doc = yaml.safe_load(CARTER_YAML)
+    doc["sut"]["locomotion_policy"] = {
+        "file": "policy.pt",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    scenario = nested / "with_policy.yaml"
+    scenario.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    assert _run_cli(scenario, tmp_path / "out") == EXIT_PASS
+    assert _conditional_kwargs(stub) == [{"oracle_plugin_dir": str(nested.resolve())}]
 
 
 # --- (8) request_identity_key: the two entrypoints emit the SAME key ---------
