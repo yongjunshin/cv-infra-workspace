@@ -469,6 +469,41 @@ class Scenario(_ForbidExtra):
         return self
 
 
+#: Shape sample for a locomotion-policy digest — the single definition of it
+#: (rendered VERBATIM into the friendly error, like ``EXAMPLE_IMAGE_REF``).
+#: Measured on the go2 C0 probe (``exported/policy.pt``, 174,184 B —
+#: reports/runner-2026-08-31-go2-c0-probe.md §11-4), kept as a SHAPE sample the
+#: way ``image_id``'s example is: it shows the form ``sha256sum <file>`` prints,
+#: not a value to copy — only your own file's digest belongs there.
+EXAMPLE_POLICY_SHA256 = "73338e49c3f1932bbcb9cf54e97ef71a9cac24bb2bb214217aa8b592cb9442fd"
+
+
+class LocomotionPolicy(_ForbidExtra):
+    """A SUT artifact that rides WITH the request: the robot's locomotion policy
+    file + the digest pinning it (CEO decision D2, 2026-08-31 — "SUT = the set of
+    user artifacts the verdict is on"; go2's SUT = {image_ref, locomotion_policy}).
+
+    Why under ``sut`` and not ``scenario``: the M4 identity projection excludes
+    the whole ``sut`` block (report/regression.py), so swapping the policy is
+    "the SAME request against a DIFFERENT SUT" — exactly the comparison the
+    regression machinery (SR-20) already makes, with zero change to it.
+
+    ``file`` is a path relative to the SCENARIO file, and it may not leave that
+    directory — the same ride-along rule the custom-oracle ``module:Class``
+    anchor follows (that directory is what the supervisor mounts read-only into
+    the runner, so a path outside it does not exist there). Resolution + the
+    digest check happen at ADMIT (loader stage 5), because a path and a hash are
+    facts about the filesystem, not about the document's shape.
+
+    The platform never SUPPLIES a policy: an absent file or a disagreeing digest
+    is a rejected request (exit 2), never a substituted default (D2 — "대체 채움
+    금지").
+    """
+
+    file: str = Field(min_length=1, examples=["policy.pt"])
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", examples=[EXAMPLE_POLICY_SHA256])
+
+
 class SutRef(_ForbidExtra):
     """SUT image reference (REQ-INTAKE-006 required element #1).
 
@@ -481,6 +516,10 @@ class SutRef(_ForbidExtra):
 
     ``image_ref``'s example is a placeholder shape on purpose — see
     ``EXAMPLE_IMAGE_REF`` above for why a real image name must not stand there.
+
+    ``locomotion_policy`` is the SECOND SUT artifact (D2, 2026-08-31) — optional
+    because it exists only for robots whose registry entry declares the slot
+    (go2); a carter request that omits it is unaffected in every plane.
     """
 
     image_ref: str = Field(min_length=1, examples=[EXAMPLE_IMAGE_REF])
@@ -488,6 +527,16 @@ class SutRef(_ForbidExtra):
         default=None,
         pattern=r"^sha256:[0-9a-f]{64}$",
         examples=["sha256:47aff5c993dac05b1664482e44af9401073336f142cb6d4919d81b47f8f9d48a"],
+    )
+    locomotion_policy: LocomotionPolicy | None = Field(
+        default=None,
+        description=(
+            "Locomotion policy artifact that rides with the request (file next to the "
+            "scenario + its sha256). Declared only for a robot whose registry entry has "
+            "the slot; validated at admit — missing file / path escape / digest mismatch "
+            "reject the request."
+        ),
+        examples=[{"file": "policy.pt", "sha256": EXAMPLE_POLICY_SHA256}],
     )
 
 

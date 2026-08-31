@@ -8,8 +8,10 @@ any failing stage rejects BEFORE the execution plane ever sees the input):
     (3) pydantic model_validate      -> schema error  = friendly reject
     (4) self-containedness           -> missing triad = reject   (REQ-INTAKE-006)
         + no platform stamp          -> submitted derivation = reject
-    (5) oracle load + bind           -> load failure  = reject   (REQ-INTAKE-007/008;
-                                        scenario dir on sys.path while binding — D-1)
+    (5) ride-along artifacts         -> load failure  = reject   (REQ-INTAKE-007/008;
+        - oracle load + bind            scenario dir on sys.path while binding — D-1)
+        - sut.locomotion_policy      -> absent / escaping the scenario dir / digest
+                                        mismatch = reject (D2 2026-08-31)
     (6) admit marking                -> AdmittedRequest           (REQ-INTAKE-009)
 
 Rejection = a raised ``ContractError`` (friendly: field path + expected +
@@ -32,6 +34,7 @@ never imports the loader — D-C/R20).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 from dataclasses import dataclass, field
@@ -49,6 +52,15 @@ from cv_infra.oracles.base import load_oracle  # sanctioned edge (.importlinter 
 
 _DOC_LINK = "M1-contract-and-schema.md §3.3 (loader pipeline)"
 
+#: Fixable example for every ``sut.locomotion_policy`` rejection — a copyable
+#: block, not a value: the digest is the one thing only the consumer's own file
+#: can answer, so the example names the COMMAND that prints it.
+_POLICY_EXAMPLE = (
+    "sut:\n  locomotion_policy:\n"
+    "    file: policy.pt          # beside this scenario file\n"
+    "    sha256: <sha256sum policy.pt>"
+)
+
 
 @dataclass(frozen=True)
 class AdmittedRequest:
@@ -62,6 +74,11 @@ class AdmittedRequest:
     warnings: tuple[str, ...]  # e.g. apiVersion deprecation (stage 2)
     source_path: str | None
     admitted: bool = field(default=True, init=False)
+    #: Absolute path of the validated ``sut.locomotion_policy`` file — resolved
+    #: ONCE here, at the only place that knows the anchor directory, so no
+    #: consumer re-derives it (blueprint §8). ``None`` = the request declared no
+    #: policy (every carter request).
+    locomotion_policy_path: str | None = None
 
 
 def load_request(
@@ -119,12 +136,11 @@ def load_request(
     _check_self_contained(request, source_path)
     _reject_platform_stamp(request, source_path)
 
-    # (5) oracle load + bind (REQ-INTAKE-007/008) ---------------------------- #
-    bound = _bind_oracles(
-        request,
-        anchor=_plugin_anchor(source, plugin_dir),
-        source_path=source_path,
-        locator=locator,
+    # (5) ride-along artifacts: oracles (REQ-INTAKE-007/008) + SUT policy (D2) #
+    anchor = _plugin_anchor(source, plugin_dir)
+    bound = _bind_oracles(request, anchor=anchor, source_path=source_path, locator=locator)
+    policy_path = _check_locomotion_policy(
+        request, anchor=anchor, source_path=source_path, locator=locator
     )
 
     # (6) admit marking (REQ-INTAKE-009) ------------------------------------- #
@@ -133,6 +149,7 @@ def load_request(
         oracles=tuple(bound),
         warnings=tuple(warnings),
         source_path=source_path,
+        locomotion_policy_path=policy_path,
     )
 
 
@@ -204,6 +221,101 @@ def _bind_oracles(
         if anchor is not None and anchor in sys.path:
             sys.path.remove(anchor)
     return bound
+
+
+def _check_locomotion_policy(
+    request: VerificationRequest,
+    *,
+    anchor: str | None,
+    source_path: str | None,
+    locator: _Locator,
+) -> str | None:
+    """Stage 5, second ride-along: validate ``sut.locomotion_policy``, return its
+    ABSOLUTE path (``None`` when the request declares none — the carter path,
+    which then does nothing at all).
+
+    Mirrors the custom-oracle ride-along above, deliberately: the artifact
+    travels NEXT TO the scenario document, so it resolves against the SAME
+    ``anchor`` directory and may not leave it. That directory is what the
+    supervisor mounts read-only into the runner (``_runner_volumes``, D-1), so a
+    path outside it is not merely untrusted — it does not exist over there.
+
+    Three ways to be rejected, all friendly + exit-2-eligible (D2 2026-08-31 —
+    the platform holds no policy, so it never fills one in): the path escapes
+    the scenario directory, the file is not there, or its bytes hash to
+    something other than the declared ``sha256``.
+    """
+    policy = request.sut.locomotion_policy
+    if policy is None:
+        return None
+    field_file = "sut.locomotion_policy.file"
+    if anchor is None:
+        raise _policy_reject(
+            field_file,
+            "a submission that carries its scenario directory (the ride-along anchor) — a "
+            "declared locomotion policy is resolved NEXT TO the scenario file, so an "
+            "anchor-less submission has nowhere to look for it",
+            repr(policy.file),
+            source_path=source_path,
+            locator=locator,
+        )
+    root = Path(anchor)  # already absolute+resolved (_plugin_anchor)
+    resolved = (root / policy.file).resolve()
+    if not resolved.is_relative_to(root):
+        raise _policy_reject(
+            field_file,
+            f"a path INSIDE the scenario directory ({root}) — the policy file rides along "
+            "with the request and only that directory reaches the runner, so '..' segments "
+            "and absolute paths cannot be read",
+            f"{policy.file!r} (resolved: {resolved})",
+            source_path=source_path,
+            locator=locator,
+        )
+    try:
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise _policy_reject(
+            field_file,
+            "an existing, readable file — the platform never supplies the policy (it is a "
+            "SUT artifact: put it next to the scenario file and commit it, or publish it "
+            "into the SUT image)",
+            f"{policy.file!r} (resolved: {resolved})",
+            source_path=source_path,
+            locator=locator,
+        ) from exc
+    if digest != policy.sha256:
+        raise _policy_reject(
+            "sut.locomotion_policy.sha256",
+            f"the sha256 of the declared file ({policy.file} hashes to {digest})",
+            repr(policy.sha256),
+            source_path=source_path,
+            locator=locator,
+        )
+    return str(resolved)
+
+
+def _policy_reject(
+    field_path: str,
+    expected: str,
+    got: str,
+    *,
+    source_path: str | None,
+    locator: _Locator,
+) -> ContractError:
+    """One friendly policy rejection — the 8 annotation keys filled exactly the
+    way stage 5's oracle rejection fills them (``_relocated`` attaches the YAML
+    line/col of the offending key)."""
+    return _relocated(
+        ContractError(
+            field_path=field_path,
+            expected=expected,
+            got=got,
+            example=_POLICY_EXAMPLE,
+            doc_link=_DOC_LINK,
+        ),
+        source_path=source_path,
+        line_col=locator(tuple(field_path.split("."))),
+    )
 
 
 def _read(source: str | Path | io.TextIOBase, source_path: str | None) -> tuple[str, str | None]:
