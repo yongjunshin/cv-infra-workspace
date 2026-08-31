@@ -14,17 +14,28 @@ not leave it, must exist, must hash to the declared digest — each violation a
 friendly 8-key ``ContractError`` and exit 2 (D2: the platform holds no policy,
 so it never fills one in). An undeclared policy does nothing at all (carter).
 
-Stdlib + pytest (+ the contract's own pyyaml/pydantic); no Isaac, no docker.
+C2c added the execution-plane half: the single JOB_SPEC producer emits the
+resolved path + declared digest as two flat keys, and both submission planes
+(``cv-infra run`` / ``POST /envelopes``) are driven here to prove they emit the
+same wire for the same document.
+
+Stdlib + pytest (+ the contract's own pyyaml/pydantic, and fastapi's TestClient
+for the REST submit plane); no Isaac, no docker — the supervisor seam is stubbed
+and the M3 runner is a duck-typed recorder.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
+import json
+import time
 from pathlib import Path
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 from cv_infra.cli.main import EXIT_CONTRACT, main
 from cv_infra.contract.errors import ANNOTATION_KEYS, ContractError
@@ -32,9 +43,15 @@ from cv_infra.contract.job_batch import JobSpecBatch
 from cv_infra.contract.job_spec import build_job_spec
 from cv_infra.contract.loader import load_request
 from cv_infra.contract.schema import EXAMPLE_POLICY_SHA256, VerificationRequest
+from cv_infra.orchestrator.api import create_app
+from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
+from cv_infra.orchestrator.store import Store
 from cv_infra.report.regression import identity_key
 from cv_infra.runner import batch as runner_batch
 from cv_infra.runner import go2_wiring
+from cv_infra.runner import main as runner_main
+from tests.test_cli_run import RecordingSupervisor
+from tests.test_cli_run import _install_supervisor as install_supervisor
 
 CARTER_FIXTURE = Path(__file__).parent / "fixtures" / "nova_carter_warehouse_goal.yaml"
 
@@ -286,17 +303,170 @@ def test_changing_the_mission_still_changes_the_key():
 
 
 # --------------------------------------------------------------------------- #
-# execution plane — declared here, wired in C2b (scope boundary, in writing)
+# execution plane — the producer (C2c: the assertion C2a left for the wiring)
 # --------------------------------------------------------------------------- #
-def test_the_job_spec_does_not_carry_the_policy_yet(tmp_path):
-    """C2a is the CONTRACT half. When C2b wires the runner it adds exactly two
-    keys — ``locomotion_policy_path`` / ``locomotion_policy_sha256`` (verbatim,
-    task-pinned) — and flips this assertion; until then the wire is byte-for-byte
-    what it was, which is what keeps the carter plane provably untouched."""
+def test_the_job_spec_carries_the_resolved_policy_pin(tmp_path):
+    """C2a declared the two key names and left the wire byte-identical; C2c wires
+    the single producer, so this is the flipped assertion.
+
+    What rides is the pair a consumer can act on with no re-derivation: the
+    ABSOLUTE path admit resolved (valid inside the container — the scenario dir
+    is ro-mounted at the same absolute path) and the DECLARED digest. The keys
+    are asserted through the CONSUMER's constants, which is what ties the
+    producer's two literals to the reader (the contract may not import a
+    sibling, so the tie is a test, G-25), and the round trip through
+    ``policy_pin`` closes it the way G-17 asks: measured, not prose.
+    """
     admitted = load_request(_case(tmp_path))
-    spec = build_job_spec(admitted.request, "req-go2:0")
+    spec = build_job_spec(
+        admitted.request, "req-go2:0", locomotion_policy_path=admitted.locomotion_policy_path
+    )
+    assert [key for key in spec if "locomotion" in key] == [
+        go2_wiring.POLICY_PATH_KEY,
+        go2_wiring.POLICY_SHA_KEY,
+    ]
+    assert spec[go2_wiring.POLICY_PATH_KEY] == str(tmp_path / "policy.pt")
+    assert spec[go2_wiring.POLICY_SHA_KEY] == POLICY_SHA
+    assert spec["sut_image_ref"] == admitted.request.sut.image_ref  # 1st artifact unmoved
+    pin = go2_wiring.policy_pin(spec)  # the runner reads back exactly what admit resolved
+    assert pin.path == admitted.locomotion_policy_path and pin.sha256 == POLICY_SHA
+    # G-74 in the ADD direction: the runner re-validates the whole document with
+    # ``extra="forbid"``, so a new top-level wire key is safe only because that
+    # side peels it off (``runner/main.parse_request``) — measured, not assumed.
+    restored, _adapter = runner_main.parse_request(spec)
+    assert restored.sut.image_ref == admitted.request.sut.image_ref
+    assert restored.scenario.scene == "go2_warehouse"
+
+
+def test_an_undeclared_policy_leaves_the_wire_byte_identical(tmp_path):
+    """The carter plane, pinned against the branch itself: even when a caller
+    hands a path in, a request that declares no policy emits the same bytes it
+    emitted before C2c. The DOCUMENT decides what is pinned (a path with no
+    declared digest would be half a pin), so the declaration is the gate."""
+    request = load_request(CARTER_FIXTURE).request
+    plain = build_job_spec(request, "jid-1")
+    with_a_stray_path = build_job_spec(
+        request, "jid-1", locomotion_policy_path=str(tmp_path / "policy.pt")
+    )
+    assert json.dumps(plain, sort_keys=True) == json.dumps(with_a_stray_path, sort_keys=True)
+    assert not [key for key in plain if "locomotion" in key]
+
+
+def test_a_declared_policy_without_a_resolved_path_emits_nothing_and_the_runner_says_so(tmp_path):
+    """The remaining arm: a caller that holds the MODEL but not the admission
+    (no path) emits neither key — and that is not a silent no-op, because the
+    consumer refuses the boot naming the plane that dropped it (G-26/G-74). This
+    is the state every go2 request was in until C2c."""
+    admitted = load_request(_case(tmp_path))
+    spec = build_job_spec(admitted.request, "req-go2:0")  # path NOT forwarded
     assert not [key for key in spec if "locomotion" in key]
-    assert spec["sut_image_ref"] == admitted.request.sut.image_ref
+    with pytest.raises(go2_wiring.PolicyContractError) as excinfo:
+        go2_wiring.check_firmware_slot(admitted.request, go2_wiring.policy_pin(spec))
+    assert go2_wiring.POLICY_PATH_KEY in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# execution plane — the two SUBMISSION planes agree (the reason the producer is
+# single: C2b's question §3 option A). Both real entrypoints are driven.
+# --------------------------------------------------------------------------- #
+class _SpecRecordingRunner:
+    """M3 runner seam that records the JOB_SPEC that rode the job (rest-glue idiom)."""
+
+    def __init__(self) -> None:
+        self.specs: list[dict] = []
+
+    def run(self, job: Job) -> JobResult:
+        self.specs.append(copy.deepcopy(job.job_spec))
+        return JobResult(job=job, state=JobState.COMPLETED, verdict=Verdict.PASS)
+
+
+def _rest_plane_spec(tmp_path: Path, scenario: Path) -> dict:
+    """The spec the REAL REST submit path puts on a job (``POST /envelopes``)."""
+    runner = _SpecRecordingRunner()
+    with Store(tmp_path / "cv.sqlite3") as store:
+        with TestClient(create_app(store, runner, k=1)) as client:
+            body = {
+                "requests": [yaml.safe_load(scenario.read_text(encoding="utf-8"))],
+                "oracle_plugin_dirs": [str(scenario.parent)],  # the ride-along anchor
+            }
+            response = client.post("/envelopes", json=body)
+            assert response.status_code == 202, response.text
+            envelope_id = response.json()["envelope_id"]
+            deadline = time.monotonic() + 10.0
+            status = client.get(f"/envelopes/{envelope_id}").json()
+            while status["status"] != "completed":
+                assert time.monotonic() < deadline, "envelope did not complete in time"
+                time.sleep(0.02)
+                status = client.get(f"/envelopes/{envelope_id}").json()
+    assert len(runner.specs) == 1
+    return runner.specs[0]
+
+
+def _cli_plane_spec(monkeypatch, tmp_path: Path, scenario: Path) -> dict:
+    """The spec the REAL ``cv-infra run`` path hands the supervisor seam."""
+    stub = RecordingSupervisor()
+    install_supervisor(monkeypatch, stub)
+    out_dir = tmp_path / "out"
+    code = main(
+        [
+            "run",
+            str(scenario),
+            "--runner-image",
+            "cv-infra-runner:x",
+            "--out-dir",
+            str(out_dir),
+            "--job-id",
+            "req-go2:0",
+        ]
+    )
+    assert code == 0, stub.calls
+    return stub.calls[0]["job_spec"]
+
+
+def _without_job_id(spec: dict) -> str:
+    """Canonical bytes of a spec minus the one key the two planes name differently."""
+    return json.dumps({k: v for k, v in spec.items() if k != "job_id"}, sort_keys=True)
+
+
+def test_both_submission_planes_put_the_same_policy_pin_on_the_wire(monkeypatch, tmp_path):
+    """``cv-infra run`` and ``POST /envelopes`` emit the SAME spec for the same
+    go2 document — the property option A was chosen for (one producer, both call
+    sites forwarding their own admission).
+
+    Armed per G-59: the input DECLARES a policy, so the equality exercises the
+    optional branch instead of agreeing about a wire neither plane filled. Both
+    entrypoints are driven for real (the fan-out plane through ``TestClient``,
+    the CLI through ``main``) — comparing the two thin aliases would prove
+    nothing, since they are the same function object; what can drift is the
+    CALL SITE forgetting to forward (G-106 ③).
+    """
+    scenario_dir = tmp_path / "scn"
+    scenario_dir.mkdir()
+    scenario = _case(scenario_dir)
+    cli_spec = _cli_plane_spec(monkeypatch, tmp_path, scenario)
+    rest_spec = _rest_plane_spec(tmp_path, scenario)
+
+    assert cli_spec[go2_wiring.POLICY_PATH_KEY] == str(scenario_dir / "policy.pt")
+    assert cli_spec[go2_wiring.POLICY_SHA_KEY] == POLICY_SHA
+    # job_id is the one honest difference: each plane names its own job.
+    assert cli_spec["job_id"] == "req-go2:0" and rest_spec["job_id"].endswith(":0")
+    assert _without_job_id(cli_spec) == _without_job_id(rest_spec)
+
+
+def test_neither_plane_puts_a_policy_key_on_an_undeclared_request(monkeypatch, tmp_path):
+    """Regression control for the carter plane through both REAL entrypoints:
+    the byte-identical wire above is not an artifact of calling the producer
+    directly."""
+    scenario = tmp_path / "scn" / "carter.yaml"
+    scenario.parent.mkdir()
+    scenario.write_text(CARTER_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    cli_spec = _cli_plane_spec(monkeypatch, tmp_path, scenario)
+    rest_spec = _rest_plane_spec(tmp_path, scenario)
+    assert not [key for key in cli_spec if "locomotion" in key]
+    assert not [key for key in rest_spec if "locomotion" in key]
+    assert _without_job_id(cli_spec) == _without_job_id(rest_spec)
+    # ...and it is the very spec the producer builds with no path at all.
+    assert build_job_spec(load_request(scenario).request, "req-go2:0") == cli_spec
 
 
 # --------------------------------------------------------------------------- #
