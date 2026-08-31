@@ -35,6 +35,7 @@ from cv_infra.runner.go2_constants import (
     DECIMATION,
     DEFAULT_JOINT_POS,
     EFFORT_LIMIT,
+    FIXED_DT,
     JOINT_ORDER,
     KD,
     KP,
@@ -227,6 +228,48 @@ def test_dc_motor_speed_clip_is_the_derived_sixty_not_a_typed_number():
     """``VEL_AT_EFFORT_LIM`` is DERIVED (V*(1+S/E)); the literal 60.0 would go
     stale the moment a re-measured saturation/effort limit made them differ."""
     assert VEL_AT_EFFORT_LIM == VELOCITY_LIMIT * (1 + SATURATION_EFFORT / EFFORT_LIMIT) == 60.0
+
+
+def test_the_measured_training_values_are_pinned_as_literals():
+    """Every OTHER test in this file reads these symbols, so it asserts "the loop
+    honours the contract" — not "the contract is what was measured". Editing
+    DECIMATION to 2 kept the whole suite green (mutation M21) while silently
+    doubling the control rate the network was trained at, so the measured VALUES
+    get one pin of their own, quoted from C0 probe §3 (2026-09-01).
+
+    A copy of a canonical value drifts (G-25), which is exactly why the copy is
+    here: it turns an edit of the trained contract into a deliberate act with a
+    red test in front of it, rather than a one-character change to a constant.
+    """
+    assert (FIXED_DT, DECIMATION) == (0.005, 4)
+    assert 1.0 / (FIXED_DT * DECIMATION) == 50.0  # policy rate; torque runs at 200 Hz
+    assert (OBS_DIM, ACTION_DIM, ACTION_SCALE) == (48, 12, 0.25)
+    assert (KP, KD) == (25.0, 0.5)
+    assert (EFFORT_LIMIT, SATURATION_EFFORT, VELOCITY_LIMIT) == (23.5, 23.5, 30.0)
+    assert JOINT_ORDER == (
+        "FL_hip_joint",
+        "FR_hip_joint",
+        "RL_hip_joint",
+        "RR_hip_joint",
+        "FL_thigh_joint",
+        "FR_thigh_joint",
+        "RL_thigh_joint",
+        "RR_thigh_joint",
+        "FL_calf_joint",
+        "FR_calf_joint",
+        "RL_calf_joint",
+        "RR_calf_joint",
+    )
+    assert DEFAULT_JOINT_POS == (0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5)
+    assert [name for name, _s, _e in OBS_LAYOUT] == [
+        "base_lin_vel",
+        "base_ang_vel",
+        "projected_gravity",
+        "velocity_commands",
+        "joint_pos",
+        "joint_vel",
+        "actions",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -451,19 +494,29 @@ def test_bind_maps_by_NAME_so_a_reordered_asset_still_gets_the_right_joint(
 ):
     """Probe §5 measured 12/12 identical order — this is the defence for the day
     the asset changes, since the observation/action vectors are positional and a
-    scrambled mapping produces a robot that fights itself in silence."""
+    scrambled mapping produces a robot that fights itself in silence.
+
+    Every joint carries a value that IDENTIFIES it (stance + 1 mm * slot), small
+    enough that no torque saturates: the first version of this test used large
+    angles, every joint clipped to -23.5 N·m, and a permutation was invisible in
+    a uniform vector — the assertion passed with the scatter mapping deleted
+    (mutation M9). The manipulation check below is what says the permutation is
+    observable at all (G-107 ②).
+    """
     shuffled = tuple(reversed(JOINT_ORDER))
-    art = _FakeArticulation(dof_names=shuffled, joint_pos=[float(i + 1) for i in range(12)])
+    offsets = tuple(0.001 * (i + 1) for i in range(12))
+    marked = {name: DEFAULT_JOINT_POS[i] + offsets[i] for i, name in enumerate(JOINT_ORDER)}
+    art = _FakeArticulation(dof_names=shuffled, joint_pos=[marked[name] for name in shuffled])
     loop, policy, _ = _ready(monkeypatch, tmp_path, art)
     assert "differs from the trained order" in capsys.readouterr().out  # loud, not silent
 
     loop.on_physics_step()
-    # dof index of JOINT_ORDER[i] is 11-i, so slot i reads raw value 12-i.
-    expected = tuple((12 - i) - DEFAULT_JOINT_POS[i] for i in range(12))
-    assert _obs_slice(policy.observations[0], "joint_pos") == pytest.approx(expected)
+    assert _obs_slice(policy.observations[0], "joint_pos") == pytest.approx(offsets)
     # ...and the effort written back is scattered into the ASSET's order.
-    torque = dc_motor_torque(DEFAULT_JOINT_POS, [12 - i for i in range(12)], ZERO12)
-    assert art.efforts[0] == pytest.approx([torque[11 - i] for i in range(12)])
+    torque = tuple(-KP * offset for offset in offsets)  # linear region: no clipping
+    scattered = [torque[11 - i] for i in range(12)]
+    assert scattered != pytest.approx(list(torque)), "manipulation check: order must be observable"
+    assert art.efforts[0] == pytest.approx(scattered)
 
 
 def test_bind_stays_quiet_when_the_asset_order_is_the_measured_one(monkeypatch, tmp_path, capsys):
@@ -538,13 +591,37 @@ def test_the_observation_carries_the_PREVIOUS_raw_action_and_starts_at_zero(monk
 
 
 def test_the_raw_action_becomes_the_joint_target_through_the_trained_offset(monkeypatch, tmp_path):
-    raw = tuple(1.0 for _ in range(ACTION_DIM))
-    art = _FakeArticulation()
+    """The full chain in ONE assertion, with the expectation spelled out in plain
+    arithmetic (not by calling the same helpers back): raw -> +0.25 scale ->
+    stance offset -> PD error -> effort. Every joint sits in the linear region on
+    purpose — a saturated vector hides both the scale and the mapping."""
+    raw = tuple(0.02 * (i + 1) - 0.1 for i in range(ACTION_DIM))
+    art = _FakeArticulation(joint_pos=list(DEFAULT_JOINT_POS))  # already at stance
     loop, _policy, _ = _ready(monkeypatch, tmp_path, art, actions=(raw,))
     loop.on_physics_step()
-    assert art.efforts[0] == pytest.approx(
-        dc_motor_torque(joint_pos_target(raw), [0.0] * 12, ZERO12)
-    )
+    assert art.efforts[0] == pytest.approx([KP * ACTION_SCALE * a for a in raw])
+
+
+def test_each_base_term_comes_from_its_OWN_accessor_and_is_rotated_into_the_body(
+    monkeypatch, tmp_path
+):
+    """Linear and angular velocity are both 3-vectors read one line apart, so
+    swapping the two accessors type-checks, runs, and teaches the policy that it
+    is spinning when it is driving. The fake's defaults are all zeros, which made
+    that swap invisible until this test gave the two terms different values
+    (mutation M13); the yaw here also proves the rotation is applied to the
+    velocities, not just to gravity."""
+    art = _FakeArticulation()
+    art.quat = list(YAW_90)  # facing world +y
+    art.lin_vel = [1.0, 0.0, 0.0]  # driving along world +x = its own right
+    art.ang_vel = [0.0, 3.0, 2.0]
+    loop, policy, _ = _ready(monkeypatch, tmp_path, art)
+    loop.on_physics_step()
+
+    obs = policy.observations[0]
+    assert _obs_slice(obs, "base_lin_vel") == pytest.approx((0.0, -1.0, 0.0))
+    assert _obs_slice(obs, "base_ang_vel") == pytest.approx((3.0, 0.0, 2.0))
+    assert _obs_slice(obs, "projected_gravity") == pytest.approx((0.0, 0.0, -1.0))  # still upright
 
 
 def test_the_latched_command_is_what_the_network_sees(monkeypatch, tmp_path):
