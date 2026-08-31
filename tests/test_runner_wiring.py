@@ -358,7 +358,38 @@ def test_undeclared_fixed_dt_leaves_the_step_at_one_sixtieth():
 def test_declared_fixed_dt_drives_both_physics_and_rendering_dt():
     spec = {**_valid_spec(), "execution_settings": {"fixed_dt": 0.02}}
     config = main.sim_config_for(main.parse_request(spec)[0])
+    # render_interval 1 (every scene but go2) reproduces the pre-B-5 coupling.
     assert (config.physics_dt, config.rendering_dt) == (0.02, 0.02)
+
+
+def test_a_go2_scene_decimates_the_render_and_leaves_the_physics_step_alone():
+    """B-5/AR-17: the render interval is the SCENE's property (the training cfg's
+    own ``sim.render_interval`` = 4), not a consumer knob.
+
+    Measured motivation: with the two coupled, ``fixed_dt: 0.005`` renders at 200
+    Hz and the go2 job runs at RTF 0.318 with its sensors on (C3 §4-1); C2b
+    measured the same scene at 1.72 with rendering_dt 0.02. The physics step —
+    the plant the policy was trained in — must NOT move with it."""
+    spec = {
+        **_valid_spec(),
+        "scenario": {**_valid_spec()["scenario"], "scene": "go2_warehouse", "robot": "go2"},
+        "execution_settings": {"fixed_dt": 0.005},
+    }
+    config = main.sim_config_for(main.parse_request(spec)[0])
+    assert config.physics_dt == 0.005  # 200 Hz plant, untouched
+    assert config.rendering_dt == pytest.approx(0.02)  # 50 Hz render = 4 physics steps
+
+
+def test_an_undeclared_dt_on_a_decimated_scene_still_decimates():
+    """The interval multiplies whatever the physics step ends up being — a go2
+    document that forgets ``fixed_dt`` is a different (wrong) plant, but its
+    render decimation is still the row's, and ``emit_sim_config`` prints both."""
+    spec = {
+        **_valid_spec(),
+        "scenario": {**_valid_spec()["scenario"], "scene": "go2_warehouse", "robot": "go2"},
+    }
+    config = main.sim_config_for(main.parse_request(spec)[0])
+    assert (config.physics_dt, config.rendering_dt) == pytest.approx((1 / 60.0, 4 / 60.0))
 
 
 def test_the_declared_knobs_reach_sim_config_through_the_real_job_spec_wire():

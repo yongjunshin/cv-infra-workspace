@@ -43,6 +43,15 @@ VIDEO_NAME = "recording.mp4"
 # scenario wiring (same reasoning as the mp4 camera below).
 BAG_SENSORS_ENV = "CV_BAG_SENSOR_TOPICS"
 
+# The transform tree. These two names are NOT configurable: tf2 fixes them, and
+# every ROS consumer (rviz replay, costmap reconstruction, "where was the robot
+# when the camera saw this") reads them by those names. They are recorded for
+# EVERY robot — carter's come from the sample scene's OmniGraph, go2's from the
+# runner's own publishers (``go2_sensors.TF_TOPIC`` / ``TF_STATIC_TOPIC``, whose
+# spelling a test pins against this copy: G-25 ② mechanical guard on a
+# deliberate duplicate, since a recorder must not depend on one robot's module).
+TF_TOPICS = ("/tf", "/tf_static")
+
 # mp4 capture defaults (module policy, not consumer contract — the camera an
 # operator reviews is not scenario wiring; revisit at the P3 recording
 # formalization if consumers need to pick a camera).
@@ -73,16 +82,22 @@ def plan_artifacts(out_dir: str | Path) -> ArtifactPaths:
 # Pure planning helpers — CPU unit-test surface.
 # --------------------------------------------------------------------------- #
 def bag_topics(config: Ros2AdapterConfig, include_sensors: bool = False) -> list[str]:
-    """Topics the MCAP bag records: /clock (always — sim-time keying) + the nav
-    streams (odom fan-out + cmd_vel), and — opt-in only — the DECLARED sensor
-    streams.
+    """Topics the MCAP bag records: /clock (always — sim-time keying), the TF
+    tree, the nav streams (odom fan-out + cmd_vel), and — opt-in only — the
+    DECLARED sensor streams.
 
-    The default is unchanged: sensor topics stay out (artifact size; R12). With
-    ``include_sensors`` the topics come from ``adapter_config.sensors`` — the
+    ``/tf`` + ``/tf_static`` are in the DEFAULT set (C3 §7-2 found them missing):
+    without them the bag cannot be replayed in rviz, no costmap can be
+    reconstructed, and — on a composed scene — every sensor frame in the bag
+    names a frame nothing in the bag defines. They cost a few hundred bytes per
+    message against the /odom already in the set.
+
+    Sensor topics stay out by default (artifact size; R12). With
+    ``include_sensors`` they come from ``adapter_config.sensors`` — the
     scenario's own declaration, so a scenario that names a different lidar gets
-    that one and no topic literal lives here (R7).
+    that one and no SENSOR topic literal lives here (R7).
     """
-    topics = [config.clock_topic, *config.odom_topics, config.cmd_vel.topic]
+    topics = [config.clock_topic, *TF_TOPICS, *config.odom_topics, config.cmd_vel.topic]
     if include_sensors:
         topics += [sensor.topic for sensor in config.sensors]
     return list(dict.fromkeys(topics))  # dedupe, order-preserving
@@ -145,6 +160,25 @@ def capture_stride(sim_fps: float, video_fps: float) -> int:
     return max(1, round(sim_fps / video_fps))
 
 
+def step_rate_hz(rendering_dt: float) -> float:
+    """How many times a second (SIM time) the step listeners fire.
+
+    ``SimRuntime.step()`` is ONE ``World.step(render=True)``, which advances the
+    world by ``rendering_dt`` (substepping physics at ``physics_dt`` inside it)
+    and calls ``on_step`` once. So the frame recorder's cadence is set by the
+    RENDER step, not by the physics step — the two stopped being the same number
+    when the go2 row started decimating the render (B-5).
+
+    This is the ``sim_fps`` the video recorders want: at 1/60 it returns the 60
+    they already defaulted to, and it is why a 200 Hz plant with a 4x render
+    decimation still produces a 10 fps mp4 that plays back in sim real time
+    instead of a 3.3x slow-motion one.
+    """
+    if rendering_dt <= 0:
+        raise ValueError("rendering_dt must be > 0")
+    return 1.0 / rendering_dt
+
+
 class RosbagRecorder:
     """rosbag2 MCAP writer (/clock always included, sim-time keyed).
 
@@ -178,6 +212,21 @@ class RosbagRecorder:
                 "MCAP backend is the M5 option-A layer (ros-jazzy-ros2bag + "
                 "rosbag2-storage-mcap; report deployment-2026-07-08-p2c5-rosbag2-layer)"
             )
+        # C3 §7-3, the SILENT half of this bug: ``ros2 bag record`` REFUSES an
+        # existing output folder ("Output folder already exists") and dies at
+        # once, but ``stop()`` then globs ``*.mcap`` and hands back the PREVIOUS
+        # run's file as this run's artifact — a stale bag wearing a fresh
+        # result's name. Refusing here is what makes that impossible: the dir is
+        # created by rosbag2 itself, so its existence always means somebody
+        # else's bag is in it. Loud + non-fatal (``_start_quiet`` degrades the
+        # artifact to None, P2-02) — a recording problem never poisons a verdict.
+        if self.paths.bag_dir.exists():
+            raise RecorderUnavailable(
+                f"rosbag2 output dir {self.paths.bag_dir} already exists — rosbag2 refuses "
+                "to write into an existing folder, and anything already in there belongs "
+                "to a PREVIOUS run (this job would have reported that stale .mcap as its "
+                "own artifact). Point RESULT_OUT at a fresh dir, or remove it"
+            )
         self.paths.bag_dir.parent.mkdir(parents=True, exist_ok=True)
         topics = bag_topics(self.config, self.include_sensors)
         # G-26 feature-on gate: the opt-in must be observable, or a knob that
@@ -195,7 +244,13 @@ class RosbagRecorder:
         )
 
     def stop(self) -> Path:  # pragma: no cover - needs the backend
-        """SIGINT for a clean rosbag2 close; return the produced .mcap path."""
+        """SIGINT for a clean rosbag2 close; return the produced .mcap path.
+
+        The glob below can only ever see THIS run's files: ``start`` refused to
+        proceed if the dir already existed, so an .mcap under it was written by
+        the child that just closed (C3 §7-3). No .mcap at all stays a loud
+        RuntimeError — ``_stop_quiet`` turns it into a warning + a null artifact.
+        """
         if self._proc is not None:
             import signal  # noqa: PLC0415
 

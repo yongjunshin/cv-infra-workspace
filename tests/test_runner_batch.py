@@ -1000,3 +1000,128 @@ def test_carrier_main_maps_a_refused_eula_to_the_platform_exit_code(monkeypatch,
     monkeypatch.setattr(batch, "run", _refuse)
     assert batch.main({}) == batch.EXIT_PLATFORM == 3
     assert "boot refused" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# C5 — the quadruped repose + the carrier parity a unit test cannot execute.
+# --------------------------------------------------------------------------- #
+def test_repose_restores_the_stance_the_registry_row_declares():
+    """The legged half of the iteration boundary (D-5).
+
+    A quadruped ends a mission with its legs wherever the last gait cycle left
+    them, so a teleport alone starts sample i+1 mid-stride. The stance VALUES
+    must come from the scene row (which took them from the measured training
+    contract), never from a literal here: a second copy of the 12 numbers is a
+    plant that drifts away from the offset the policy adds its actions to.
+    """
+    source = Path(sim_runtime.__file__).read_text(encoding="utf-8")
+    called = _called_names(_method(source, "SimRuntime", "repose_robot"))
+    assert "set_joint_positions" in called, "the repose leaves a quadruped mid-stride"
+    assert "scene_row" in called, "the stance was written from somewhere other than the row"
+
+
+def test_the_policy_episode_state_is_dropped_before_the_restage_not_after():
+    """Order pin (C5): ``World.reset(soft=True)`` "will do one step internally
+    regardless" (vendor docstring — the same property the record swap is placed
+    around), and that step runs the physics callbacks. A policy reset AFTER the
+    restage therefore lets sample i's last gait torque be applied to sample i+1's
+    robot once, before the repose has even written the stance.
+
+    Reset first and the two agree by construction: the loop's post-reset joint
+    target IS ``go2_constants.DEFAULT_JOINT_POS``, which is the stance the row
+    declares and the repose writes.
+    """
+    run = _batch_run_function()
+    lines: dict[str, list[int]] = {}
+    for node in ast.walk(run):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            lines.setdefault(node.func.attr, []).append(node.lineno)
+    (reset,) = lines["reset"]  # policy.reset() — the carrier's only bare reset
+    (restage,) = lines["restage"]
+    assert reset < restage, "the policy carried sample i's episode state into the reset step"
+
+
+def test_the_carrier_publishes_the_same_sensor_suite_a_single_job_does():
+    """A COMPOSED scene (go2) ships no vendor ROS graph — not even /clock — so a
+    carrier that only ran the FU-17 graph walk would publish NOTHING and every
+    sample would fail the readiness barrier waiting on a clock nobody sources.
+
+    Pinned by NAME on the same three seams ``main.run`` uses, because "the two
+    entrypoints stage the same world" is the property the batch exists to keep
+    (the sample IS the job — p6 §0).
+    """
+    run = _batch_run_function()
+    called = _called_names(run)
+    for seam in ("build_sensor_suite", "register_sensor_hooks", "_attach_optional_streams"):
+        assert seam in called, f"the carrier never calls {seam}"
+    # ``detach`` by its RECEIVER: the telemetry sampler spells that name too, so a
+    # bare-attribute check would pass on a carrier with no sensor suite at all
+    # (G-106: a guard its own bug satisfies). ``attach`` moved into the helper,
+    # which the two tests below drive directly.
+    spelled = {
+        ast.unparse(node.func)
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "sensors.detach" in spelled
+    # ...and the graph-only spelling it replaced must be gone: leaving it next to
+    # the suite would enable render products for topics the RUNNER publishes and
+    # warn about every one of them.
+    assert "enable_declared_sensors" not in called
+
+
+class _FakeSensors:
+    """A ``Go2SensorSuite``-shaped stand-in (attach/detach return report lines)."""
+
+    def __init__(self) -> None:
+        self.attached: tuple | None = None
+
+    def attach(self, node, on_step) -> list[str]:
+        self.attached = (node, on_step)
+        return ["[cv-runner] go2_sensors inventory=8"]
+
+
+def test_a_composed_worlds_streams_are_attached_to_the_carriers_one_node(monkeypatch, capsys):
+    """Both optional attachments, on the shape a go2 carrier has."""
+    from types import SimpleNamespace
+
+    from cv_infra.contract.adapter_schema import Ros2AdapterConfig
+    from cv_infra.runner import go2_wiring
+
+    subscribed: list = []
+    monkeypatch.setattr(
+        go2_wiring,
+        "subscribe_cmd_vel",
+        lambda node, cmd_vel, on_command: subscribed.append((node, cmd_vel.topic, on_command)),
+    )
+    node, on_step = object(), []
+    adapter = SimpleNamespace(node=node)
+    sim = SimpleNamespace(on_step=on_step)
+    sensors, policy = _FakeSensors(), SimpleNamespace(set_command=lambda *a: None)
+
+    batch._attach_optional_streams(adapter, sim, Ros2AdapterConfig(), sensors, policy)
+
+    assert sensors.attached == (node, on_step)  # the suite publishes on the STEP hook
+    assert "go2_sensors inventory=8" in capsys.readouterr().out  # ...and says so (G-26)
+    assert subscribed == [(node, "/cmd_vel", policy.set_command)]  # ONE rclpy node
+
+
+def test_a_carter_carrier_attaches_neither_stream(monkeypatch, capsys):
+    """Positive control for the pair above: the pre-wired scene's carrier must
+    behave byte-identically to its pre-go2 self — no publishers, no subscription,
+    no extra line in the boot log."""
+    from types import SimpleNamespace
+
+    from cv_infra.contract.adapter_schema import Ros2AdapterConfig
+    from cv_infra.runner import go2_wiring
+
+    monkeypatch.setattr(
+        go2_wiring,
+        "subscribe_cmd_vel",
+        lambda *a, **k: pytest.fail("a carter carrier subscribed to /cmd_vel"),
+    )
+    adapter = SimpleNamespace(node=object())
+    batch._attach_optional_streams(
+        adapter, SimpleNamespace(on_step=[]), Ros2AdapterConfig(), None, None
+    )
+    assert capsys.readouterr().out == ""

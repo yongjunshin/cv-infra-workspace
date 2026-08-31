@@ -110,28 +110,27 @@ def check_firmware_slot(request: object, pin: PolicyPin | None) -> None:
     robot lies down and every criterion then measures a heap on the floor (C1
     §6-3 measured it), which reads as a SUT failure instead of a missing artifact.
 
-    The declaration is also read from the request model (``sut.locomotion_policy``):
-    a document that declares a policy the WIRE did not carry would otherwise boot
-    and silently run no policy at all — the same silent no-op, one plane earlier.
+    C2c §6-1 (their measurement, our repair): this used to open with a third,
+    "PLANE SKEW" branch keyed on ``request.sut.locomotion_policy``. That field is
+    ALWAYS None here — ``runner.main.parse_request`` re-nests only
+    ``sut_image_ref``, and ``contract.loader`` never returns a declaration
+    without its resolved path (devworld's input) — so the branch could not fire
+    in either caller, while the failure it described (the wire lost a declared
+    path) surfaces as the slot branch below. The skew is therefore named in THAT
+    message instead of in a branch nothing can reach: one reachable rejection
+    that lists both causes beats two, one of which is decoration (G-74: name the
+    plane, not the symptom).
     """
     slots = scene_firmware_slots(request.scenario.scene)
-    declared = getattr(request.sut, "locomotion_policy", None)
-    # PLANE SKEW first: this one is about the document vs the wire, so it must
-    # not be reported as "the request ships none" — the request ships one, the
-    # wire dropped it (G-74 class: name the plane, not the symptom).
-    if declared is not None and pin is None:
-        raise PolicyContractError(
-            "the request declares sut.locomotion_policy but the JOB_SPEC carries no "
-            f"{POLICY_PATH_KEY} — the submission plane must put the RESOLVED path on the "
-            "wire (contract.job_spec.build_job_spec); running the job without it would "
-            "silently ignore a declared SUT artifact"
-        )
     if LOCOMOTION_SLOT in slots and pin is None:
         raise PolicyContractError(
             f"scenario.scene {request.scenario.scene!r} declares the {LOCOMOTION_SLOT!r} "
-            "firmware slot (this robot runs its locomotion policy onboard) but the request "
-            "ships none — declare sut.locomotion_policy: {file, sha256} next to the "
-            "scenario file. The platform holds no policy and substitutes none"
+            "firmware slot (this robot runs its locomotion policy onboard) but this "
+            f"JOB_SPEC carries no {POLICY_PATH_KEY}. Either the request declares no "
+            "sut.locomotion_policy — declare it as {file, sha256} next to the scenario "
+            "file — or it does and the submission plane dropped the RESOLVED path from "
+            "the wire (contract.job_spec.build_job_spec). The platform holds no policy "
+            "and substitutes none"
         )
     if pin is not None and LOCOMOTION_SLOT not in slots:
         raise PolicyContractError(

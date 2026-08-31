@@ -14,8 +14,8 @@ and this module renders that path (``iteration_result_path``).
 Sequence — boot ONCE, then per sample i:
 
     admit every spec (0 GPU seconds) -> bridge bootstrap -> SimulationApp ->
-    ros2 bridge -> scene/robot/telemetry (sample 0's staging) -> adapter wire ->
-    render product
+    ros2 bridge -> scene/robot/telemetry/sensors (sample 0's staging) ->
+    adapter wire (+ sensor & /cmd_vel publishers) -> render product
       | i: re-pin seed -> restage (obstacle move + set, soft reset, repose) ->
       |    sim_config line -> SUT realign + settle -> readiness -> cycle telemetry
       |    accumulator -> bag/mp4 -> mission -> evaluate -> results/<i>/result.json
@@ -66,6 +66,7 @@ from cv_infra.runner.main import (
     READINESS_TIMEOUT_S,
     BadJobSpec,
     _abort_recorders,
+    _emit,
     _print_contact_partners,
     _start_quiet,
     _stop_quiet,
@@ -73,12 +74,14 @@ from cv_infra.runner.main import (
     announce_oracle_plugin_dir,
     artifact_paths,
     build_oracles,
+    build_sensor_suite,
     criteria_view,
     hard_exit,
     load_firmware_slot,
     obstacle_specs,
     parse_request,
     read_request_identity_key,
+    register_sensor_hooks,
     require_job_id,
     sim_config_for,
     validate_oracle_params,
@@ -477,6 +480,30 @@ def reexec_argv() -> list[str]:
     return [sys.executable, "-m", BATCH_MODULE]
 
 
+def _attach_optional_streams(
+    adapter: object, sim: object, config: object, sensors: object, policy: object
+) -> None:
+    """The two "declared, or nothing happens" attachments, after ``adapter.wire``.
+
+    A carter carrier attaches NEITHER (its scene's OmniGraphs publish, and it runs
+    no onboard policy); a go2 carrier attaches both. They belong together because
+    they share one deadline: both must be live BEFORE the first sample's
+    readiness barrier — in a composed world WE are the ``/clock`` source and the
+    barrier waits for clock FLOW (G-19), and an unattached legged robot spends
+    the whole wait lying on the floor (C1 §6-3).
+
+    Extracted from ``run`` rather than inlined next to the wire: the carrier loop
+    sits at the C901 ceiling, and these two branches are the ones a unit test can
+    still reach (everything around them needs a GPU).
+    """
+    from cv_infra.runner.go2_wiring import subscribe_cmd_vel  # noqa: PLC0415
+
+    if sensors is not None:
+        _emit(sensors.attach(adapter.node, sim.on_step))
+    if policy is not None:
+        subscribe_cmd_vel(adapter.node, config.cmd_vel, policy.set_command)
+
+
 def _settle_world(adapter: object, settle_s: float) -> float:
     """Pump the sim ``settle_s`` SIM-seconds after a realign; return the time reached.
 
@@ -528,12 +555,13 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         install_readonly_error_counter,
         observe,
     )
-    from cv_infra.runner.go2_wiring import attach_policy_loop, subscribe_cmd_vel  # noqa: PLC0415
+    from cv_infra.runner.go2_wiring import attach_policy_loop  # noqa: PLC0415
     from cv_infra.runner.realign import SutRealigner  # noqa: PLC0415
     from cv_infra.runner.recording import (  # noqa: PLC0415
         LoopVideoRecorder,
         RosbagRecorder,
         plan_artifacts,
+        step_rate_hz,
     )
     from cv_infra.runner.ros_bridge import (  # noqa: PLC0415
         bootstrap_bridge_env,
@@ -565,6 +593,13 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     # batch whose samples pin different ones, so loading sample 0's bytes here is
     # loading every sample's. Still pre-boot: a digest mismatch is exit 2.
     policy = load_firmware_slot(head.policy)
+    # D-2: the same runner-published sensor suite ``main.run`` builds — a COMPOSED
+    # scene (go2) ships no vendor ROS graph, not even /clock, so without this a
+    # carrier would publish nothing and every sample would fail the readiness
+    # barrier on a clock nobody sources. Built from the HEAD spec because the
+    # three inputs it reads (scene, adapter_config, criteria.chassis_path) are all
+    # ``_UNIFORM_FIELDS`` rows, i.e. already proven identical across the batch.
+    sensors = build_sensor_suite(head.request, head.criteria)
 
     trace = BootTrace()
     sim = SimRuntime(sim_config_for(head.request), trace=trace)
@@ -612,8 +647,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         if staging.pool_plan:
             sim.pre_reset.append(lambda _world: sim.spawn_obstacle_pool(staging.pool_plan))
             sim.pre_reset.append(lambda _world: sim.apply_obstacle_set(staging.head_obstacles))
-        if staging.sensor_topics:
-            sim.pre_reset.append(lambda _world: sim.enable_declared_sensors(staging.sensor_topics))
+        register_sensor_hooks(sim, sensors, staging.sensor_topics)
         sim.load_scene(identity_key)  # emits sample 0's sim_config line
         sampler.attach(sim.world)
         if policy is not None:  # C2b: post-reset bind + physics callback (measured)
@@ -624,14 +658,17 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         trace.begin(PHASE_ADAPTER_WIRE)
         adapter.wire(sim.simulation_app, base_config)
         trace.end(PHASE_ADAPTER_WIRE)
-        if policy is not None:
-            subscribe_cmd_vel(adapter.node, base_config.cmd_vel, policy.set_command)
+        # Sensor publishers + the policy's /cmd_vel, ONCE per carrier and before
+        # the first sample's barrier (see the helper). The publishers outlive
+        # every sample: a per-sample attach would create n publishers on one node
+        # and be discovered by nobody (G-26).
+        _attach_optional_streams(adapter, sim, base_config, sensors, policy)
         summary.doc["boot"]["adapter_wire_s"] = round(watch.end("adapter_wire"), 4)
 
         # ONE render product + ONE realigner for the whole carrier: a per-sample
         # render product would re-add the VRAM growth term p6c2 removed, and a
         # per-sample publisher would never be discovered in time (G-26).
-        video = LoopVideoRecorder()
+        video = LoopVideoRecorder(sim_fps=step_rate_hz(sim.config.rendering_dt))
         video.open_render_product()
         sim.on_step.append(video.capture_frame)
         realigner = SutRealigner(adapter.node, adapter.step_and_spin, lambda: adapter.sim_time_s)
@@ -667,14 +704,21 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
             sim.config.seed = request.scenario.seed
             sim.pin_determinism_seeds()
             if position:  # sample 0's world is the one load_scene just staged
+                if policy is not None:
+                    # D-5: the loop's carried state IS episode state (the last raw
+                    # action feeds the next observation, the command is the previous
+                    # mission's last twitch, the joint target is mid-gait). Dropped
+                    # BEFORE the restage, not after: ``World.reset(soft=True)`` "will
+                    # do one step internally regardless" (vendor docstring, the same
+                    # property the telemetry accumulator swap is placed around), and
+                    # that step runs the physics callback — with a stale target it
+                    # would apply sample i's last gait torque to sample i+1's robot.
+                    # After the reset the loop's target IS the stance repose writes
+                    # (both are ``go2_constants.DEFAULT_JOINT_POS``), so the world
+                    # the settle starts from is coherent by construction.
+                    policy.reset()
                 sim.restage(pose, obstacle, obstacle_set=obstacle_set)
                 sim.emit_sim_config(identity_key)  # per-sample applied-settings line
-                if policy is not None:
-                    # D-5: the loop's carried state IS episode state (last raw
-                    # action feeds the next observation, the command is the
-                    # previous mission's last twitch). Restoring the STANCE joint
-                    # positions after a teleport is C5's (repose), measured there.
-                    policy.reset()
             iter_watch.end("restage")
 
             iter_watch.begin("realign")
@@ -846,6 +890,10 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
     finally:
         observe("boot summary", trace.emit_summary)
         observe("cache delta", emit_cache_delta, cache_before, erofs_counter)
+        if sensors is not None:
+            # On EVERY path (main.run's stance): "the camera never produced a
+            # frame" is exactly the silence a failed batch needs stated aloud.
+            _emit(sensors.detach())
         sampler.detach()
         _abort_recorders(rosbag, video)  # no child process / writer leak
         adapter.teardown()

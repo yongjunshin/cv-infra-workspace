@@ -34,6 +34,13 @@ from cv_infra.runner.boot_trace import (
     PHASE_SCENE_LOAD,
 )
 
+# The go2 registry row's two ROBOT properties (C5). Imported, never retyped: the
+# stance a repose restores must be the SAME 12 numbers the policy offsets its
+# actions from, and the render decimation must be the SAME number the policy was
+# trained under — a second copy of either is a plant that drifts silently
+# (go2_constants is measured data only: no torch, no isaacsim, no I/O).
+from cv_infra.runner.go2_constants import DEFAULT_JOINT_POS, RENDER_INTERVAL
+
 
 class EulaNotAcceptedError(RuntimeError):
     """Raised when the runtime operator consent env is absent (LOCKED §8, NEG-2)."""
@@ -67,8 +74,11 @@ class SimConfig:
     replaces the never-consumed ``initial_pose_xyz`` placeholder; the contract
     carries no ``z`` on purpose — floor contact owns it, see ``InitialPose``.)
 
-    ``physics_dt`` / ``rendering_dt`` default to 1/60 and are overridden only by
-    a DECLARED ``execution_settings.fixed_dt``.
+    ``physics_dt`` / ``rendering_dt`` default to 1/60. ``physics_dt`` is
+    overridden only by a DECLARED ``execution_settings.fixed_dt``;
+    ``rendering_dt`` is that step times the scene's ``render_interval``
+    (B-5/AR-17 — 1 for every scene but go2, so this is the same 1/60 it always
+    was). Both are assembled by ``main.sim_config_for``, off the GPU path.
     """
 
     scene_ref: str
@@ -210,6 +220,15 @@ class SceneAsset:
       robot runs onboard, e.g. go2's locomotion policy. The platform infers no
       meaning from a slot here; it only lets the request's ``sut`` block be
       checked against what the robot declares (consumed in C2, not in C1).
+    * ``default_joint_pos`` — the STANCE a repose restores between batch samples
+      (C5/D-5). ``()`` means "leave joint positions alone", which is the carter
+      meaning: its joints are wheel angles, physically irrelevant to where a
+      mission starts. A LEGGED robot's are not — sample i+1 would start from
+      whatever leg configuration sample i ended in.
+    * ``render_interval`` — physics steps per RENDERED frame (B-5/AR-17). 1 =
+      render every step (carter, unchanged). The go2 row mirrors the TRAINING
+      config's own ``sim.render_interval``, which is what makes this a
+      reproduction knob rather than a performance shortcut.
     """
 
     scene_usd: str
@@ -219,6 +238,8 @@ class SceneAsset:
     robot_spawn_prim: str | None = None
     robot_spawn_z: float = 0.0
     firmware_slots: tuple[str, ...] = ()
+    default_joint_pos: tuple[float, ...] = ()
+    render_interval: int = 1
 
 
 SCENE_ASSETS: dict[str, SceneAsset] = {
@@ -259,6 +280,16 @@ SCENE_ASSETS: dict[str, SceneAsset] = {
         robot_spawn_z=0.32,
         # D-3: go2 runs its locomotion policy onboard -> one slot. carter = none.
         firmware_slots=("locomotion_policy",),
+        # C5/D-5: the trained stance. A quadruped that keeps sample i's leg
+        # configuration into sample i+1 starts the next mission mid-gait — the
+        # same hidden coupling the velocity zeroing removes, one layer down.
+        default_joint_pos=DEFAULT_JOINT_POS,
+        # B-5/AR-17: the TRAINING cfg's own ``sim.render_interval`` (= 4). The
+        # sensor rates are sim-clock gated (go2_sensors.RateGate) and the policy
+        # + telemetry ride PHYSICS callbacks, so decimating the render changes
+        # what is DRAWN, not what is simulated or judged. C2b measured the lever
+        # on this exact scene: rendering_dt 0.005 -> 0.02 took RTF 0.95 -> 1.72.
+        render_interval=RENDER_INTERVAL,
     ),
 }
 
@@ -342,6 +373,22 @@ def resolve_scene(scene_ref: str) -> SceneAsset:
         f"unknown scenario.scene {scene_ref!r} — known scenes: {sorted(SCENE_ASSETS)} "
         "(or pass a direct .usd/.usda/.usdz reference)"
     )
+
+
+def scene_row(scene_ref: str) -> SceneAsset:
+    """The registry row for a scene ref — an EMPTY row for anything unresolvable.
+
+    Callers that only want a ROBOT PROPERTY (the repose stance, the render
+    decimation) must not pre-empt ``load_scene``'s "unknown scene" error, which
+    is the one that lists the known scenes and is raised where the operator can
+    act on it. So an unknown name answers here exactly like a direct ``.usd``
+    ref does: with the defaults, i.e. "this scene declares nothing special".
+    Same stance (and same reason) as ``go2_wiring.scene_firmware_slots``.
+    """
+    try:
+        return resolve_scene(scene_ref)
+    except ValueError:
+        return SceneAsset(scene_usd=scene_ref)
 
 
 def is_direct_usd_ref(scene_usd: str) -> bool:
@@ -907,7 +954,7 @@ def initial_pose_world_transform(
 REPOSE_LOG_MARKER = "repose_applied="
 
 
-def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz) -> str:
+def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz, stance=()) -> str:
     """One structured line per repose — what was DECLARED and what was WRITTEN.
 
     Both sides are printed because they are different objects: the declared block
@@ -915,12 +962,21 @@ def repose_log_line(prim_path: str, declared: dict, position, orientation_wxyz) 
     trailing note names what this repose does NOT touch, so a W1 reading of
     "the robot is in the right place but the wheels are spinning" has the code's
     own statement of scope next to it.
+
+    ``stance`` is the registry row's ``default_joint_pos`` (C5): the line says
+    which of the two things happened, because "restored 12 joints" and "left the
+    joints alone" are BOTH correct answers depending on the robot, and a reader
+    of a legged sample's log has no other way to tell them apart.
     """
+    joints = (
+        f"joint POSITIONS restored to the declared stance ({len(stance)} dof)"
+        if stance
+        else "joint POSITIONS untouched"
+    )
     return (
         f"[cv-runner] {REPOSE_LOG_MARKER}{prim_path} declared={declared} "
         f"position={position} orientation_wxyz={orientation_wxyz} "
-        "(z from the scene asset; lin/ang + joint velocities zeroed, "
-        "joint POSITIONS untouched)"
+        f"(z from the scene asset; lin/ang + joint velocities zeroed, {joints})"
     )
 
 
@@ -1542,11 +1598,20 @@ class SimRuntime:
         and it would surface as unexplained variance in exactly the comparison
         this platform exists to make.
 
-        SURFACED ASSUMPTION (v1 — W1 measures it): joint POSITIONS are left alone.
-        The MVP robot is a differential-drive base whose joint positions are wheel
-        angles, physically irrelevant to where a mission starts. If W1's settling
-        gate says otherwise, ``set_joint_positions`` is the one-line addition; the
-        log line says out loud that this run did not touch them.
+        Joint POSITIONS are restored when — and only when — the scene's registry
+        row DECLARES a stance (``default_joint_pos``). That is the one-line
+        addition v1 reserved for the case a settling gate needed it, and C5 is
+        that case: a quadruped ends a mission with its legs wherever the last
+        gait cycle left them, so sample i+1 would start mid-stride from a
+        teleported base. The carter row declares no stance and therefore keeps
+        its exact v1 meaning (its joints are wheel angles — irrelevant to where a
+        mission starts, and the log line still says so).
+
+        do-not-reinvent: ``set_joint_positions`` is the vendor's own articulation
+        write, the sibling of the velocity zeroing right next to it. The stance
+        VALUES are not this layer's: they come from the registry row, which took
+        them from the measured training contract (``go2_constants``), so the pose
+        this restores is the same one the policy offsets its actions from.
         """
         import numpy as np  # noqa: PLC0415 (legal post-SimulationApp, D-C)
         from isaacsim.core.prims import SingleArticulation  # noqa: PLC0415
@@ -1563,10 +1628,13 @@ class SimRuntime:
         robot.set_world_pose(position=np.array(position), orientation=np.array(orientation))
         robot.set_linear_velocity(np.zeros(3))
         robot.set_angular_velocity(np.zeros(3))
+        stance = scene_row(self.config.scene_ref).default_joint_pos
+        if stance:
+            robot.set_joint_positions(np.array(stance))
         dof = robot.num_dof
         if dof:
             robot.set_joint_velocities(np.zeros(dof))
-        print(repose_log_line(target, pose, position, orientation), flush=True)
+        print(repose_log_line(target, pose, position, orientation, stance), flush=True)
 
     def restage(
         self,

@@ -30,17 +30,36 @@ def test_plan_artifacts_layout(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Bag planning: /clock always first, nav streams, dedupe (REQ-EXEC-008).
+# Bag planning: /clock always first, TF, nav streams, dedupe (REQ-EXEC-008).
 # --------------------------------------------------------------------------- #
-def test_bag_topics_clock_plus_nav_streams():
+def test_bag_topics_clock_plus_tf_plus_nav_streams():
     topics = recording.bag_topics(_cfg())
     assert topics[0] == "/clock"  # sim-time keying is non-negotiable
-    assert topics == ["/clock", "/odom", "/chassis/odom", "/cmd_vel"]
+    assert topics == ["/clock", "/tf", "/tf_static", "/odom", "/chassis/odom", "/cmd_vel"]
+
+
+def test_the_transform_tree_is_in_the_default_bag():
+    """C3 §7-2: a bag without TF cannot be replayed in rviz and no costmap can be
+    rebuilt from it — and on a COMPOSED scene every sensor message in the bag is
+    stamped with a frame the bag then fails to define. Both robots publish them
+    (carter from its OmniGraph, go2 from the runner), so this is the DEFAULT set,
+    not an opt-in like the sensor streams next door."""
+    assert set(recording.TF_TOPICS) <= set(recording.bag_topics(_cfg()))
+    assert set(recording.TF_TOPICS) <= set(recording.bag_topics(_cfg_with_sensors()))
+
+
+def test_the_recorders_tf_names_are_the_names_the_runner_publishes_on():
+    """G-25 ② mechanical guard on a deliberate duplicate: the recorder must not
+    import one robot's sensor module for two names tf2 fixes for everybody, but a
+    silent divergence would record two topics nothing publishes on."""
+    from cv_infra.runner import go2_sensors
+
+    assert recording.TF_TOPICS == (go2_sensors.TF_TOPIC, go2_sensors.TF_STATIC_TOPIC)
 
 
 def test_bag_topics_dedupes_preserving_order():
     cfg = Ros2AdapterConfig.model_validate({"odom_topics": ["/odom", "/odom"]})
-    assert recording.bag_topics(cfg) == ["/clock", "/odom", "/cmd_vel"]
+    assert recording.bag_topics(cfg) == ["/clock", "/tf", "/tf_static", "/odom", "/cmd_vel"]
 
 
 # --------------------------------------------------------------------------- #
@@ -61,6 +80,8 @@ def test_declared_sensors_are_excluded_by_default():
     # a config without sensors would pass whatever the code did.
     assert recording.bag_topics(_cfg_with_sensors()) == [
         "/clock",
+        "/tf",
+        "/tf_static",
         "/odom",
         "/chassis/odom",
         "/cmd_vel",
@@ -82,7 +103,13 @@ def test_opt_in_dedupes_a_sensor_that_is_already_a_nav_stream():
             "sensors": [{"topic": "/odom", "type": "nav_msgs/msg/Odometry"}],
         }
     )
-    assert recording.bag_topics(cfg, include_sensors=True) == ["/clock", "/odom", "/cmd_vel"]
+    assert recording.bag_topics(cfg, include_sensors=True) == [
+        "/clock",
+        "/tf",
+        "/tf_static",
+        "/odom",
+        "/cmd_vel",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -128,6 +155,22 @@ def test_capture_stride():
     assert recording.capture_stride(30.0, 60.0) == 1  # never below every-step
     with pytest.raises(ValueError):
         recording.capture_stride(60.0, 0.0)
+
+
+def test_step_rate_is_the_render_step_not_the_physics_step():
+    """B-5: ``SimRuntime.step()`` advances the world by ``rendering_dt`` and calls
+    the step listeners ONCE, so the capture cadence follows the RENDER.
+
+    The two numbers were the same until the go2 row started decimating the
+    render; taking the physics rate here would write a 200 Hz world's frames at
+    one every 6 physics steps = 33 sim-fps into a 10 fps container, i.e. a 3.3x
+    slow-motion mp4 of a mission that was judged in sim time."""
+    assert recording.step_rate_hz(1.0 / 60.0) == pytest.approx(60.0)  # carter, unchanged
+    assert recording.step_rate_hz(0.02) == pytest.approx(50.0)  # go2: 0.005 physics x4
+    # ...and that is the stride the recorder needs for a 10 fps mp4 of sim time.
+    assert recording.capture_stride(recording.step_rate_hz(0.02), 10.0) == 5
+    with pytest.raises(ValueError):
+        recording.step_rate_hz(0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +369,41 @@ def test_rosbag_start_spawns_the_sourced_child_and_says_what_it_records(
     # G-18 evidence culture: the recorder's own output is kept as a file.
     assert (paths.bag_dir.parent / "rosbag2.log").is_file()
     assert child.stdout is not None
+
+
+def test_rosbag_start_refuses_an_existing_bag_dir_instead_of_returning_a_stale_one(
+    tmp_path, monkeypatch
+):
+    """C3 §7-3, the bug this closes: ``ros2 bag record`` REFUSES an existing
+    output folder and dies, but ``stop()`` then globs ``*.mcap`` and hands the
+    PREVIOUS run's file back as this run's artifact — a stale bag wearing a fresh
+    result's name (C3's own verification nearly reported one).
+
+    The dir is created by rosbag2 itself, so its existence always means somebody
+    else's bag is in it. Loud + non-fatal: ``main._start_quiet`` degrades the
+    artifact to None (P2-02), the mission is untouched."""
+    _fake_backend(monkeypatch, tmp_path)
+    paths = recording.plan_artifacts(tmp_path / "out")
+    paths.bag_dir.mkdir(parents=True)
+    stale = paths.bag_dir / "bag_0.mcap"
+    stale.write_bytes(b"a previous run's bag")
+
+    with pytest.raises(recording.RecorderUnavailable) as excinfo:
+        recording.RosbagRecorder(paths, _cfg()).start()
+
+    message = str(excinfo.value)
+    assert str(paths.bag_dir) in message and "PREVIOUS run" in message
+    assert not _FakePopen.calls  # nothing was spawned into the occupied dir
+    assert stale.read_bytes() == b"a previous run's bag"  # ...and nothing was clobbered
+
+
+def test_rosbag_start_accepts_a_fresh_out_dir(tmp_path, monkeypatch):
+    """Positive control for the guard above: the production shape (a per-job
+    out-dir whose ``bag/`` does not exist yet) still spawns the recorder."""
+    _fake_backend(monkeypatch, tmp_path)
+    paths = recording.plan_artifacts(tmp_path / "out")
+    recording.RosbagRecorder(paths, _cfg()).start()
+    assert len(_FakePopen.calls) == 1
 
 
 def test_rosbag_abort_closes_the_log_file_and_stays_idempotent(tmp_path, monkeypatch):
