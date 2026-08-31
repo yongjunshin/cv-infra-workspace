@@ -1131,7 +1131,7 @@ def test_a_carter_carrier_attaches_neither_stream(monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 # C5b / AR-19 — the settle runs BEFORE the realign, and the seed is the GT pose.
 # --------------------------------------------------------------------------- #
-def test_the_settle_runs_before_the_realign_so_the_seed_is_a_pose_that_stopped_moving():
+def test_the_realign_is_settled_on_both_sides_and_then_the_mission_starts():
     """ORDER pin (AR-19). Until C5b the carrier realigned and THEN settled, so the
     world moved after AMCL had been told where the robot was.
 
@@ -1140,8 +1140,14 @@ def test_the_settle_runs_before_the_realign_so_the_seed_is_a_pose_that_stopped_m
     (0.25 m) of odometry, so the filter never corrects itself and the mission
     starts on a belief a metre behind the robot (U1 §6-1: 6 recovery rounds,
     +75 s sim on the single-job reproduction; every sample of a repeats=5 batch
-    would begin there). The three calls a unit test cannot execute are pinned in
-    the order that repair IS.
+    would begin there).
+
+    TWO pumps, one on each side, and the second one is not symmetry for its own
+    sake — it was MEASURED into existence (WS run 1 of this very cycle): with the
+    settle moved up and nothing after the realign, the seed landed verbatim in
+    AMCL and the goal was still dispatched onto the previous sample's belief
+    (``Begin navigating from current location (-6.84, 5.89)``, plan of 0 poses,
+    aborted after 0.28 sim-seconds). So the pin is the whole sequence.
     """
     run = _batch_run_function()
     called: dict[str, list[int]] = {}
@@ -1152,12 +1158,13 @@ def test_the_settle_runs_before_the_realign_so_the_seed_is_a_pose_that_stopped_m
             )
             called.setdefault(name, []).append(node.lineno)
     (restage,) = called["restage"]
-    (settle,) = called["_settle_world"]
+    settle, converge = sorted(called["_settle_world"])  # exactly two, in this order
     (realign,) = called["realign"]
     (readiness,) = called["await_ready"]
-    assert restage < settle < realign < readiness, (
-        f"restage {restage} / settle {settle} / realign {realign} / readiness {readiness} — "
-        "a realign that precedes the settle seeds AMCL with a pose the world then leaves"
+    assert restage < settle < realign < converge < readiness, (
+        f"restage {restage} / settle {settle} / realign {realign} / converge {converge} / "
+        f"readiness {readiness} — the seed must be taken from a world that stopped moving "
+        "AND the SUT must be given time to act on it before the mission"
     )
 
 
