@@ -119,8 +119,9 @@ cv-infra submit scenarios/*.yaml --wait                                     # �
 | `2` | **CONTRACT** — 시나리오·계약 오류(잘못된 YAML, 미지 `apiVersion`) | `failure` + YAML 인라인 annotation |
 | `3` | **INFRA** — 인프라 문제(오케스트레이터 다운·EULA 미동의·러너 크래시). **SUT 판정이 아니다** | `neutral` |
 
-시나리오 문법 전체(랜덤화·장애물·커스텀 oracle)·CLI 7개 명령·결과 읽는 법은
-**[`docs/user-guide.md`](docs/user-guide.md)**.
+시나리오 문법 전체(랜덤화·장애물·커스텀 oracle)·CLI 7개 명령·결과 읽는 법, 그리고 **사족보행(go2)
+로봇**의 추가 계약(보행 정책·센서 인벤토리·판정 스코프·dev-world)은
+**[`docs/user-guide.md`](docs/user-guide.md)**(§8).
 
 ## 문서
 

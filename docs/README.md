@@ -8,7 +8,7 @@
 | 문서 | 무엇 |
 |---|---|
 | [installation.md](installation.md) | **설치 매뉴얼** — GPU 호스트 한 대에 올리는 최소 경로(요구사항 → 명시 동의 → 캐시 워밍 → 기동 → `cv-infra selftest` 검증 → 업그레이드 → 최초 설치 트러블슈팅) |
-| [user-guide.md](user-guide.md) | **사용 매뉴얼** — 시나리오 계약·랜덤화·CLI·CI 배선·exit 0/1/2/3·리포트/회귀 읽기 |
+| [user-guide.md](user-guide.md) | **사용 매뉴얼** — 시나리오 계약·랜덤화·CLI·CI 배선·exit 0/1/2/3·리포트/회귀 읽기 + **사족보행(go2) 절**(보행 정책·센서 인벤토리·판정 스코프·dev-world) |
 | [releases.md](releases.md) | 릴리즈 대장 — *어떤 태그를 쓰고 어떤 태그를 쓰면 안 되는지*의 정본(릴리즈별 노트·정정 이력) |
 | [version-compatibility.md](version-compatibility.md) | 버전 호환 매트릭스 — Action 태그 · CLI/패키지 · 계약 `apiVersion` **3축(서로 독립)** |
 
