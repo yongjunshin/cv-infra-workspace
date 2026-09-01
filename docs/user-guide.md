@@ -50,7 +50,7 @@ acceptance_criteria:
 |---|---|---|
 | `apiVersion` | **예** | 이 문서가 어느 계약 버전으로 쓰였는지. **생략하면 거부된다**(조용히 현행으로 간주하지 않는다). 값은 `cv-infra/v1` → §7 |
 | `scenario` | **예** | 세계와 미션. `scene`/`robot`(자산 지정) · `goal`(x·y·yaw, 기본 프레임 `map`) · `seed`(결정성) · `timeout_s`(**sim 시간** 예산, wall-clock 아님). 선택: `initial_pose`(출발 포즈 3축) · `obstacles`(§3) · 레거시 `debug_obstacle`(상자 1개) |
-| `sut` | **예** | 검증 대상 로봇 SW의 **컨테이너 이미지 ref**. 플랫폼은 이것을 pull해 띄울 뿐 빌드하거나 내부를 고치지 않는다(블랙박스). 선택 `image_id`로 정확한 Image Id를 핀할 수 있다 |
+| `sut` | **예** | 검증 대상 로봇 SW의 **컨테이너 이미지 ref**. 플랫폼은 이것을 pull해 띄울 뿐 빌드하거나 내부를 고치지 않는다(블랙박스). 선택 `image_id`로 정확한 Image Id를 핀할 수 있고, 보행 정책처럼 **이미지 밖에 사는 SUT 산출물**은 `locomotion_policy`로 실어 보낸다(§8.2) |
 | `interface` | 아니오(기본값) | SUT와 시뮬레이터를 잇는 **ROS 2 배선**. 생략하면 ROS/Nav2 관례 기본값(`jazzy` · `/cmd_vel` · `/navigate_to_pose` · `/clock` …)이 쓰인다. **`odom_topics`·`sensors`는 기본값이 없다** — 자기 로봇의 토픽을 여기에 적어야 센서 스트림이 흐른다 |
 | `acceptance_criteria` | **예**(≥1) | "무엇을 통과로 보는가". 빌트인 `reached_goal`·`no_collision` + 커스텀 oracle(§4). **기준도 입력**이다 |
 | `execution_settings` | 아니오 | `repeats`(표본 수) · `min_pass_ratio`(통과 임계) · `fixed_dt` → §2.5 |
@@ -147,7 +147,7 @@ acceptance_criteria:
 
 실측(2026-08-30, 위 §2.2 예제 · `cv-derive/1` · seed 42): 표본 0 =
 `initial_pose (x -6.1821, y -1.2083, yaw 3.2691)` · `goal.y 5.0` · `derivation {cv-derive/1, 0}`.
-같은 문서를 다시 제출해도 같은 값이다. (제출 전 미리보기 CLI는 아직 없다 — §8.)
+같은 문서를 다시 제출해도 같은 값이다. (제출 전 미리보기 CLI는 아직 없다 — §9.)
 
 ### 2.4 SUT 비결정성은 다른 문제다
 
@@ -221,7 +221,7 @@ acceptance_criteria:
 
 | 규칙 | 내용 |
 |---|---|
-| `asset` 3형태 | ① 큐레이션 레지스트리 이름 — **`chair` · `desk` · `forklift`**(bbox·z_offset·콜라이더를 실측한 뒤 등재) ② 직접 `.usd`/`.usda`/`.usdz` 참조(자기 자산) ③ **`box`**(내장 큐보이드). `scenario.scene`과 같은 해석 규칙이며, 미지 이름은 아는 이름을 나열하며 거부된다 |
+| `asset` 3형태 | ① 큐레이션 레지스트리 이름 — **`chair` · `desk` · `forklift` · `person`**(bbox·z_offset·콜라이더를 실측한 뒤 등재) ② 직접 `.usd`/`.usda`/`.usdz` 참조(자기 자산) ③ **`box`**(내장 큐보이드). `scenario.scene`과 같은 해석 규칙이며, 미지 이름은 아는 이름을 나열하며 거부된다. ⚠ `person`은 **bind pose(팔 벌린 자세)로 스폰되어 폭 1.76 m**다(실측) — 통로 배치는 어깨너비가 아니라 이 값으로 계산하라 |
 | 치수 | `height`/`width`/`depth`는 **`box` 전용**이다. USD 자산은 자기 extent를 갖고 오므로 비-box에 선언하면 조용히 무시하지 않고 거부한다. `z`는 없다 — 바닥 접촉이 결정한다 |
 | 개수 | `count`는 정수 또는 `{randint: [lo, hi]}`. 계약이 그룹당 `0..32`로 제한하고, 러너가 **표본당 총 풀 32 prim**(버킷 합)을 넘는 계획을 부팅 전에 거부한다. 둘 다 오타 방어용 **구조적 상한**(측정값 아님) |
 | 정적·부동 | 장애물은 **밀리지 않는 정적 충돌체**다. 동적 물리(`RigidBodyAPI`/`ArticulationRootAPI`)를 실은 USD 자산은 부팅 시점에 거부된다 |
@@ -488,12 +488,284 @@ scenarios/my_scenario.yaml:7:9
 
 ---
 
-## 8. 한계·주의 (알고 쓰기)
+## 8. 사족보행 로봇(go2) — 씬 · 보행 정책 · 센서
+
+> §1~§7의 계약은 로봇 종류와 무관하다. 이 절은 **go2 시나리오가 추가로 선언하는 것**과 **그 값이
+> 어디서 측정됐는지**만 말한다. 값의 정본은 러너 코드와 씬 실측이고 아래는 사본이다.
+
+한 장으로 보면 이렇다. **★ 표시가 carter 문서와 다른 전부**이고 — 씬·로봇 · `fixed_dt` · 보행 정책 ·
+판정 스코프 네 가지다 — 아래 소절이 그 넷을 하나씩 설명한다.
+
+```yaml
+apiVersion: cv-infra/v1
+
+scenario:
+  scene: go2_warehouse                              # ★ §8.1
+  robot: go2                                        # ★ §8.1
+  initial_pose: { x: -6.0, y: -1.0, yaw: 1.5708 }   # z 는 선언하지 않는다(§8.1)
+  goal: { x: -6.0, y: 5.0, yaw: 1.5708 }
+  seed: 42
+  timeout_s: 180
+
+execution_settings:
+  fixed_dt: 0.005                                   # ★ 200 Hz = 정책의 훈련 조건(§8.1)
+
+sut:
+  image_ref: ghcr.io/<org>/<image>@sha256:<64-hex-digest>
+  locomotion_policy:                                # ★ SUT 산출물 둘째(§8.2)
+    file: policy.pt
+    sha256: 73338e49c3f1932bbcb9cf54e97ef71a9cac24bb2bb214217aa8b592cb9442fd
+
+interface:
+  type: ros2
+  adapter_config:
+    odom_topics: [/odom]                            # 선언한 것만 발행된다(§8.3)
+    sensors:
+      - { topic: /scan, type: sensor_msgs/msg/LaserScan }
+
+acceptance_criteria:
+  - oracle: reached_goal
+    params: { position_tolerance_m: 1.0 }           # 예산 근거 = §8.5
+  - oracle: no_collision
+    params:
+      chassis_path: /World/Go2/base
+      collision_scope: robot                        # ★ 없으면 다리 접촉이 안 세진다(§8.4)
+      collision_excluded_paths:
+        - /World/GroundPlane/collisionPlane
+        - /World/Warehouse_Empty_small_realtime/GroundPlane/CollisionPlane
+```
+
+실사용 예제(측정값이 주석으로 붙은 T0/랜덤/순찰 시나리오)는 소비자 예제 저장소
+`cv-infra-user-go2`의 `scenarios/*.yaml`.
+
+### 8.1 씬·로봇 — 무엇이 부팅되나
+
+| 선언 | 값 | 뜻 |
+|---|---|---|
+| `scenario.scene` | `go2_warehouse` | carter 샘플과 **같은 창고 USD** + 같은 extras 레이어 + go2 로봇을 합성한다. 두 레이어가 identity로 붙으므로 **carter 점유맵이 그대로 유효**하다 |
+| `scenario.robot` | `go2` | 로봇 자산 지정 |
+| `scenario.initial_pose` | `x`·`y`·`yaw` | **`z`는 선언하지 않는다** — 러너가 로봇별 드롭 높이(go2 = **0.32 m**)에서 떨어뜨린다 |
+| `execution_settings.fixed_dt` | **0.005** 권장 | 200 Hz 물리 = 이 보행 정책의 **훈련 조건**. 렌더 비용은 러너가 씬 레지스트리의 데시메이션(`render_interval`)으로 흡수하므로, 소비자가 렌더 주기를 따로 선언할 필요는 없다 |
+
+- 로봇 프림은 `/World/Go2`, 접촉 판정 앵커(articulation root)는 `/World/Go2/base`다(§8.4).
+- **정책이 없으면 서 있지도 못한다.** go2 자산의 관절 드라이브 게인은 0이라, 보행 정책이 붙지 않은
+  채 씬을 부팅하면 로봇은 그냥 주저앉는다(실측). 그래서 §8.2는 선택 항목이 아니다.
+- 드롭 높이 0.32는 **실측 채택값**이다(2026-09-01, 같은 seed·dt·3 s 정착, 변수는 높이 하나):
+  z `0.40` → 정착까지 슬라이드 **0.117 m** · z **`0.32` → 0.0197 m** · z `0.25` → 0.337 m(피치 0.378 rad).
+  낮을수록 좋은 것이 아니다 — 0.25는 발이 이미 스탠스를 통과한 상태로 시작한다.
+- 정본: [`cv_infra/runner/sim_runtime.py`](../cv_infra/runner/sim_runtime.py)의
+  `SCENE_ASSETS["go2_warehouse"]`(측정표가 주석으로 붙어 있다).
+
+### 8.2 SUT는 산출물 **둘**이다 — `sut.locomotion_policy`
+
+바퀴 로봇의 SUT는 이미지 하나지만, 보행 로봇의 SUT는 **이미지 + 보행 정책 파일**이다. 정책은
+이미지 밖에 살면서 요청과 **함께 실려 간다**.
+
+```yaml
+sut:
+  image_ref: ghcr.io/<org>/<image>@sha256:<64-hex-digest>
+  locomotion_policy:
+    file: policy.pt          # 시나리오 YAML 옆(하위 디렉토리 허용, 디렉토리 이탈 금지)
+    sha256: 73338e49c3f1932bbcb9cf54e97ef71a9cac24bb2bb214217aa8b592cb9442fd
+```
+
+`sha256`은 `sha256sum policy.pt`의 출력 그대로(64 lowercase hex)다 — 위 값은 참조 SUT가 쓰는
+공개 `go2_flat` 사전학습 정책의 실측 digest이며, **자기 파일의 값으로 바꿔 쓰는 자리**다.
+
+규칙(전부 **접수 단계** = GPU 0초):
+
+- 두 키 **모두 필수** — 절반짜리 핀은 핀이 아니다.
+- 파일이 없거나 읽을 수 없으면 **exit 2**. 플랫폼은 정책을 **공급하지 않는다**(SUT 산출물이다).
+- 시나리오 디렉토리 **밖**을 가리키면 exit 2(`..`·절대경로·밖을 가리키는 심링크). 러너에 도달하는
+  것은 그 디렉토리뿐이라, 밖의 경로는 "위험한 경로"가 아니라 **거기 존재하지 않는 경로**다.
+- digest 불일치는 exit 2이고 **조용한 폴백이 없다**. 에러가 파일의 **실제 해시를 알려 준다**.
+- 러너는 정책을 로드하는 시점에 **다시** 해시를 대조한다.
+- 씬이 요구하는 슬롯(go2 = `locomotion_policy`)을 시나리오가 안 실으면 러너가 **부팅 전에** exit 2다.
+
+★ **정책 교체 = "같은 요청, 다른 SUT".** 회귀 비교축인 `request_identity_key`는 `sut` 블록을 통째로
+제외하므로(§6.3), 정책만 바꾼 런은 **같은 baseline 행**에 대해 판정된다 — 정책을 고쳤을 때 회귀가
+보이는 것이 목적이다.
+
+정본: [`cv_infra/contract/schema.py`](../cv_infra/contract/schema.py)(`LocomotionPolicy`) ·
+접수 검증 = [`cv_infra/contract/loader.py`](../cv_infra/contract/loader.py) ·
+identity 투영 = [`cv_infra/report/regression.py`](../cv_infra/report/regression.py).
+
+### 8.3 센서 — 러너가 발행한다(합성 씬에는 벤더 ROS 그래프가 없다)
+
+carter 자산은 자기 ROS 그래프를 들고 오지만 go2 씬은 **플랫폼이 합성한 세계**라, 토픽을 러너가 직접
+발행한다. 그래서 **`interface.adapter_config`에 적은 것이 곧 존재하는 것**이다.
+
+| topic | type | rate(**sim-time**) | frame | 게이팅 |
+|---|---|---|---|---|
+| `clock_topic`(기본 `/clock`) | `rosgraph_msgs/msg/Clock` | 매 스텝(= 1/`fixed_dt`) | — | **상시** |
+| `/tf` | `tf2_msgs/msg/TFMessage` | 30 Hz | `odom`→`base_link` | **상시** |
+| `odom_topics[]`의 전부 | `nav_msgs/msg/Odometry` | 30 Hz | `odom`→`base_link` | **상시**(GT 포즈, 드리프트 0) |
+| `/tf_static` | `tf2_msgs/msg/TFMessage` | latched | `base_link`→`go2_camera` · `base_link`→`go2_lidar` | 센서 선언 시 |
+| `sensors[]`의 rgb | `sensor_msgs/msg/Image`(`rgb8` 640×480) | 10 Hz | `go2_camera` | **선언** |
+| `sensors[]`의 depth | `sensor_msgs/msg/Image`(`32FC1`) | 10 Hz | `go2_camera` | **선언** |
+| `sensors[]`의 camera_info | `sensor_msgs/msg/CameraInfo` | 10 Hz | `go2_camera` | **선언** |
+| `sensors[]`의 scan | `sensor_msgs/msg/LaserScan`(3200 beam · 360° · min range 0.05 m) | 10 Hz | `go2_lidar` | **선언** |
+
+```yaml
+interface:
+  type: ros2
+  adapter_config:
+    odom_topics: [/odom]                    # 여러 개 선언하면 같은 Odometry가 전부에 팬아웃된다
+    sensors:                                # 선언한 것만 발행된다(= 선언한 것만 비용을 낸다)
+      - { topic: /scan,                   type: sensor_msgs/msg/LaserScan }
+      - { topic: /camera/image_raw,       type: sensor_msgs/msg/Image }
+      - { topic: /camera/depth/image_raw, type: sensor_msgs/msg/Image }      # 'depth' 세그먼트로 식별
+      - { topic: /camera/camera_info,     type: sensor_msgs/msg/CameraInfo }
+```
+
+- **토픽 이름은 전부 `adapter_config`에서 온다.** 코드에 박힌 이름은 `/tf`·`/tf_static` 둘뿐이고,
+  그건 tf2가 고정한 이름이다.
+- **rgb와 depth는 타입으로 못 가른다**(둘 다 `Image`) → **토픽 경로에 `depth` 세그먼트가 있으면
+  depth**(ROS image_pipeline 관례). 어느 토픽이 어느 스트림이 됐는지는 부팅 인벤토리가 출력한다.
+- 러너가 만들 수 없는 타입을 선언하면 부팅 로그에 **WARNING 1줄** — 조용히 무시하지 않는다.
+  같은 스트림을 두 토픽으로 선언하면 부팅 전에 exit 2다(카메라 1대·라이다 1대).
+- QoS는 전부 RELIABLE·KEEP_LAST(5)이고 `/tf_static`만 TRANSIENT_LOCAL(늦게 뜬 노드가 받아야 한다).
+  스탬프는 전부 **sim time**이므로 SUT는 `use_sim_time:=true`로 띄운다.
+- **rate 열은 sim-time 기준**이다. 벽시계 rate = sim rate × RTF(§8.7 ②).
+- 정적 프레임은 `base_link`→`go2_camera` 이동 `(0.28, 0, 0.12) m` + ROS optical 회전 ·
+  `base_link`→`go2_lidar` 이동 `(0, 0, 0.15) m` 회전 없음. 라이다는 azimuth 0 = 정면, 양수 = 왼쪽
+  (ROS `LaserScan` 규약과 같다 — 실측 확인).
+- 부팅 로그의 인벤토리(`[cv-runner] go2_sensors inventory=<n>` + 토픽 한 줄씩)가 **그 런에 실제로
+  존재한 토픽**이다. 오결선은 여기서 즉시 보인다.
+- ⚠ **선언한 센서 토픽은 mcap에 기본 수록되지 않는다**(용량 — 진단용 옵트인). 백에 들어가는 것은
+  `clock_topic` · TF · `odom_topics` · `cmd_vel`이다(§6.4).
+
+정본: [`cv_infra/runner/go2_sensors.py`](../cv_infra/runner/go2_sensors.py)
+(`topic_inventory` + 마운트·레이트·라이다 상수).
+
+### 8.4 충돌 판정 스코프 — 사족보행은 `collision_scope: robot`
+
+`no_collision`의 기본 스코프 `chassis`는 선언한 `chassis_path` **프림 자신**의 접촉만 센다. 바퀴
+로봇에는 맞지만 **사족보행에는 눈을 감는다**: go2의 접촉 당사자는 항상 발·정강이이고 base가 아니다.
+실측(2026-09-01) — 앞발 밑 상자에 걸려 **완전히 전복된 런**(장애물과 263건 접촉, roll 3.14)의
+`collision_count`가 **0**이었다.
+
+```yaml
+  - oracle: no_collision
+    params:
+      chassis_path: /World/Go2/base        # articulation root = 서브트리 앵커
+      collision_scope: robot               # ★ 이 한 줄이 다리 접촉을 판정에 들인다
+      collision_excluded_paths:            # ★ 바닥은 프림 2개이고 철자의 대소문자가 다르다
+        - /World/GroundPlane/collisionPlane
+        - /World/Warehouse_Empty_small_realtime/GroundPlane/CollisionPlane
+```
+
+| `collision_scope` | 무엇을 세나 | 언제 |
+|---|---|---|
+| `chassis`(기본) | `chassis_path` 프림 **자신**의 접촉 | 바퀴 로봇 — 이 필드가 생기기 전 문서의 판정이 **그대로** 보존된다 |
+| `robot` | `chassis_path`의 **서브트리 전체** | 사족보행 — 발·정강이↔장애물 접촉이 판정에 들어온다 |
+
+- `robot`을 선언하면 **발↔바닥 접촉도 후보가 된다**(정상 보행 1런에 ~1,930건) → **바닥 프림을 반드시
+  `collision_excluded_paths`에 넣어라.** 위 두 경로 중 하나만 넣으면 **정상 보행이 fail한다.**
+- 두 경로는 이 씬의 **실측값**(2026-09-01)이다. 다른 씬의 값을 확인하려면 리포트의 접촉 파트너
+  목록을 읽어라 — 실제 접촉 상대의 프림 경로가 그대로 나온다(측정으로 채우는 자리다).
+- go2 자산은 self-collision이 꺼져 있어 **로봇 자기 링크를 제외할 필요가 없다**.
+- 장애물 풀 `/World/cv_obstacles`는 **일부러 제외하지 않는 것이 기본**이다 — 장애물에 부딪히는 것은
+  세야 한다(§3.1).
+- 기본값이 `robot`이 아닌 이유: 이 필드를 선언하지 않은 기존 요청의 `request_identity_key`가
+  **움직이지 않아야** 회귀 baseline이 보존된다(§6.3).
+
+정본: [`cv_infra/oracles/no_collision.py`](../cv_infra/oracles/no_collision.py)
+(`DEFAULT_COLLISION_SCOPE`·`resolve_collision_scope`) · 리덕션 =
+[`cv_infra/runner/telemetry.py`](../cv_infra/runner/telemetry.py) · 계약 =
+[`cv_infra/contract/schema.py`](../cv_infra/contract/schema.py).
+
+### 8.5 허용오차 예산 — 두 항 모두 실측으로 채워라
+
+go2의 `reached_goal.position_tolerance_m`는 취향이 아니라 **측정값의 합**이다. 참조 SUT
+(nav2 + 공개 `go2_flat` 사전학습 정책)의 실측(2026-09-01):
+
+| 항 | 값 | 무엇 |
+|---|---|---|
+| SUT 자신의 goal checker 허용오차 | **0.50 m** | nav2는 **자기 믿음**이 이만큼 가까우면 멈춘다 — GT 잔차는 여기서 시작한다 |
+| 측위 믿음 오차 | **0.387 m** | 같은 순간의 GT `(-5.938, 4.896)` vs `/amcl_pose` `(-6.276, 4.708)` |
+| 합 → 선언값 | 0.89 → **1.0** | 참조 시나리오가 선언한 값 |
+
+여기에 **정책 기동 과도기**를 더 얹어라. 정책이 붙는 순간 로봇이 헤딩 방향으로 **약 1 m 튄다**
+(실측 0.94~0.98 m, 방위를 바꿔도·부팅을 반복해도 소수 셋째 자리까지 재현). 귀결:
+
+- **미션은 `initial_pose`가 선언한 자리에서 시작하지 않는다** — 랜덤 창·통로 여유·출발점 계산은
+  이 ~1 m를 포함해야 한다.
+- 배치(`repeats > 1`)에서는 표본마다 이 과도기가 다시 일어난다.
+- 판정 자체는 first-reach라 여유가 더 있다(참조 런의 GT 최근접 **0.295 m** vs 선언 1.0 m). 예산은
+  평균이 아니라 **최악**을 덮는 값이다.
+
+⚠ 위 수치는 **참조 SUT의 값**이다. 다른 정책·다른 내비 스택이면 다시 재라 — 재는 자리가 §8.6이다.
+
+### 8.6 dev-world — 로컬 개발 루프(GitHub도 오케스트레이터도 없이)
+
+검증 잡과 **같은 씬·같은 로봇·같은 보행 정책·같은 센서 퍼블리셔**를 세우고 **미션도 판정도 기록도
+없이** 계속 스텝하는 모드다. 개발자의 앱이 상대하는 세계를 로컬에 띄우는 것이 목적이다.
+
+```bash
+# 러너 이미지 안에서(Isaac 번들 인터프리터)
+./python.sh -m cv_infra.runner.devworld <scenario.yaml> [--max-steps N]
+```
+
+- **입력은 검증 요청 YAML 그대로**다 — CI에 보낼 바로 그 파일. 같은 6단계 접수 게이트를 통과하므로
+  (정책 digest 대조 포함) **여기서 거부되는 문서는 CI에서도 거부되고**, 여기서 도는 문서는 거기서도
+  돈다. 별도의 "개발용 씬 설정"이 없다는 것이 요점이다.
+- 부팅하면 §8.3의 토픽 인벤토리와 배너가 찍힌다:
+
+```
+[cv-devworld] ready — the world is running; no mission, no oracle, no recording
+[cv-devworld] drive it: ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.4}}"
+[cv-devworld] stop it: Ctrl-C
+```
+
+- 앱은 **평범한 ROS 2 노드**로 붙인다 — 같은 네트워크·같은 `ROS_DOMAIN_ID`, `use_sim_time:=true`.
+  rviz도 `cv-infra` CLI도 필요 없다.
+- exit: `0` 정상 종료 · `2` 인자/시나리오 거부(접수·정책 핀·슬롯) · `3` EULA 미동의.
+  `--max-steps N`은 무인 스모크용(그만큼 돌고 스스로 exit 0).
+- 판정도 기록도 없으므로 **계측을 자유롭게 붙일 수 있다** — §8.5의 두 수치가 여기서 나왔다.
+
+정본: [`cv_infra/runner/devworld.py`](../cv_infra/runner/devworld.py).
+
+### 8.7 알려진 한계 · CI 예산
+
+**① 배치 표본의 확률적 저속 스톨(추적 중, 소비자 SUT 표면).** 같은 이미지·같은 시나리오·같은
+호스트에서 배치 런이 **한 번은 1/3 pass(exit 1), 16분 뒤에는 3/3 pass(exit 0)** 로 갈렸다
+(2026-09-01 실측). 관측된 모양은 이렇다 — 미션 초반 정상 가속 → 약 1초 뒤 전진 명령 붕괴 → 로봇
+정지(전진 명령 `|linear.x| > 0.05` 비율 **0.15** vs 같은 런 통과 표본 **0.86**). 충돌도 전도도 없이
+**예산만 소진**한다. 배치 5런에서 **첫 표본은 5/5 통과**했고 실패는 표본 단위가 아니라 **런 단위**로
+나타났다(2런 전부 실패 / 3런 전부 통과). 원인은 보행 정책의 **저속 데드존**(0.2 m/s 미만 명령의
+추종률 5~23 %)과 표본 간 재배치 경로로 좁혀져 있고, 정책 재학습(백로그 B-11)에서 추적한다.
+
+- 플랫폼은 이 분산을 **숨기지 않는다** — 표본 분포·`flaky`·회귀 상태(`regressed`/`improved`)가 그대로
+  렌더된다(§6.2). 실제로 그 표면이 이 현상을 드러냈다.
+- 완화: 게이트 시나리오는 **저속·정밀 정렬을 요구하지 않는 미션**으로 쓰고(무방향 goal · 넉넉한
+  허용오차 §8.5), `timeout_s`·`min_pass_ratio`를 이 분산 위에서 정하라(§2.5).
+
+**② CI 예산**(2026-09-01, 제품 경로·워크스테이션 1대 실측):
+
+| 런 | 표본 | 벽시계 |
+|---|---|---|
+| 단건(카메라 미선언) | 1 | 약 1분 |
+| 랜덤(카메라 미선언) | 5 | 약 2분 50초 |
+| 순찰(카메라 3스트림 + scan) | 3 | 약 2분 15초 |
+
+- 부팅(웜 캐시)에 **잡당 약 25초**가 든다 — 표본을 늘리는 것이 잡을 늘리는 것보다 싸다(배치는 부팅
+  1회로 n표본을 돈다).
+- **카메라를 선언하면 느려진다**: RTF **0.93**(카메라 미선언) → **0.75**(rgb+depth+info+scan).
+  구독자가 없는 스트림은 선언하지 마라.
+- 인스턴스당 VRAM 피크 실측 **4,756~5,042 MiB**(go2 잡 4종, 2 s 주기 NVML 표집).
+- 같은 순간에 제출한 두 잡이 **순차로 실행된** 관측이 두 사이클에서 반복됐다 — CI 예산은 잡이 겹치지
+  않는다고 보고 잡아라.
+
+---
+
+## 9. 한계·주의 (알고 쓰기)
 
 | 한계 | 지금의 우회 |
 |---|---|
 | **보이는 미지도 장애물은 안정적인 CI 게이트가 되기 어렵다** — 같은 입력에서 통과/실패가 진동한다(실측 p7c3 T5, 60 GPU 표본: 같은 문서를 연속 두 번 돌린 두 팔이 5/5 ↔ 1/5로 갈렸다) | 게이트 시나리오는 높이 ≤ `0.10` m로 가시성을 끊고(실측 5/5), 보이는 가구는 **비게이트 강건성 데모**로 쓴다. 표본 비율은 판정이 아니라 분포로 읽는다(§3.2) |
 | SUT 비결정성은 플랫폼이 제거하지 않는다 | `repeats` + `min_pass_ratio`가 그것을 다루는 사양이다(§2.5) |
+| go2 배치 표본이 **확률적으로 저속 스톨**한다 — 같은 입력이 1/3 ↔ 3/3으로 갈린 실측이 있다 | 분산은 리포트 표면에 그대로 보인다. 게이트 문면·예산을 그 분산 위에서 정하라(§8.7 ①) |
 | 실패한 표본의 **구체 좌표**가 PR 표면에 아직 없다 | 실패 표본의 rosbag/영상 첨부로 확인 |
 | 표본별 배치 내부 로그가 CI 첨부 밖에 있다 | 운영 호스트에서 확인 |
 | 제출 전 *"내 seed가 어떤 표본을 만들지"* 미리보기 CLI가 없다 | 파생은 결정적이므로 첫 런의 기록이 곧 미리보기 |
