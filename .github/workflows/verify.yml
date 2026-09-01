@@ -42,6 +42,27 @@
 # consumer-facing contract (the inputs below, `scenarios` default included) is
 # unchanged — a consumer pinning `@v1` gets the repair with no edit.
 #
+# INPUT VISIBILITY (go2 C6d, AR-33): delivering the inputs into the runner workspace
+# is not enough. The CLI validates them on THIS side, but the orchestrator RE-ADMITS
+# the request on its own side, and the ride-along artifacts a request may carry —
+# `sut.locomotion_policy` and a scenario-adjacent custom oracle module — are read
+# from the scenario's directory THERE (D-1: that directory is also what the
+# supervisor bind-mounts into the runner). A submission straight from
+# `$GITHUB_WORKSPACE` therefore names a path the control plane cannot resolve.
+# MEASURED on the go2 consumer PR (2026-09-01, job 99702862827) — the guard below
+# listed all 5 delivered files, and 0.3 s later the server rejected the request:
+#   sut.locomotion_policy.file: expected an existing, readable file …, got
+#   'policy.pt' (resolved: /home/etri/cv-infra-gh-runner-user-go2/_work/…/scenarios/
+#   policy.pt)
+# The deployment CAN name ONE extra input root (`CV_CI_WORKSPACE_ROOT`, an optional
+# `:ro` bind — docs/deploy/README.md §3-②' 함정 4), and on that host it points at a
+# DIFFERENT runner's `_work`; a third runner home is simply outside it, and so is
+# every consumer host we have not configured. The repair is below and needs neither:
+# the guarded tree is COPIED into `${CV_OUT_DIR}/ci-inputs/${GITHUB_RUN_ID}/` — the
+# deployment's own job-artifact root, which is always bind-mounted at an identical
+# host path — submitted from there, and removed at the end of the job. No contract,
+# no mount and no consumer edit: a `@v1` pin gets this the moment the tag moves.
+#
 # PINS (§2-7): every `uses:` is an immutable commit SHA (trailing comment = the
 # semver tag). No floating/mutable tag ref (moving major or branch). Bump = new SHA.
 # p5c20 ⑤: the three stock actions moved to their first `runs.using: node24` major
@@ -261,6 +282,93 @@ jobs:
           [ "${bad}" -eq 0 ] || die "the submitted scenario set does not match this run's delivered inputs (see the errors above)"
           echo "cv-infra: ${matched} scenario file(s) selected, all delivered by this run."
 
+      # ── (2b) STAGE THE GUARDED INPUTS WHERE THE CONTROL PLANE CAN READ THEM (AR-33)
+      # The guard above proved WHAT this run delivered; this step moves that exact
+      # tree somewhere the orchestrator can re-admit it from. Copy semantics matter:
+      # the whole delivered tree rides, with its relative layout intact, so every
+      # ride-along file (`sut.locomotion_policy`, a `module:Class` oracle) still sits
+      # NEXT TO its scenario — that adjacency IS the contract (loader stage 5 resolves
+      # both against the scenario's directory and refuses anything outside it).
+      #
+      # THE GUARD'S CONCLUSION MUST SURVIVE THE MOVE, so this step does not merely
+      # copy: it asserts the staged tree's relative-path file set EQUALS the delivered
+      # list the guard wrote. "Everything submitted was delivered by this run" is then
+      # still a fact on the new root, not an assumption about `cp` (G-59). The submit
+      # step below `cd`s into this root and keeps the DELIVERED SPELLING of the glob,
+      # so `::error file=` annotations still land on the PR diff (D-L).
+      #
+      # CV_OUT_DIR UNSET = the pre-AR-33 behaviour, unchanged, plus a loud warning:
+      # this repair needs a host path BOTH planes can see, and the platform refuses to
+      # guess one (FU-10). A carter-shaped consumer (no ride-along file) keeps working
+      # either way, which is exactly why the warning has to name what will break.
+      #
+      # SAFETY: the target is DERIVED here (CV_OUT_DIR + the numeric run id), never
+      # interpolated from a workflow expression, and every refusal is control flow
+      # (G-93). The only recursive delete is the previous ATTEMPT of THIS run id.
+      - name: Stage delivered inputs where the control plane can read them
+        id: stage-inputs
+        run: |
+          set -euo pipefail
+          die() { echo "::error::cv-infra input staging: $*"; exit 2; }
+
+          ws="${GITHUB_WORKSPACE:-${PWD}}"
+          tmp="${RUNNER_TEMP:-/tmp}"
+          out="${CV_OUT_DIR:-}"
+          run_id="${GITHUB_RUN_ID:-}"
+
+          if [ -z "${out}" ]; then
+            echo "::warning title=cv-infra::CV_OUT_DIR is not set on this runner, so the scenarios are submitted straight from the runner workspace. The control plane re-admits the request against ITS OWN filesystem and does not mount the runner's _work tree: any request carrying a ride-along file next to its scenario (sut.locomotion_policy, a scenario-adjacent custom oracle module) will be REJECTED at admit with 'does not exist' (exit 2). Set CV_OUT_DIR to the deployment's job-artifact root in the runner service environment (<runner home>/.env) — see docs/deploy/README.md."
+            echo "dir=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "${out}" in /*) ;; *) die "CV_OUT_DIR is not an absolute path: '${out}'" ;; esac
+          [ -d "${out}" ] || die "CV_OUT_DIR '${out}' is not a directory on this runner — it must be the SAME host path the control plane mounts as its job-artifact root"
+          [ ! -L "${out}" ] || die "CV_OUT_DIR is a symlink: '${out}' — the control plane resolves the path on its own side, where the link may not exist"
+          case "${run_id}" in
+            "" ) die "GITHUB_RUN_ID is unset/empty — refusing to stage into a directory this run cannot own" ;;
+            *[!0-9]* ) die "GITHUB_RUN_ID is not numeric: '${run_id}'" ;;
+          esac
+
+          stage="${out}/ci-inputs/${run_id}"
+          # A re-run (attempt 2+) reuses the run id, so an older attempt's tree may be
+          # sitting here. Empty it — same reason the workspace is emptied above.
+          if [ -e "${stage}" ]; then
+            [ ! -L "${stage}" ] || die "'${stage}' is a symlink — refusing to stage into it"
+            [ -d "${stage}" ] || die "'${stage}' exists and is not a directory"
+            stale="$(find "${stage}" -mindepth 1 | wc -l)"
+            find "${stage}" -mindepth 1 -delete
+            echo "cv-infra: cleared ${stale} entr(ies) left by an earlier attempt of run ${run_id}"
+          fi
+          mkdir -p "${stage}"
+
+          # The whole delivered tree, layout intact (`.` = hidden entries included).
+          cp -a "${ws}/." "${stage}/"
+
+          # The guard's list, re-measured on the new root: set equality or stop.
+          delivered="${tmp}/cv-infra-delivered-inputs.txt"
+          [ -f "${delivered}" ] || die "no delivered-input list at '${delivered}' — the input guard did not run, so the staged tree cannot be attributed to this run"
+          staged="${tmp}/cv-infra-staged-inputs.txt"
+          find "${stage}" -mindepth 1 -type f -printf '%P\n' | LC_ALL=C sort > "${staged}"
+          if ! diff -u "${delivered}" "${staged}" > "${tmp}/cv-infra-staging.diff"; then
+            sed 's/^/  /' "${tmp}/cv-infra-staging.diff"
+            die "the staged tree is not what this run delivered (diff above: '-' = delivered but not staged, '+' = staged but not delivered)"
+          fi
+          echo "cv-infra: staged $(wc -l < "${staged}") delivered file(s) -> ${stage}"
+          sed 's/^/  - /' "${staged}"
+
+          # MEASURED 2026-09-01 on the deployment host: admitting a scenario whose
+          # criteria name a scenario-adjacent oracle makes the CONTROL PLANE import
+          # that module, which leaves a root-owned `__pycache__/` behind (the plane
+          # runs as root in its container). The runner user cannot unlink files inside
+          # a root-owned directory, so the cleanup at the end of this job would leave
+          # residue forever. Creating the directory FIRST keeps it owned by the runner
+          # user: root then writes the .pyc INTO our directory, and we can remove it.
+          find "${stage}" -type f -name '*.py' -printf '%h\n' | LC_ALL=C sort -u |
+            while IFS= read -r dir; do mkdir -p "${dir}/__pycache__"; done
+
+          echo "dir=${stage}" >> "$GITHUB_OUTPUT"
+
       # ── (3) Submit + wait: the exit code is the terminal aggregated verdict (0/1/2/3,
       # M8-D11). `set +e` + a captured code keeps publishing on failure; the final
       # step re-exits it so the job reflects the CLI verdict.
@@ -270,15 +378,27 @@ jobs:
           # sut_image rides as env (ref-only); scenario->image injection is p5c4.
           CV_INFRA_SUT_IMAGE: ${{ inputs.sut_image }}
           CV_INFRA_API: ${{ inputs.api }}
+          # Where the guarded inputs now live (AR-33). Empty = CV_OUT_DIR unset on this
+          # runner -> submit from the workspace exactly as before.
+          CV_SUBMIT_DIR: ${{ steps.stage-inputs.outputs.dir }}
         run: |
           set +e
+          ws="${GITHUB_WORKSPACE:-${PWD}}"
+          err="${ws}/submit.err"
+          submit_dir="${CV_SUBMIT_DIR:-}"
+          [ -n "${submit_dir}" ] || submit_dir="${ws}"
+          echo "cv-infra: submitting from ${submit_dir}"
           # D-K: `cv-infra submit <glob> …` synthesizes the size-N envelope (CLI-owned).
           # --trigger-source ci-cd records CI provenance verbatim (REQ-INTAKE-003);
           # --wait folds the terminal aggregated verdict into the exit code.
-          out=$(cv-infra submit ${{ inputs.scenarios }} --trigger-source ci-cd --wait \
-                  --timeout "${{ inputs.timeout_s }}" 2> submit.err)
+          # The `cd` is the AR-33 repair and nothing else moves: the glob keeps its
+          # delivered spelling, so the request's oracle/policy anchor becomes the
+          # staged directory (visible to BOTH planes) while the error `source_path`
+          # stays consumer-repo-relative for the PR annotations (D-L).
+          out=$(cd "${submit_dir}" && cv-infra submit ${{ inputs.scenarios }} --trigger-source ci-cd --wait \
+                  --timeout "${{ inputs.timeout_s }}" 2> "${err}")
           code=$?
-          cat submit.err >&2
+          cat "${err}" >&2
           echo "code=${code}" >> "$GITHUB_OUTPUT"
           if [ "${code}" -eq 2 ]; then
             # Contract error: no report to fetch; the annotate step surfaces the
@@ -287,7 +407,7 @@ jobs:
             exit 0
           fi
           env_id=$(printf '%s\n' "${out}" | head -n1)
-          if cv-infra report "${env_id}" --json > report.json 2>> submit.err; then
+          if cv-infra report "${env_id}" --json > report.json 2>> "${err}"; then
             echo "have_report=true" >> "$GITHUB_OUTPUT"
           else
             echo "have_report=false" >> "$GITHUB_OUTPUT"
@@ -374,6 +494,49 @@ jobs:
             payloads/
             artifacts/
           if-no-files-found: warn
+
+      # ── (8) ALWAYS give the staged inputs back (AR-33). They live under the
+      # deployment's artifact root, which is production storage on a shared host —
+      # "잔존물 0" is the same rule the output plane already holds itself to.
+      # This step deletes ONE directory: the `ci-inputs/<this run id>` tree the
+      # staging step created. The path is DERIVED here from the same two variables
+      # (never taken from a step output, never from a workflow expression), every
+      # refusal is control flow, and other runs' trees plus every `cvj-*` job
+      # directory are outside it by construction.
+      # NOT FATAL: a leftover is reported as a warning, not as a red job — turning a
+      # passing verification red because the control plane left a root-owned file
+      # behind would punish the consumer for our own housekeeping.
+      - name: Remove this run's staged inputs
+        id: cleanup-inputs
+        if: always()
+        run: |
+          set -uo pipefail
+          out="${CV_OUT_DIR:-}"
+          run_id="${GITHUB_RUN_ID:-}"
+          if [ -z "${out}" ]; then
+            echo "cv-infra: CV_OUT_DIR unset — nothing was staged, nothing to remove"
+            exit 0
+          fi
+          case "${out}" in /*) ;; *) echo "::warning title=cv-infra::staged-input cleanup skipped: CV_OUT_DIR is not an absolute path ('${out}')"; exit 0 ;; esac
+          case "${run_id}" in
+            ""|*[!0-9]*)
+              echo "::warning title=cv-infra::staged-input cleanup skipped: GITHUB_RUN_ID is unset or not numeric ('${run_id}') — refusing to delete a directory this run cannot name"
+              exit 0 ;;
+          esac
+          stage="${out}/ci-inputs/${run_id}"
+          if [ ! -d "${stage}" ] || [ -L "${stage}" ]; then
+            echo "cv-infra: no staged-input directory at ${stage} — nothing to remove"
+            exit 0
+          fi
+          n="$(find "${stage}" -mindepth 1 | wc -l)"
+          find "${stage}" -mindepth 1 -delete 2>/dev/null
+          rmdir "${stage}" 2>/dev/null
+          if [ -e "${stage}" ]; then
+            echo "::warning title=cv-infra::staged inputs could not be fully removed from ${stage} (entries left, listed below). The control plane runs as root and may leave a bytecode cache next to a custom oracle; remove it on the deployment host."
+            find "${stage}" -mindepth 1 -printf '  - %y %M %u %P\n'
+            exit 0
+          fi
+          echo "cv-infra: removed ${n} staged entr(ies); ${stage} is gone"
 
       # Reflect the CLI verdict as the job status (the nuanced infra=neutral signal
       # lives on the Check Run conclusion above; the job status is the coarse gate).

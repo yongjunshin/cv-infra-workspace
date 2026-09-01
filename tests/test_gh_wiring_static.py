@@ -839,6 +839,8 @@ def _exec(script: str, ws: Path, temp: Path, *, cwd: Path | None = None, **overr
         # DECLARED defaults (the consumer-facing glob included).
         "CV_SCENARIOS": _workflow_input_default("scenarios"),
         "CV_SCENARIOS_ARTIFACT": _workflow_input_default("scenarios_artifact"),
+        # the runner file a step writes its outputs into (`echo k=v >> $GITHUB_OUTPUT`).
+        "GITHUB_OUTPUT": str(temp / "github-output.txt"),
     }
     env.update({k: v for k, v in overrides.items() if v is not None})
     for key, value in overrides.items():
@@ -1054,3 +1056,427 @@ def test_the_guard_rejects_a_selection_from_outside_the_delivered_tree(tmp_path)
     )
     assert result.returncode == 2
     assert "is NOT one of this run's delivered inputs" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# (I) CI INPUT VISIBILITY — staging into the deployment's root (go2 C6d, AR-33)
+# --------------------------------------------------------------------------- #
+# (H) proved WHAT the run delivers. This section is about WHERE it is readable
+# from. The CLI admits the request on the runner; the orchestrator RE-ADMITS it in
+# its own container, and a request that carries a ride-along file next to its
+# scenario (`sut.locomotion_policy`, a `module:Class` oracle) is resolved against
+# the scenario's directory THERE. That container does not mount the runner's
+# `_work` tree, so the go2 consumer PR died at admit with "does not exist" —
+# 5 files delivered, guarded, and invisible (2026-09-01, job 99702862827).
+#
+# The repair copies the guarded tree into `${CV_OUT_DIR}/ci-inputs/${RUN_ID}/`
+# (a root both planes see at an identical host path) and submits from there,
+# then gives the directory back. It is tested THE WAY IT SHIPS — the shell the
+# workflow embeds is EXECUTED against a planted runner layout, including the
+# submit step, whose `cv-infra` is stubbed so the test can read the CWD and the
+# argv the CLI would have received (a repair that only exists in prose is not a
+# repair — G-100). YAML plane on purpose: the release tag moves only this plane
+# and the runtime `cv_infra` package does not travel with it (G-43).
+
+_STAGE_STEP_ID = "stage-inputs"
+_CLEANUP_STEP_ID = "cleanup-inputs"
+#: The go2 delivery, as measured on the failing consumer run: two scenarios, two
+#: scenario-adjacent oracle modules, and the locomotion policy (D2) — the second
+#: SUT artifact, which travels in the REQUEST and not in the image.
+_GO2_DELIVERED = [
+    "scenarios/go2_t0_smoke.yaml",
+    "scenarios/go2_ta_nav_random.yaml",
+    "scenarios/hold_near_goal.py",
+    "scenarios/upright.py",
+    "scenarios/policy.pt",
+]
+_EXPR = re.compile(r"\$\{\{\s*([^}]+?)\s*\}\}")
+
+
+def _interpolate(script: str) -> str:
+    """Resolve the ``${{ inputs.X }}`` expressions GitHub substitutes before the
+    shell ever runs — with the workflow's OWN declared defaults, so the test keeps
+    no second copy of the consumer contract (G-25/G-56)."""
+
+    def one(match: re.Match[str]) -> str:
+        expr = match.group(1)
+        assert expr.startswith("inputs."), f"unresolvable expression in a run: {expr}"
+        return str(_workflow_input_default(expr.split(".", 1)[1]))
+
+    return _EXPR.sub(one, script)
+
+
+def _outputs(temp: Path) -> dict[str, str]:
+    """The `$GITHUB_OUTPUT` file a step just wrote, parsed."""
+    path = temp / "github-output.txt"
+    if not path.exists():
+        return {}
+    return dict(
+        line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line
+    )
+
+
+def _guarded_delivery(tmp_path: Path, delivered: list[str] | None = None) -> tuple[Path, Path]:
+    """clean -> deliver -> guard, all three as the workflow runs them."""
+    ws, temp = _runner_layout(tmp_path)
+    clean = _exec(_script(_load(_VERIFY_WORKFLOW), _CLEAN_STEP_ID), ws, temp)
+    assert clean.returncode == 0, clean.stderr
+    _plant(ws, _GO2_DELIVERED if delivered is None else delivered)
+    guard = _exec(_script(_load(_VERIFY_WORKFLOW), _GUARD_STEP_ID), ws, temp)
+    assert guard.returncode == 0, guard.stdout + guard.stderr
+    return ws, temp
+
+
+def _out_root(tmp_path: Path) -> Path:
+    """A stand-in for the deployment's job-artifact root, with a job directory and
+    another run's staged tree already in it — the canaries every deletion below
+    must leave alone."""
+    out = tmp_path / "cv-infra-prod" / "out"
+    (out / "cvj-env-b56d38370060-r0" / "result").mkdir(parents=True)
+    (out / "cvj-env-b56d38370060-r0" / "result" / "result.json").write_text("{}", encoding="utf-8")
+    (out / "ci-inputs" / "99999999999" / "scenarios").mkdir(parents=True)
+    (out / "ci-inputs" / "99999999999" / "scenarios" / "other.yaml").write_text(
+        "# another run\n", encoding="utf-8"
+    )
+    return out
+
+
+def _canaries(out: Path) -> dict[str, Path]:
+    return {
+        "job artifact": out / "cvj-env-b56d38370060-r0" / "result" / "result.json",
+        "another run's inputs": out / "ci-inputs" / "99999999999" / "scenarios" / "other.yaml",
+    }
+
+
+def _stage(ws: Path, temp: Path, **overrides):
+    return _exec(_script(_load(_VERIFY_WORKFLOW), _STAGE_STEP_ID), ws, temp, **overrides)
+
+
+def _cleanup(ws: Path, temp: Path, **overrides):
+    return _exec(_script(_load(_VERIFY_WORKFLOW), _CLEANUP_STEP_ID), ws, temp, **overrides)
+
+
+def _relfiles(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+
+
+# --- (I1) workflow TEXT: where the two new steps sit, and what they may read ---
+def test_staging_sits_between_the_guard_and_submit_and_cleanup_always_runs_last():
+    doc = _load(_VERIFY_WORKFLOW)
+    guard = _step_index(doc, _by_id(_GUARD_STEP_ID))
+    stage = _step_index(doc, _by_id(_STAGE_STEP_ID))
+    submit = _step_index(doc, _by_id("verify"))
+    cleanup = _step_index(doc, _by_id(_CLEANUP_STEP_ID))
+    # staging may only ever act on a tree the guard already vouched for.
+    assert guard < stage < submit < cleanup
+    steps = _steps(doc)
+    # the cleanup runs on every outcome, and only the verdict follows it.
+    assert steps[cleanup]["if"] == "always()"
+    assert _runs(steps[cleanup + 1 :]).strip() == "exit ${{ steps.verify.outputs.code }}"
+
+
+def test_the_staging_and_cleanup_shells_derive_their_target_and_refuse_by_control_flow():
+    doc = _load(_VERIFY_WORKFLOW)
+    stage = _script(doc, _STAGE_STEP_ID)
+    cleanup = _script(doc, _CLEANUP_STEP_ID)
+    for script in (stage, cleanup):
+        # the path is DERIVED from two runner variables — never interpolated from a
+        # workflow expression into a shell that deletes (the clean step's rule).
+        assert "${{" not in script
+        assert 'out="${CV_OUT_DIR:-}"' in script
+        assert 'run_id="${GITHUB_RUN_ID:-}"' in script
+        assert 'stage="${out}/ci-inputs/${run_id}"' in script
+    # the only recursive deletes are inside that one directory.
+    deletions = [
+        line.strip() for line in (stage + "\n" + cleanup).splitlines() if "-delete" in line
+    ]
+    assert deletions == [
+        'find "${stage}" -mindepth 1 -delete',
+        'find "${stage}" -mindepth 1 -delete 2>/dev/null',
+    ], deletions
+    assert stage.count("die ") >= 8  # G-93: each refusal is control flow, not an echo
+    assert 'die() { echo "::error::cv-infra input staging: ' in stage
+
+
+def test_the_submit_step_reads_the_staged_directory_from_the_staging_step_only():
+    doc = _load(_VERIFY_WORKFLOW)
+    step = next(s for s in _steps(doc) if s.get("id") == "verify")
+    assert step["env"]["CV_SUBMIT_DIR"] == "${{ steps.stage-inputs.outputs.dir }}"
+    script = step["run"]
+    # the glob keeps its delivered spelling (D-L annotations) — the CWD moves, not
+    # the paths (this is also the assertion H asserts from the other side).
+    assert 'cd "${submit_dir}" && cv-infra submit ${{ inputs.scenarios }}' in script
+    assert 'submit_dir="${CV_SUBMIT_DIR:-}"' in script
+    assert '[ -n "${submit_dir}" ] || submit_dir="${ws}"' in script  # unset = pre-AR-33
+
+
+# --- (I2) the staging shell, executed --------------------------------------- #
+def test_staging_copies_the_guarded_tree_with_every_ride_along_next_to_its_scenario(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    result = _stage(ws, temp, CV_OUT_DIR=str(out))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    stage = out / "ci-inputs" / "33230008911"
+    assert _outputs(temp)["dir"] == str(stage)
+    # (a) the staged tree IS the delivered tree — same relative layout, so the
+    # policy file and both oracle modules still sit next to the scenarios (the
+    # adjacency the loader's stage 5 resolves against).
+    assert _relfiles(stage) == set(_GO2_DELIVERED)
+    assert (stage / "scenarios" / "policy.pt").read_text(encoding="utf-8") == (
+        ws / "scenarios" / "policy.pt"
+    ).read_text(encoding="utf-8")
+    # (b) a COPY: the workspace the publish steps still run in is untouched.
+    assert _relfiles(ws) == set(_GO2_DELIVERED)
+    # (c) the operator can read what moved where (G-26).
+    assert f"staged 5 delivered file(s) -> {stage}" in result.stdout
+    assert "  - scenarios/policy.pt" in result.stdout
+    # (d) nothing else in the deployment root was touched.
+    for label, canary in _canaries(out).items():
+        assert canary.exists(), label
+
+
+def test_staging_precreates_the_bytecode_cache_the_control_plane_would_own(tmp_path):
+    """MEASURED 2026-09-01: admitting a scenario-adjacent oracle makes the control
+    plane (root, in its container) write `__pycache__/` into the staged directory,
+    and the runner user cannot unlink files inside a root-owned directory. The
+    directory is therefore created HERE, by the runner user, so the cleanup can
+    still empty it. Without this the residue is permanent — measured on the
+    deployment host at `out/_c4c/__pycache__` (root:root 755)."""
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    assert _stage(ws, temp, CV_OUT_DIR=str(out)).returncode == 0
+    cache = out / "ci-inputs" / "33230008911" / "scenarios" / "__pycache__"
+    assert cache.is_dir()
+    assert os.access(cache, os.W_OK)  # ours, so a root-written .pyc can be removed
+
+
+def test_staging_reuses_the_run_id_but_never_an_earlier_attempts_tree(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    stage = out / "ci-inputs" / "33230008911"
+    (stage / "scenarios").mkdir(parents=True)
+    (stage / "scenarios" / "attempt-1-leftover.yaml").write_text("# stale\n", encoding="utf-8")
+    (stage / "junk.txt").write_text("stale\n", encoding="utf-8")
+    result = _stage(ws, temp, CV_OUT_DIR=str(out), GITHUB_RUN_ATTEMPT="2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cleared 3 entr(ies) left by an earlier attempt" in result.stdout
+    assert _relfiles(stage) == set(_GO2_DELIVERED)
+
+
+def test_staging_stops_when_the_staged_tree_is_not_what_the_guard_vouched_for(tmp_path):
+    """편측 변이 (G-59): the set-equality check is what carries the guard's
+    conclusion onto the new root. Plant a file AFTER the guard ran — exactly the
+    shape of a residue the guard never saw — and the staging must refuse to submit
+    from a tree it cannot attribute to this run."""
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    _plant(ws, ["scenarios/snuck_in_after_the_guard.yaml"])
+    result = _stage(ws, temp, CV_OUT_DIR=str(out))
+    assert result.returncode == 2
+    assert "::error::cv-infra input staging: the staged tree is not what this run delivered" in (
+        result.stdout
+    )
+    assert "+scenarios/snuck_in_after_the_guard.yaml" in result.stdout  # the diff, shown
+
+
+def test_staging_stops_without_the_guards_delivered_list(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    (temp / "cv-infra-delivered-inputs.txt").unlink()
+    result = _stage(ws, temp, CV_OUT_DIR=str(_out_root(tmp_path)))
+    assert result.returncode == 2
+    assert "the input guard did not run" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "label,overrides,expected",
+    [
+        ("relative root", {"CV_OUT_DIR": "cv-infra-prod/out"}, "not an absolute path"),
+        ("absent root", {"CV_OUT_DIR": "/nonexistent/cv-infra-prod/out"}, "is not a directory"),
+        ("run id unset", {"GITHUB_RUN_ID": None}, "GITHUB_RUN_ID is unset/empty"),
+        ("run id not numeric", {"GITHUB_RUN_ID": "../../etc"}, "is not numeric"),
+    ],
+)
+def test_staging_refuses_a_target_it_cannot_vouch_for(tmp_path, label, overrides, expected):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    result = _stage(ws, temp, **{"CV_OUT_DIR": str(out), **overrides})
+    assert result.returncode == 2, label
+    assert "::error::cv-infra input staging:" in result.stdout
+    assert expected in result.stdout
+    assert not (out / "ci-inputs" / "33230008911").exists()  # refused BEFORE creating
+    for name, canary in _canaries(out).items():
+        assert canary.exists(), name
+
+
+def test_staging_refuses_a_symlinked_deployment_root(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    link = tmp_path / "out-link"
+    link.symlink_to(out, target_is_directory=True)
+    result = _stage(ws, temp, CV_OUT_DIR=str(link))
+    assert result.returncode == 2
+    assert "is a symlink" in result.stdout
+    assert not (out / "ci-inputs" / "33230008911").exists()
+
+
+# --- (I3) CV_OUT_DIR unset: the old behaviour, and it says what will break ----
+def test_without_cv_out_dir_nothing_is_staged_and_the_warning_names_the_casualty(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    result = _stage(ws, temp, CV_OUT_DIR=None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    warning = next(line for line in result.stdout.splitlines() if line.startswith("::warning"))
+    # a silent fallback is what cost the go2 PR a red run with no explanation:
+    # the message must name the variable to set AND what fails without it.
+    assert "CV_OUT_DIR" in warning
+    assert "sut.locomotion_policy" in warning
+    assert "exit 2" in warning
+    assert _outputs(temp)["dir"] == ""  # -> the submit step falls back to the workspace
+
+
+# --- (I4) the submit step, executed against a stub CLI ------------------------ #
+def _stub_cli(tmp_path: Path) -> tuple[Path, Path]:
+    """A `cv-infra` on PATH that records the directory it was invoked from and its
+    argv. This is what lets the test read the request's ORACLE/POLICY ANCHOR (the
+    scenario's parent dir, i.e. the CWD-resolved glob match) instead of asserting
+    it in prose."""
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "cv-infra-invocations.txt"
+    stub = bin_dir / "cv-infra"
+    stub.write_text(
+        "#!/bin/bash\n"
+        f'{{ echo "cwd=$(pwd)"; for a in "$@"; do echo "arg=$a"; done; }} >> "{log}"\n'
+        'if [ "$1" = "submit" ]; then echo "env-stub00000"; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bin_dir, log
+
+
+def _submit(ws: Path, temp: Path, bin_dir: Path, **overrides):
+    script = _interpolate(_script(_load(_VERIFY_WORKFLOW), "verify"))
+    return _exec(
+        script,
+        ws,
+        temp,
+        PATH=f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        **overrides,
+    )
+
+
+def test_submit_runs_from_the_staged_root_with_the_delivered_spelling(tmp_path):
+    """★ The repair, end to end: same glob, same spelling, different anchor.
+
+    The scenario paths the CLI receives stay consumer-repo-relative (so an exit-2
+    annotation still lands on the PR diff — D-L), while the directory they resolve
+    against is now one the control plane can read (AR-33).
+    """
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    assert _stage(ws, temp, CV_OUT_DIR=str(out)).returncode == 0
+    stage = out / "ci-inputs" / "33230008911"
+
+    bin_dir, log = _stub_cli(tmp_path)
+    result = _submit(ws, temp, bin_dir, CV_SUBMIT_DIR=str(stage))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    calls = log.read_text(encoding="utf-8").splitlines()
+    submit_cwd = calls[0]
+    args = [line[4:] for line in calls if line.startswith("arg=")]
+    assert submit_cwd == f"cwd={stage}"  # the anchor moved …
+    assert args[:3] == [  # … and nothing else did (glob expanded in the staged root)
+        "submit",
+        "scenarios/go2_t0_smoke.yaml",
+        "scenarios/go2_ta_nav_random.yaml",
+    ]
+    assert not any(a.startswith("/") for a in args), args  # no absolute path submitted
+    assert "--trigger-source" in args and "ci-cd" in args and "--wait" in args
+    # the report/publish plane still runs in the workspace, not in the staged tree.
+    outputs = _outputs(temp)  # (the staging step's `dir` is in this file too)
+    assert (outputs["code"], outputs["have_report"]) == ("0", "true")
+    assert (ws / "report.json").exists()
+    assert not (stage / "report.json").exists()
+
+
+def test_submit_falls_back_to_the_workspace_when_nothing_was_staged(tmp_path):
+    """The CV_OUT_DIR-unset path, paired with its warning (G-35): the job still
+    submits — from the workspace, exactly as before AR-33."""
+    ws, temp = _guarded_delivery(tmp_path)
+    bin_dir, log = _stub_cli(tmp_path)
+    result = _submit(ws, temp, bin_dir, CV_SUBMIT_DIR="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text(encoding="utf-8").splitlines()[0] == f"cwd={ws}"
+
+
+# --- (I5) the cleanup shell, executed ---------------------------------------- #
+def test_cleanup_removes_this_runs_staged_tree_and_only_that(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    assert _stage(ws, temp, CV_OUT_DIR=str(out)).returncode == 0
+    stage = out / "ci-inputs" / "33230008911"
+    assert stage.is_dir()
+
+    result = _cleanup(ws, temp, CV_OUT_DIR=str(out))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stage.exists()
+    assert f"{stage} is gone" in result.stdout
+    for label, canary in _canaries(out).items():
+        assert canary.exists(), label
+    assert (out / "ci-inputs").is_dir()  # the shared parent survives for other runs
+
+
+def test_cleanup_reports_a_leftover_it_cannot_own_without_reddening_the_job(tmp_path):
+    """The root-owned `__pycache__` case, simulated with a directory this process
+    cannot write into: the residue must be NAMED, and the job must still carry the
+    CLI's verdict rather than a housekeeping failure."""
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    assert _stage(ws, temp, CV_OUT_DIR=str(out)).returncode == 0
+    locked = out / "ci-inputs" / "33230008911" / "scenarios" / "__pycache__"
+    (locked / "hold_near_goal.cpython-311.pyc").write_bytes(b"\x00pyc")
+    locked.chmod(0o500)
+    try:
+        result = _cleanup(ws, temp, CV_OUT_DIR=str(out))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "::warning title=cv-infra::staged inputs could not be fully removed" in result.stdout
+        assert "hold_near_goal.cpython-311.pyc" in result.stdout
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "label,overrides",
+    [
+        ("root unset", {"CV_OUT_DIR": None}),
+        ("root relative", {"CV_OUT_DIR": "cv-infra-prod/out"}),
+        ("run id unset", {"GITHUB_RUN_ID": None}),
+        ("run id not numeric", {"GITHUB_RUN_ID": "../99999999999"}),
+    ],
+)
+def test_cleanup_deletes_nothing_when_it_cannot_name_this_runs_directory(
+    tmp_path, label, overrides
+):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    assert _stage(ws, temp, CV_OUT_DIR=str(out)).returncode == 0
+    result = _cleanup(ws, temp, **{"CV_OUT_DIR": str(out), **overrides})
+    assert result.returncode == 0, label  # never a red job for a skipped cleanup
+    assert (out / "ci-inputs" / "33230008911").is_dir(), label  # untouched, not deleted
+    for name, canary in _canaries(out).items():
+        assert canary.exists(), name
+
+
+def test_cleanup_refuses_to_follow_a_symlinked_staging_directory(tmp_path):
+    ws, temp = _guarded_delivery(tmp_path)
+    out = _out_root(tmp_path)
+    outside = tmp_path / "production-store"
+    outside.mkdir()
+    (outside / "cv-infra.sqlite3").write_text("production", encoding="utf-8")
+    (out / "ci-inputs").mkdir(exist_ok=True)
+    (out / "ci-inputs" / "33230008911").symlink_to(outside, target_is_directory=True)
+    result = _cleanup(ws, temp, CV_OUT_DIR=str(out))
+    assert result.returncode == 0
+    assert "nothing to remove" in result.stdout
+    assert (outside / "cv-infra.sqlite3").read_text(encoding="utf-8") == "production"
