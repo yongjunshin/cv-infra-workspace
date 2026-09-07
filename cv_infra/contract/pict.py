@@ -351,13 +351,19 @@ def plan(
     is loud about it. Truncation is the honest alternative: the prefix is a real
     partial covering array and ``coverage_of_prefix`` says exactly how partial.
 
-    ``orders="auto"`` opts back into the old walk-down (``DEFAULT_ORDERS``, or
-    any explicit sequence) for callers who would rather trade k than rows. That
-    branch keeps the one design opinion this module ever had — **repeats are cut
-    last**, never below ``MIN_REPEATS``: with MEASURED per-case flakiness 0.333,
-    a 76 %-coverage suite whose verdicts are statistics beats a 100 %-coverage
-    suite whose verdicts are single draws. A caller that DECLARED its repeats is
-    not asking to be second-guessed, so the default branch honours the number.
+    ``orders="auto"`` opts back into the old walk-down (``DEFAULT_ORDERS``) for
+    callers who would rather trade k than rows, and **only that branch** keeps
+    the one design opinion this module ever had — repeats are cut last, never
+    below ``MIN_REPEATS``: with MEASURED per-case flakiness 0.333, a 76 %-coverage
+    suite whose verdicts are statistics beats a 100 %-coverage suite whose
+    verdicts are single draws. Every other call honours ``budget.repeats``
+    verbatim, an explicit ``orders=[...]`` sequence included: that sequence buys
+    the walk-down and nothing else, because a caller that named a repeats number
+    is not asking to be second-guessed by the shape of a different argument.
+
+    Assumption, surfaced because the signature cannot: with ``orders="auto"`` the
+    ``order`` argument is unused (the walk is ``DEFAULT_ORDERS``). Pass one or the
+    other, not both.
 
     Cost per run comes from the caller, so this function stays pure and
     CPU-testable: no clock, no store, no probe.
@@ -366,8 +372,7 @@ def plan(
         raise ValueError("concurrency must be >= 1")
     if budget.repeats < 1:
         raise ValueError("budget.repeats must be >= 1")
-    walk_down = orders is not None
-    repeats = max(budget.repeats, MIN_REPEATS) if walk_down else budget.repeats
+    repeats = max(budget.repeats, MIN_REPEATS) if orders == "auto" else budget.repeats
     per_case_s = cost_s_per_run * repeats / concurrency
     if per_case_s <= 0:
         raise ValueError("cost_s_per_run must be > 0")
@@ -440,9 +445,14 @@ def _orders_to_try(
     number of parameters"), which ``inputs`` pre-empts with a friendlier exit-2
     from ``_declared_parameters``. The walk-down branch clamps instead, because
     there the whole point is to land on SOME order that a 2-axis space can hold.
+
+    A string other than ``"auto"`` is a typo, not a sequence of orders: name it
+    here rather than let ``int(o)`` die on one of its characters.
     """
     if orders is None:
         return [int(order)]
+    if isinstance(orders, str) and orders != "auto":
+        raise ValueError(f'orders must be "auto" or a sequence of ints, not {orders!r}')
     wanted = DEFAULT_ORDERS if orders == "auto" else orders
     ordered = sorted({int(o) for o in wanted}, reverse=True)
     if not ordered:

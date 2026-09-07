@@ -13,8 +13,8 @@ which silently degrades the gate if it drifts:
 * (2) **the requested k is the k that runs, and a declared repeats is honoured.**
   The gate's coverage claim is only true if nothing downgrades it behind the
   report's back, so ``plan`` cuts ROWS, not the order, and takes ``repeats`` at
-  its word. The old walk-down (and with it the MEASURED-flakiness repeats floor)
-  survives as the opt-in ``orders="auto"`` branch.
+  its word. The old walk-down survives as the opt-in ``orders`` argument, and
+  the MEASURED-flakiness repeats floor rides ONLY on ``orders="auto"``.
 * (3) **truncation is honest.** A budget-cut suite reports the coverage it
   actually achieved, and the prefix curve is monotone so that number means
   something.
@@ -241,8 +241,11 @@ def test_auto_cuts_cases_not_repeats_when_the_budget_is_tight() -> None:
 
 
 @needs_pict
-def test_auto_clamps_an_order_the_space_cannot_hold() -> None:
-    """A 2-axis space asked for 3-wise: give it all of the space, do not reject."""
+def test_an_explicit_order_sequence_walks_down_without_touching_repeats() -> None:
+    """A 2-axis space asked for 3-wise: give it all of the space, do not reject —
+    and the repeats the caller DECLARED survive the walk-down. Only ``"auto"``
+    (the caller handing us a budget to reduce against) may raise them to the
+    MEASURED-flakiness floor; the shape of ``orders`` is not that consent."""
     plan = pict.plan(
         "a: 1, 2\nb: 3, 4\n",
         budget=pict.Budget(wallclock_s=3600, repeats=1),
@@ -250,6 +253,7 @@ def test_auto_clamps_an_order_the_space_cannot_hold() -> None:
         orders=[3],
     )
     assert plan.requested_order == 2
+    assert plan.repeats == 1
 
 
 def test_plan_rejects_nonsense_arguments() -> None:
@@ -263,6 +267,8 @@ def test_plan_rejects_nonsense_arguments() -> None:
         pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=0.0)
     with pytest.raises(ValueError, match="orders must not be empty"):
         pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=1.0, orders=[])
+    with pytest.raises(ValueError, match='orders must be "auto"'):
+        pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=1.0, orders="pairwise")
 
 
 # --- (3) truncation is honest ---------------------------------------------------------
