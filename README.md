@@ -179,6 +179,40 @@ verify/out/*
 !verify/out/.gitkeep       # 디렉터리는 커밋, 내용물은 런 잔여물
 ```
 
+## 실측 (etri6000, 2026-09-07)
+
+`cv-infra selftest`(번들 예제: 낙하 큐브 6케이스 = drop_height 3 × cube_scale 2, `repeats 1`,
+`pict_k 2`, `concurrency 1`)의 **첫 라이브 GPU 실행**. 호스트 = RTX PRO 6000 Blackwell
+(97,887 MiB) · 드라이버 580.159.03 · 이미지 `isaac-sim:5.1.0@sha256:f3563cb2…`(이미 로컬,
+pull 0초).
+
+| 항목 | 측정값 |
+|---|---|
+| 전체 벽시계 | **95초** / 6케이스 (케이스당 14.27–16.31초, 평균 14.78) |
+| Isaac 부팅(`app ready`) | **10.5초** (웜 10.46–11.19 · 콜드 10.56–10.91) |
+| 시뮬레이션(121 스텝) | 약 1.8초 · 컨테이너 teardown 약 0.5초 |
+| VRAM (Isaac 프로세스) | **3,993 MiB** 피크, 6케이스 전부 동일 |
+| 캐시 증가분(콜드→) | **11 MB** (kit 11M · compute 72K · home 32K) |
+
+읽는 법, 정직하게:
+
+- **VRAM 3,993 MiB는 1 Hz 샘플링의 하한**이지 증명된 최대가 아니다. 케이스가 ~14초라 그보다
+  짧은 첨두는 놓칠 수 있다.
+- **이 워크로드에서는 웜 캐시가 부팅을 빠르게 하지 않는다** — 콜드와 웜의 `app ready`가 통계적으로
+  같고, 빈 캐시 트리가 11 MB만 자랐다. 부팅 시간은 이미지 레이어에서 올라오는 Kit 확장 기동이
+  지배한다. **일반화 금지**: 이 예제는 로컬 지오메트리만 쓰는 물리 전용 씬이다. 클라우드 자산을
+  여는 실제 씬은 첫 런에 수 분의 자산 다운로드를 낸다.
+- 콜드 런 한 케이스가 **59.4초**로 튀었다(`app ready` 이후 약 45초 정체). 웜 두 번에서 재현되지
+  않았고 원인을 귀속하지 못했다 — 케이스당 상한을 예산으로 잡을 때 참고할 것(`--case-timeout-s`
+  기본 1800초라 위험 구간은 아니다).
+- **concurrency > 1은 측정되지 않았다.** 위 스크래치 제약 때문에 k=1로만 돌렸다. VRAM 여유
+  (~90 GiB)로는 산술상 여러 케이스가 들어가지만 그건 추정이지 측정이 아니다.
+
+증거: 컨테이너 내부 로그가 자기 GPU 표(`NVIDIA RTX PRO 6000 Blackwell … 97887 MB`,
+`Driver Version: 580.159.03`)와 Warp/CUDA 초기화를 찍었고, 자유낙하 z의 2계 차분이
+0.002725 m = 9.81·(1/60)²로 정확히 일치했으며, 여섯 케이스 모두 `z_final == cube_scale/2`
+(정지 시 반높이)로 끝났다.
+
 ## exit 계약
 
 프로세스 종료 코드가 판정이고, Check Run의 conclusion은 여기서 유도된다(`report.json`의
@@ -236,12 +270,22 @@ logs/<case>.sim.log         # 케이스별 컨테이너 로그
 | NVIDIA EULA·텔레메트리 동의 | `bash scripts/consent/accept_eula.sh` → 기록 + `ACCEPT_EULA`/`PRIVACY_CONSENT`를 러너 서비스 환경에 로드. 상태 확인 = `scripts/consent/check_consent.sh` |
 | PICT 바이너리 | `bash scripts/workstation_setup/install_pict.sh` (핀 커밋 clone+make, `export CV_PICT_BIN=…` 줄을 출력) |
 | Omniverse 캐시 트리 (**이미지별**) | `bash scripts/measure/warm_cache.sh <cache-root>/<digest12> provision` 로 그 이미지의 6-way 트리 생성(+uid 1234 소유). `<digest12>` = `sim_image` 다이제스트의 앞 12 hex — Kit 셰이더·CUDA 컴퓨트·자산 캐시는 Isaac 빌드에 묶이므로 한 트리를 이미지끼리 공유하면 캐시가 아니라 오염이다. 서브트리가 없으면 조용히 콜드로 돌지 않고 **이 명령을 그대로 찍으며 멈춘다**(CLI는 uid 1234로 chown할 수 없으므로 만들지 않는다). 첫 런이 그 캐시를 채운다(케이스별 CoW 스크래치이므로 공유 베이스는 건드리지 않는다) |
-| 캐시 스크래치 루트 | **운영자가 직접 만든다** — `mkdir -p <scratch-root>` 후 uid 1234가 쓸 수 있게(예: `chmod 0777`). 어떤 스크립트도 이 루트를 만들지 않는다(케이스별 하위 dir만 런타임에 생긴다). 없으면 시끄럽게 거절 |
+| 캐시 스크래치 루트 (**선택 — 대개 켜지 말 것**) | 켜면(`CV_ISAAC_CACHE_SCRATCH_ROOT`) 케이스마다 웜 베이스를 `cp -a`로 복사해 쓴다. **실측(2026-09-07): CLI를 uid 1234가 아닌 계정으로 돌리면 동작하지 않는다** — 베이스의 uid-1234 `0700` 디렉터리를 읽지 못해 `cp -a`가 죽고, 설령 복사돼도 소유권 보존 가드가 거부한다(둘 다 시끄럽게 실패하고 스크래치를 폐기하므로 조용한 콜드 런은 없다). **root 권한을 가진 CLI 신원이 아니면 unset으로 두고 concurrency=1로 돌린다.** 켤 거라면 루트는 운영자가 직접 만든다(`mkdir -p` + uid 1234 쓰기 가능) — 어떤 스크립트도 만들지 않는다 |
 | GitHub self-hosted 러너 (`cv-infra-gpu` 라벨) | `bash scripts/workstation_setup/register_gh_runner.sh` |
 | `cv-infra` 콘솔 스크립트 + `import cv_infra` 가능한 python(같은 venv) | 이 저장소를 체크아웃해 `uv sync --frozen` |
 
 동의는 **자동 수락되지 않는다.** 이 저장소에는 어떤 동의 값도 커밋돼 있지 않고, CI가 그것을
 합성할 수도 없다 — 기록이 없으면 admit이 exit 3으로 멈춘다.
+
+**러너 서비스 환경**: GitHub Actions 잡은 러너의 `.env`(`<runner-home>/.env`)에서 환경을 받고,
+러너 Listener는 그 파일을 **기동 시 한 번만** 읽는다. 따라서 `ACCEPT_EULA`·`PRIVACY_CONSENT`·
+`CV_PICT_BIN`·`CV_ISAAC_CACHE_ROOT`를 거기에 적었다면 **서비스를 재시작해야** 잡에 반영된다.
+반영 전에는 `cv-infra verify`가 exit 3(INFRA)로 멈춘다 — 조용히 통과하지 않는다.
+
+**수동 SSH 실행 주의(실측)**: 로그인 셸이 이 호스트에 없는 로케일(`ko_KR.UTF-8` 등)을 `LC_*`로
+전달하면 PICT의 wide-char 읽기가 깨지면서 *"Order cannot be larger than number of parameters"*
+라는 엉뚱한 에러가 난다. 수동 실행 시 `export LC_ALL=C.UTF-8`. GitHub Actions 경로는
+`LANG=en_US.UTF-8`만으로 충분해 영향 없다.
 
 ## fork PR 신뢰 경계 (public 저장소라면 반드시 읽을 것)
 
