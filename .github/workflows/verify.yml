@@ -3,7 +3,8 @@
 #   jobs:
 #     verify:                              # job-level `uses:` — no runs-on/steps here
 #       permissions: { checks: write, pull-requests: write, contents: read }
-#       uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@v2
+#       uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@minimal-verify
+#       #     ^ branch ref until a v2 release tag exists; then pin to the tag (README §consumer)
 #       with:
 #         sim_script: verify/sim.py
 #         sim_input_space: verify/param_space.pict
