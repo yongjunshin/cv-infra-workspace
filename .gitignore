@@ -30,3 +30,8 @@ results/
 *.mcap
 *.mp4
 *.log
+
+# --- Selftest example output — the DIRECTORY is committed (the read-only checkout needs
+#     the mount point to exist; see contract/inputs.py), its CONTENTS are run residue. ---
+examples/selftest/out/*
+!examples/selftest/out/.gitkeep

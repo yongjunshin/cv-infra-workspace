@@ -50,6 +50,7 @@ USAGE = (
     "                       [--oracle-script <path>] [--pict-k K] [--repeats N]\n"
     "                       [--budget-s S] [--sim-image REF] [--concurrency K]\n"
     "                       [--report-only] [--update-baseline] [--run-dir DIR]\n"
+    "       cv-infra selftest [any `verify` flag]\n"
     "\n"
     "exit: 0 pass · 1 a check failed or regressed · 2 the request was refused"
     " · 3 the platform could not judge"
@@ -60,20 +61,65 @@ REPORT_FILE = "report.json"
 ERRORS_FILE = "errors.json"
 PAYLOADS_DIR = "payloads"
 
+#: The bundled example, checkout-relative (``examples/selftest`` in THIS repository).
+SELFTEST_DIR = "examples/selftest"
+
+#: ``selftest`` = ``verify`` with the bundled example filled in. Presets come FIRST so a
+#: later flag of the operator's own wins (argparse keeps the last occurrence).
+SELFTEST_PRESET: tuple[str, ...] = (
+    "--checkout",
+    inputs.DEFAULT_CHECKOUT,
+    "--sim-script",
+    f"{SELFTEST_DIR}/sim.py",
+    "--input-space",
+    f"{SELFTEST_DIR}/param_space.pict",
+    "--output-dir",
+    f"{SELFTEST_DIR}/out",
+    "--oracle-script",
+    f"{SELFTEST_DIR}/oracle.py",
+)
+
+COMMANDS = ("verify", "selftest")
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry point. Never lets an unexpected fault exit 1: an uncaught Python
     exception would otherwise reach CI as "your robot failed" (exit 1), when what
     happened is that OUR code broke (exit 3)."""
     args = list(sys.argv[1:] if argv is None else argv)
-    if not args or args[0] != "verify":
+    if not args or args[0] not in COMMANDS:
         print(USAGE, file=sys.stderr)
         return EXIT_PASS if args[:1] in (["-h"], ["--help"]) else EXIT_CONTRACT
     try:
+        if args[0] == "selftest":
+            return selftest(args[1:], os.environ)
         return verify(args[1:], os.environ)
     except Exception:  # noqa: BLE001 - see the docstring: a platform fault is exit 3
         traceback.print_exc()
         return EXIT_INFRA
+
+
+def selftest(argv: Sequence[str], environ: Mapping[str, str]) -> int:
+    """Run the bundled example through the ordinary ``verify`` pipeline.
+
+    This is the runner's own smoke test: it needs no consumer repository, no cloud
+    asset and no robot, so a broken image, GPU, mount or PICT install is diagnosed HERE
+    instead of in someone's pull request.
+
+    The example is not part of the installed wheel (only ``cv_infra`` is packaged), so
+    its absence means cv-infra is being invoked from outside its own checkout — a
+    provisioning fact about the runner, hence exit 3 and not a request rejection.
+    """
+    checkout = _path_flag(argv, flag="--checkout", default=inputs.DEFAULT_CHECKOUT)
+    if not (checkout / SELFTEST_DIR).is_dir():
+        print(
+            f"cv-infra: {SELFTEST_DIR}/ is not in {checkout} — `selftest` runs the example"
+            " that ships with the cv-infra source tree. Run it from a checkout of this"
+            " repository, or point --checkout at one.",
+            file=sys.stderr,
+        )
+        return EXIT_INFRA
+    return verify([*SELFTEST_PRESET, *argv], environ)
 
 
 def verify(argv: Sequence[str], environ: Mapping[str, str]) -> int:
@@ -83,7 +129,7 @@ def verify(argv: Sequence[str], environ: Mapping[str, str]) -> int:
     try:
         spec = inputs.parse(argv, environ)
     except ContractError as err:
-        return _reject(err, _run_dir_hint(argv))
+        return _reject(err, _path_flag(argv, flag="--run-dir", default=inputs.DEFAULT_RUN_DIR))
     except inputs.InfraError as err:
         print(f"cv-infra: {err}", file=sys.stderr)
         return EXIT_INFRA
@@ -305,19 +351,22 @@ def _empty_gate_error(spec: Any, report: dict[str, Any]) -> ContractError:
     )
 
 
-def _run_dir_hint(argv: Sequence[str]) -> Path:
-    """Where ``errors.json`` goes when the arguments themselves were rejected.
+def _path_flag(argv: Sequence[str], *, flag: str, default: str) -> Path:
+    """One path flag, read off raw argv before (or instead of) a full parse.
 
-    A rejection still has to be FINDABLE by the workflow step that annotates it, so the
-    run dir is read off argv with a tolerant scan rather than from the (never built)
-    spec. Unparseable flags simply leave the default.
+    Two callers need this. A rejection still has to leave ``errors.json`` where the
+    workflow's annotate step looks, so ``--run-dir`` is read even though no spec was
+    ever built; and ``selftest`` must know the checkout before it can say whether the
+    example is there. Both scan tolerantly — unparseable flags simply leave the default,
+    since the real parser is the one that gets to complain about them.
     """
-    import argparse  # noqa: PLC0415 - only the rejection path needs a second parser
+    import argparse  # noqa: PLC0415 - only these two paths need a second parser
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--run-dir", default=inputs.DEFAULT_RUN_DIR)
+    parser.add_argument(flag, default=default)
     known, _ = parser.parse_known_args(list(argv))
-    return Path(known.run_dir).expanduser().resolve()
+    raw = getattr(known, flag.lstrip("-").replace("-", "_"))
+    return Path(raw).expanduser().resolve()
 
 
 def _run_relative(path: Path | None, run_dir: Path) -> str | None:
