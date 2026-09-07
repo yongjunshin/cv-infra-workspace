@@ -47,8 +47,9 @@ from cv_infra.report import aggregate
 
 USAGE = (
     "usage: cv-infra verify --sim-script <path> --input-space <path> --output-dir <path>\n"
+    "                       --sim-image <name>@sha256:<64 hex>\n"
     "                       [--oracle-script <path>] [--pict-k K] [--repeats N]\n"
-    "                       [--budget-s S] [--sim-image REF] [--concurrency K]\n"
+    "                       [--budget-s S] [--concurrency K]\n"
     "                       [--report-only] [--update-baseline] [--run-dir DIR]\n"
     "       cv-infra selftest [any `verify` flag]\n"
     "\n"
@@ -66,9 +67,15 @@ SELFTEST_DIR = "examples/selftest"
 
 #: ``selftest`` = ``verify`` with the bundled example filled in. Presets come FIRST so a
 #: later flag of the operator's own wins (argparse keeps the last occurrence).
+#:
+#: This is the ONLY caller that passes ``DEFAULT_SIM_IMAGE``: ``--sim-image`` is required
+#: and un-defaulted for a consumer (the image their script was developed against — see
+#: ``contract.inputs._digest_pinned_image``), and the bundled example's is this one.
 SELFTEST_PRESET: tuple[str, ...] = (
     "--checkout",
     inputs.DEFAULT_CHECKOUT,
+    "--sim-image",
+    inputs.DEFAULT_SIM_IMAGE,
     "--sim-script",
     f"{SELFTEST_DIR}/sim.py",
     "--input-space",

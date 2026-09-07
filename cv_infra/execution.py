@@ -7,9 +7,10 @@ else in the package stays docker-free, so the whole pipeline is testable on a CP
 with a duck-typed fake client (the idiom the orchestrator seam already relied on).
 
 Most of the docker-facing machinery here is LIFTED from
-``cv_infra/orchestrator/supervisor.py`` — cache CoW seeding, the image-present gate
-with its pull-liveness watchdog, the supervision loop, the finally-teardown — because
-those blocks encode measurements, not opinions:
+``cv_infra/orchestrator/supervisor.py`` (removed in the M4 cleanup; see git history) —
+cache CoW seeding, the image-present gate with its pull-liveness watchdog, the
+supervision loop, the finally-teardown — because those blocks encode measurements, not
+opinions:
 
 * ``:ro`` on a Kit/CUDA cache does not make it read-only, it turns it OFF (measured
   47 s -> 1.05 s per robot spawn); hence the per-case ``cp -a`` copy-on-write seed
@@ -219,10 +220,34 @@ def _env_path(name: str) -> str | None:
     return value
 
 
+def _image_namespace(sim_image: str) -> str:
+    """``<digest12>`` — the cache subtree that belongs to THIS image, and only it.
+
+    Every tier under the cache root is derived from the Isaac BUILD that wrote it: Kit's
+    shader cache, the CUDA ComputeCache and the asset closure are all keyed to that
+    build's own formats. Pointing two different images at one tree is not a shared warm
+    cache, it is corruption — and the shape it takes (a stale shader blob loaded by a
+    different Kit) is a crash nobody can trace back to a directory.
+
+    The admit contract already refuses an image that is not digest-pinned
+    (``contract.inputs._digest_pinned_image``), so the 12 hex chars always exist here;
+    they are short enough for an operator to type and wide enough to be unique.
+    """
+    match = re.search(r"@sha256:([0-9a-f]{12})", sim_image)
+    if match is None:
+        raise ValueError(
+            f"sim image {sim_image!r} is not digest-pinned, so its cache subtree cannot be"
+            " named — the per-image cache namespace is what keeps one image's Kit/CUDA"
+            " caches out of another's (pass `--sim-image <name>@sha256:...`)"
+        )
+    return match.group(1)
+
+
 def _cache_volumes(
     cache_root: str | os.PathLike[str] | None,
     cache_scratch_root: str | os.PathLike[str] | None,
     slug: str,
+    sim_image: str,
 ) -> tuple[dict[str, dict[str, str]], Path | None]:
     """Resolve cache roots to docker ``volumes`` binds — single-tier or per-case seeded.
     Returns ``(volumes, per-case scratch | None)``.
@@ -230,6 +255,10 @@ def _cache_volumes(
     Effective roots = the arguments (win) or ``$CV_ISAAC_CACHE_ROOT`` /
     ``$CV_ISAAC_CACHE_SCRATCH_ROOT``; when neither is set there are ZERO cache mounts
     (a cold but correct run — the CI default until a runner is provisioned).
+
+    The base root is namespaced PER IMAGE: the six tiers live under
+    ``<cache_root>/<digest12>`` (see ``_image_namespace``). The scratch root is not —
+    its children are already per-case slugs, and nothing warm is shared there.
 
     * base root alone -> one layer: all six binds ``rw`` from the base. Fine for
       ``concurrency=1``; two concurrent cases would share the same lock files.
@@ -255,11 +284,16 @@ def _cache_volumes(
         )
     if not root:
         return {}, None
-    resolved = Path(root).resolve()
+    resolved = Path(root).resolve() / _image_namespace(sim_image)
     if not resolved.is_dir():
+        # Neither silently cold (the failure everyone believes is a warm run) nor created
+        # here: the tree has to be owned by uid 1234 for the container to write it (G-15),
+        # and this process is not root. Name the exact command instead.
         raise ValueError(
-            f"cache_root {resolved} does not exist or is not a directory "
-            f"(creating + chown 1234:1234 is scripts/measure/warm_cache.sh's job)"
+            f"cache subtree {resolved} does not exist or is not a directory — this image's"
+            " cache was never provisioned. Run: bash scripts/measure/warm_cache.sh"
+            f" {resolved} provision (it creates the 6-way tree and chowns it to 1234:1234;"
+            " the CLI must not, it is not root)"
         )
     if scratch_root is None:
         return {
@@ -694,7 +728,7 @@ def run_sim_case(
     started = time.monotonic()
     try:
         out_dir = _prepare_case_dir(run_dir, slug)
-        volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, slug)
+        volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, slug, spec.sim_image)
         _ensure_image_present(
             client,
             spec.sim_image,

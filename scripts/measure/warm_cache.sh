@@ -16,13 +16,20 @@
 # for the scene that consumer actually opens — which the removed `warm` mode could only
 # guess at (it booted a fixed scene through a script that no longer exists).
 #
-# The cache root is a HOST ABSOLUTE path (sibling-container safety) and is what the
-# execution seam reads as CV_ISAAC_CACHE_ROOT. The platform deliberately does NOT create
-# or chown it (it refuses loudly on a missing root) — that is THIS script's job.
+# The cache root is a HOST ABSOLUTE path (sibling-container safety). It is PER IMAGE:
+# the execution seam mounts `$CV_ISAAC_CACHE_ROOT/<digest12>` (first 12 hex of the sim
+# image's sha256), because Kit shader / CUDA compute / asset caches belong to one Isaac
+# build and sharing one tree across images is corruption, not a warm cache. So the root
+# passed here is that per-image subtree:
+#
+#   bash warm_cache.sh /var/cache/cv-infra/f3563cb2ba0c provision
+#
+# The platform deliberately does NOT create or chown it (it refuses loudly on a missing
+# subtree, printing this very command) — that is THIS script's job.
 #
 # sudo (G-15): none — file perms go through a docker root helper (--user 0), not host sudo.
 #
-# Usage: bash warm_cache.sh <cache-root-abs> [provision|strip-gpu]
+# Usage: bash warm_cache.sh <cache-root-abs>/<digest12> [provision|strip-gpu]
 set -euo pipefail
 
 export CV_STEP=measure-warm

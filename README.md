@@ -41,6 +41,7 @@ jobs:
       sim_script: verify/sim.py
       sim_input_space: verify/param_space.pict
       sim_output_dir: verify/out
+      sim_image: nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb…   # 다이제스트 핀(태그 불가)
       oracle_script: verify/oracle.py     # 빼면 스윕 모드(게이트하지 않음)
 ```
 
@@ -56,12 +57,12 @@ jobs:
 |---|---|---|---|
 | `sim_script` **(필수)** | `--sim-script` | — | 체크아웃 상대경로. 케이스마다 컨테이너에서 `/isaac-sim/python.sh <sim_script> --<축>=<값> ...`, env `CV_SEED=<int>` |
 | `sim_input_space` **(필수)** | `--input-space` | — | PICT 모델. 축 이름은 CLI 플래그로 안전해야 한다(`^[A-Za-z][A-Za-z0-9_-]*$`, `help`/`h` 금지) |
-| `sim_output_dir` **(필수)** | `--output-dir` | — | 체크아웃 기준 **엄격한 상대 하위경로**(절대경로·`..` 금지)이며 체크아웃에 **디렉터리로 존재**해야 한다 |
+| `sim_output_dir` **(필수)** | `--output-dir` | — | 체크아웃 기준 **엄격한 상대 하위경로**(절대경로·`..`·맨 `.` 모두 금지)이며 체크아웃에 **디렉터리로 존재**해야 한다 |
 | `oracle_script` | `--oracle-script` | 없음 | 있으면 **게이트 모드**, 없으면 **스윕 모드** |
 | `pict_k` | `--pict-k` | `2` | 커버링 배열 강도. **요구값 그대로**(조용한 하향 없음) |
 | `repeats` | `--repeats` | `1` | 케이스당 반복. 1도 그대로 존중하고 `single_sample`로 라벨한다 |
 | `budget` | `--budget-s` | 없음 | 벽시계 상한(초). 케이스 착수 **전에만** 검사 |
-| `sim_image` | `--sim-image` | `isaac-sim:5.1.0@sha256:f3563c…` | 추가 의존성이 필요하면 소비자의 파생 이미지 |
+| `sim_image` **(필수)** | `--sim-image` | — | **다이제스트 핀 필수**(`<name>@sha256:<64 hex>` — 태그는 거절). 소비자가 자기 스크립트를 개발한 바로 그 이미지를 선언한다(아래 §이미지 패리티). 다이제스트 얻는 법: `docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/isaac-sim:5.1.0` |
 | `concurrency` | `--concurrency` | `1` | 동시 케이스 수. 전 컨테이너가 GPU 하나를 시분할하므로 상한은 VRAM |
 | `report_only` | `--report-only` | `false` | bool 키가 없는 verdict(지표·메모만)를 거절 대신 허용 |
 | `runner_label` | — | `cv-infra-gpu` | GPU 워크스테이션을 고르는 러너 라벨 |
@@ -73,7 +74,8 @@ CLI 전용 운영 플래그: `--checkout`(기본 `.`) · `--run-dir`(기본 `./.
 
 환경변수: `ACCEPT_EULA`·`PRIVACY_CONSENT`(없으면 exit 3) · `CV_PICT_BIN`(PICT 바이너리) ·
 `CV_BASELINE_DB`(기본 `~/.cv-infra/baselines.sqlite3`) ·
-`CV_ISAAC_CACHE_ROOT`/`CV_ISAAC_CACHE_SCRATCH_ROOT`(둘 다 없으면 캐시 마운트 0개) ·
+`CV_ISAAC_CACHE_ROOT`(6-way 트리는 그 아래 **이미지별** `<digest12>/`에 있다) ·
+`CV_ISAAC_CACHE_SCRATCH_ROOT`(둘 다 없으면 캐시 마운트 0개) ·
 `GITHUB_SHA`(리포트·베이스라인 행의 출처 라벨).
 
 ## verdict — 예약 키 0개, **타입이 의미다**
@@ -146,6 +148,23 @@ python3 examples/selftest/oracle.py --drop_height=1.5 --cube_scale=0.5   # 오�
 호스트 디렉터리를 `<checkout>/<sim_output_dir>` 위에 rw로 오버레이할 뿐이므로, 로컬에서는
 같은 명령이 그냥 작업 트리에 쓴다.
 
+## 이미지 패리티
+
+`sim_image`에 **기본값이 없는** 이유: 플랫폼이 고른 이미지는 **아무도 그 스크립트로 검증한 적
+없는** 이미지다. Isaac Sim은 메이저가 바뀌면 파이썬 API를 깬다. 게다가 **태그는 움직인다** —
+`isaac-sim:5.1.0`이 조용히 다시 푸시되면 어제 초록이던 스크립트가 오늘 ERROR 레인으로 간다.
+다이제스트는 움직이지 않는다.
+
+무엇이 보장되고 무엇이 안 되는지:
+
+- **보장**: 소프트웨어 환경(Isaac/Kit 빌드·번들 파이썬·확장)이 로컬에서 돌린 것과 **같은
+  바이트**다.
+- **보장 안 됨**: 호스트 쪽 차이 — GPU 모델·VRAM·드라이버. 러너 호스트 드라이버는 **R580
+  브랜치**이고, 컨테이너는 그것을 그대로 본다.
+- **비용**: 새 이미지는 **콜드 런 한 번**(자산 다운로드 + 셰이더/컴퓨트 캐시 채우기)과 디스크
+  **약 17–20 GB**를 쓴다. 캐시는 이미지별로 분리되므로(아래 §러너 프로비저닝) 이미지를 바꾸면
+  캐시도 새로 채운다. **낡은 이미지·캐시 정리(prune)는 운영자 몫**이다 — 플랫폼은 지우지 않는다.
+
 ## 출력 디렉터리와 `.gitkeep`
 
 체크아웃은 컨테이너에 **읽기 전용**으로 들어간다. 그 위의 마운트 포인트(`sim_output_dir`)는
@@ -216,7 +235,8 @@ logs/<case>.sim.log         # 케이스별 컨테이너 로그
 | 드라이버 R580 + Docker CE + NVIDIA Container Toolkit + 이미지 pull | [`scripts/workstation_setup/`](scripts/workstation_setup/README.md) (`provision.sh` · `realign_driver_r580.sh` · `pull_isaac.sh` · `test_gpu_passthrough.sh`) |
 | NVIDIA EULA·텔레메트리 동의 | `bash scripts/consent/accept_eula.sh` → 기록 + `ACCEPT_EULA`/`PRIVACY_CONSENT`를 러너 서비스 환경에 로드. 상태 확인 = `scripts/consent/check_consent.sh` |
 | PICT 바이너리 | `bash scripts/workstation_setup/install_pict.sh` (핀 커밋 clone+make, `export CV_PICT_BIN=…` 줄을 출력) |
-| Omniverse 캐시 트리 | `bash scripts/measure/warm_cache.sh <cache-root-abs> provision` 로 6-way 트리 생성(+uid 1234 소유), `CV_ISAAC_CACHE_ROOT`/`CV_ISAAC_CACHE_SCRATCH_ROOT` export. 첫 런이 그 캐시를 채운다(케이스별 CoW 스크래치이므로 공유 베이스는 건드리지 않는다) |
+| Omniverse 캐시 트리 (**이미지별**) | `bash scripts/measure/warm_cache.sh <cache-root>/<digest12> provision` 로 그 이미지의 6-way 트리 생성(+uid 1234 소유). `<digest12>` = `sim_image` 다이제스트의 앞 12 hex — Kit 셰이더·CUDA 컴퓨트·자산 캐시는 Isaac 빌드에 묶이므로 한 트리를 이미지끼리 공유하면 캐시가 아니라 오염이다. 서브트리가 없으면 조용히 콜드로 돌지 않고 **이 명령을 그대로 찍으며 멈춘다**(CLI는 uid 1234로 chown할 수 없으므로 만들지 않는다). 첫 런이 그 캐시를 채운다(케이스별 CoW 스크래치이므로 공유 베이스는 건드리지 않는다) |
+| 캐시 스크래치 루트 | **운영자가 직접 만든다** — `mkdir -p <scratch-root>` 후 uid 1234가 쓸 수 있게(예: `chmod 0777`). 어떤 스크립트도 이 루트를 만들지 않는다(케이스별 하위 dir만 런타임에 생긴다). 없으면 시끄럽게 거절 |
 | GitHub self-hosted 러너 (`cv-infra-gpu` 라벨) | `bash scripts/workstation_setup/register_gh_runner.sh` |
 | `cv-infra` 콘솔 스크립트 + `import cv_infra` 가능한 python(같은 venv) | 이 저장소를 체크아웃해 `uv sync --frozen` |
 

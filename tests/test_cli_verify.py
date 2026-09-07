@@ -72,6 +72,8 @@ def argv(tmp_path, *, oracle=True, **flags):
         "verify/param_space.pict",
         "--output-dir",
         "verify/out",
+        "--sim-image",
+        inputs.DEFAULT_SIM_IMAGE,
     ]
     if oracle:
         args += ["--oracle-script", "verify/oracle.py"]

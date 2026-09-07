@@ -23,10 +23,11 @@ Four rules, each with the reason it is that way and not the obvious alternative:
   never be the reason a run cannot report. Absent baseline = ``no_baseline`` = skip,
   which is also the honest first-run state.
 
-Write discipline is ``orchestrator/store.py``'s: one connection, one lock, WAL +
-``busy_timeout`` so concurrent cases wait out a lock instead of erroring, and
-``PRAGMA user_version`` so a file written by a NEWER build refuses to be written blind
-rather than being silently downgraded.
+Write discipline is ``orchestrator/store.py``'s (removed in the M4 cleanup; see git
+history — the two shorthand ``store.py`` mentions below are that same file): one
+connection, one lock, WAL + ``busy_timeout`` so concurrent cases wait out a lock
+instead of erroring, and ``PRAGMA user_version`` so a file written by a NEWER build
+refuses to be written blind rather than being silently downgraded.
 
 The read path deliberately does NOT create the database's parent directory (a
 comparison that fabricates state can only fabricate green); the update path does,

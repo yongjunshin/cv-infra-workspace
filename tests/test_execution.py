@@ -36,6 +36,7 @@ from cv_infra.execution import (
     _cache_volumes,
     _discard_scratch,
     _ensure_image_present,
+    _image_namespace,
     _image_present,
     _pull_with_liveness,
     _teardown,
@@ -51,6 +52,7 @@ from tests.conftest import (
     ORACLE_SCRIPT,
     OUTPUT_DIR,
     SIM_IMAGE,
+    SIM_IMAGE_DIGEST12,
     SIM_SCRIPT,
     FakeClient,
     FakeContainer,
@@ -410,10 +412,14 @@ def test_teardown_never_masks_the_outcome(capsys):
 
 
 def _warm_cache(tmp_path) -> tuple[Path, Path]:
-    """A provisioned warm base (all three tiers) + an empty scratch root."""
+    """A provisioned warm base + an empty scratch root.
+
+    The tiers live under the cache root's PER-IMAGE subtree (``<root>/<digest12>``) —
+    the shape ``warm_cache.sh <root>/<digest12> provision`` leaves behind.
+    """
     base = tmp_path / "warm"
     for subpath, _bind in CACHE_BASE_MOUNTS:
-        tier = base / subpath
+        tier = base / SIM_IMAGE_DIGEST12 / subpath
         tier.mkdir(parents=True)
         (tier / "shader.bin").write_bytes(b"cached")
     scratch_root = tmp_path / "scratch"
@@ -433,17 +439,21 @@ def test_no_cache_configured_means_zero_cache_mounts(tmp_path, monkeypatch):
     assert execution.error is None
 
 
-def test_a_single_tier_cache_binds_all_six_dirs_rw(tmp_path, monkeypatch):
+def test_a_single_tier_cache_binds_all_six_dirs_rw_under_the_image_namespace(tmp_path, monkeypatch):
     base = tmp_path / "warm"
-    base.mkdir()
+    (base / SIM_IMAGE_DIGEST12).mkdir(parents=True)
     monkeypatch.setenv(CACHE_ROOT_ENV, str(base))
     monkeypatch.delenv(CACHE_SCRATCH_ROOT_ENV, raising=False)
 
-    volumes, scratch = _cache_volumes(None, None, "cvc-x")
+    volumes, scratch = _cache_volumes(None, None, "cvc-x", SIM_IMAGE)
 
     assert scratch is None
     assert len(volumes) == len(CACHE_MOUNTS)
     assert {bind["mode"] for bind in volumes.values()} == {"rw"}  # :ro turns caches OFF
+    # Kit/CUDA caches belong to one Isaac BUILD — a second image gets its own subtree.
+    assert set(volumes) == {
+        str(base / SIM_IMAGE_DIGEST12 / subpath) for subpath, _bind in CACHE_MOUNTS
+    }
 
 
 def test_a_seeded_cache_copies_the_warm_tiers_and_never_binds_the_base(tmp_path, capsys):
@@ -465,7 +475,7 @@ def test_the_seeded_runtime_dirs_are_world_writable(tmp_path):
     """dockerd would create a missing bind source as root; the image runs as uid 1234."""
     base, scratch_root = _warm_cache(tmp_path)
 
-    volumes, scratch = _cache_volumes(base, scratch_root, "cvc-x")
+    volumes, scratch = _cache_volumes(base, scratch_root, "cvc-x", SIM_IMAGE)
     try:
         for subpath, _bind in CACHE_SCRATCH_MOUNTS:
             mode = (scratch / subpath).stat().st_mode
@@ -477,28 +487,42 @@ def test_the_seeded_runtime_dirs_are_world_writable(tmp_path):
 
 def test_a_scratch_root_without_a_base_is_refused(tmp_path):
     with pytest.raises(ValueError, match="without cache_root"):
-        _cache_volumes(None, tmp_path, "cvc-x")
+        _cache_volumes(None, tmp_path, "cvc-x", SIM_IMAGE)
 
 
-def test_a_missing_cache_root_is_loud(tmp_path):
-    with pytest.raises(ValueError, match="does not exist or is not a directory"):
-        _cache_volumes(tmp_path / "absent", None, "cvc-x")
+def test_a_cache_root_without_this_images_subtree_names_the_command_to_run(tmp_path):
+    """Never silently cold, and never created here: the tree must be owned by uid 1234."""
+    base = tmp_path / "warm"
+    base.mkdir()
+
+    with pytest.raises(ValueError) as exc:
+        _cache_volumes(base, None, "cvc-x", SIM_IMAGE)
+
+    message = str(exc.value)
+    assert str(base / SIM_IMAGE_DIGEST12) in message
+    assert "warm_cache.sh" in message and "provision" in message
+
+
+def test_an_image_without_a_digest_cannot_name_a_cache_subtree(tmp_path):
+    """The admit gate refuses one already; the seam refuses to guess if it ever slips."""
+    with pytest.raises(ValueError, match="not digest-pinned"):
+        _image_namespace("nvcr.io/nvidia/isaac-sim:5.1.0")
 
 
 def test_a_missing_scratch_root_is_loud(tmp_path):
     base, _scratch = _warm_cache(tmp_path)
     with pytest.raises(ValueError, match="scratch ROOT is host provisioning"):
-        _cache_volumes(base, tmp_path / "absent", "cvc-x")
+        _cache_volumes(base, tmp_path / "absent", "cvc-x", SIM_IMAGE)
 
 
 def test_an_unprovisioned_warm_tier_is_refused_rather_than_seeded_empty(tmp_path):
     base = tmp_path / "warm"
-    base.mkdir()
+    (base / SIM_IMAGE_DIGEST12).mkdir(parents=True)
     scratch_root = tmp_path / "scratch"
     scratch_root.mkdir()
 
     with pytest.raises(ValueError, match="never provisioned"):
-        _cache_volumes(base, scratch_root, "cvc-x")
+        _cache_volumes(base, scratch_root, "cvc-x", SIM_IMAGE)
 
 
 def test_a_failed_copy_is_loud_and_leaves_no_orphan(tmp_path):
@@ -509,7 +533,7 @@ def test_a_failed_copy_is_loud_and_leaves_no_orphan(tmp_path):
     blocker.write_text("not a directory", encoding="utf-8")
 
     with pytest.raises(RuntimeError) as exc:
-        _cache_volumes(base, scratch_root, "cvc-x")
+        _cache_volumes(base, scratch_root, "cvc-x", SIM_IMAGE)
 
     assert "cache seed failed for" in str(exc.value)
     assert not (scratch_root / "cvc-x").exists()  # no ~1 GB orphan behind the error
@@ -519,7 +543,7 @@ def test_an_empty_cache_env_is_loud_instead_of_meaning_unset(tmp_path, monkeypat
     monkeypatch.setenv(CACHE_ROOT_ENV, "   ")
 
     with pytest.raises(ValueError, match="set but empty"):
-        _cache_volumes(None, None, "cvc-x")
+        _cache_volumes(None, None, "cvc-x", SIM_IMAGE)
 
 
 class _StatOnlyPath:

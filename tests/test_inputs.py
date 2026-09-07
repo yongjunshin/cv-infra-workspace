@@ -28,7 +28,12 @@ BASE_ARGS = (
     "verify/param_space.pict",
     "--output-dir",
     "verify/out",
+    "--sim-image",
+    inputs.DEFAULT_SIM_IMAGE,
 )
+
+#: Another well-formed digest pin — a consumer's derived image, not the stock one.
+DERIVED_IMAGE = "acme/isaac@sha256:" + "de" * 32
 
 
 def make_checkout(tmp_path: Path, *, model: str = MODEL, sim: str = "# sim\n") -> Path:
@@ -51,10 +56,13 @@ def make_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
     return env
 
 
-def parse_args(tmp_path, *extra, checkout=None, env=None, base=None):
+def parse_args(tmp_path, *extra, checkout=None, env=None, base=None, sim_image=True):
+    """``BASE_ARGS`` + ``extra``. ``sim_image=False`` drops the base ``--sim-image`` pair,
+    so a test can supply its own (or none at all — the flag is required)."""
     checkout = make_checkout(tmp_path) if checkout is None else checkout
+    base_args = BASE_ARGS if sim_image else BASE_ARGS[: BASE_ARGS.index("--sim-image")]
     return inputs.parse(
-        [*BASE_ARGS, *extra],
+        [*base_args, *extra],
         make_env(tmp_path) if env is None else env,
         checkout_base=checkout if base is None else base,
     )
@@ -82,7 +90,7 @@ def test_a_complete_request_becomes_a_spec_with_container_relative_paths(tmp_pat
     assert (spec.pict_k, spec.repeats, spec.concurrency) == (2, 3, 1)
     assert spec.budget_s is None and spec.report_only is False
     assert spec.update_baseline is False and spec.checkout_sha is None
-    assert spec.sim_image == inputs.DEFAULT_SIM_IMAGE
+    assert spec.sim_image == inputs.DEFAULT_SIM_IMAGE  # what BASE_ARGS asked for
     assert spec.run_dir == (tmp_path / "checkout" / ".cv-infra-run").resolve()
     assert spec.baseline_db == Path("~/.cv-infra/baselines.sqlite3").expanduser()
     assert spec.pict_bin == str(tmp_path / "pict")
@@ -105,7 +113,7 @@ def test_the_operational_flags_are_all_honoured(tmp_path):
         "--report-only",
         "--update-baseline",
         "--sim-image",
-        "acme/isaac@sha256:dead",
+        DERIVED_IMAGE,
         "--case-timeout-s",
         "60",
         "--oracle-timeout-s",
@@ -121,7 +129,7 @@ def test_the_operational_flags_are_all_honoured(tmp_path):
 
     assert (spec.pict_k, spec.budget_s, spec.concurrency) == (1, 10800.0, 4)
     assert spec.report_only is True and spec.update_baseline is True
-    assert spec.sim_image == "acme/isaac@sha256:dead"
+    assert spec.sim_image == DERIVED_IMAGE
     assert (spec.case_timeout_s, spec.oracle_timeout_s) == (60.0, 30.0)
     assert (spec.shm_size, spec.max_zip_mb) == ("16g", 8)
     assert spec.run_dir == (tmp_path / "run").resolve()
@@ -185,6 +193,23 @@ def test_an_unknown_flag_is_a_friendly_rejection_not_an_argparse_dump(tmp_path):
 
     assert error.field_path == "(arguments)"
     assert "--not-a-flag" in error.got
+
+
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [
+        ("nvcr.io/nvidia/isaac-sim:5.1.0", "a tag moves; the digest is the pin"),
+        ("nvcr.io/nvidia/isaac-sim", "a bare name is not even a version"),
+        ("isaac@sha256:dead", "a truncated digest is not a digest"),
+        ("", "no default: the consumer names the image they developed against"),
+    ],
+)
+def test_a_sim_image_that_is_not_digest_pinned_is_refused(tmp_path, value, why):
+    error = reject(tmp_path, *(("--sim-image", value) if value else ()), sim_image=False)
+
+    assert error.field_path == "--sim-image", why
+    # the example is the command that PRODUCES the digest, not a digest to copy
+    assert "docker inspect" in error.example and "RepoDigests" in error.example
 
 
 def test_a_checkout_that_is_not_a_directory_is_refused(tmp_path):

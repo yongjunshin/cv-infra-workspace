@@ -20,7 +20,10 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
-SIM_IMAGE = "isaac-sim:test"
+#: Digest-pinned, like every admitted image: the execution seam names this image's
+#: cache subtree after the first 12 hex chars of the digest.
+SIM_IMAGE_DIGEST12 = "ab12cd34ef56"
+SIM_IMAGE = f"isaac-sim:test@sha256:{SIM_IMAGE_DIGEST12}{'0' * 52}"
 SIM_SCRIPT = "verify/sim.py"
 ORACLE_SCRIPT = "verify/oracle.py"
 OUTPUT_DIR = "verify/out"

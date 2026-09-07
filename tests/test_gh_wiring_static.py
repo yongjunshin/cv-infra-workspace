@@ -67,6 +67,18 @@ def workflow_call_inputs(text: str) -> list[str]:
     return names
 
 
+def input_block(text: str, name: str) -> str:
+    """One input's own lines under ``on.workflow_call.inputs`` (its keys are indent 8)."""
+    lines = text.splitlines()
+    start = lines.index(f"      {name}:") + 1
+    body = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith("        "):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
 def run_scripts(text: str) -> str:
     """Every ``run: |`` block's body, joined — the shell the workflow actually executes.
 
@@ -100,6 +112,18 @@ def ci_yml() -> str:
 
 def test_declared_inputs_are_exactly_the_contract(verify_yml: str) -> None:
     assert set(workflow_call_inputs(verify_yml)) == set(INPUT_TO_FLAG) | WORKFLOW_ONLY_INPUTS
+
+
+def test_the_sim_image_input_is_required_and_undefaulted(verify_yml: str) -> None:
+    """The image is the consumer's declaration of what their script was developed
+    against (``contract.inputs._digest_pinned_image``): a default here would be the
+    platform picking an Isaac build nobody verified the script on."""
+    block = input_block(verify_yml, "sim_image")
+
+    assert "required: true" in block
+    assert "default:" not in block
+    # the description carries the one-liner that PRODUCES the digest
+    assert "docker inspect" in block and "RepoDigests" in block
 
 
 def test_every_input_is_read_somewhere(verify_yml: str) -> None:

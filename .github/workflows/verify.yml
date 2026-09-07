@@ -8,6 +8,7 @@
 #         sim_script: verify/sim.py
 #         sim_input_space: verify/param_space.pict
 #         sim_output_dir: verify/out
+#         sim_image: nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb…   # digest, never a tag
 #         oracle_script: verify/oracle.py       # omit => sweep mode (does not gate)
 #
 # The inputs below are the CLI's flags, one for one (`cv-infra verify --help`), so the
@@ -90,10 +91,13 @@ on:
         type: string
       sim_image:
         description: >-
-          Simulation image. Digest-pinned stock Isaac Sim by default; a consumer needing
-          extra dependencies passes their own derived image.
-        required: false
-        default: "nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54"
+          Simulation image, DIGEST-PINNED (`<name>@sha256:<64 hex>`) — a tag is refused.
+          Declare the very image your sim script was developed against: Isaac Sim breaks
+          its Python APIs across majors and a tag can be repushed under you, so a digest
+          is what makes CI the environment you tested locally. Read it off that image
+          with: docker inspect --format '{{index .RepoDigests 0}}'
+          nvcr.io/nvidia/isaac-sim:5.1.0
+        required: true
         type: string
       concurrency:
         description: "Cases in flight at once. Every container shares one GPU; VRAM is the ceiling."

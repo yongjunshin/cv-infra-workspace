@@ -40,9 +40,13 @@ from typing import NoReturn
 from cv_infra.contract import pict
 from cv_infra.contract.errors import ContractError
 
-# The pinned stock image. DUPLICATED (not imported) from ``cv_infra.execution``: the
-# contract is the lowest layer and must import no sibling module, so the two literals
-# are held equal by a test instead of by an import (tests/test_inputs.py).
+# The pinned stock image. NOT a default for ``--sim-image`` (that flag is required —
+# see ``_digest_pinned_image``): the single consumer of this constant is
+# ``cv-infra selftest``, which runs THIS repository's own example and therefore is the
+# one caller entitled to name the image it was written against. DUPLICATED (not
+# imported) from ``cv_infra.execution``: the contract is the lowest layer and must
+# import no sibling module, so the two literals are held equal by a test instead of by
+# an import (tests/test_inputs.py).
 DEFAULT_SIM_IMAGE = (
     "nvcr.io/nvidia/isaac-sim:5.1.0"
     "@sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54"
@@ -69,6 +73,9 @@ COMMIT_SHA_ENV = "GITHUB_SHA"
 
 #: Static headless heuristic (warning only — see the module doc).
 _HEADLESS_FALSE = re.compile(r"headless.*False")
+
+#: A digest-pinned image reference — ``<name>@sha256:<64 hex>`` and nothing else.
+_DIGEST_PINNED = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 
 
 class InfraError(RuntimeError):
@@ -201,7 +208,7 @@ def parse(
             if args.budget_s is None
             else _bounded_float(args.budget_s, flag="--budget-s", example="10800")
         ),
-        sim_image=args.sim_image,
+        sim_image=_digest_pinned_image(args.sim_image),
         concurrency=_bounded_int(args.concurrency, flag="--concurrency", minimum=1, example="2"),
         report_only=args.report_only,
         update_baseline=args.update_baseline,
@@ -236,7 +243,7 @@ class _Parser(argparse.ArgumentParser):
             expected="the documented `cv-infra verify` flags",
             got=message,
             example="--sim-script verify/sim.py --input-space verify/param_space.pict "
-            "--output-dir verify/out",
+            "--output-dir verify/out --sim-image <name>@sha256:<64 hex>",
         )
 
 
@@ -252,7 +259,7 @@ def _parser() -> _Parser:
     parser.add_argument("--pict-k", default=str(DEFAULT_PICT_K))
     parser.add_argument("--repeats", default=str(DEFAULT_REPEATS))
     parser.add_argument("--budget-s")
-    parser.add_argument("--sim-image", default=DEFAULT_SIM_IMAGE)
+    parser.add_argument("--sim-image")
     parser.add_argument("--concurrency", default=str(DEFAULT_CONCURRENCY))
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--update-baseline", action="store_true")
@@ -354,6 +361,32 @@ def _checkout_output_dir(value: str | None, checkout: Path) -> str:
             example="--output-dir verify/out",
         )
     return relative
+
+
+def _digest_pinned_image(value: str | None) -> str:
+    """The simulation image, required and pinned by DIGEST — a tag is never enough.
+
+    LOCAL PARITY is the whole reason: the consumer declares the very image their sim
+    script was developed against, so the container CI boots is byte-identical to the one
+    that ran on their workstation. Isaac Sim breaks its Python APIs across majors, and a
+    tag moves — ``isaac-sim:5.1.0`` can be repushed under a green pipeline and turn a
+    passing script into an ERROR lane nobody changed. A digest cannot move.
+
+    Hence no default: an image the PLATFORM picked would be an image nobody verified the
+    script against, and the failure would surface as the consumer's bug.
+    """
+    raw = (value or "").strip()
+    if not _DIGEST_PINNED.match(raw):
+        raise ContractError(
+            field_path="--sim-image",
+            expected="a digest-pinned image reference (`<name>@sha256:<64 hex>`) — a tag "
+            "moves under you, a digest does not, and the run must be the image the sim "
+            "script was developed against",
+            got=raw or "(missing)",
+            example="read the digest off the image you ran locally: docker inspect "
+            "--format '{{index .RepoDigests 0}}' nvcr.io/nvidia/isaac-sim:5.1.0",
+        )
+    return raw
 
 
 def _bounded_int(raw: str, *, flag: str, minimum: int, example: str) -> int:
