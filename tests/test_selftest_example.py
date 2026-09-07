@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from cv_infra.cli import main as cli
-from cv_infra.contract import pict
+from cv_infra.contract import inputs, pict
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / cli.SELFTEST_DIR
@@ -39,8 +39,8 @@ ISAAC_PREFIXES = ("omni", "isaacsim", "pxr")
 TRAJECTORY = {"seed": 7, "drop_height": 1.5, "cube_scale": 0.5, "z": [1.5, 1.1, 0.31, 0.25]}
 
 
-def imports_of(tree: ast.Module, *, toplevel: bool) -> list[tuple[int, str]]:
-    """``(lineno, root module)`` for every import — module level only, or all of them."""
+def imports_of(tree: ast.AST, *, toplevel: bool) -> list[tuple[int, str]]:
+    """``(lineno, root module)`` for every import — direct children only, or all of them."""
     nodes = tree.body if toplevel else ast.walk(tree)
     found = []
     for node in nodes:
@@ -87,11 +87,17 @@ def test_sim_imports_nothing_isaac_before_simulationapp():
     tree = ast.parse(SIM.read_text(encoding="utf-8"))
     assert [name for _, name in imports_of(tree, toplevel=True) if name in ISAAC_PREFIXES] == []
 
-    boot = [line for line, name in imports_of(tree, toplevel=False) if name == "isaacsim"]
+    # Stronger than "not at module level", which only inspects the module's direct
+    # children: EVERY Isaac import must sit inside a function body, so none of them can
+    # execute at import time — they run only once a caller has booted SimulationApp.
+    in_functions = {
+        line
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        for line, _ in imports_of(node, toplevel=False)
+    }
     isaac = [line for line, name in imports_of(tree, toplevel=False) if name in ISAAC_PREFIXES]
-    # `from isaacsim import SimulationApp` is the first Isaac import in the file; every
-    # omni.*/isaacsim.* import below it runs only after the app was instantiated.
-    assert min(boot) == min(isaac)
+    assert isaac and set(isaac) <= in_functions
 
 
 def test_both_scripts_use_the_same_checkout_relative_output_path():
@@ -100,7 +106,7 @@ def test_both_scripts_use_the_same_checkout_relative_output_path():
     assert expected in ORACLE.read_text(encoding="utf-8")
 
 
-def test_the_model_axes_are_exactly_the_flags_both_scripts_accept():
+def test_both_scripts_accept_every_declared_axis():
     text = MODEL.read_text(encoding="utf-8")
     pict.validate_model(text, source_path=str(MODEL))
     axes = set(pict._declared_parameters(text))
@@ -172,8 +178,26 @@ def test_selftest_presets_the_example_and_lets_later_flags_win(monkeypatch):
     argv = seen["argv"]
     assert argv[: len(cli.SELFTEST_PRESET)] == list(cli.SELFTEST_PRESET)
     assert argv[-4:] == ["--checkout", str(ROOT), "--repeats", "3"]
-    # the operator's --checkout is the LAST occurrence, so argparse keeps it
-    assert argv.index("--checkout", len(cli.SELFTEST_PRESET)) > argv.index("--checkout")
+
+
+def test_the_operators_checkout_beats_the_presets(tmp_path):
+    """The preceding test pins the ORDER; this one pins what the order buys.
+
+    The preset's own ``--checkout .`` would resolve to ``tmp_path``, where no example
+    exists — so parsing at all proves the operator's later flag won, and the admitted
+    spec is the one that names this repository.
+    """
+    binary = tmp_path / "pict"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    env = {"ACCEPT_EULA": "Y", "PRIVACY_CONSENT": "Y", pict.PICT_BIN_ENV: str(binary)}
+
+    spec = inputs.parse(
+        [*cli.SELFTEST_PRESET, "--checkout", str(ROOT)], env, checkout_base=tmp_path
+    )
+
+    assert spec.checkout == ROOT
+    assert spec.sim_script == f"{cli.SELFTEST_DIR}/sim.py"
 
 
 def test_selftest_without_the_example_is_infra_not_a_rejection(tmp_path, capsys):

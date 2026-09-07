@@ -6,5 +6,10 @@
 #
 # 3 x 2 = 6 combinations; pairwise (pict_k: 2) covers them all here, which is what makes
 # this a selftest: it always runs the whole grid.
-drop_height: 0.5, 1.5, 3.0
+#
+# Every combination must land comfortably on the "fell" side of the oracle's threshold
+# (drop_height - 0.2 m) against a cube that comes to rest at cube_scale/2: the lowest
+# drop is 0.8 and not 0.5 so that even the big cube keeps ~0.35 m of margin instead of
+# 0.05 m, i.e. an unsettled bounce cannot turn the RUNNER's smoke test red.
+drop_height: 0.8, 1.5, 3.0
 cube_scale: 0.2, 0.5

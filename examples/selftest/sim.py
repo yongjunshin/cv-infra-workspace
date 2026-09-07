@@ -37,6 +37,7 @@ import json
 import os
 import random
 import sys
+import traceback
 from pathlib import Path
 
 #: Checkout-root-relative, matching the workflow's `sim_output_dir` — see the docstring.
@@ -112,15 +113,24 @@ def main() -> int:
     from isaacsim import SimulationApp
 
     simulation_app = SimulationApp({"headless": not args.gui})
+    rc = 0
     try:
         record = simulate(args, seed)
         OUT_PATH.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         print(f"[selftest] wrote {OUT_PATH} ({len(record['z'])} samples, seed {seed})", flush=True)
+    except Exception as exc:  # noqa: BLE001 - the sim log is the case's only diagnostic
+        # Say WHY here or nowhere: close() below ends the process, so an exception left
+        # to propagate never gets its traceback printed and the failure would surface
+        # only as the oracle being unable to read trajectory.json.
+        print(f"[selftest] ERROR unhandled exception: {exc!r}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        rc = 1
     finally:
         # G-62: this ends the process with status 0 — nothing below runs, and the exit
-        # code cannot carry a verdict. The oracle judges the file, not this status.
+        # code cannot carry a verdict (rc above is honesty, not a channel). The oracle
+        # judges the file, not this status.
         simulation_app.close()
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
