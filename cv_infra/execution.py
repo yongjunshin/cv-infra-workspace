@@ -174,11 +174,13 @@ def run_key(case: Any) -> str:
     return f"{case.case_index:04d}-{case.case_id}-r{case.repeat}"
 
 
-def _resolve_docker_client(docker_client: Any) -> Any:
+def resolve_docker_client(docker_client: Any) -> Any:
     """The injected duck-typed client, else a lazily-imported real one.
 
     Lazy so importing this module (and running the whole CPU test suite) needs no
-    docker daemon and no SDK import; tests inject a fake.
+    docker daemon and no SDK import; tests inject a fake. Public because the CLI
+    resolves the client ONCE for a whole run (a dead daemon is then one exit-3 line
+    instead of one ERROR per case).
     """
     if docker_client is not None:
         return docker_client
@@ -679,7 +681,7 @@ def run_sim_case(
     status cannot travel out of the container. It only separates "died badly" (ERROR)
     from "ran to completion" (ask the oracle).
     """
-    client = _resolve_docker_client(client)
+    client = resolve_docker_client(client)
     slug = slug_for(run_key(case))
     run_dir = Path(run_dir)
     log_path = run_dir / "logs" / f"{slug}.sim.log"
@@ -757,7 +759,7 @@ def run_oracle(
     lane. The image is already local — the sim run just pulled it — so no pull gate
     here.
     """
-    client = _resolve_docker_client(client)
+    client = resolve_docker_client(client)
     slug = slug_for(run_key(case))
     container = None
     rc: int | None = None

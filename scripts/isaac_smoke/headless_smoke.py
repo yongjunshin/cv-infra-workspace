@@ -6,7 +6,8 @@ Run INSIDE the isaac-sim:5.1.0 container via the bundled interpreter:
     /isaac-sim/python.sh headless_smoke.py --mode smoke     --out /cv/out
     /isaac-sim/python.sh headless_smoke.py --mode handshake --out /cv/out
 
-Modes (dispatched by the run_smoke.sh / run_dds_handshake.sh host wrappers):
+Modes (`smoke` is dispatched by the run_smoke.sh host wrapper; `handshake` is a
+hand-driven ROS 2 probe — its wrapper was removed with the two-container SUT model):
   smoke      DoD-P1-04 (REQ-EXEC-001): boot SimulationApp({"headless": True}),
              step PhysX (falling cube), capture >=1 off-screen render-product frame
              to a file and assert it is NON-black (pixel mean AND std > 0 — R19/D-A),

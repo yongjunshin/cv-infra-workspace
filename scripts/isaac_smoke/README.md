@@ -1,16 +1,19 @@
-# Isaac Smoke + DDS Handshake (M2 / Phase 1)
+# Isaac headless smoke
 
-Host-side wrappers + one in-container script that close **DoD-P1-04** (headless
-`SimulationApp` smoke with a non-black off-screen frame) and **DoD-P1-05** (container-
-boundary DDS handshake with a separate `ros:jazzy` container). No custom image is
+A host-side wrapper + one in-container script that prove the pinned Isaac image boots
+headless on this host and renders a non-black off-screen frame. No custom image is
 built; everything runs on the pinned `isaac-sim:5.1.0` base (`common.sh` pins).
 
 | File | Role |
 |---|---|
 | `headless_smoke.py` | runs INSIDE the container via `/isaac-sim/python.sh` (`--mode smoke\|handshake`) |
-| `run_smoke.sh` | DoD-P1-04 wrapper: boot, GPU-PID evidence, frame + non-black assertion |
-| `run_dds_handshake.sh` | DoD-P1-05 wrapper: `/clock` forward, `/cmd_vel` reverse, endpoints, SHM-off |
-| `fastdds_udp_profile.xml` | Fast DDS UDPv4-only profile (SHM transport disabled, R8) |
+| `run_smoke.sh` | boot, GPU-PID evidence, frame + non-black assertion |
+
+> The DDS handshake WRAPPER (`run_dds_handshake.sh`) and its Fast DDS UDPv4 profile
+> were removed with the rest of the two-container SUT model: the platform no longer
+> runs a second container beside the sim, so nothing drives them. `headless_smoke.py`
+> keeps its `--mode handshake` path for an operator debugging ROS 2 inside the image by
+> hand; the measurements below are the record of when it last ran.
 
 ## Run (on the workstation)
 
@@ -18,11 +21,9 @@ built; everything runs on the pinned `isaac-sim:5.1.0` base (`common.sh` pins).
 rsync -a scripts/ etri6000:~/cv-infra-p1-smoke/scripts/     # from the repo checkout
 ssh etri6000
 CV_EULA_CONSENT=yes bash ~/cv-infra-p1-smoke/scripts/isaac_smoke/run_smoke.sh
-CV_EULA_CONSENT=yes bash ~/cv-infra-p1-smoke/scripts/isaac_smoke/run_dds_handshake.sh
 ```
 
-Serial contract: the handshake refuses to run until the smoke has passed
-(`out/last_smoke_pass`). Evidence lands under `~/cv-infra-p1-smoke/out/<run-id>/`
+Evidence lands under `~/cv-infra-p1-smoke/out/<run-id>/`
 (`container.log`, `nvidia_smi_evidence.txt`, `frame_0001.*`, `clock_echo.txt`,
 `cmd_vel_info.txt`, `*_dev_shm.txt`, ...).
 
@@ -59,7 +60,7 @@ runtime env is synthesized from that input and injected with `-e` for that run o
   so /dev/shm stays near-empty. Kept at 1g for Kit headroom (docker default 64m).
 * **Multicast discovery on the bridge net: WORKS** (measured) — `/clock` echoed by
   the ros:jazzy peer via default multicast discovery (~437 msg/s observed); the
-  `initialPeers` unicast fallback in `run_dds_handshake.sh` was NOT needed.
+  `initialPeers` unicast fallback in the (since removed) DDS wrapper was NOT needed.
 * **Frame capture**: plain `world.step(render=True)` alone never flushed annotator
   data (measured: empty after 80 steps); `rep.orchestrator.step()` is required to
   trigger the replicator capture (headless_smoke.py does both).

@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# warm_cache.sh — M5 asset/shader cache warming + provisioning (scripts/measure).
+# warm_cache.sh — Omniverse cache-tree lifecycle for the runner host (scripts/measure).
 #
-# Owns the Omniverse disk-cache tree lifecycle for the P2-09 cold/warm measurement and
-# for the production runner mounts (D-1 opt B). Three idempotent modes:
+# Owns the disk-cache tree the case containers mount (CV_ISAAC_CACHE_ROOT). Two
+# idempotent modes:
 #
 #   provision   create the 6-way cache subtree + chown 1234:1234 (G-15). EMPTY tree.
-#               -> prepares the "cold-fresh" condition (assets+shaders+compute all cold).
-#   warm        provision, then boot the scene ONCE (warm_scene.py) to fill the FULL
-#               dependency closure (assets on disk) + the GPU-derived shader/compute
-#               caches. -> prepares the "warm-all" condition. (default)
+#               -> the "cold-fresh" condition (assets + shaders + compute all cold).
+#               (default)
 #   strip-gpu   from a warmed tree, delete only the GPU-DERIVED caches (Kit shader +
 #               ComputeCache + GLCache), KEEP the portable asset cache (.cache/ov).
-#               -> prepares the "cold-assets-warm-shaders" condition.
+#               -> the "cold-assets-warm-shaders" condition.
 #
-# The cache root is a HOST ABSOLUTE path (sibling-container safety, D-O) and is what the
-# supervisor reads as CV_ISAAC_CACHE_ROOT (D-1). The supervisor deliberately does NOT
-# create or chown it (it raises a loud ValueError on a missing root) — that is THIS
-# script's job. Mounts follow the D-1 canonical 6-way table verbatim.
+# WARMING the tree is no longer a mode here: it is just a run. `cv-infra verify` boots
+# the consumer's own sim script against these mounts, so the first run fills the closure
+# for the scene that consumer actually opens — which the removed `warm` mode could only
+# guess at (it booted a fixed scene through a script that no longer exists).
 #
-# EULA (NEG-2; LOCKED §8): booting to warm requires per-run operator consent
-# (CV_EULA_CONSENT=yes) — refused otherwise (exit 3). No ACCEPT_EULA literal is baked.
+# The cache root is a HOST ABSOLUTE path (sibling-container safety) and is what the
+# execution seam reads as CV_ISAAC_CACHE_ROOT. The platform deliberately does NOT create
+# or chown it (it refuses loudly on a missing root) — that is THIS script's job.
+#
 # sudo (G-15): none — file perms go through a docker root helper (--user 0), not host sudo.
 #
-# Usage: CV_EULA_CONSENT=yes bash warm_cache.sh <cache-root-abs> [provision|warm|strip-gpu]
+# Usage: bash warm_cache.sh <cache-root-abs> [provision|strip-gpu]
 set -euo pipefail
 
 export CV_STEP=measure-warm
@@ -34,88 +34,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/measure/common.sh
 source "$SCRIPT_DIR/common.sh"
 
-# EULA gate FIRST — before touching args or the filesystem. Booting Isaac to warm needs
-# per-run operator consent (NEG-2). Verification: `unset CV_EULA_CONSENT;
-# warm_cache.sh /tmp/nonexistent` -> exit 3 (this line, before the root is ever used).
+# Consent gate FIRST — before touching args or the filesystem. Nothing here BOOTS Isaac,
+# but every mode runs the NVIDIA image as a root helper, so the host still needs a valid
+# consent record (exit 3 without one, before the root is ever used).
 measure_eula_gate no-boot
 
 CACHE_ROOT="${1:-$_OPERATOR_CACHE_ROOT}"
-MODE="${2:-warm}"
+MODE="${2:-provision}"
 [[ -n "$CACHE_ROOT" ]] \
-  || die "cache root required: pass <cache-root-abs> or set CV_ISAAC_CACHE_ROOT (D-1). usage: CV_EULA_CONSENT=yes $0 <cache-root-abs> [provision|warm|strip-gpu]"
+  || die "cache root required: pass <cache-root-abs> or set CV_ISAAC_CACHE_ROOT. usage: $0 <cache-root-abs> [provision|strip-gpu]"
 case "$CACHE_ROOT" in
   /*) : ;;
   *) die "cache root must be a HOST ABSOLUTE path (sibling-container safety, D-O): $CACHE_ROOT" ;;
 esac
 case "$MODE" in
-  provision | warm | strip-gpu) : ;;
-  *) die "unknown mode '$MODE' (want: provision | warm | strip-gpu)" ;;
+  provision | strip-gpu) : ;;
+  *) die "unknown mode '$MODE' (want: provision | strip-gpu)" ;;
 esac
-
-[[ "$MODE" == "warm" ]] && measure_eula_gate boot
 
 require_cmd docker
 IMG="$CV_MEASURE_IMAGE"
-
-# Cache mounts = D-1 canonical 6-way (verbatim). The host subpaths mirror
-# CV_MEASURE_CACHE_SUBPATHS in common.sh so tree creation cannot drift from the mounts.
-cache_mounts() {
-  printf '%s\n' \
-    -v "$CACHE_ROOT/cache/kit:/isaac-sim/kit/cache:rw" \
-    -v "$CACHE_ROOT/cache/home:/isaac-sim/.cache:rw" \
-    -v "$CACHE_ROOT/cache/computecache:/isaac-sim/.nv/ComputeCache:rw" \
-    -v "$CACHE_ROOT/logs:/isaac-sim/.nvidia-omniverse/logs:rw" \
-    -v "$CACHE_ROOT/data:/isaac-sim/.local/share/ov/data:rw" \
-    -v "$CACHE_ROOT/documents:/isaac-sim/Documents:rw"
-}
-
-obstacle_asset_paths() {
-  # The p7 obstacle registry, DERIVED from the runner's own OBSTACLE_ASSETS table
-  # rather than re-typed here: a warmed asset that is not the asset the runner
-  # references is a silently-cold measurement (the copy-drift class G-25 names,
-  # and the same reason warm_scene.py sources DEFAULT_SCENE_REL from SCENE_ASSETS).
-  # Import only — no SimulationApp, so this costs no GPU and no EULA.
-  docker run --rm --network none --entrypoint /isaac-sim/python.sh "$IMG" -c \
-    'from cv_infra.runner.sim_runtime import OBSTACLE_ASSETS
-for asset in OBSTACLE_ASSETS.values(): print(asset.usd_path)' \
-    | grep '^/'
-}
-
-warm_scene() {
-  # Boot the runner image with warm_scene.py (entrypoint override, G-14) on a dedicated
-  # non-host bridge (R8). One scene load fills the closure; --rm cleans up.
-  # Arg 1 = the USD to open (assets-root relative); default = the measurement scene.
-  local scene_rel="${1:-$CV_MEASURE_SCENE_REL}"
-  docker network inspect "$CV_MEASURE_NET" >/dev/null 2>&1 \
-    || docker network create --driver bridge "$CV_MEASURE_NET" >/dev/null
-  local cname="cv-measure-warm-$$"
-  # One evidence dir PER TARGET: warm_scene.py always writes warm_rx_samples.csv,
-  # so a shared dir would leave only the last target's samples (G-18).
-  local slug
-  slug="$(printf '%s' "$scene_rel" | tr -c 'A-Za-z0-9._-' '_')"
-  local evid="${CV_MEASURE_OUT:-$CACHE_ROOT/.warm-evidence}/$slug"
-  mkdir -p "$evid" 2>/dev/null || true
-  measure_chown_dir "$evid" "$IMG"   # warm_scene writes as uid 1234
-
-  local mounts=()
-  mapfile -t mounts < <(cache_mounts)
-
-  log "warming closure: $scene_rel via $IMG (net=$CV_MEASURE_NET, evidence=$evid)"
-  docker rm -f "$cname" >/dev/null 2>&1 || true
-  docker run --rm --name "$cname" \
-    --network "$CV_MEASURE_NET" \
-    --gpus all \
-    -e NVIDIA_DRIVER_CAPABILITIES=all \
-    "${CV_EULA_DOCKER_ARGS[@]}" \
-    --shm-size "$CV_MEASURE_SHM_SIZE" \
-    "${mounts[@]}" \
-    -v "$SCRIPT_DIR:/cv/measure:ro" \
-    -v "$evid:/cv/measure-out:rw" \
-    --entrypoint /isaac-sim/python.sh \
-    "$IMG" /cv/measure/warm_scene.py \
-    --scene-rel "$scene_rel" --out /cv/measure-out \
-    || die "warm_scene failed for $scene_rel (see $evid; container=$cname)"
-}
 
 strip_gpu_cache() {
   # Remove GPU-DERIVED caches only (they regenerate per GPU): Kit RTX/shader cache
@@ -140,21 +78,6 @@ log "mode=$MODE cache_root=$CACHE_ROOT image=$IMG cache_bytes_before=$before_byt
 case "$MODE" in
   provision)
     measure_provision_tree "$CACHE_ROOT" "$IMG"
-    ;;
-  warm)
-    measure_provision_tree "$CACHE_ROOT" "$IMG"
-    warm_scene "$CV_MEASURE_SCENE_REL"
-    # The registered obstacle props ride the same warming, one open_stage each.
-    # Measured (p7c1 W0 gate ⓔ): the registry's closure costs 102.87 MiB / 35.6 s
-    # COLD against 0.14 MiB / 2.2 s fully warm — and that 35 s lands inside the
-    # runner's BOOT, where the batch watchdog is already counting.
-    obstacle_rels="$(obstacle_asset_paths)" || die \
-      "could not read OBSTACLE_ASSETS from $IMG (image older than the p7 wheel?) — a silent skip here leaves every obstacle asset COLD at boot"
-    while read -r rel; do
-      # `if`, not `[[ ]] &&`: a false test as the loop body's last command trips
-      # `set -e` and would kill the script on a trailing empty line.
-      if [[ -n "$rel" ]]; then warm_scene "$rel"; fi
-    done <<< "$obstacle_rels"
     ;;
   strip-gpu)
     measure_provision_tree "$CACHE_ROOT" "$IMG"   # ensure tree shape (idempotent)

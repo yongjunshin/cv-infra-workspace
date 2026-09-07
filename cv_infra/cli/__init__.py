@@ -1,1 +1,1 @@
-"""CLI package (M8): `cv-infra` entry point and exit-code contract."""
+"""The ``cv-infra`` command line: ``main`` (verify) and its publish glue."""

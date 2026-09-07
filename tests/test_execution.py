@@ -38,16 +38,16 @@ from cv_infra.execution import (
     _ensure_image_present,
     _image_present,
     _pull_with_liveness,
-    _resolve_docker_client,
     _teardown,
     gpu_device_requests,
+    resolve_docker_client,
     run_key,
     run_oracle,
     run_sim_case,
     slug_for,
     zip_output,
 )
-from tests.conftest_exec import (
+from tests.conftest import (
     ORACLE_SCRIPT,
     OUTPUT_DIR,
     SIM_IMAGE,
@@ -711,7 +711,7 @@ def test_a_stalled_pull_is_the_cases_error_and_starts_no_container(tmp_path):
 def test_an_injected_client_is_used_as_is():
     client = FakeClient()
 
-    assert _resolve_docker_client(client) is client
+    assert resolve_docker_client(client) is client
 
 
 def test_without_an_injected_client_the_sdk_is_imported_lazily(monkeypatch):
@@ -720,7 +720,7 @@ def test_without_an_injected_client_the_sdk_is_imported_lazily(monkeypatch):
 
     monkeypatch.setattr(docker, "from_env", lambda: "REAL-CLIENT")
 
-    assert _resolve_docker_client(None) == "REAL-CLIENT"
+    assert resolve_docker_client(None) == "REAL-CLIENT"
 
 
 def test_the_default_image_is_the_pinned_stock_digest():

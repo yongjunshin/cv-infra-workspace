@@ -277,7 +277,7 @@ readonly CV_DRIVER_TARGET_STAGE2="580.65.06-0ubuntu1"          # NVIDIA CUDA ubu
 # ---------------------------------------------------------------------------
 # --- P1-04/05 isaac smoke + DDS pins (M2) ---
 # ---------------------------------------------------------------------------
-# Sourced by scripts/isaac_smoke/{run_smoke.sh,run_dds_handshake.sh}. Same rules as
+# Sourced by scripts/isaac_smoke/run_smoke.sh. Same rules as
 # above: pins live here only; env-overridable defaults follow the CV_ISAAC_DIGEST
 # 2-stage pattern (pull by exact tag once -> lock @sha256 here -> reference by digest).
 

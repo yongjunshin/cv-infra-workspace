@@ -1,35 +1,24 @@
-; import-linter configuration (M8 / DoD-P0-04) — boundary enforcement.
+; import-linter configuration — the one boundary this package enforces.
 ;
-; Phase 0 layer rule: ``cv_infra.contract`` is the foundational (lowest) layer.
-; Every other sub-package may depend on the contract, but the contract must NOT
-; depend on any of them. Encoded as a ``forbidden`` contract so siblings stay
-; free to evolve their own dependency order (only the contract-is-lowest
-; boundary is enforced — the precise rule the gate requires, nothing more).
+; ``cv_infra.contract`` is the foundational layer: the input contract, the case
+; derivation and the verdict typing must be readable and testable without dragging in
+; docker, the baseline store, the report or the CLI. Every other module may depend on
+; the contract; the contract depends on none of them.
 ;
-; This file is the seed for the cross-repo boundary enforcement that grows in
-; later Phases (consumer must not import platform sources, etc.).
+; Encoded as ``forbidden`` rather than ``layers`` on purpose: the siblings are free to
+; order their own dependencies (the CLI drives execution, report and baselines), and
+; only the contract-is-lowest boundary is asserted — the rule we actually need.
 
 [importlinter]
 root_package = cv_infra
 
 [importlinter:contract:contract-is-foundational]
-name = cv_infra.contract is the foundational layer (imports no sibling package)
+name = cv_infra.contract is the foundational layer (imports no sibling module)
 type = forbidden
 source_modules =
     cv_infra.contract
-; D-4' (2026-07-10): ``cv_infra.adapter`` removed from this list because the
-; package itself is DELETED (adapter schema now lives INSIDE the foundational
-; layer at cv_infra/contract/adapter_schema.py) — not a boundary relaxation:
-; every still-existing sibling remains forbidden to the contract.
 forbidden_modules =
-    cv_infra.orchestrator
-    cv_infra.runner
+    cv_infra.execution
+    cv_infra.baselines
     cv_infra.report
     cv_infra.cli
-    cv_infra.oracles
-; P3 cycle-1 (M1 §3.3 stage 5): the contract loader BINDS oracle plugins via the
-; M1-owned loader entry in cv_infra/oracles/base.py (itself stdlib+contract.errors
-; only). This single sanctioned edge is allowed; everything else in
-; cv_infra.oracles (concrete M2 oracles) stays forbidden to the contract.
-ignore_imports =
-    cv_infra.contract.loader -> cv_infra.oracles.base

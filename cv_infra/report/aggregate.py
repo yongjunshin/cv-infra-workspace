@@ -1,314 +1,306 @@
-"""VerificationReport assembly (M4 §3.3 A + §3.4, SR-19) — REQ-REPORT-001/007.
+"""Report assembly — the runs become one case-major document, and that document
+decides the exit code.
 
-Assembles the report JSON (M4<->M8 합의 스키마, §3.4) from three inputs per
-request: the M3 ``RequestRollup`` (verdict/flakiness), the M1 Verification Request
-wire dump (identity/sut/scenario), and the per-repeat Result wire dumps
-(metrics/artifacts). It reuses ``matrix.build_matrix`` for the report-level
-pass/fail matrix — so the LOCKED §7.12 재계산-금지 idiom (rollup verdict/flakiness
-consumed VERBATIM, never recomputed from ``verdicts``) lives in ONE place and is
-consumed here, and layers on:
+Two public functions and one rule about their order: ``build_report`` folds every run
+into the schema-1 report and stamps ``summary.exit_code`` on it with ``exit_code_of``,
+so the JSON, the process exit status and the CI Check conclusion are three views of ONE
+decision. Nothing downstream re-derives a verdict from the runs (``report/github.py``
+reads ``summary.exit_code``; the workflow reads the process status).
 
-* ``request_identity_key`` + regression judgement per row (via ``regression`` +
-  ``baseline`` — baseline read from the internal store only, C-1);
-* ``report_outcome`` (pass|fail|errored) — the exit-driving key M8 owns the
-  mapping for (LOCKED §7.9); ``errored>0`` -> ``errored`` (exit-3 priority, §3.3 D);
-* artifact selection per the 2026-07-16 decisions (all failure jobs + one
-  deterministic representative pass; per-job size-cap exclusion + warning; policy
-  only — actual file upload/sizing is M8's plane).
+The folds, and why they are these folds:
 
-Stdlib only (no pydantic): the report is a plain dict M8 renders as ~수십 줄
-markdown, and the core produces it standalone with no GitHub token (M4-09 이식성).
+* A check is a **pass ratio** over the case's judged runs, not a boolean: ``repeats``
+  makes one case N samples, and 2/3 is neither pass nor fail — it is the number the
+  baseline compares. ``n`` rides with every ratio so a reader can see how thin it is.
+* A metric keeps **every value plus the mean**. The mean is what the baseline compares;
+  the values are what makes a suspicious mean readable.
+* ERRORED runs contribute NOTHING to ratios or means. An infrastructure fault is not
+  the robot failing, and folding it in would fabricate a regression. It is still
+  counted, still shown, and a case whose runs ALL errored is the case's own ``error``
+  result — the exit fold turns a run of nothing-but-errors into exit 3.
+* Only cases that actually RAN appear in the matrix. A budget-truncated tail is
+  reported as counts and coverage (``summary.coverage``), never as empty rows, because
+  a row with no runs reads like a case that produced nothing.
 """
 
 from __future__ import annotations
 
-from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from cv_infra.contract.apiversion import API_VERSION
-from cv_infra.orchestrator.models import RequestRollup
-from cv_infra.orchestrator.store import Store
-from cv_infra.report.baseline import find_baseline
-from cv_infra.report.matrix import build_matrix
-from cv_infra.report.regression import (
-    STATUS_IMPROVED,
-    STATUS_NO_BASELINE,
-    STATUS_REGRESSED,
-    STATUS_UNCHANGED,
-    identity_key,
-    judge_regression,
+from cv_infra.baselines import STATUS_SKIPPED, CaseObservation
+from cv_infra.cli.exit_codes import (
+    EXIT_CONTRACT,
+    EXIT_FAIL,
+    EXIT_INFRA,
+    EXIT_PASS,
+    REPORT_OUTCOME_BY_EXIT,
 )
+from cv_infra.contract.verdict import LANE_OK, CaseRunResult
 
-#: Artifact selection policy provenance (decisions/2026-07-16-p5-artifact-return.md).
-_ARTIFACT_POLICY = (
-    "failures-all + representative-pass-1 (결정 #1); per-job MCAP 상한 초과 시 제외+경고,"
-    " 부분 bag 트렁케이션 금지 (결정 #2, 상한 = 32 MiB provisional); retention = GitHub Actions"
-    " 기본값 재사용 (결정 #3). 실제 업로드/용량 측정은 M8 plane."
-)
+#: Report JSON schema version. Bump only with the consumers of ``report.json``.
+SCHEMA = 1
+
+RESULT_PASS = "pass"
+RESULT_FAIL = "fail"
+RESULT_ERROR = "error"
 
 
-@dataclass
-class RequestReportInput:
-    """One request's inputs to the report (aligns the three producers per request).
+@dataclass(frozen=True)
+class RunRecord:
+    """One case+repeat as the pipeline observed it: the execution facts plus the judged
+    result. ``zip``/``log`` are RUN-DIR-RELATIVE strings, because the report travels to
+    a reader (a PR, an artifact zip) where the host's absolute paths mean nothing."""
 
-    * ``request`` — the M1 Verification Request wire dump (``model_dump(mode="json",
-      by_alias=True)``): source of ``request_identity_key``, ``sut_ref``, scenario.
-    * ``rollup`` — the M3 ``RequestRollup`` (SR-10): verdict/flakiness consumed
-      VERBATIM (LOCKED §7.12), matched to this request by ``request_id``.
-    * ``results`` — the per-repeat M1 Result wire dumps IN REPEAT ORDER (index 0 =
-      repeat 0): source of metrics + artifacts + per-job artifact selection. An
-      optional ``result_json`` key (path to the result.json file) and ``mcap_bytes``
-      hint (for the size-cap policy) may ride each result dump — both supplied by
-      the persistence/M8 plane, absent here by default.
+    repeat: int
+    seed: int
+    rc_sim: int | None
+    rc_oracle: int | None
+    wall_s: float
+    result: CaseRunResult
+    zip: str | None = None
+    log: str | None = None
+    zip_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class CaseRecord:
+    """One case: its identity, its axis assignment and the runs it actually got."""
+
+    case_id: str
+    axes: Mapping[str, str]
+    repeats_planned: int
+    runs: tuple[RunRecord, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlanInfo:
+    """What the covering array asked for versus what the budget allowed.
+
+    ``coverage_achieved`` is the order-k coverage the EXECUTED prefix retains
+    (``contract.pict.coverage_of_prefix``) — not ``cases_run / cases_planned``: cutting
+    a third of the rows does not cost a third of the combinations, and reporting the
+    row fraction as "coverage" would understate what the run actually proved.
     """
 
-    request: dict[str, Any]
-    rollup: RequestRollup
-    results: list[dict[str, Any]] = field(default_factory=list)
+    requested_k: int
+    cases_planned: int
+    cases_run: int
+    coverage_achieved: float = 1.0
+    truncated_after_case: int | None = None
+
+
+@dataclass(frozen=True)
+class CaseFold:
+    """One case's numbers: checks as pass ratios, metrics as value lists, and the keys
+    the oracle could not judge."""
+
+    checks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    nulls: list[str] = field(default_factory=list)
+    judged: int = 0
+
+    @property
+    def result(self) -> str:
+        if not self.judged:
+            return RESULT_ERROR
+        if any(entry["pass_ratio"] < 1.0 for entry in self.checks.values()):
+            return RESULT_FAIL
+        return RESULT_PASS
+
+
+def fold_case(case: CaseRecord) -> CaseFold:
+    """Fold one case's judged runs into ratios, value lists and null keys."""
+    judged = [run.result for run in case.runs if run.result.lane == LANE_OK]
+    checks: dict[str, dict[str, Any]] = {}
+    metrics: dict[str, dict[str, Any]] = {}
+    nulls: set[str] = set()
+    for result in judged:
+        for name, value in result.checks.items():
+            entry = checks.setdefault(name, {"true": 0, "n": 0})
+            entry["true"] += int(value)
+            entry["n"] += 1
+        for name, value in result.metrics.items():
+            metrics.setdefault(name, {"values": []})["values"].append(value)
+        nulls.update(result.nulls)
+    return CaseFold(
+        checks={
+            name: {"pass_ratio": entry["true"] / entry["n"], "n": entry["n"]}
+            for name, entry in sorted(checks.items())
+        },
+        metrics={
+            name: {"values": entry["values"], "mean": sum(entry["values"]) / len(entry["values"])}
+            for name, entry in sorted(metrics.items())
+        },
+        nulls=sorted(nulls),
+        judged=len(judged),
+    )
+
+
+def observations(cases: Iterable[CaseRecord]) -> list[CaseObservation]:
+    """The cases as baseline observations — the input to ``baselines.compare_best_effort``.
+
+    ``repeats_run`` is the number of JUDGED runs, not the number attempted: it is what
+    the ratios were computed from, and it is what ``single_sample`` labels.
+    """
+    out: list[CaseObservation] = []
+    for case in cases:
+        fold = fold_case(case)
+        out.append(
+            CaseObservation(
+                case_key=case.case_id,
+                checks={name: entry["pass_ratio"] for name, entry in fold.checks.items()},
+                metrics={name: entry["mean"] for name, entry in fold.metrics.items()},
+                repeats_run=fold.judged,
+                errored=fold.judged == 0,
+            )
+        )
+    return out
 
 
 def build_report(
-    inputs: list[RequestReportInput],
-    store: Store,
+    spec: Any,
+    plan: PlanInfo,
+    cases: Sequence[CaseRecord],
+    baseline_outcome: Any,
     *,
-    envelope_id: str,
-    trigger_source: str,
+    baseline_updated: bool = False,
     generated_at: str | None = None,
-    max_mcap_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Assemble the VerificationReport dict (§3.4) for one envelope.
+    """Everything the run produced, as the schema-1 report dict.
 
-    ``store`` is the internal cv-infra store — the ONLY baseline source (C-1).
-    ``max_mcap_bytes`` is the per-job MCAP cap (결정 #2, 32 MiB provisional in api.py);
-    ``None`` = no cap -> no exclusions. This function is READ-ONLY w.r.t. baselines;
-    advancing them for future runs is a separate ``baseline.update_baseline`` call.
+    ``spec`` is duck-typed (``contract.inputs.VerifySpec``) — it is read for the input
+    echo and the mode only. ``generated_at`` is injectable so a test can pin the one
+    non-deterministic field.
     """
-    generated_at = generated_at or datetime.now(UTC).isoformat()
-    # LOCKED §7.12: the report-level matrix (verdict/flakiness/summary counts) is
-    # built by the ONE idiom in matrix.build_matrix, which consumes rollup values
-    # verbatim. build_report never re-derives a verdict — it only enriches.
-    core = build_matrix([inp.rollup for inp in inputs])
-    core_by_id = {row["request_id"]: row for row in core["matrix"]}
-    # Iterate in the same request_id sort build_matrix used, so rows align 1:1.
+    folds = [fold_case(case) for case in cases]
     rows = [
-        _report_row(inp, core_by_id[inp.rollup.request_id], store, max_mcap_bytes)
-        for inp in sorted(inputs, key=lambda i: i.rollup.request_id)
+        _matrix_row(case, fold, baseline_outcome) for case, fold in zip(cases, folds, strict=True)
     ]
-    return {
-        "apiVersion": API_VERSION,
-        "kind": "VerificationReport",
-        "envelope_id": envelope_id,
-        "trigger_source": trigger_source,
-        "generated_at": generated_at,
-        "summary": _summary(core["summary"]),
+    report = {
+        "schema": SCHEMA,
+        "generated_at": generated_at or datetime.now(UTC).isoformat(),
+        "mode": spec.mode,
+        "inputs": {
+            "sim_script": spec.sim_script,
+            "sim_input_space": spec.sim_input_space,
+            "sim_output_dir": spec.sim_output_dir,
+            "oracle_script": spec.oracle_script,
+            "pict_k": spec.pict_k,
+            "repeats": spec.repeats,
+            "budget_s": spec.budget_s,
+            "sim_image": spec.sim_image,
+            "concurrency": spec.concurrency,
+            "report_only": spec.report_only,
+            "checkout_sha": spec.checkout_sha,
+        },
+        "summary": {
+            "exit_code": None,  # stamped below — exit_code_of reads the finished report
+            "report_outcome": None,
+            "cases_planned": plan.cases_planned,
+            "cases_run": plan.cases_run,
+            "cases_errored": sum(1 for fold in folds if fold.result == RESULT_ERROR),
+            "runs_total": sum(len(case.runs) for case in cases),
+            "checks_failed": sum(
+                1 for fold in folds for entry in fold.checks.values() if entry["pass_ratio"] < 1.0
+            ),
+            "regressions": getattr(baseline_outcome, "regressed", 0),
+            "coverage": {
+                "requested_k": plan.requested_k,
+                "achieved": plan.coverage_achieved,
+                "truncated_after_case": plan.truncated_after_case,
+            },
+        },
         "matrix": rows,
-        "baseline_summary": _baseline_summary(rows),
-    }
-
-
-def _report_row(
-    inp: RequestReportInput,
-    core_row: dict[str, Any],
-    store: Store,
-    max_mcap_bytes: int | None,
-) -> dict[str, Any]:
-    """One §3.4 ``matrix`` row: the core row ENRICHED, never re-judged.
-
-    ``core_row`` carries the rollup's verdict/flakiness verbatim (LOCKED §7.12 —
-    nothing here re-derives them); this adds the identity key, the C-1 baseline
-    judgement (internal store only), the representative metrics and the artifact
-    selection."""
-    rollup = inp.rollup
-    request_id = rollup.request_id
-    current_verdict = core_row["verdict"]  # rollup verdict verbatim (may be None)
-    ikey = identity_key(inp.request)
-    reg = judge_regression(request_id, current_verdict, find_baseline(store, ikey))
-    return {
-        "request_id": request_id,
-        "request_identity_key": ikey,
-        "sut_ref": _sut_ref(inp.request),
-        "scenario": _scenario_label(inp.request),
-        "rollup": {
-            "repeats": len(rollup.verdicts),
-            "verdicts": [v.value for v in rollup.verdicts],
-            "flaky": bool(rollup.flakiness),
-            "verdict": current_verdict,
+        "baseline": {
+            "db": str(getattr(baseline_outcome, "db", "")),
+            "available": bool(getattr(baseline_outcome, "available", False)),
+            "compared": getattr(baseline_outcome, "compared", 0),
+            "absent": getattr(baseline_outcome, "absent", 0),
+            "regressed": getattr(baseline_outcome, "regressed", 0),
+            "improved": getattr(baseline_outcome, "improved", 0),
+            "metric_changes": getattr(baseline_outcome, "metric_changes", 0),
+            "updated": baseline_updated,
         },
-        # p6 §0-14: the request's DECLARED judgement policy (None = the frozen
-        # any-fail rule). A ROW-level sibling of ``rollup`` — never inside it,
-        # because ``rollup`` mirrors M3's frozen ``RequestRollup`` shape and the
-        # ratio is not a field of it (it is an input the caller applied).
-        "min_pass_ratio": _declared_min_pass_ratio(inp.request),
-        "flakiness": core_row["flakiness"],
-        "metrics": _metrics(inp.results, current_verdict),
-        "regression": {
-            "status": reg.status,
-            "baseline_sut_ref": reg.baseline_sut_ref,
-            "baseline_established_at": reg.baseline_established_at,
-            "baseline_verdict": reg.baseline_verdict,
-            "detail": reg.detail,
-        },
-        "artifacts": _select_artifacts(inp.results, max_mcap_bytes),
+        "artifacts": _artifacts(cases),
     }
+    exit_code = exit_code_of(report)
+    report["summary"]["exit_code"] = exit_code
+    report["summary"]["report_outcome"] = REPORT_OUTCOME_BY_EXIT[exit_code]
+    return report
 
 
-def _summary(core_summary: dict[str, Any]) -> dict[str, Any]:
-    """§3.4 ``summary`` = the core counts (total/passed/failed/errored) + two keys.
+def exit_code_of(report: Mapping[str, Any]) -> int:
+    """The report's own exit code — the single fold, read back from the document.
 
-    ``verdict`` = pure domain pass/fail (any domain failure -> fail), computed
-    INDEPENDENTLY of errored (§3.3 D "verdict와 별개로"). ``report_outcome`` is that
-    verdict with the errored tri-state layered ON TOP (errored wins — exit-3
-    priority) and is what M8 keys exit off (LOCKED §7.9); the failure threshold is
-    written ONCE so the two keys can never disagree about what "failed" means."""
-    summary = dict(core_summary)
-    verdict = "fail" if summary["failed"] > 0 else "pass"
-    summary["verdict"] = verdict
-    summary["report_outcome"] = "errored" if summary["errored"] > 0 else verdict
-    return summary
-
-
-def _baseline_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """§3.4 ``baseline_summary``, DERIVED from the rows that carry the judgements.
-
-    Counting off ``regression.status`` (the same field ``github._rows_with_status``
-    enumerates by) makes "회귀 N건" and the N lines under it structurally the same
-    set — a tally kept alongside the loop could drift from the rows it describes.
-    ``matched`` = a baseline was actually compared; ``absent`` = skipped (no
-    baseline OR errored current), so matched+absent == total."""
-    statuses = Counter(row["regression"]["status"] for row in rows)
-    absent = statuses[STATUS_NO_BASELINE]
-    regressed = statuses[STATUS_REGRESSED]
-    return {
-        "matched": len(rows) - absent,
-        "absent": absent,
-        "regressed": regressed,
-        "improved": statuses[STATUS_IMPROVED],
-        "unchanged": statuses[STATUS_UNCHANGED],
-        "note": (
-            f"baseline 미비교 {absent}건은 정상(skip: baseline 부재 또는 errored 요청);"
-            f" 회귀 {regressed}건 (NFR-REPORT-002)"
-        ),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Row helpers (pure)
-# --------------------------------------------------------------------------- #
-def _sut_ref(request: dict[str, Any]) -> str | None:
-    """Render the SUT ref for the row: ``image_ref`` or ``image_ref@image_id``."""
-    sut = request.get("sut") or {}
-    image_ref = sut.get("image_ref")
-    image_id = sut.get("image_id")
-    if image_ref and image_id:
-        return f"{image_ref}@{image_id}"
-    return image_ref
-
-
-def _declared_min_pass_ratio(request: dict[str, Any]) -> float | None:
-    """The request's declared ``execution_settings.min_pass_ratio`` (p6 §0-14), or None.
-
-    Read off the SAME captured M1 wire dump the caller read it from when it rolled
-    up (``api._min_pass_ratio`` -> ``roll_up(min_pass_ratio=...)``), so the row can
-    only ever say what was actually applied to the verdict it displays. The
-    normalization rule is DUPLICATED from ``api._min_pass_ratio`` rather than
-    imported (importing ``orchestrator.api`` here would be circular — api imports
-    this module — and would drag fastapi into the renderer's graph, M4-09); the
-    duplicate is held to its source by
-    ``tests/test_report_distribution_surface.py::test_row_ratio_agrees_with_the_rollup_caller``
-    (G-25 복제본 + repo-내부 기계적 가드).
+    Sweep mode (no oracle) and ``--report-only`` never gate: they ran, they reported,
+    and the workflow marks the Check neutral. Admit rejections (2) and infrastructure
+    faults (3) never reach here — they exit before a report exists — with ONE exception
+    that only the finished report can see: a gate whose judged verdicts contain no
+    boolean at all asserts nothing, so it is refused (2) rather than reported green.
     """
-    settings = request.get("execution_settings")
-    if not isinstance(settings, dict):
-        return None
-    ratio = settings.get("min_pass_ratio")
-    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
-        return None
-    return float(ratio)
+    summary = report["summary"]
+    if report["mode"] == "sweep" or report["inputs"]["report_only"]:
+        return EXIT_PASS
+    judged = any(
+        run["error"] is None and run["verdict"] is not None
+        for row in report["matrix"]
+        for run in row["runs"]
+    )
+    if not judged:
+        return EXIT_INFRA  # every case ERRORed (or none ran): incomplete, not a verdict
+    if not any(row["checks"] for row in report["matrix"]):
+        return EXIT_CONTRACT
+    if summary["checks_failed"] or summary["regressions"]:
+        return EXIT_FAIL
+    return EXIT_PASS
 
 
-def _scenario_label(request: dict[str, Any]) -> str | None:
-    """Scenario label = ``scenario.scene`` (there is no separate name field, M1 §3.2)."""
-    scenario = request.get("scenario") or {}
-    return scenario.get("scene")
+# --- internals ------------------------------------------------------------------------
 
 
-def _first_repeat(results: list[dict[str, Any]], *, passing: bool) -> int | None:
-    """Lowest repeat index whose result did (``passing``) / did not (``not passing``)
-    pass, or ``None`` if there is none.
-
-    The ONE "first matching repeat" rule, so the two places that need a
-    deterministic representative — the metrics row and the artifact
-    representative-pass (결정 #1) — mean the same thing by "first"."""
-    for index, result in enumerate(results):
-        if (result.get("verdict") == "pass") == passing:
-            return index
-    return None
-
-
-def _representative_index(results: list[dict[str, Any]], verdict: str | None) -> int | None:
-    """Deterministic representative result index for metrics: first result matching
-    the rollup verdict (pass-request -> first pass, fail/errored -> first non-pass),
-    falling back to index 0. ``None`` when there are no results."""
-    if not results:
-        return None
-    match = _first_repeat(results, passing=verdict == "pass")
-    return match if match is not None else 0
+def _matrix_row(case: CaseRecord, fold: CaseFold, baseline_outcome: Any) -> dict[str, Any]:
+    regression = getattr(baseline_outcome, "cases", {}).get(case.case_id)
+    return {
+        "case_id": case.case_id,
+        "axes": dict(case.axes),
+        "result": fold.result,
+        "repeats_planned": case.repeats_planned,
+        "repeats_run": len(case.runs),
+        "runs": [_run_entry(run) for run in case.runs],
+        "checks": fold.checks,
+        "metrics": fold.metrics,
+        "nulls": fold.nulls,
+        "regression": {
+            "status": getattr(regression, "status", STATUS_SKIPPED),
+            "details": [dict(detail) for detail in getattr(regression, "details", ())],
+        },
+    }
 
 
-def _metrics(results: list[dict[str, Any]], verdict: str | None) -> dict[str, Any]:
-    """The representative result's declared metrics map ({} when no results)."""
-    index = _representative_index(results, verdict)
-    if index is None:
-        return {}
-    return dict(results[index].get("metrics") or {})
+def _run_entry(run: RunRecord) -> dict[str, Any]:
+    return {
+        "repeat": run.repeat,
+        "seed": run.seed,
+        "rc_sim": run.rc_sim,
+        "rc_oracle": run.rc_oracle,
+        "wall_s": round(run.wall_s, 3),
+        "zip": run.zip,
+        "log": run.log,
+        "error": run.result.error,
+        "verdict": run.result.verdict,
+    }
 
 
-def _select_artifacts(results: list[dict[str, Any]], max_mcap_bytes: int | None) -> dict[str, Any]:
-    """Per-job artifact selection (결정 #1/#2). Returns ``{policy, selected}``.
-
-    Selected = every failure-class job (verdict != pass) + the ONE representative
-    pass (lowest repeat index, deterministic). Non-representative passes are
-    dropped (용량 절제). Each selected entry reserves ``excluded``/``warnings`` for
-    the size-cap policy (결정 #2); actual sizing/upload is M8's."""
-    rep_pass_index = _first_repeat(results, passing=True)
-    selected: list[dict[str, Any]] = []
-    for index, result in enumerate(results):
-        if result.get("verdict") != "pass":
-            role = "failure"
-        elif index == rep_pass_index:
-            role = "representative-pass"
-        else:
-            continue  # non-representative pass — not uploaded (결정 #1 중복 가치 낮음)
-        artifacts = result.get("artifacts") or {}
-        entry = {
-            "repeat_index": index,
-            "role": role,
-            "verdict": result.get("verdict"),
-            "result_json": result.get("result_json"),
-            "rosbag_mcap": artifacts.get("mcap"),
-            "recording_mp4": artifacts.get("mp4"),
-            "excluded": [],
-            "warnings": [],
-        }
-        _apply_mcap_cap(entry, result.get("mcap_bytes"), max_mcap_bytes)
-        selected.append(entry)
-    return {"policy": _ARTIFACT_POLICY, "selected": selected}
-
-
-def _apply_mcap_cap(entry: dict[str, Any], size_bytes: int | None, cap_bytes: int | None) -> None:
-    """결정 #2: over-cap MCAP -> exclude from upload + warn (no truncation).
-
-    No-op when the cap is unset (caller passed ``None``) or the size is unknown (M8
-    measures on its plane) — this file expresses the POLICY and receives the cap as a
-    param (32 MiB provisional wired in api.py), never hardcoding 상한 수치 here."""
-    if cap_bytes is None or size_bytes is None:
-        return
-    if entry["rosbag_mcap"] is not None and size_bytes > cap_bytes:
-        entry["warnings"].append(
-            f"MCAP {size_bytes}B가 잡별 상한 {cap_bytes}B 초과 — 업로드 제외"
-            " (부분 bag 트렁케이션 금지: 명시적 부재+경고, 결정 #2)"
-        )
-        entry["excluded"].append("rosbag_mcap")
-        entry["rosbag_mcap"] = None
+def _artifacts(cases: Sequence[CaseRecord]) -> dict[str, Any]:
+    """Every collected zip and log, plus the zips that hold a manifest instead of the
+    files (the size cap tripped) — named so a reader is not left wondering why an
+    archive is 2 KB."""
+    runs = [run for case in cases for run in case.runs]
+    return {
+        "zips": [run.zip for run in runs if run.zip],
+        "logs": [run.log for run in runs if run.log],
+        "oversize_replaced": [run.zip for run in runs if run.zip and run.zip_truncated],
+    }

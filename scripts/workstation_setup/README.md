@@ -271,7 +271,7 @@ what a given run uses:
 | `/usr/bin/apt-get` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh` | `apt-get update`; `apt-get install -y <pinned pkgs>` (realign: single guarded install/remove transaction + `purge` of 595 config residue) |
 | `/usr/bin/install` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh`, `register_gh_runner.sh` | place apt keyring (`/etc/apt/keyrings/...`, `/usr/share/keyrings/...`) + `sources.list.d` + `preferences.d` files; runner systemd unit (pin refresh / content drift); this drop-in's own updates |
 | `/usr/bin/systemctl` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh`, `register_gh_runner.sh` | `systemctl enable --now docker`; `systemctl restart docker`; realign: `systemctl reboot` (only with `--reboot`); runner: `stop` / `daemon-reload` / `enable --now` |
-| `/usr/bin/docker` | `test_gpu_passthrough.sh`, `pull_isaac.sh`, `isaac_smoke/run_smoke.sh`, `isaac_smoke/run_dds_handshake.sh` | `docker run --rm --gpus all ...`; `docker image inspect ...`; `docker pull ...`; smoke `docker run/network/logs/rm ...` |
+| `/usr/bin/docker` | `test_gpu_passthrough.sh`, `pull_isaac.sh`, `isaac_smoke/run_smoke.sh` | `docker run --rm --gpus all ...`; `docker image inspect ...`; `docker pull ...`; smoke `docker run/network/logs/rm ...` |
 
 **Removed at P2 (FU-6)**: `/usr/sbin/usermod` (`usermod -aG docker etri`) and
 `/usr/bin/nvidia-ctk` (`nvidia-ctk runtime configure --runtime=docker`) — one-shot

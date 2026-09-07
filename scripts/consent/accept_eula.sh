@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# accept_eula.sh — NVIDIA Isaac Sim consent gate (M5 §3.7; REQ-DEPLOY-008/009/010/011,
-# NFR-DEPLOY-004, LOCKED §8). Step ② of the C-2 deployment flow:
+# accept_eula.sh — NVIDIA Isaac Sim consent gate. Step ② of provisioning a runner host:
 #
-#   ① provision.sh   ② THIS SCRIPT   ③ docker compose up   ④ cv-infra selftest
+#   ① provision.sh   ② THIS SCRIPT   ③ export the acceptance env for the GitHub runner
 #
-# Four steps, in this order (M5 §3.7):
+# Four steps, in this order:
 #   1. present the license + privacy notice the operator is being asked to accept
 #   2. take an EXPLICIT operator decision — never a default, never inferred
 #   3. record it: eula_accepted + eula_operator_identity + eula_consented_at
-#   4. only THEN write the derived acceptance values into the runtime env file
-#      (docker/.env, git-ignored) that the control plane forwards to runners
+#   4. only THEN write the derived acceptance values into a git-ignored env file the
+#      operator loads into the runner's environment (`cv-infra verify` refuses to run
+#      without ACCEPT_EULA and PRIVACY_CONSENT set — it never reads this file itself)
 #
 # NEG-2 / LOCKED §8: no acceptance value is committed anywhere in this repository. The
 # value written in step 4 is DERIVED at run time from what the operator typed (same idiom
@@ -35,7 +35,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../workstation_setup/common.sh"
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="${CV_ENV_FILE:-$REPO_ROOT/docker/.env}"
+# Repo root, and named `.env` so the committed .gitignore already covers it (the guard
+# below re-checks that, because this file holds an acceptance value).
+ENV_FILE="${CV_ENV_FILE:-$REPO_ROOT/.env}"
 IDENTITY="${CV_CONSENT_IDENTITY:-}"
 
 while (($#)); do
@@ -161,8 +163,8 @@ log "consent recorded -> $CV_CONSENT_RECORD"
 # 4. ONLY NOW: derive the runtime acceptance env (M5 §3.7 step 4)
 # ---------------------------------------------------------------------------
 # Derived from what the operator typed ("yes" -> "Y"), exactly like run_smoke.sh does for
-# a single run. The runtime env — not this record — is what the runner's boot guard
-# honors (single source of truth, M5 §3.7 D-O/F7); the record is why it may exist.
+# a single run. The runtime ENV — not this record — is what every boot guard honors; the
+# record is why that env may exist.
 _consent_upper="${CONSENT_INPUT^^}"
 ACCEPT_VALUE="${_consent_upper:0:1}"
 
@@ -198,11 +200,10 @@ bash "$SCRIPT_DIR/check_consent.sh"
 
 cat <<NEXT
 
-  Consent is on file. Next:
-    CV_SOURCE_REVISION="\$(git rev-parse HEAD)" \\
-      docker compose -f docker/compose.yaml up -d --build
-  (that prefix stamps the built image with its source commit — a build without it is
-   refused; docs/deploy/README.md §3-③. Without --build it is not needed.)
+  Consent is on file. Next: load the acceptance env into the environment the GitHub
+  runner service starts with, so `cv-infra verify` inherits it:
+    set -a; . $ENV_FILE; set +a          # this shell
+    systemctl --user set-environment ...  # or the runner service's own env file
   The gate can be re-checked at any time (exit 0 = recorded, exit 3 = not):
     bash scripts/consent/check_consent.sh
 
