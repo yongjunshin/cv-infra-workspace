@@ -270,6 +270,33 @@ def test_report_only_accepts_the_check_less_verdict_and_never_gates():
     )
 
 
+def test_a_sweep_whose_every_case_errored_is_incomplete_not_a_clean_sweep():
+    """Not gating is not the same as not reporting: if every container died, the sweep
+    proved nothing, and calling that "pass" hides a broken image behind a green run."""
+    spec = SimpleNamespace(**{**SPEC.__dict__, "mode": "sweep", "oracle_script": None})
+    report = build([case([error_run(0)])], spec=spec)
+    assert report["summary"]["exit_code"] == 3
+    assert report["summary"]["report_outcome"] == "errored"
+
+
+def test_report_only_whose_every_case_errored_is_incomplete_too():
+    spec = SimpleNamespace(**{**SPEC.__dict__, "report_only": True})
+    assert build([case([error_run(0)])], spec=spec)["summary"]["exit_code"] == 3
+
+
+def test_a_run_that_started_no_case_at_all_is_incomplete():
+    """The budget was gone before the first case: an empty matrix asserts nothing."""
+    spec = SimpleNamespace(**{**SPEC.__dict__, "mode": "sweep", "oracle_script": None})
+    plan = aggregate.PlanInfo(
+        requested_k=2,
+        cases_planned=4,
+        cases_run=0,
+        coverage_achieved=0.0,
+        truncated_after_case=-1,
+    )
+    assert build([], spec=spec, plan=plan)["summary"]["exit_code"] == 3
+
+
 def test_sweep_mode_runs_reports_and_never_gates():
     spec = SimpleNamespace(**{**SPEC.__dict__, "mode": "sweep", "oracle_script": None})
     report = build([case([ok_run(0)])], spec=spec)

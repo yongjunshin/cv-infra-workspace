@@ -95,6 +95,10 @@ def has_boolean_check(results: Iterable[CaseRunResult]) -> bool:
     A gate whose verdicts are all metrics and notes cannot fail, so it would report a
     green check while asserting nothing. The caller rejects that (exit 2) unless
     ``--report-only`` says the emptiness is intended.
+
+    The pipeline itself asks this question of the finished REPORT
+    (``report.aggregate.exit_code_of``), where the ratios already exist — this is the
+    same rule for a caller holding results in hand.
     """
     return any(result.checks for result in results)
 

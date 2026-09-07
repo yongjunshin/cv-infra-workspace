@@ -226,6 +226,26 @@ def test_a_sweep_runs_every_case_judges_nothing_and_never_gates(tmp_path):
     assert report["matrix"][0]["checks"] == {}
 
 
+@needs_pict
+def test_a_sweep_whose_every_case_errored_exits_3(tmp_path):
+    """A sweep does not gate, but it does have to be COMPLETE: every container dying is
+    an infrastructure fault, and publishing it as a pass would hide a broken image."""
+    spec = spec_for(tmp_path, oracle=False)
+    assert cli.run_verify(spec, client_for(exit_code=1), environ=environ(tmp_path)) == 3
+    report = report_of(tmp_path)
+    assert report["summary"]["cases_errored"] == CASES
+    assert report["summary"]["report_outcome"] == "errored"
+
+
+@needs_pict
+def test_report_only_whose_every_case_errored_exits_3_too(tmp_path):
+    """``--report-only`` waives the CHECK requirement, not the requirement that the run
+    actually happened."""
+    spec = spec_for(tmp_path, report_only=True)
+    assert cli.run_verify(spec, client_for(exit_code=1), environ=environ(tmp_path)) == 3
+    assert report_of(tmp_path)["summary"]["report_outcome"] == "errored"
+
+
 # --- the budget -----------------------------------------------------------------------
 
 
@@ -255,7 +275,11 @@ def test_a_budget_that_is_already_spent_runs_nothing_and_says_so(tmp_path):
     report = report_of(tmp_path)
     assert report["summary"]["cases_run"] == 0
     assert report["summary"]["coverage"]["achieved"] == 0.0
-    assert report["summary"]["coverage"]["truncated_after_case"] is None
+    # -1, not None: "everything was cut" must not be indistinguishable from "nothing was
+    # cut", or the published summary cannot explain why zero cases ran.
+    assert report["summary"]["coverage"]["truncated_after_case"] == -1
+    published = (tmp_path / "run" / "payloads" / "step-summary.md").read_text(encoding="utf-8")
+    assert f"budget reached: ran 0/{CASES} cases" in published
 
 
 # --- baselines ------------------------------------------------------------------------

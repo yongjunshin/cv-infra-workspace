@@ -169,8 +169,10 @@ def _run_cases(
 ) -> tuple[list[aggregate.CaseRecord], int | None]:
     """Run the cases (``concurrency`` at a time) until the budget runs out.
 
-    Returns the cases that RAN plus the index of the last one, or ``None`` when nothing
-    was cut. The deadline is read at the top of each case's task, i.e. at the moment
+    Returns the cases that RAN plus the index of the last one (``-1`` when the budget
+    was gone before the first case even started — distinct from ``None``, "nothing was
+    cut", so the report can say WHY zero cases ran). The deadline is read at the top of
+    each case's task, i.e. at the moment
     that case would start: workers take the queue in array order, so what runs is the
     array's prefix — which is what makes the reported coverage meaningful.
     """
@@ -190,7 +192,7 @@ def _run_cases(
     ran = [record for record in records if record is not None]
     if len(ran) == len(plan_cases):
         return ran, None
-    return ran, (len(ran) - 1 if ran else None)
+    return ran, len(ran) - 1
 
 
 def _run_case(

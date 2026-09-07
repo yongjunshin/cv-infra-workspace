@@ -13,10 +13,11 @@
 #
 # Two gates, one boundary (M5 §3.7 D-O/F7) — do NOT collapse them into one:
 #   * THIS record = "did an operator consent, who, when" — host-side audit + gate.
-#   * The runtime ENV that the runner receives = the boot gate the runner actually
-#     honors (ACCEPT_EULA absent -> cv_infra/runner/sim_runtime.py refuses to boot Isaac,
-#     exit 3). The record is the REASON that env is allowed to exist, not a second
-#     source of truth for the boot decision.
+#   * The runtime ENV that the run receives = the gate cv-infra actually honors
+#     (ACCEPT_EULA/PRIVACY_CONSENT absent -> cv_infra/contract/inputs.py refuses the run
+#     with exit 3, before any container starts; when present, execution.py passes them
+#     through to the Isaac container). The record is the REASON that env is allowed to
+#     exist, not a second source of truth for the boot decision.
 #
 # Usage:
 #   bash scripts/consent/check_consent.sh [--quiet]

@@ -83,6 +83,11 @@ class PlanInfo:
     (``contract.pict.coverage_of_prefix``) — not ``cases_run / cases_planned``: cutting
     a third of the rows does not cost a third of the combinations, and reporting the
     row fraction as "coverage" would understate what the run actually proved.
+
+    ``truncated_after_case`` is the index of the last case that RAN when the budget
+    cut the tail, ``-1`` when the budget was already spent before the first case, and
+    ``None`` when nothing was cut — "everything was cut" and "nothing was cut" are
+    different facts, and a reader of a 0-case run needs to be told which one it was.
     """
 
     requested_k: int
@@ -235,22 +240,28 @@ def build_report(
 def exit_code_of(report: Mapping[str, Any]) -> int:
     """The report's own exit code — the single fold, read back from the document.
 
-    Sweep mode (no oracle) and ``--report-only`` never gate: they ran, they reported,
-    and the workflow marks the Check neutral. Admit rejections (2) and infrastructure
-    faults (3) never reach here — they exit before a report exists — with ONE exception
-    that only the finished report can see: a gate whose judged verdicts contain no
-    boolean at all asserts nothing, so it is refused (2) rather than reported green.
+    Two questions, and their ORDER is the contract:
+
+    1. **Did anything come back clean?** A run whose every run ERRORed — and a run that
+       started no case at all — is INCOMPLETE: it proved nothing, so it is an
+       infrastructure fault (3) in EVERY mode. This is asked BEFORE the non-gating
+       shortcut on purpose: a sweep whose containers all died (bad image, wrong script,
+       every case timing out) must not read as a healthy sweep just because a sweep
+       does not gate.
+    2. **Does this run gate?** Sweep mode (no oracle) and ``--report-only`` report and
+       stop there; the workflow marks the Check neutral.
+
+    Admit rejections (2) never reach here — they exit before a report exists — with ONE
+    exception that only the finished report can see: a gate whose judged verdicts
+    contain no boolean at all asserts nothing, so it is refused (2) rather than
+    reported green.
     """
     summary = report["summary"]
+    ran_clean = any(run["error"] is None for row in report["matrix"] for run in row["runs"])
+    if not ran_clean:
+        return EXIT_INFRA  # every case ERRORed (or none ran): incomplete, not a verdict
     if report["mode"] == "sweep" or report["inputs"]["report_only"]:
         return EXIT_PASS
-    judged = any(
-        run["error"] is None and run["verdict"] is not None
-        for row in report["matrix"]
-        for run in row["runs"]
-    )
-    if not judged:
-        return EXIT_INFRA  # every case ERRORed (or none ran): incomplete, not a verdict
     if not any(row["checks"] for row in report["matrix"]):
         return EXIT_CONTRACT
     if summary["checks_failed"] or summary["regressions"]:

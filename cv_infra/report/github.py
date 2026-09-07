@@ -133,12 +133,19 @@ def _truncation_line(report: dict[str, Any]) -> str:
     """The one line a budget-cut run owes its reader: what ran, and what that covers."""
     summary = report["summary"]
     coverage = summary["coverage"]
-    if coverage["truncated_after_case"] is None:
+    cut = coverage["truncated_after_case"]
+    if cut is None:
         return ""
+    # -1 = the budget was gone before the first case started: there is no "after case N"
+    # to name, but a 0-case run is exactly the one that MUST say why it ran nothing.
+    where = (
+        f"(truncated after case {cut})"
+        if cut >= 0
+        else "(the budget was spent before the first case)"
+    )
     return (
         f"⚠ budget reached: ran {summary['cases_run']}/{summary['cases_planned']} cases "
-        f"(truncated after case {coverage['truncated_after_case']}), "
-        f"{coverage['achieved']:.1%} of the {coverage['requested_k']}-wise coverage."
+        f"{where}, {coverage['achieved']:.1%} of the {coverage['requested_k']}-wise coverage."
     )
 
 

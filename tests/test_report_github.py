@@ -141,6 +141,17 @@ def test_a_truncated_run_reports_what_ran_and_what_it_covers():
     assert "ran 9/14 cases (truncated after case 8), 91.2% of the 2-wise coverage." in body(report)
 
 
+def test_a_run_the_budget_cut_entirely_says_so_instead_of_showing_no_line():
+    report = make_report(
+        summary={
+            "cases_planned": 4,
+            "cases_run": 0,
+            "coverage": {"requested_k": 2, "achieved": 0.0, "truncated_after_case": -1},
+        }
+    )
+    assert "ran 0/4 cases (the budget was spent before the first case)" in body(report)
+
+
 def test_an_untruncated_run_carries_no_budget_line():
     assert "budget reached" not in body(make_report())
 
