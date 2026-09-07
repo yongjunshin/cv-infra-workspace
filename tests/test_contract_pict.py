@@ -10,9 +10,11 @@ which silently degrades the gate if it drifts:
   baseline is normal, never a failure). The gate goes quiet instead of red.
   Both halves are asserted: unseeded regeneration loses the old rows, seeded
   regeneration keeps all of them.
-* (2) **budget -> order, and repeats are cut LAST.** The one design opinion in
-  the module (MEASURED flakiness 0.333 on this project's batch path makes a
-  single-draw verdict noise).
+* (2) **the requested k is the k that runs, and a declared repeats is honoured.**
+  The gate's coverage claim is only true if nothing downgrades it behind the
+  report's back, so ``plan`` cuts ROWS, not the order, and takes ``repeats`` at
+  its word. The old walk-down (and with it the MEASURED-flakiness repeats floor)
+  survives as the opt-in ``orders="auto"`` branch.
 * (3) **truncation is honest.** A budget-cut suite reports the coverage it
   actually achieved, and the prefix curve is monotone so that number means
   something.
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 
 import pytest
 
@@ -111,16 +114,17 @@ def test_seeding_preserves_every_prior_case_across_a_model_edit() -> None:
     assert "floor" in after.parameters
 
 
-# --- (2) budget -> order, repeats cut last --------------------------------------------
+# --- (2) the requested order runs; rows are what the budget cuts -----------------------
 
 
 @needs_pict
-def test_plan_takes_the_richest_order_the_budget_affords() -> None:
-    """42 rows x 3 repeats / 4 concurrency at 300 s/run = 2.6 h — a 3 h budget buys 3-wise."""
+def test_plan_generates_exactly_the_requested_order() -> None:
+    """42 rows x 3 repeats / 4 concurrency at 300 s/run = 2.6 h — a 3 h budget holds 3-wise."""
     plan = pict.plan(
         GO2_MODEL,
         budget=pict.Budget(wallclock_s=3 * 3600, repeats=3),
         cost_s_per_run=300.0,
+        order=3,
         concurrency=4,
     )
     assert plan.requested_order == 3
@@ -130,33 +134,36 @@ def test_plan_takes_the_richest_order_the_budget_affords() -> None:
 
 
 @needs_pict
-def test_plan_falls_back_to_pairwise_when_three_wise_does_not_fit() -> None:
-    """Same workload, a 1 h budget: 3-wise (2.6 h) is out, pairwise (52 min) is in."""
+def test_plan_truncates_rows_rather_than_downgrading_the_requested_order() -> None:
+    """The M5 repair. Same workload, a 1 h budget: 3-wise no longer fits, and the OLD
+    behaviour quietly returned a full pairwise array — a report that says "3-wise" while
+    covering pairs only. Now the order stands and the array is cut, which ``coverage``
+    reports as the fraction it is."""
     plan = pict.plan(
         GO2_MODEL,
         budget=pict.Budget(wallclock_s=3600, repeats=3),
         cost_s_per_run=300.0,
+        order=3,
         concurrency=4,
     )
-    assert plan.requested_order == 2
-    assert plan.cases == 14
-    assert plan.truncated_from is None
+    assert plan.requested_order == 3
+    assert plan.truncated_from == 42
+    assert plan.cases == 16  # 3600 s / (300 s x 3 repeats / 4)
+    assert plan.coverage < 1.0
 
 
 @needs_pict
-def test_plan_cuts_cases_not_repeats_when_the_budget_is_tight() -> None:
-    """The design opinion: statistics survive, coverage is spent. MEASURED flakiness
-    0.333 makes a single-draw verdict noise, so repeats never fall below the floor."""
+def test_plan_honours_a_declared_repeats_of_one() -> None:
+    """``repeats:`` is a consumer input, not a suggestion. The floor that used to
+    override it now lives only in the opt-in walk-down (test below)."""
     plan = pict.plan(
         GO2_MODEL,
-        budget=pict.Budget(wallclock_s=1800, repeats=3),
+        budget=pict.Budget(wallclock_s=3600, repeats=1),
         cost_s_per_run=300.0,
         concurrency=4,
     )
-    assert plan.repeats == pict.MIN_REPEATS
-    assert plan.cases < 14
-    assert plan.truncated_from == 14
-    assert plan.est_wallclock_s <= 1800
+    assert plan.repeats == 1
+    assert plan.runs == plan.cases
 
 
 @needs_pict
@@ -172,14 +179,77 @@ def test_plan_refuses_a_budget_that_affords_no_case_at_all() -> None:
 
 
 @needs_pict
-def test_plan_never_honours_a_repeats_below_the_flakiness_floor() -> None:
+def test_plan_rejects_an_order_wider_than_the_space() -> None:
+    """No clamping in the default branch: PICT's own reject is the honest answer, and
+    ``inputs`` pre-empts it with a friendlier exit-2 before any GPU time is spent."""
+    with pytest.raises(pict.PictError):
+        pict.plan(
+            "a: 1, 2\nb: 3, 4\n",
+            budget=pict.Budget(wallclock_s=3600, repeats=1),
+            cost_s_per_run=1.0,
+            order=3,
+        )
+
+
+# --- (2b) the opt-in walk-down (orders="auto") -----------------------------------------
+
+
+@needs_pict
+def test_auto_takes_the_richest_order_the_budget_affords() -> None:
+    """Opt in, and the old behaviour is back: 1 h buys pairwise, not a cut 3-wise."""
     plan = pict.plan(
         GO2_MODEL,
-        budget=pict.Budget(wallclock_s=3600, repeats=1),
+        budget=pict.Budget(wallclock_s=3600, repeats=3),
         cost_s_per_run=300.0,
         concurrency=4,
+        orders="auto",
+    )
+    assert plan.requested_order == 2
+    assert plan.cases == 14
+    assert plan.truncated_from is None
+
+
+@needs_pict
+def test_auto_cuts_cases_not_repeats_when_the_budget_is_tight() -> None:
+    """The design opinion, now scoped to this branch: statistics survive, coverage is
+    spent. MEASURED flakiness 0.333 makes a single-draw verdict noise, so a budget the
+    caller asked us to reduce against never takes repeats below the floor."""
+    plan = pict.plan(
+        GO2_MODEL,
+        budget=pict.Budget(wallclock_s=1800, repeats=1),
+        cost_s_per_run=300.0,
+        concurrency=4,
+        orders="auto",
     )
     assert plan.repeats == pict.MIN_REPEATS
+    assert plan.cases < 14
+    assert plan.truncated_from == 14
+    assert plan.est_wallclock_s <= 1800
+
+
+@needs_pict
+def test_auto_clamps_an_order_the_space_cannot_hold() -> None:
+    """A 2-axis space asked for 3-wise: give it all of the space, do not reject."""
+    plan = pict.plan(
+        "a: 1, 2\nb: 3, 4\n",
+        budget=pict.Budget(wallclock_s=3600, repeats=1),
+        cost_s_per_run=1.0,
+        orders=[3],
+    )
+    assert plan.requested_order == 2
+
+
+def test_plan_rejects_nonsense_arguments() -> None:
+    """Programmer errors (not consumer input): loud ValueError, no PICT invocation."""
+    budget = pict.Budget(wallclock_s=3600, repeats=1)
+    with pytest.raises(ValueError, match="concurrency"):
+        pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=1.0, concurrency=0)
+    with pytest.raises(ValueError, match="repeats"):
+        pict.plan(GO2_MODEL, budget=pict.Budget(wallclock_s=1.0, repeats=0), cost_s_per_run=1.0)
+    with pytest.raises(ValueError, match="cost_s_per_run"):
+        pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=0.0)
+    with pytest.raises(ValueError, match="orders must not be empty"):
+        pict.plan(GO2_MODEL, budget=budget, cost_s_per_run=1.0, orders=[])
 
 
 # --- (3) truncation is honest ---------------------------------------------------------
@@ -257,6 +327,35 @@ def test_empty_model_is_rejected() -> None:
         pict.validate_model("# nothing but a comment\n")
 
 
+def test_a_parameter_with_no_values_is_rejected() -> None:
+    with pytest.raises(pict.PictError, match="declares no values") as exc:
+        pict.validate_model("a: 1\nb:  ,  \n")
+    assert exc.value.source_line == 2
+
+
+@pytest.mark.parametrize("name", ["2lighting", "light ing", "--lighting"])
+def test_an_axis_name_that_is_not_a_usable_flag_is_rejected(name: str) -> None:
+    """PICT accepts these happily; they explode as `--2lighting=dim` inside the GPU
+    container, hours later. The model is where that is cheap to say."""
+    with pytest.raises(pict.PictError, match="long-flag") as exc:
+        pict.validate_model(f"speed: 0.2\n{name}: bright, dim\n", source_path="space.pict")
+    assert exc.value.source_line == 2 and exc.value.source_path == "space.pict"
+
+
+@pytest.mark.parametrize("name", sorted(pict.RESERVED_AXIS_NAMES))
+def test_an_axis_named_after_the_scripts_own_help_is_rejected(name: str) -> None:
+    """`--help=on` prints usage and exits 0 — a case that ran nothing, reported green."""
+    with pytest.raises(pict.PictError, match="--help") as exc:
+        pict.validate_model(f"{name}: on, off\n")
+    assert exc.value.source_line == 1
+
+
+def test_lines_that_are_neither_parameters_nor_constraints_are_ignored() -> None:
+    """PICT tolerates stray text; the pre-check must not invent a rejection for it."""
+    pict.validate_model("a: 1, 2\nnot a declaration\n")
+    assert pict._declared_parameters("a: 1, 2\nnot a declaration\n") == ["a"]
+
+
 def test_missing_binary_names_the_env_var() -> None:
     with pytest.raises(pict.PictError, match=pict.PICT_BIN_ENV):
         pict.resolve_binary("/nonexistent/pict-binary-that-is-not-there")
@@ -275,3 +374,62 @@ def test_as_dicts_and_tsv_round_trip() -> None:
     lines = array.to_tsv().splitlines()
     assert lines[0].split("\t") == list(array.parameters)
     assert len(lines) == len(array) + 1
+
+
+@needs_pict
+def test_an_untruncated_plan_summary_states_full_coverage() -> None:
+    plan = pict.plan(
+        GO2_MODEL,
+        budget=pict.Budget(wallclock_s=3600, repeats=1),
+        cost_s_per_run=1.0,
+    )
+    assert "TRUNCATED" not in plan.summary()
+    assert "100.0% coverage" in plan.summary()
+
+
+@needs_pict
+def test_coverage_of_a_whole_array_is_one_by_construction() -> None:
+    """``coverage`` normalises an array against the combinations THAT ARRAY realises
+    (constraints legitimately forbid the rest), so a complete array is 1.0 and the
+    honest partial number is ``coverage_of_prefix``'s job."""
+    assert pict.coverage(pict.generate(GO2_MODEL, order=2), 2) == 1.0
+
+
+@pytest.mark.parametrize(
+    "fn", [pict.coverage, lambda array, order: pict.coverage_of_prefix(array, 1, order)]
+)
+def test_coverage_of_a_space_narrower_than_the_order_is_one(fn) -> None:
+    """One axis has no PAIRS to miss — 0/0 is full coverage, not a crash."""
+    single = pict.CoveringArray(parameters=("a",), rows=(("1",),), order=2)
+    assert fn(single, 2) == 1.0
+
+
+@needs_pict
+def test_a_model_pict_itself_rejects_is_located_by_line() -> None:
+    """The shape validate_model deliberately leaves to PICT (a type mismatch): its
+    terse prose becomes a located, friendly rejection."""
+    model = (
+        "speed: 0.2, 0.4\nlighting: bright, dim\n\n"
+        'IF [speed] = "0.2" THEN [lighting] = bright;\n'
+    )
+    with pytest.raises(pict.PictError, match="Incorrect numeric value") as exc:
+        pict.generate(model, source_path="space.pict")
+    assert exc.value.source_line == 4 and exc.value.source_path == "space.pict"
+
+
+def test_pict_output_that_is_not_a_table_is_rejected() -> None:
+    """Both parse guards: no rows at all, and a row that is ragged because a value
+    contained a TAB. Neither can be reproduced through the binary, so they are
+    asserted against the parser directly."""
+    with pytest.raises(pict.PictError, match="no rows"):
+        pict._parse("\n", order=2, source_path=None)
+    with pytest.raises(pict.PictError, match="3 values for 2 parameters"):
+        pict._parse("a\tb\n1\t2\t3\n", order=2, source_path=None)
+
+
+def test_a_silent_pict_rejection_still_says_something() -> None:
+    """PICT is not obliged to print prose on a nonzero exit, and an unquotable
+    complaint has no line to point at — neither may be invented."""
+    proc = subprocess.CompletedProcess(args=["pict"], returncode=7, stdout=" \n", stderr="")
+    assert pict._pict_message(proc) == "PICT exited 7 without a message."
+    assert pict._locate("a: 1, 2\n", "") is None

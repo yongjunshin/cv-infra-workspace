@@ -67,12 +67,6 @@ DEFAULT_BASELINE_DB = "~/.cv-infra/baselines.sqlite3"
 #: GitHub stamps the verified commit here; it labels the report and any baseline row.
 COMMIT_SHA_ENV = "GITHUB_SHA"
 
-#: An axis becomes ``--<name>=<value>`` in the sim script's own argv, so a name that is
-#: not a legal long flag produces an unrunnable command line, and ``help``/``h`` collide
-#: with the argparse every standard script has.
-RESERVED_AXIS_NAMES = frozenset({"help", "h"})
-_FLAG_SAFE_AXIS = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-
 #: Static headless heuristic (warning only — see the module doc).
 _HEADLESS_FALSE = re.compile(r"headless.*False")
 
@@ -179,9 +173,9 @@ def parse(
     sim_output_dir = _checkout_output_dir(args.output_dir, checkout)
 
     input_space_text = (checkout / sim_input_space).read_text(encoding="utf-8")
+    # validate_model owns the whole model shape, axis names included (M5).
     pict.validate_model(input_space_text, source_path=sim_input_space)
     axes = pict._declared_parameters(input_space_text)
-    _reject_unsafe_axis_names(axes, input_space_text, source_path=sim_input_space)
 
     pict_k = _bounded_int(args.pict_k, flag="--pict-k", minimum=1, example="2")
     if pict_k > len(axes):
@@ -390,37 +384,6 @@ def _bounded_float(raw: str, *, flag: str, example: str) -> float:
             example=f"{flag} {example}",
         )
     return value
-
-
-def _reject_unsafe_axis_names(axes: Sequence[str], model_text: str, *, source_path: str) -> None:
-    """Every axis name must survive becoming ``--<name>=<value>`` in the script's argv.
-
-    M5 moves this into ``pict.validate_model`` (where the rest of the model shape is
-    checked); it lives here for now so the rejection exists before that refactor.
-    """
-    for name in axes:
-        if _FLAG_SAFE_AXIS.match(name) and name not in RESERVED_AXIS_NAMES:
-            continue
-        reason = (
-            "collides with the sim script's own --help/-h"
-            if name in RESERVED_AXIS_NAMES
-            else "is not a usable long-flag name"
-        )
-        raise pict.PictError(
-            f"axis '{name}' {reason}.",
-            source_path=source_path,
-            line=_line_of_declaration(model_text, name),
-            hint="each axis becomes `--<name>=<value>` in the sim script's argv, so a "
-            "name must match [A-Za-z][A-Za-z0-9_-]* and must not be `help` or `h`",
-        )
-
-
-def _line_of_declaration(model_text: str, name: str) -> int | None:
-    """Line where ``name`` is declared — None when it is not in this text (no location)."""
-    for lineno, raw in enumerate(model_text.splitlines(), start=1):
-        if raw.split(":", 1)[0].strip() == name:
-            return lineno
-    return None
 
 
 def _headless_warnings(script_path: Path, source_path: str) -> tuple[str, ...]:

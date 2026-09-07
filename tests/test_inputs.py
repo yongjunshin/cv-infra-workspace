@@ -309,10 +309,6 @@ def test_an_axis_named_after_the_scripts_own_help_is_refused(tmp_path, name):
     assert "--help" in error.got and error.source_line == 1
 
 
-def test_the_declaration_locator_reports_no_line_for_a_foreign_name():
-    assert inputs._line_of_declaration("lighting: dim\n", "speed") is None
-
-
 # --- (6) exit-3: the runner's own provisioning -----------------------------------------
 
 

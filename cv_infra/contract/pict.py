@@ -13,15 +13,19 @@ that the images pin by commit. This module shells out to it and owns only the
 three things PICT does not do:
 
 * **budget -> order.** PICT answers "how many cases for order k", never "what k
-  fits in 3 hours". ``plan`` walks k downward until the case count times the
-  repeat axis fits, then truncates when even k=2 does not.
+  fits in 3 hours". ``plan`` generates the k it was ASKED for and truncates the
+  array when the budget cannot hold it; walking k downward is the opt-in
+  ``orders="auto"`` mode, because a silently downgraded k is a coverage claim
+  the report would still print as satisfied.
 * **achieved coverage.** PICT's ``/s`` reports its own combination count, not
   the coverage of a TRUNCATED prefix. A budget-cut suite must report what it
   actually covered, so ``coverage`` recomputes it from the rows.
 * **friendly errors.** PICT rejects with terse prose and NO line number
-  ("Input Error: Parameter/value type mismatch: ..."). The request surface owes
-  the file/line/column treatment every other stage gives (NFR-INTAKE-002), so
-  ``validate_model`` pre-checks the shape and locates PICT's own complaint.
+  ("Input Error: Parameter/value type mismatch: ..."), and it has no opinion at
+  all about a parameter name that cannot become ``--<name>=<value>`` on the sim
+  script's command line. The request surface owes the file/line/column
+  treatment every other stage gives (NFR-INTAKE-002), so ``validate_model``
+  pre-checks the shape and locates PICT's own complaint.
 
 MEASURED anchors for the numbers in these docstrings (2026-09-07, the go2 patrol
 space: 8 parameters, 2 constraints, 1,296-cell grid):
@@ -49,22 +53,32 @@ import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from cv_infra.contract.errors import ContractError
 
 #: Env override for the pinned binary (deployment resolves it; tests inject it).
 PICT_BIN_ENV = "CV_PICT_BIN"
 
-#: The orders ``plan`` will try, richest first. 2 = pairwise is the floor: below
-#: it there is no combinatorial claim left to make, only a value-coverage one.
+#: The orders ``plan(orders="auto")`` will try, richest first. 2 = pairwise is the
+#: floor: below it there is no combinatorial claim left to make, only a
+#: value-coverage one.
 DEFAULT_ORDERS: tuple[int, ...] = (3, 2)
 
-#: Repeats floor. This project MEASURED flakiness 0.333 on the batch path
-#: (QA 2026-09-01: one document 1/3 then 3/3 sixteen minutes apart on the same
-#: image and host), so a suite that spends its whole budget on distinct cases run
-#: ONCE is a row of coin flips and its regression signal is noise. ``plan`` cuts
-#: cases before it cuts repeats below this.
+#: Repeats floor for the ``orders="auto"`` branch ONLY. This project MEASURED
+#: flakiness 0.333 on the batch path (QA 2026-09-01: one document 1/3 then 3/3
+#: sixteen minutes apart on the same image and host), so a suite that spends its
+#: whole budget on distinct cases run ONCE is a row of coin flips. When the caller
+#: hands ``plan`` a budget to reduce against, cases are cut before repeats fall
+#: below this — but a DECLARED ``repeats`` is honoured verbatim (the workflow's
+#: ``repeats:`` input means what it says; the operator owns that trade).
 MIN_REPEATS = 3
+
+#: An axis becomes ``--<name>=<value>`` in the sim script's own argv, so a name that
+#: is not a legal long flag produces an unrunnable command line, and ``help``/``h``
+#: collide with the argparse every standard script has.
+RESERVED_AXIS_NAMES = frozenset({"help", "h"})
+_FLAG_SAFE_AXIS = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 _PARAM_LINE = re.compile(r"^\s*([^#:{}][^:]*?)\s*:\s*(.+?)\s*$")
 _CONSTRAINT_START = re.compile(r"^\s*(IF|#\s*constraint|\[)", re.IGNORECASE)
@@ -184,15 +198,19 @@ def resolve_binary(pict_bin: str | os.PathLike[str] | None = None) -> str:
 def validate_model(model_text: str, *, source_path: str | None = None) -> None:
     """Pre-check the model and reject with file/line — PICT itself gives neither.
 
-    Catches the four shapes that actually bite (all four measured against the
-    real binary on 2026-09-07):
+    Catches the five shapes that actually bite (the first four measured against
+    the real binary on 2026-09-07):
 
     1. a parameter declared AFTER the first constraint (PICT: "Missing opening
        bracket or misplaced keyword", no line);
     2. a duplicate parameter name (PICT silently keeps one);
     3. an empty value list;
     4. a constraint referencing a parameter that was never declared (PICT:
-       "Input Error", no line).
+       "Input Error", no line);
+    5. a parameter name that cannot become ``--<name>=<value>`` in the sim
+       script's argv. PICT accepts anything here — the breakage surfaces much
+       later as an unparseable command line inside the GPU container, so it is
+       rejected at admit time with the line that declared it.
 
     Type mismatches (a quoted numeric in a constraint) are left to PICT — its
     own message names the offending clause, and ``generate`` locates the line.
@@ -218,6 +236,19 @@ def validate_model(model_text: str, *, source_path: str | None = None) -> None:
         if not match:
             continue
         name, values = match.group(1).strip(), match.group(2).strip()
+        if not _FLAG_SAFE_AXIS.match(name) or name in RESERVED_AXIS_NAMES:
+            reason = (
+                "collides with the sim script's own --help/-h"
+                if name in RESERVED_AXIS_NAMES
+                else "is not a usable long-flag name"
+            )
+            raise PictError(
+                f"axis '{name}' {reason}.",
+                source_path=source_path,
+                line=lineno,
+                hint="each axis becomes `--<name>=<value>` in the sim script's argv, so a "
+                "name must match [A-Za-z][A-Za-z0-9_-]* and must not be `help` or `h`",
+            )
         if first_constraint is not None:
             raise PictError(
                 f"parameter '{name}' is declared after the first constraint "
@@ -313,25 +344,38 @@ def plan(
     budget: Budget,
     cost_s_per_run: float,
     concurrency: int = 1,
-    orders: Sequence[int] = DEFAULT_ORDERS,
+    order: int = 2,
+    orders: Sequence[int] | Literal["auto"] | None = None,
     seed_rows: CoveringArray | None = None,
     pict_bin: str | os.PathLike[str] | None = None,
     source_path: str | None = None,
 ) -> CasePlan:
-    """Pick the richest order that fits ``budget``, truncating only as a last resort.
+    """Fit the REQUESTED order into ``budget``, truncating only as a last resort.
 
-    The decision order is deliberate and is the one design opinion in this
-    module: **repeats are cut last**. In a system with MEASURED per-case
-    flakiness, a 76 %-coverage suite whose verdicts are statistics beats a
-    100 %-coverage suite whose verdicts are single draws — the second one
-    manufactures regressions that are not there (M4 judges pass->fail).
+    Default (``orders=None``): generate exactly ``order``-wise and, if the array
+    does not fit, cut the array — never the order. A silently downgraded k is
+    the worst of the failure modes available here, because the report keeps
+    printing "requested k" while covering less than it claims, and nothing in CI
+    is loud about it. Truncation is the honest alternative: the prefix is a real
+    partial covering array and ``coverage`` says exactly how partial.
+
+    ``orders="auto"`` opts back into the old walk-down (``DEFAULT_ORDERS``, or
+    any explicit sequence) for callers who would rather trade k than rows. That
+    branch keeps the one design opinion this module ever had — **repeats are cut
+    last**, never below ``MIN_REPEATS``: with MEASURED per-case flakiness 0.333,
+    a 76 %-coverage suite whose verdicts are statistics beats a 100 %-coverage
+    suite whose verdicts are single draws. A caller that DECLARED its repeats is
+    not asking to be second-guessed, so the default branch honours the number.
 
     Cost per run comes from the caller (M3 keeps a per-SUT rolling measurement),
     so this function stays pure and CPU-testable: no clock, no store, no probe.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
-    repeats = max(budget.repeats, MIN_REPEATS)
+    if budget.repeats < 1:
+        raise ValueError("budget.repeats must be >= 1")
+    walk_down = orders is not None
+    repeats = max(budget.repeats, MIN_REPEATS) if walk_down else budget.repeats
     per_case_s = cost_s_per_run * repeats / concurrency
     if per_case_s <= 0:
         raise ValueError("cost_s_per_run must be > 0")
@@ -339,26 +383,21 @@ def plan(
     if budget.max_cases is not None:
         affordable = min(affordable, budget.max_cases)
 
-    ordered = sorted({int(o) for o in orders}, reverse=True)
-    if not ordered:
-        raise ValueError("orders must not be empty")
-    # PICT refuses an order larger than the parameter count ("Order cannot be
-    # larger than number of parameters"), so a 2-axis space asked for 3-wise
-    # would hard-fail on a request that is perfectly answerable. Drop those
-    # orders here: asking for more coverage than a space can hold is satisfied
-    # by giving it all of the space, not by rejecting the request.
-    width = len(_declared_parameters(model_text))
-    ordered = [o for o in ordered if o <= width] or [min(ordered[-1], width)]
+    ordered = _orders_to_try(model_text, order=order, orders=orders)
     smallest: CoveringArray | None = None
-    for order in ordered:
+    for candidate in ordered:
         array = generate(
-            model_text, order=order, seed_rows=seed_rows, pict_bin=pict_bin, source_path=source_path
+            model_text,
+            order=candidate,
+            seed_rows=seed_rows,
+            pict_bin=pict_bin,
+            source_path=source_path,
         )
         smallest = array
         if len(array) <= affordable:
             return CasePlan(
                 array=array,
-                requested_order=order,
+                requested_order=candidate,
                 truncated_from=None,
                 coverage=1.0,
                 repeats=repeats,
@@ -397,6 +436,27 @@ def coverage_of_prefix(array: CoveringArray, keep: int, order: int) -> float:
 
 
 # --- internals ------------------------------------------------------------------------
+
+
+def _orders_to_try(
+    model_text: str, *, order: int, orders: Sequence[int] | Literal["auto"] | None
+) -> list[int]:
+    """The order(s) ``plan`` will generate, richest first.
+
+    ``None`` means the single requested order and no clamping: an order wider
+    than the space is PICT's own loud reject ("Order cannot be larger than
+    number of parameters"), which ``inputs`` pre-empts with a friendlier exit-2
+    from ``_declared_parameters``. The walk-down branch clamps instead, because
+    there the whole point is to land on SOME order that a 2-axis space can hold.
+    """
+    if orders is None:
+        return [int(order)]
+    wanted = DEFAULT_ORDERS if orders == "auto" else orders
+    ordered = sorted({int(o) for o in wanted}, reverse=True)
+    if not ordered:
+        raise ValueError("orders must not be empty")
+    width = len(_declared_parameters(model_text))
+    return [o for o in ordered if o <= width] or [min(ordered[-1], width)]
 
 
 def _declared_parameters(model_text: str) -> list[str]:
@@ -447,11 +507,15 @@ def _parse(stdout: str, *, order: int, source_path: str | None) -> CoveringArray
 
 
 def _pict_message(proc: subprocess.CompletedProcess[str]) -> str:
+    """PICT's first line of prose, or the exit code when it rejected silently.
+
+    The text is stripped first, so its first line is the first line that says
+    anything — the old blank-line skip inside the loop was unreachable.
+    """
     text = (proc.stdout + "\n" + proc.stderr).strip()
-    for line in text.splitlines():
-        if line.strip():
-            return line.strip()
-    return f"PICT exited {proc.returncode} without a message."
+    if not text:
+        return f"PICT exited {proc.returncode} without a message."
+    return text.splitlines()[0].strip()
 
 
 def _locate(model_text: str, output: str) -> int | None:
