@@ -167,6 +167,19 @@ def test_plan_honours_a_declared_repeats_of_one() -> None:
 
 
 @needs_pict
+def test_an_undeclared_repeats_defaults_to_one_not_to_the_floor() -> None:
+    """The floor must not survive as a dataclass default either: a caller that says
+    nothing about repeats gets the contract default (1), not three silent extra runs."""
+    plan = pict.plan(
+        GO2_MODEL,
+        budget=pict.Budget(wallclock_s=3600),
+        cost_s_per_run=300.0,
+        concurrency=4,
+    )
+    assert plan.repeats == 1
+
+
+@needs_pict
 def test_plan_refuses_a_budget_that_affords_no_case_at_all() -> None:
     """A budget too small for ONE case is a rejected request, not an empty suite."""
     with pytest.raises(pict.PictError, match="affords no cases"):

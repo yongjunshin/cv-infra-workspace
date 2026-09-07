@@ -135,10 +135,16 @@ class CoveringArray:
 
 @dataclass(frozen=True)
 class Budget:
-    """What the consumer is willing to spend. Time is the real constraint."""
+    """What the consumer is willing to spend. Time is the real constraint.
+
+    ``repeats`` defaults to the contract's own default (the workflow's ``repeats:``
+    input is 1), NOT to ``MIN_REPEATS``: a floor hidden in a dataclass default is the
+    same silent second-guessing the default ``plan`` branch stopped doing. The floor
+    lives in the ``orders="auto"`` budget-reduction branch and nowhere else.
+    """
 
     wallclock_s: float
-    repeats: int = MIN_REPEATS
+    repeats: int = 1
     max_cases: int | None = None
 
 
