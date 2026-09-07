@@ -87,13 +87,13 @@ source = ["cv_infra"]  # product code only; tests/ and scripts/ are not instrume
 show_missing = true
 precision = 1
 
-# ⚠ TEMPORARILY 95, DOWN FROM 100 — restore in M8.
-# The debt this number was written for is PAID: M5's repairs + adapted tests took
-# cv_infra/contract/pict.py to 100.0% and the whole package back to 100.0% (measured
-# 2026-09-07). The line stays at 95 only because raising the ratchet is M8's assigned
-# step; until then it permits a regression the suite does not actually have, so a
-# module landing below 100 is caught by review, not by this number.
-fail_under = 95
+# 100, restored in M8 (it was temporarily 95 through the M4 rewrite). The suite measures
+# 100.0% of statements AND branches on every module, so this is the number the code
+# actually holds — not an aspiration. A ratchet below the measured value is worse than
+# no ratchet: it silently permits the first uncovered branch, which is exactly the one
+# nobody meant to add. A module that cannot reach 100 carries per-line
+# `# pragma: no cover - <reason>` (process entry lines), never a lowered total.
+fail_under = 100
 #
 # exclude policy = coverage's default pragma regex only. The convention
 # `# pragma: no cover - <reason>` already matches it, so no extra config is needed.

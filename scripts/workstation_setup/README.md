@@ -383,16 +383,20 @@ GitHub may refuse jobs from runners **>30 days** behind the minimum supported ve
 `BEGIN SHA linux-x64` marker), then re-run the script — it stops the service, swaps
 the binaries (registration survives; `.runner` is untouched), and restarts.
 
-### Hardening state (public repo; R10 / OD-1 / D-J)
+### Hardening state (public repo)
 
 Applied at registration time — exposure starts the moment the runner is online:
 
 - Repo Actions fork-PR policy: **require approval for ALL outside collaborators**
   (not just first-time). Set via API/UI at registration; re-check after org/repo changes.
-- **No workflow consumes the `cv-infra-gpu` label until P5** — `ci.yml` stays
-  single-tier `ubuntu-latest`; the runner sits idle by design.
-- GPU jobs will never check out / execute PR-head sources: the SUT enters as an
-  **image ref only** (enforced at P5); `pull_request_target` is not used anywhere.
+  This is the control that matters: `verify.yml` CHECKS OUT and RUNS the caller's head
+  branch on this host (the sim script, the PICT model and the oracle are the consumer's
+  files), so an unapproved fork PR would be arbitrary code on the GPU. See the trust
+  boundary section of the repository README.
+- `pull_request_target` is not used anywhere, and the verify job checks out with
+  `persist-credentials: false` so the job token does not linger in the worktree.
+- Only `verify.yml` consumes the `cv-infra-gpu` label; `ci.yml` stays single-tier
+  `ubuntu-latest` (no GPU, no docker daemon, fake docker client in the suite).
 
 ### Teardown
 

@@ -26,6 +26,9 @@ dist/
 .env
 
 # --- Verification run outputs & caches (stateless: results/cache are mounted, not committed) ---
+# `.cv-infra-run/` is the CLI's default --run-dir (report.json, payloads, zips, logs):
+# run residue by construction, and CI writes it under $RUNNER_TEMP instead.
+.cv-infra-run/
 results/
 *.mcap
 *.mp4
