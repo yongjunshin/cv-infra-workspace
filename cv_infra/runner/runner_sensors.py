@@ -41,7 +41,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from cv_infra.contract.adapter_schema import Ros2AdapterConfig, SensorInput
-from cv_infra.runner.go2_policy import quat_apply_inverse
+from cv_infra.contract.profile import RobotProfile
+from cv_infra.runner.onboard import quat_apply_inverse
 
 # --------------------------------------------------------------------------- #
 # Frames and mounts — MEASURED, then written (C3 probe A2, 2026-09-01).
@@ -53,8 +54,8 @@ TF_TOPIC = "/tf"
 TF_STATIC_TOPIC = "/tf_static"
 
 #: Sensor frame ids used when the scenario declares no ``frame`` for a stream.
-DEFAULT_CAMERA_FRAME = "go2_camera"
-DEFAULT_LIDAR_FRAME = "go2_lidar"
+DEFAULT_CAMERA_FRAME = "camera_link"
+DEFAULT_LIDAR_FRAME = "lidar_link"
 
 #: Camera mount, base_link -> camera, metres. MEASURED: the base subtree (trunk
 #: + head) spans x [-0.128, +0.332] / y +-0.097 / z [-0.097, +0.089] around the
@@ -152,7 +153,7 @@ TF_STATIC_QOS_DEPTH = 1
 #: Verbatim grep marker (G-26 prove-it-ran gate; pinned by a CPU test): the topic
 #: inventory this runner actually created. A sensor stack that silently published
 #: nothing and one that was never asked to publish read the same in a log.
-SENSOR_INVENTORY_LOG_MARKER = "go2_sensors inventory="
+SENSOR_INVENTORY_LOG_MARKER = "runner_sensors inventory="
 
 # Stream keys — the internal names for the four declarable streams.
 STREAM_RGB = "camera_rgb"
@@ -176,6 +177,100 @@ _SUPPORTED_TYPES = {_IMAGE_TYPE, _CAMERA_INFO_TYPE, _LASER_SCAN_TYPE}
 # --------------------------------------------------------------------------- #
 # Declaration -> streams (pure).
 # --------------------------------------------------------------------------- #
+Vec3 = tuple[float, float, float]
+QuatWXYZ = tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class SensorRig:
+    """Where this robot's sensors are bolted and what they are — from the profile.
+
+    Until v2 these were module constants, which is to say the platform knew one
+    consumer's camera mount, focal length and lidar MODEL NAME. They are the
+    same values; only their source moved. A stream the profile does not declare
+    leaves its fields ``None`` and the suite simply never builds it — which is
+    also how a pre-wired scene (whose asset ships its own graphs) declares
+    nothing at all.
+    """
+
+    camera_frame: str = DEFAULT_CAMERA_FRAME
+    lidar_frame: str = DEFAULT_LIDAR_FRAME
+    camera_mount_xyz: Vec3 = (0.0, 0.0, 0.0)
+    camera_optical_quat_wxyz: QuatWXYZ = (1.0, 0.0, 0.0, 0.0)
+    lidar_mount_xyz: Vec3 = (0.0, 0.0, 0.0)
+    camera_resolution: tuple[int, int] = (640, 480)
+    camera_focal_length: float = 1.2
+    camera_clipping_range: tuple[float, float] = (0.05, 100.0)
+    camera_distortion_model: str = "plumb_bob"
+    camera_distortion_coeffs: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0)
+    lidar_config: str = "RPLIDAR_S2E"
+    lidar_no_return: float = -1.0
+    odom_rate_hz: float = 30.0
+    camera_rate_hz: float = 10.0
+    scan_rate_hz: float = 10.0
+
+    @classmethod
+    def from_profile(cls, robot: RobotProfile) -> SensorRig:
+        """Collapse the declared streams into the rig the publishers read.
+
+        The camera family (rgb / depth / camera_info) shares ONE physical
+        camera, so its mount and optics are taken from whichever of those
+        streams is declared first: two declarations that disagree would be two
+        cameras, and this rig models one.
+        """
+        by_stream = {s.stream: s for s in robot.sensors}
+        cam = next(
+            (by_stream[k] for k in ("camera_rgb", "camera_depth", "camera_info") if k in by_stream),
+            None,
+        )
+        scan = by_stream.get("scan")
+        defaults = cls()
+        return cls(
+            camera_frame=cam.frame if cam else defaults.camera_frame,
+            lidar_frame=scan.frame if scan else defaults.lidar_frame,
+            camera_mount_xyz=cam.mount_xyz if cam else defaults.camera_mount_xyz,
+            camera_optical_quat_wxyz=(
+                cam.mount_quat_wxyz if cam else defaults.camera_optical_quat_wxyz
+            ),
+            lidar_mount_xyz=scan.mount_xyz if scan else defaults.lidar_mount_xyz,
+            camera_resolution=(
+                cam.resolution if cam and cam.resolution else defaults.camera_resolution
+            ),
+            camera_focal_length=(
+                cam.focal_length if cam and cam.focal_length else defaults.camera_focal_length
+            ),
+            camera_clipping_range=(
+                cam.clipping_range if cam and cam.clipping_range else defaults.camera_clipping_range
+            ),
+            camera_distortion_model=(
+                cam.distortion_model
+                if cam and cam.distortion_model
+                else defaults.camera_distortion_model
+            ),
+            camera_distortion_coeffs=(
+                cam.distortion_coeffs
+                if cam and cam.distortion_coeffs
+                else defaults.camera_distortion_coeffs
+            ),
+            lidar_config=scan.config if scan and scan.config else defaults.lidar_config,
+            lidar_no_return=(
+                scan.no_return_value
+                if scan and scan.no_return_value is not None
+                else defaults.lidar_no_return
+            ),
+            odom_rate_hz=robot.odom_rate_hz,
+            camera_rate_hz=cam.rate_hz if cam else defaults.camera_rate_hz,
+            scan_rate_hz=scan.rate_hz if scan else defaults.scan_rate_hz,
+        )
+
+
+#: The rig a caller gets when it passes none. Every value is a ROS convention or
+#: a neutral placeholder — a real robot's mounts and optics arrive from its
+#: profile, never from here. It exists so the pure helpers stay callable in
+#: isolation, not as a stand-in for a declaration.
+_NEUTRAL_RIG = SensorRig()
+
+
 @dataclass(frozen=True)
 class SensorStream:
     """One declared stream this runner will publish: its topic and frame id."""
@@ -199,6 +294,7 @@ def classify_sensor(topic: str, type_name: str) -> str | None:
 
 def plan_sensor_streams(
     sensors: Iterable[SensorInput],
+    rig: SensorRig = _NEUTRAL_RIG,
 ) -> tuple[dict[str, SensorStream], list[str]]:
     """Declared sensors -> ``{stream key: SensorStream}`` + the unsupported ones.
 
@@ -231,10 +327,10 @@ def plan_sensor_streams(
         matched[key] = sensor
     camera_frame = _family_frame(matched, (STREAM_RGB, STREAM_DEPTH, STREAM_CAMERA_INFO))
     frames = {
-        STREAM_RGB: camera_frame or DEFAULT_CAMERA_FRAME,
-        STREAM_DEPTH: camera_frame or DEFAULT_CAMERA_FRAME,
-        STREAM_CAMERA_INFO: camera_frame or DEFAULT_CAMERA_FRAME,
-        STREAM_SCAN: _family_frame(matched, (STREAM_SCAN,)) or DEFAULT_LIDAR_FRAME,
+        STREAM_RGB: camera_frame or rig.camera_frame,
+        STREAM_DEPTH: camera_frame or rig.camera_frame,
+        STREAM_CAMERA_INFO: camera_frame or rig.camera_frame,
+        STREAM_SCAN: _family_frame(matched, (STREAM_SCAN,)) or rig.lidar_frame,
     }
     streams = {
         key: SensorStream(key=key, topic=sensor.topic, frame=frames[key])
@@ -328,14 +424,14 @@ class FirstDataGate:
                 return None
             self.first_data_at = sim_time_s
             return (
-                f"[cv-runner] go2_sensors {self.name}: first data at "
+                f"[cv-runner] runner_sensors {self.name}: first data at "
                 f"sim_time={sim_time_s:.3f}s ({count} sample(s))"
             )
         if self._warned or sim_time_s - self._start < self.patience_s:
             return None
         self._warned = True
         return (
-            f"[cv-runner] WARNING: go2_sensors {self.name} has produced EMPTY frames "
+            f"[cv-runner] WARNING: runner_sensors {self.name} has produced EMPTY frames "
             f"for {sim_time_s - self._start:.1f}s of sim time — the sensor is "
             "attached but returns no samples (C0 probe §6-3: an RTX lidar fails "
             "this way, not by raising)"
@@ -344,8 +440,8 @@ class FirstDataGate:
     def summary(self) -> str:
         """One line at teardown: did this stream ever carry anything?"""
         if self.first_data_at is None:
-            return f"[cv-runner] WARNING: go2_sensors {self.name} NEVER produced data"
-        return f"[cv-runner] go2_sensors {self.name}: first data at {self.first_data_at:.3f}s"
+            return f"[cv-runner] WARNING: runner_sensors {self.name} NEVER produced data"
+        return f"[cv-runner] runner_sensors {self.name}: first data at {self.first_data_at:.3f}s"
 
 
 # --------------------------------------------------------------------------- #
@@ -386,7 +482,11 @@ def quat_wxyz_to_xyzw(quat_wxyz: Iterable[float]) -> tuple[float, float, float, 
     return (x, y, z, w)
 
 
-def static_transforms(base_link: str, streams: dict[str, SensorStream]) -> list[TransformFields]:
+def static_transforms(
+    base_link: str,
+    streams: dict[str, SensorStream],
+    rig: SensorRig = _NEUTRAL_RIG,
+) -> list[TransformFields]:
     """``base_link`` -> the sensor frames THIS run actually publishes.
 
     Only declared streams get a transform: a static TF to a frame no message ever
@@ -399,8 +499,8 @@ def static_transforms(base_link: str, streams: dict[str, SensorStream]) -> list[
             TransformFields(
                 parent=base_link,
                 child=camera.frame,
-                translation=CAMERA_MOUNT_XYZ,
-                rotation_xyzw=quat_wxyz_to_xyzw(CAMERA_OPTICAL_QUAT_WXYZ),
+                translation=rig.camera_mount_xyz,
+                rotation_xyzw=quat_wxyz_to_xyzw(rig.camera_optical_quat_wxyz),
             )
         )
     scan = streams.get(STREAM_SCAN)
@@ -409,7 +509,7 @@ def static_transforms(base_link: str, streams: dict[str, SensorStream]) -> list[
             TransformFields(
                 parent=base_link,
                 child=scan.frame,
-                translation=LIDAR_MOUNT_XYZ,
+                translation=rig.lidar_mount_xyz,
                 # The RTX lidar prim is authored with no rotation and its azimuth
                 # zero is the prim's +X with positive angles going counter-
                 # clockwise — MEASURED with a post 1.5 m off the robot's RIGHT,
@@ -445,7 +545,7 @@ def odom_fields(
     world-frame velocities Isaac reports have to be rotated into the body. nav2's
     controller reads that twist as the robot's own forward/strafe/yaw rate, and a
     world-frame twist would read as a robot driving sideways whenever it is not
-    facing +X. The rotation is ``go2_policy.quat_apply_inverse`` — the same one
+    facing +X. The rotation is ``onboard.quat_apply_inverse`` — the same one
     the policy's observation uses, so the two cannot disagree.
     """
     quat = tuple(float(v) for v in quat_wxyz)
@@ -508,6 +608,7 @@ def camera_info_fields(
     focal_length: float,
     horizontal_aperture: float,
     vertical_aperture: float,
+    rig: SensorRig = _NEUTRAL_RIG,
 ) -> CameraInfoFields:
     """The full CameraInfo payload (K/P/R/D) for the rendered pinhole camera."""
     fx, fy, cx, cy = camera_intrinsics(
@@ -516,8 +617,8 @@ def camera_info_fields(
     return CameraInfoFields(
         width=int(width),
         height=int(height),
-        distortion_model=CAMERA_DISTORTION_MODEL,
-        d=CAMERA_DISTORTION_COEFFS,
+        distortion_model=rig.camera_distortion_model,
+        d=rig.camera_distortion_coeffs,
         k=(fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0),
         # A monocular camera is its own rectified frame: R = identity and P is K
         # with a zero translation column (REP-104).
@@ -546,6 +647,7 @@ def scan_fields(
     horizontal_resolution_deg: float,
     depth_range_m: Iterable[float],
     scan_time_s: float,
+    rig: SensorRig = _NEUTRAL_RIG,
 ) -> ScanFields:
     """Flat-scan annotator output -> LaserScan values (angles in radians).
 
@@ -561,7 +663,7 @@ def scan_fields(
     range-check it against ``angle_max``, so the derived value is the one that
     cannot contradict the array.
     """
-    ranges = tuple(math.inf if d <= LIDAR_NO_RETURN else float(d) for d in depths)
+    ranges = tuple(math.inf if d <= rig.lidar_no_return else float(d) for d in depths)
     if not ranges:
         raise ValueError("flat scan carried 0 beams — nothing to publish")
     azimuth = [float(v) for v in azimuth_range_deg]
@@ -595,7 +697,10 @@ class InventoryRow:
 
 
 def topic_inventory(
-    config: Ros2AdapterConfig, streams: dict[str, SensorStream], step_rate_hz: float | None = None
+    config: Ros2AdapterConfig,
+    streams: dict[str, SensorStream],
+    step_rate_hz: float | None = None,
+    rig: SensorRig = _NEUTRAL_RIG,
 ) -> list[InventoryRow]:
     """Every topic this suite publishes, in one table (log + report + U1 input)."""
     # The rate column is a STRING because three of its values are not numbers:
@@ -608,12 +713,12 @@ def topic_inventory(
         InventoryRow(
             TF_TOPIC,
             "tf2_msgs/msg/TFMessage",
-            f"{ODOM_RATE_HZ:g} Hz",
+            f"{rig.odom_rate_hz:g} Hz",
             f"{config.frames.odom}->{config.frames.base_link}",
             "always",
         ),
     ]
-    static = static_transforms(config.frames.base_link, streams)
+    static = static_transforms(config.frames.base_link, streams, rig=rig)
     if static:
         rows.append(
             InventoryRow(
@@ -628,17 +733,17 @@ def topic_inventory(
         InventoryRow(
             topic,
             "nav_msgs/msg/Odometry",
-            f"{ODOM_RATE_HZ:g} Hz",
+            f"{rig.odom_rate_hz:g} Hz",
             f"{config.frames.odom}->{config.frames.base_link}",
             "always",
         )
         for topic in config.odom_topics
     )
     types = {
-        STREAM_RGB: (_IMAGE_TYPE, CAMERA_RATE_HZ),
-        STREAM_DEPTH: (_IMAGE_TYPE, CAMERA_RATE_HZ),
-        STREAM_CAMERA_INFO: (_CAMERA_INFO_TYPE, CAMERA_RATE_HZ),
-        STREAM_SCAN: (_LASER_SCAN_TYPE, SCAN_RATE_HZ),
+        STREAM_RGB: (_IMAGE_TYPE, rig.camera_rate_hz),
+        STREAM_DEPTH: (_IMAGE_TYPE, rig.camera_rate_hz),
+        STREAM_CAMERA_INFO: (_CAMERA_INFO_TYPE, rig.camera_rate_hz),
+        STREAM_SCAN: (_LASER_SCAN_TYPE, rig.scan_rate_hz),
     }
     rows.extend(
         InventoryRow(stream.topic, types[key][0], f"{types[key][1]:g} Hz", stream.frame, "declared")
@@ -666,10 +771,11 @@ class StageSensors:
     Everything above this line is pure; everything inside the methods below is
     ``isaacsim`` and therefore GPU-only. Keeping the vendor surface in ONE class
     is what lets the whole suite be exercised on CPU with a recording fake, the
-    same way ``Go2PolicyLoop`` takes an articulation.
+    same way ``PolicyLoop`` takes an articulation.
     """
 
     body: object  # SingleRigidPrim over the chassis (GT pose/velocity)
+    rig: SensorRig = _NEUTRAL_RIG  # the profile this stage was built from
     camera: object | None = None  # isaacsim.sensors.camera.Camera
     lidar: object | None = None  # isaacsim.sensors.rtx.LidarRtx
 
@@ -691,8 +797,8 @@ class StageSensors:
         ``initialize()`` has created the render product."""
         if self.camera is not None:
             self.camera.initialize()
-            self.camera.set_focal_length(CAMERA_FOCAL_LENGTH_STAGE_UNITS)
-            self.camera.set_clipping_range(*CAMERA_CLIPPING_RANGE_M)
+            self.camera.set_focal_length(self.rig.camera_focal_length)
+            self.camera.set_clipping_range(*self.rig.camera_clipping_range)
             self.camera.add_distance_to_image_plane_to_frame()
         if self.lidar is not None:
             self.lidar.initialize()
@@ -735,7 +841,9 @@ class StageSensors:
 
 
 def build_stage_sensors(
-    chassis_path: str, streams: dict[str, SensorStream]
+    chassis_path: str,
+    streams: dict[str, SensorStream],
+    rig: SensorRig = _NEUTRAL_RIG,
 ) -> StageSensors:  # pragma: no cover - GPU path (Isaac authoring)
     """Author the camera / lidar prims under the chassis and bind the GT body.
 
@@ -761,18 +869,18 @@ def build_stage_sensors(
     )
     if camera_stream is not None:
         sensors.camera = Camera(
-            prim_path=f"{chassis_path}/{DEFAULT_CAMERA_FRAME}",
-            name=DEFAULT_CAMERA_FRAME,
-            resolution=CAMERA_RESOLUTION,
-            translation=CAMERA_MOUNT_XYZ,
+            prim_path=f"{chassis_path}/{rig.camera_frame}",
+            name=rig.camera_frame,
+            resolution=rig.camera_resolution,
+            translation=rig.camera_mount_xyz,
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
     if STREAM_SCAN in streams:
         sensors.lidar = LidarRtx(
-            prim_path=f"{chassis_path}/{DEFAULT_LIDAR_FRAME}",
-            name=DEFAULT_LIDAR_FRAME,
-            translation=LIDAR_MOUNT_XYZ,
-            config_file_name=LIDAR_CONFIG,
+            prim_path=f"{chassis_path}/{rig.lidar_frame}",
+            name=rig.lidar_frame,
+            translation=rig.lidar_mount_xyz,
+            config_file_name=rig.lidar_config,
         )
         sensors.lidar.attach_annotator("IsaacComputeRTXLidarFlatScan")
     return sensors
@@ -839,7 +947,7 @@ class _Publishers:
     streams: dict = field(default_factory=dict)
 
 
-class Go2SensorSuite:
+class RunnerSensorSuite:
     """Publishes the SUT-facing streams of a runner-composed world (D-2).
 
     Lifecycle, mirroring ``PhysicsTelemetrySampler``'s two phases because it has
@@ -861,23 +969,27 @@ class Go2SensorSuite:
         config: Ros2AdapterConfig,
         chassis_path: str,
         *,
-        stage_factory: Callable[[str, dict], StageSensors] = build_stage_sensors,
+        stage_factory: Callable[..., StageSensors] = build_stage_sensors,
+        rig: SensorRig = _NEUTRAL_RIG,
         ros_types_factory: Callable[[], RosTypes] = import_ros_types,
     ) -> None:
         self.config = config
         self.chassis_path = chassis_path
-        self.streams, self.unsupported = plan_sensor_streams(config.sensors)
+        #: The consumer's rig — mounts, optics, rates. Held rather than imported:
+        #: which camera is bolted where is a fact about somebody's robot.
+        self.rig = rig
+        self.streams, self.unsupported = plan_sensor_streams(config.sensors, rig=rig)
         self._stage_factory = stage_factory
         self._ros_types_factory = ros_types_factory
         self._stage: StageSensors | None = None
         self._types: RosTypes | None = None
         self._pubs: _Publishers | None = None
         self._gates = {
-            "odom": RateGate(ODOM_RATE_HZ),
-            STREAM_RGB: RateGate(CAMERA_RATE_HZ),
-            STREAM_DEPTH: RateGate(CAMERA_RATE_HZ),
-            STREAM_CAMERA_INFO: RateGate(CAMERA_RATE_HZ),
-            STREAM_SCAN: RateGate(SCAN_RATE_HZ),
+            "odom": RateGate(self.rig.odom_rate_hz),
+            STREAM_RGB: RateGate(self.rig.camera_rate_hz),
+            STREAM_DEPTH: RateGate(self.rig.camera_rate_hz),
+            STREAM_CAMERA_INFO: RateGate(self.rig.camera_rate_hz),
+            STREAM_SCAN: RateGate(self.rig.scan_rate_hz),
         }
         self._data_gates = {
             STREAM_RGB: FirstDataGate(STREAM_RGB),
@@ -897,7 +1009,7 @@ class Go2SensorSuite:
                 "params / adapter_config) — scene-path hardcoding is forbidden (R7)"
             )
         self._world = world
-        self._stage = self._stage_factory(self.chassis_path, self.streams)
+        self._stage = self._stage_factory(self.chassis_path, self.streams, rig=self.rig)
 
     def attach(self, node: object, on_step: list | None = None) -> list[str]:
         """Create the publishers, latch ``/tf_static``, return the inventory lines."""
@@ -924,9 +1036,9 @@ class Go2SensorSuite:
             },
         )
         if STREAM_CAMERA_INFO in self.streams:
-            self._camera_info = camera_info_fields(*self._stage.calibration())
+            self._camera_info = camera_info_fields(*self._stage.calibration(), rig=self.rig)
         self._publish_static_transforms()
-        lines = inventory_lines(topic_inventory(self.config, self.streams))
+        lines = inventory_lines(topic_inventory(self.config, self.streams, rig=self.rig))
         if not self.config.odom_topics:
             lines.append(
                 "[cv-runner] WARNING: interface.adapter_config declares NO odom_topics — "
@@ -1055,7 +1167,8 @@ class Go2SensorSuite:
             frame["azimuthRange"],
             frame["horizontalResolution"],
             frame["depthRange"],
-            1.0 / SCAN_RATE_HZ,
+            1.0 / self.rig.scan_rate_hz,
+            rig=self.rig,
         )
         msg = self._types.LaserScan()
         self._stamp_header(msg, stamp, self.streams[STREAM_SCAN].frame)
@@ -1070,7 +1183,7 @@ class Go2SensorSuite:
         self._emit(STREAM_SCAN, self._pubs.streams[STREAM_SCAN], msg)
 
     def _publish_static_transforms(self) -> None:
-        transforms = static_transforms(self.config.frames.base_link, self.streams)
+        transforms = static_transforms(self.config.frames.base_link, self.streams, rig=self.rig)
         if not transforms:
             return
         msg = self._types.TFMessage()
@@ -1127,7 +1240,7 @@ class Go2SensorSuite:
 
 def sensor_suite_for(
     scene_asset: object, config: Ros2AdapterConfig, chassis_path: str
-) -> Go2SensorSuite | None:
+) -> RunnerSensorSuite | None:
     """The suite for a composed scene, or None for a pre-wired one (carter).
 
     ONE decision site for "does this run publish its own sensors", so the two
@@ -1135,4 +1248,4 @@ def sensor_suite_for(
     """
     if not scene_needs_runner_sensors(scene_asset):
         return None
-    return Go2SensorSuite(config, chassis_path)
+    return RunnerSensorSuite(config, chassis_path)

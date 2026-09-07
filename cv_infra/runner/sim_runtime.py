@@ -28,6 +28,7 @@ import random
 import time
 from dataclasses import dataclass
 
+from cv_infra.contract.profile import EmbodimentProfile
 from cv_infra.runner.boot_trace import (
     PHASE_FIRST_RENDER_FRAME,
     PHASE_ROBOT_SPAWN,
@@ -37,9 +38,6 @@ from cv_infra.runner.boot_trace import (
 # The go2 registry row's two ROBOT properties (C5). Imported, never retyped: the
 # stance a repose restores must be the SAME 12 numbers the policy offsets its
 # actions from, and the render decimation must be the SAME number the policy was
-# trained under — a second copy of either is a plant that drifts silently
-# (go2_constants is measured data only: no torch, no isaacsim, no I/O).
-from cv_infra.runner.go2_constants import DEFAULT_JOINT_POS, RENDER_INTERVAL
 
 
 class EulaNotAcceptedError(RuntimeError):
@@ -241,6 +239,28 @@ class SceneAsset:
     default_joint_pos: tuple[float, ...] = ()
     render_interval: int = 1
 
+    @classmethod
+    def from_profile(cls, profile: EmbodimentProfile) -> SceneAsset:
+        """Build the scene row from the request's own embodiment document (v2).
+
+        This is the whole point of the boundary move: the same record the
+        registry used to hold, filled from the consumer's file instead of from
+        platform source, so a world and robot the platform has never seen needs
+        no platform change to run.
+        """
+        robot = profile.robot
+        return cls(
+            scene_usd=profile.world.scene_usd,
+            robot_prim_candidates=tuple(robot.prim_candidates),
+            extra_scene_usds=tuple(profile.world.extra_usds),
+            robot_usd=robot.usd,
+            robot_spawn_prim=robot.spawn_prim,
+            robot_spawn_z=robot.spawn_z,
+            firmware_slots=(("onboard",) if robot.onboard is not None else ()),
+            default_joint_pos=tuple(robot.reset_joint_pos),
+            render_interval=robot.render_interval,
+        )
+
 
 SCENE_ASSETS: dict[str, SceneAsset] = {
     # cv-infra-user/scenarios/nova_carter_warehouse_goal.yaml: scene name (M1 Scenario).
@@ -248,49 +268,14 @@ SCENE_ASSETS: dict[str, SceneAsset] = {
         scene_usd="/Isaac/Samples/ROS2/Scenario/carter_warehouse_navigation.usd",
         robot_prim_candidates=("/World/Nova_Carter_ROS", "/World/Carter_ROS"),
     ),
-    # go2 (D-1). Every path here is C0-probe MEASURED on the live 5.1.0 asset root
-    # (probe §4, all URLs HTTP 200) — never typed from memory, because a
-    # remembered path is a 404 at reference time, i.e. a boot failure after the
-    # GPU was already paid (G-28).
-    #
-    # ``scene_usd`` is the SAME warehouse the carter sample references, opened
-    # directly, and ``extra_scene_usds`` is the SAME extras layer: identity +
-    # identity, so the carter occupancy map transfers (probe A5).
-    #
-    # ``robot_usd`` is the IsaacLab-flavoured go2 — deliberately not the
-    # ``/Isaac/Robots/Unitree/Go2/go2.usd`` sibling: this is the asset the
-    # locomotion policy was TRAINED against (12 dof in the same order, 19 bodies),
-    # and the policy contract is what makes one of the two right (probe §3/§5).
-    "go2_warehouse": SceneAsset(
-        scene_usd="/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd",
-        extra_scene_usds=("/Isaac/Environments/Simple_Warehouse/Stage/warehouse_extras.usd",),
-        robot_usd="/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd",
-        robot_spawn_prim="/World/Go2",
-        robot_prim_candidates=("/World/Go2",),
-        # C1 MEASURED (this cycle, workstation, 3 s stance-hold settle from a
-        # standing drop, same seed/dt, one variable): the drop height decides how
-        # far the robot SLIDES before it is standing still, and that slide is
-        # error on every initial_pose the scenario declares.
-        #   z=0.40 (the training init height) -> slide 0.1170 m, pitch -0.069 rad
-        #   z=0.32                            -> slide 0.0197 m, pitch +0.013 rad
-        #   z=0.25                            -> slide 0.3373 m, pitch +0.378 rad
-        # 0.32 wins by 5.9x and is ADOPTED. It is not "lower is better": 0.25
-        # starts the feet already through their stance and the robot pitches.
-        # Settled base height is ~0.28 either way (C0 A7 measured 0.279~0.288).
-        robot_spawn_z=0.32,
-        # D-3: go2 runs its locomotion policy onboard -> one slot. carter = none.
-        firmware_slots=("locomotion_policy",),
-        # C5/D-5: the trained stance. A quadruped that keeps sample i's leg
-        # configuration into sample i+1 starts the next mission mid-gait — the
-        # same hidden coupling the velocity zeroing removes, one layer down.
-        default_joint_pos=DEFAULT_JOINT_POS,
-        # B-5/AR-17: the TRAINING cfg's own ``sim.render_interval`` (= 4). The
-        # sensor rates are sim-clock gated (go2_sensors.RateGate) and the policy
-        # + telemetry ride PHYSICS callbacks, so decimating the render changes
-        # what is DRAWN, not what is simulated or judged. C2b measured the lever
-        # on this exact scene: rendering_dt 0.005 -> 0.02 took RTF 0.95 -> 1.72.
-        render_interval=RENDER_INTERVAL,
-    ),
+    # A second row does not belong here. The go2 world that used to live at this
+    # spot moved to the consumer's own embodiment profile — with it went the
+    # robot USD, the measured drop height, the trained stance and the training
+    # cfg's render interval, i.e. a set of facts about somebody else's robot that
+    # the platform was holding and had to be edited for every new consumer.
+    # v2 requests carry ``embodiment:`` and build their row with
+    # ``SceneAsset.from_profile``; this dict is the v1 registry form only, kept
+    # for the documents that still name a scene, and it is deleted with v1.
 }
 
 
@@ -357,14 +342,24 @@ def scene_compose_log_line(
     )
 
 
-def resolve_scene(scene_ref: str) -> SceneAsset:
-    """Map a scenario scene name to its asset ref; direct USD refs pass through.
+def resolve_scene(scene_ref: str | EmbodimentProfile) -> SceneAsset:
+    """Map a scene REF to its asset row; an embodiment profile builds its own.
+
+    Three forms, in the order a request can supply them:
+
+    * an ``EmbodimentProfile`` (v2) — the consumer's own document, which carries
+      every asset ref and robot property directly. Nothing is looked up: this is
+      the form that lets an unseen robot run with no platform change.
+    * a direct ``.usd`` ref — used as-is, no robot-prim knowledge.
+    * a registry NAME (v1) — the shrinking compatibility path.
 
     A ``.usd``-suffixed ref (omniverse://, http(s)://, or a mounted path) is used
     as-is with no robot-prim knowledge (P3 direction: consumer-supplied scenes).
     An unknown scene NAME is bad input -> loud ValueError listing known scenes
     (REQ-INTAKE-005 friendly-error direction).
     """
+    if isinstance(scene_ref, EmbodimentProfile):
+        return SceneAsset.from_profile(scene_ref)
     if scene_ref in SCENE_ASSETS:
         return SCENE_ASSETS[scene_ref]
     if scene_ref.endswith((".usd", ".usda", ".usdz")):
@@ -375,7 +370,7 @@ def resolve_scene(scene_ref: str) -> SceneAsset:
     )
 
 
-def scene_row(scene_ref: str) -> SceneAsset:
+def scene_row(scene_ref: str | EmbodimentProfile) -> SceneAsset:
     """The registry row for a scene ref — an EMPTY row for anything unresolvable.
 
     Callers that only want a ROBOT PROPERTY (the repose stance, the render
@@ -383,12 +378,12 @@ def scene_row(scene_ref: str) -> SceneAsset:
     is the one that lists the known scenes and is raised where the operator can
     act on it. So an unknown name answers here exactly like a direct ``.usd``
     ref does: with the defaults, i.e. "this scene declares nothing special".
-    Same stance (and same reason) as ``go2_wiring.scene_firmware_slots``.
+    Same stance (and same reason) as ``onboard_wiring.scene_firmware_slots``.
     """
     try:
         return resolve_scene(scene_ref)
     except ValueError:
-        return SceneAsset(scene_usd=scene_ref)
+        return SceneAsset(scene_usd=str(scene_ref))
 
 
 def is_direct_usd_ref(scene_usd: str) -> bool:
@@ -1626,7 +1621,7 @@ class SimRuntime:
         do-not-reinvent: ``set_joint_positions`` is the vendor's own articulation
         write, the sibling of the velocity zeroing right next to it. The stance
         VALUES are not this layer's: they come from the registry row, which took
-        them from the measured training contract (``go2_constants``), so the pose
+        them from the request's own embodiment profile, so the pose
         this restores is the same one the policy offsets its actions from.
 
         The HEIGHT comes from the row too when it declares one (``repose_height``

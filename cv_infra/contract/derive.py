@@ -36,7 +36,10 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Mapping
+from typing import Any
 
+from cv_infra.contract.pict import CoveringArray
 from cv_infra.contract.schema import (
     Choice,
     Obstacle,
@@ -178,6 +181,90 @@ def _expand_obstacles(groups: list[Obstacle], rng: random.Random) -> list[dict]:
             for _ in range(n)
         )
     return expanded
+
+
+def expand_cases(request: VerificationRequest, array: CoveringArray) -> list[VerificationRequest]:
+    """One submitted request + its covering array -> one CONCRETE request per case.
+
+    This is the CASE axis, and it is deliberately a separate step from
+    ``materialize_request`` below, which is the REPEAT axis:
+
+    * PICT picks the CELL. It is discrete and combinatorial by construction, so
+      it answers "which combinations must be tried".
+    * A distribution jitters WITHIN a cell, per repeat, from the seed. It answers
+      "how much does this cell vary".
+
+    Splitting them costs nothing downstream — a case is just another request in
+    the envelope, so M3's 2-axis fan-out (``request x repeats``) expands the pair
+    with ZERO change to it — and it keeps the two questions answerable
+    separately. A consumer that wants both writes ``{param: ...}`` on the axis
+    that must be covered and a distribution on the axis that must vary; the
+    values a case pins are substituted here, and whatever distributions survive
+    are drawn per repeat exactly as before.
+
+    Identity falls out for free: the substituted values ARE the document, so two
+    runs of the same case hash to the same ``request_identity_key`` without the
+    key ever learning what a covering array is.
+    """
+    names = set(array.parameters)
+    declared = _param_refs(request)
+    unknown = sorted(declared - names)
+    if unknown:
+        raise ValueError(
+            f"the document binds {{param: ...}} to {unknown}, which the input-space model "
+            f"does not declare (it declares {sorted(names)})"
+        )
+    unread = sorted(names - declared)
+    if unread:
+        raise ValueError(
+            f"the input-space model declares {unread}, which no field reads — an axis "
+            "nothing binds is an axis that silently does not vary; bind it with "
+            "'{param: <name>}' or remove it from the model"
+        )
+    return [_substitute_case(request, case, index) for index, case in enumerate(array.as_dicts())]
+
+
+def _param_refs(request: VerificationRequest) -> set[str]:
+    """Every ``{param: name}`` the submitted document binds, at any depth."""
+    found: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if set(node) == {"param"} and isinstance(node["param"], str):
+                found.add(node["param"])
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(request.model_dump(mode="json"))
+    return found
+
+
+def _substitute_case(
+    request: VerificationRequest, case: Mapping[str, str], index: int
+) -> VerificationRequest:
+    """Replace every ``{param: name}`` with this case's value and re-validate.
+
+    Values arrive from PICT as text and are coerced by pydantic on re-validation,
+    so a model that offers ``on, off`` where the field wants a number is rejected
+    at admit with the ordinary friendly error rather than crashing a runner.
+    """
+    scenario = _substituted(request.scenario.model_dump(), case)
+    scenario["derivation"] = {"version": DERIVE_VERSION, "index": index, "case": dict(case)}
+    return request.model_copy(update={"scenario": Scenario.model_validate(scenario)}, deep=True)
+
+
+def _substituted(node: Any, case: Mapping[str, str]) -> Any:
+    if isinstance(node, Mapping):
+        if set(node) == {"param"} and isinstance(node["param"], str):
+            return case[node["param"]]
+        return {key: _substituted(value, case) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_substituted(value, case) for value in node]
+    return node
 
 
 def materialize_request(request: VerificationRequest, index: int) -> VerificationRequest:

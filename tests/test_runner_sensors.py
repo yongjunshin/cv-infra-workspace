@@ -24,8 +24,8 @@ import sys
 import pytest
 
 from cv_infra.contract.adapter_schema import Ros2AdapterConfig, SensorInput
-from cv_infra.runner.go2_policy import quat_apply_inverse
-from cv_infra.runner.go2_sensors import (
+from cv_infra.runner.onboard import quat_apply_inverse
+from cv_infra.runner.runner_sensors import (
     CAMERA_MOUNT_XYZ,
     CAMERA_OPTICAL_QUAT_WXYZ,
     CAMERA_RATE_HZ,
@@ -40,9 +40,10 @@ from cv_infra.runner.go2_sensors import (
     TF_STATIC_TOPIC,
     TF_TOPIC,
     FirstDataGate,
-    Go2SensorSuite,
     RateGate,
     RosTypes,
+    RunnerSensorSuite,
+    SensorRig,
     StageSensors,
     camera_info_fields,
     camera_intrinsics,
@@ -59,6 +60,12 @@ from cv_infra.runner.go2_sensors import (
     topic_inventory,
 )
 from cv_infra.runner.sim_runtime import SCENE_ASSETS
+from tests.conftest import GO2_PROFILE
+
+#: The go2 consumer's RIG, read from its own embodiment document. Mounts, optics
+#: and the lidar model used to be platform constants; the tests below assert the
+#: same values, now sourced from the file the runner is actually fed.
+RIG = SensorRig.from_profile(GO2_PROFILE.robot)
 
 UPRIGHT = (1.0, 0.0, 0.0, 0.0)
 #: yaw +90 deg — the robot faces world +y.
@@ -197,11 +204,12 @@ def _ros_types():
 
 def _suite(config=None, stage=None, chassis="/World/Go2/base"):
     stage = stage if stage is not None else _FakeStage()
-    suite = Go2SensorSuite(
+    suite = RunnerSensorSuite(
         config if config is not None else _config(),
         chassis,
-        stage_factory=lambda _path, _streams: stage,
+        stage_factory=lambda _path, _streams, rig: stage,
         ros_types_factory=_ros_types,
+        rig=RIG,
     )
     return suite, stage
 
@@ -232,7 +240,7 @@ def test_each_declared_type_selects_its_stream_and_depth_is_told_by_its_namespac
 
 
 def test_the_go2_declaration_plans_four_streams_with_the_default_frames():
-    streams, unsupported = plan_sensor_streams(GO2_SENSORS)
+    streams, unsupported = plan_sensor_streams(GO2_SENSORS, rig=RIG)
     assert unsupported == []
     assert {k: s.topic for k, s in streams.items()} == {
         STREAM_RGB: "/camera/image_raw",
@@ -252,7 +260,7 @@ def test_one_declared_camera_frame_is_shared_by_the_whole_camera_family():
         SensorInput(topic="/cam/depth/img", type="sensor_msgs/msg/Image"),
         SensorInput(topic="/cam/info", type="sensor_msgs/msg/CameraInfo"),
     ]
-    streams, _ = plan_sensor_streams(sensors)
+    streams, _ = plan_sensor_streams(sensors, rig=RIG)
     assert {s.frame for s in streams.values()} == {"eye"}
 
 
@@ -261,7 +269,8 @@ def test_a_declared_scan_frame_is_honoured_and_does_not_leak_into_the_camera():
         [
             SensorInput(topic="/scan", type="sensor_msgs/msg/LaserScan", frame="laser"),
             SensorInput(topic="/cam/rgb", type="sensor_msgs/msg/Image"),
-        ]
+        ],
+        rig=RIG,
     )
     assert streams[STREAM_SCAN].frame == "laser"
     assert streams[STREAM_RGB].frame == "go2_camera"
@@ -271,7 +280,8 @@ def test_an_unsupported_declaration_is_reported_in_its_DECLARED_spelling():
     """FU-17's bug class in its runner-published form: declared, but nothing
     publishes it. Silence here is a scenario that believes it has a lidar."""
     streams, unsupported = plan_sensor_streams(
-        [SensorInput(topic="/front_3d_lidar/lidar_points", type="sensor_msgs/msg/PointCloud2")]
+        [SensorInput(topic="/front_3d_lidar/lidar_points", type="sensor_msgs/msg/PointCloud2")],
+        rig=RIG,
     )
     assert streams == {}
     assert unsupported == ["/front_3d_lidar/lidar_points"]
@@ -283,11 +293,12 @@ def test_two_topics_asking_for_the_same_stream_is_a_loud_rejection():
             [
                 SensorInput(topic="/cam/rgb", type="sensor_msgs/msg/Image"),
                 SensorInput(topic="/other/rgb", type="sensor_msgs/msg/Image"),
-            ]
+            ],
+            rig=RIG,
         )
 
 
-def test_only_a_scene_that_composes_its_own_robot_needs_runner_sensors():
+def test_only_a_scene_that_composes_its_own_robot_needs_runner_sensors(go2_world):
     """The registry already knows: a row with ``robot_usd`` is a world we
     ASSEMBLED (no vendor graph, not even /clock); carter's row is a pre-wired
     sample whose graphs we must not duplicate."""
@@ -295,10 +306,10 @@ def test_only_a_scene_that_composes_its_own_robot_needs_runner_sensors():
     assert scene_needs_runner_sensors(SCENE_ASSETS["nova_carter_warehouse"]) is False
 
 
-def test_sensor_suite_for_returns_none_on_a_prewired_scene():
+def test_sensor_suite_for_returns_none_on_a_prewired_scene(go2_world):
     assert sensor_suite_for(SCENE_ASSETS["nova_carter_warehouse"], _config(), "/x") is None
     suite = sensor_suite_for(SCENE_ASSETS["go2_warehouse"], _config(), "/World/Go2/base")
-    assert isinstance(suite, Go2SensorSuite)
+    assert isinstance(suite, RunnerSensorSuite)
     assert set(suite.streams) == {STREAM_RGB, STREAM_DEPTH, STREAM_CAMERA_INFO, STREAM_SCAN}
 
 
@@ -375,8 +386,8 @@ def test_the_camera_static_transform_is_the_ros_OPTICAL_rotation():
 
 
 def test_static_transforms_cover_exactly_the_declared_sensor_frames():
-    streams, _ = plan_sensor_streams(GO2_SENSORS)
-    transforms = static_transforms("base_link", streams)
+    streams, _ = plan_sensor_streams(GO2_SENSORS, rig=RIG)
+    transforms = static_transforms("base_link", streams, rig=RIG)
     assert [(t.parent, t.child) for t in transforms] == [
         ("base_link", "go2_camera"),
         ("base_link", "go2_lidar"),
@@ -387,12 +398,14 @@ def test_static_transforms_cover_exactly_the_declared_sensor_frames():
     # angles grow counter-clockwise (a post off the robot's RIGHT came back at
     # -49 deg), which IS the ROS LaserScan convention -> no rotation.
     assert transforms[1].rotation_xyzw == (0.0, 0.0, 0.0, 1.0)
-    assert static_transforms("base_link", {}) == []
+    assert static_transforms("base_link", {}, rig=RIG) == []
 
 
 def test_a_camera_only_declaration_publishes_no_lidar_transform():
-    streams, _ = plan_sensor_streams([SensorInput(topic="/i", type="sensor_msgs/msg/Image")])
-    assert [t.child for t in static_transforms("base_link", streams)] == ["go2_camera"]
+    streams, _ = plan_sensor_streams(
+        [SensorInput(topic="/i", type="sensor_msgs/msg/Image")], rig=RIG
+    )
+    assert [t.child for t in static_transforms("base_link", streams, rig=RIG)] == ["go2_camera"]
 
 
 def test_odometry_pose_is_world_but_the_twist_is_rotated_into_the_body():
@@ -428,7 +441,7 @@ def test_camera_intrinsics_reject_a_zero_or_negative_optic():
 
 
 def test_camera_info_is_a_rectified_monocular_pinhole():
-    info = camera_info_fields(640, 480, 1.2, 2.0954999923706055, 1.5716249465942382)
+    info = camera_info_fields(640, 480, 1.2, 2.0954999923706055, 1.5716249465942382, rig=RIG)
     fx = info.k[0]
     assert (info.width, info.height) == (640, 480)
     assert info.distortion_model == "plumb_bob"
@@ -443,7 +456,7 @@ def test_camera_info_is_a_rectified_monocular_pinhole():
 def test_scan_no_return_becomes_infinity_not_a_zero_range_obstacle():
     """MEASURED: the annotator writes -1.0 for a ray that hit nothing. Passing
     that through would put an obstacle 1 m BEHIND every empty bearing."""
-    fields = scan_fields([1.0, -1.0, 3.0], [-180.0, 179.8875], 0.1125, [0.05, 30.0], 0.1)
+    fields = scan_fields([1.0, -1.0, 3.0], [-180.0, 179.8875], 0.1125, [0.05, 30.0], 0.1, rig=RIG)
     assert fields.ranges == (1.0, math.inf, 3.0)
     assert fields.range_min == 0.05
     assert fields.range_max == 30.0
@@ -452,7 +465,7 @@ def test_scan_no_return_becomes_infinity_not_a_zero_range_obstacle():
 def test_scan_angles_are_radians_and_angle_max_is_derived_from_the_array():
     """Consumers compute ray i's bearing as angle_min + i * increment; deriving
     angle_max from the same arithmetic is what keeps the two from contradicting."""
-    fields = scan_fields([1.0] * 3200, [-180.0, 179.8875], 0.1125, [0.05, 30.0], 0.1)
+    fields = scan_fields([1.0] * 3200, [-180.0, 179.8875], 0.1125, [0.05, 30.0], 0.1, rig=RIG)
     assert fields.angle_min == pytest.approx(-math.pi)
     assert fields.angle_increment == pytest.approx(math.radians(0.1125))
     assert fields.angle_max == pytest.approx(math.radians(-180.0 + 3199 * 0.1125))
@@ -464,7 +477,7 @@ def test_scan_angles_are_radians_and_angle_max_is_derived_from_the_array():
 
 def test_an_empty_scan_is_a_loud_refusal_to_publish_a_beamless_laserscan():
     with pytest.raises(ValueError, match="0 beams"):
-        scan_fields([], [-180.0, 180.0], 0.1125, [0.05, 30.0], 0.1)
+        scan_fields([], [-180.0, 180.0], 0.1125, [0.05, 30.0], 0.1, rig=RIG)
 
 
 # --------------------------------------------------------------------------- #
@@ -472,8 +485,8 @@ def test_an_empty_scan_is_a_loud_refusal_to_publish_a_beamless_laserscan():
 # --------------------------------------------------------------------------- #
 def test_the_inventory_names_every_topic_with_its_rate_frame_and_gating():
     config = _config(odom_topics=["/odom", "/chassis/odom"])
-    streams, _ = plan_sensor_streams(GO2_SENSORS)
-    rows = topic_inventory(config, streams)
+    streams, _ = plan_sensor_streams(GO2_SENSORS, rig=RIG)
+    rows = topic_inventory(config, streams, rig=RIG)
     by_topic = {row.topic: row for row in rows}
     assert set(by_topic) == {
         "/clock",
@@ -499,7 +512,7 @@ def test_the_inventory_names_every_topic_with_its_rate_frame_and_gating():
 
 
 def test_the_inventory_lines_carry_the_grep_marker_and_one_line_per_topic():
-    rows = topic_inventory(_config(), plan_sensor_streams(GO2_SENSORS)[0])
+    rows = topic_inventory(_config(), plan_sensor_streams(GO2_SENSORS, rig=RIG)[0], rig=RIG)
     lines = inventory_lines(rows)
     assert lines[0] == f"[cv-runner] {SENSOR_INVENTORY_LOG_MARKER}{len(rows)}"
     assert len(lines) == len(rows) + 1
@@ -510,7 +523,7 @@ def test_the_inventory_lines_carry_the_grep_marker_and_one_line_per_topic():
 
 
 def test_a_scene_without_declared_sensors_still_publishes_the_always_on_set():
-    rows = topic_inventory(_config(sensors=[]), {})
+    rows = topic_inventory(_config(sensors=[]), {}, rig=RIG)
     assert [row.topic for row in rows] == ["/clock", TF_TOPIC, "/odom"]
 
 
@@ -744,7 +757,7 @@ def test_importing_the_sensor_module_pulls_no_ros_isaac_or_numpy():
     """It is imported by ``runner.main`` on every job, including carter's, and by
     the host-side test suite — neither may need a ROS install to do it."""
     code = (
-        "import sys; import cv_infra.runner.go2_sensors\n"
+        "import sys; import cv_infra.runner.runner_sensors\n"
         "roots = {'torch', 'isaacsim', 'omni', 'carb', 'pxr', 'rclpy', 'cv2', 'numpy'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in roots))\n"
     )
@@ -804,18 +817,18 @@ def _request(scene: str, sensors: list[dict] | None = None):
     )
 
 
-def test_main_builds_the_suite_for_a_composed_scene_and_skips_a_prewired_one():
+def test_main_builds_the_suite_for_a_composed_scene_and_skips_a_prewired_one(go2_world):
     from cv_infra.runner.main import build_sensor_suite
 
     criteria = {"chassis_path": "/World/Go2/base"}
     sensors = [{"topic": "/scan", "type": "sensor_msgs/msg/LaserScan"}]
     assert build_sensor_suite(_request("nova_carter_warehouse", sensors), criteria) is None
     suite = build_sensor_suite(_request("go2_warehouse", sensors), criteria)
-    assert isinstance(suite, Go2SensorSuite)
+    assert isinstance(suite, RunnerSensorSuite)
     assert suite.chassis_path == "/World/Go2/base"
 
 
-def test_a_sensor_declaration_the_runner_cannot_serve_is_rejected_pre_boot():
+def test_a_sensor_declaration_the_runner_cannot_serve_is_rejected_pre_boot(go2_world):
     """0 GPU seconds and exit 2, like the obstacle-asset check next to it: a
     duplicate stream discovered mid-boot would be a platform failure for what is
     plainly a bad document."""

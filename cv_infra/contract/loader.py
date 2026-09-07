@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,7 +47,9 @@ import yaml
 from pydantic import ValidationError
 
 from cv_infra.contract import errors as _errors
+from cv_infra.contract import pict as _pict
 from cv_infra.contract.errors import ContractError
+from cv_infra.contract.profile import EmbodimentProfile
 from cv_infra.contract.schema import EXAMPLE_IMAGE_REF, VerificationRequest
 from cv_infra.contract.version import resolve_api_version
 from cv_infra.oracles.base import load_oracle  # sanctioned edge (.importlinter ignore)
@@ -79,6 +83,20 @@ class AdmittedRequest:
     #: consumer re-derives it (blueprint §8). ``None`` = the request declared no
     #: policy (every carter request).
     locomotion_policy_path: str | None = None
+    #: Absolute paths of the validated ``sut.artifacts`` entries, keyed by the
+    #: declared ``file`` — the v2 generalisation of ``locomotion_policy_path``.
+    #: The platform records identity and infers nothing about what any entry is
+    #: FOR; ``embodiment.robot.onboard.artifact`` says that, on the consumer side.
+    artifact_paths: Mapping[str, str] = field(default_factory=dict)
+    #: The loaded embodiment profile (``None`` = a v1 registry-form request).
+    embodiment: EmbodimentProfile | None = None
+    #: sha256 over the embodiment document with the SUT-owned entries removed —
+    #: the identity axis for "same world and robot" (see ``embodiment_digest``).
+    embodiment_digest: str | None = None
+    #: Absolute paths of the ride-along input-space files (``space.model`` and the
+    #: optional committed ``space.array``).
+    space_model_path: str | None = None
+    space_array_path: str | None = None
 
 
 def load_request(
@@ -142,6 +160,15 @@ def load_request(
     policy_path = _check_locomotion_policy(
         request, anchor=anchor, source_path=source_path, locator=locator
     )
+    artifact_paths = _check_artifacts(
+        request, anchor=anchor, source_path=source_path, locator=locator
+    )
+    embodiment, embodiment_digest = _load_embodiment(
+        request, anchor=anchor, source_path=source_path, locator=locator
+    )
+    space_model, space_array = _check_space(
+        request, anchor=anchor, source_path=source_path, locator=locator
+    )
 
     # (6) admit marking (REQ-INTAKE-009) ------------------------------------- #
     return AdmittedRequest(
@@ -150,6 +177,11 @@ def load_request(
         warnings=tuple(warnings),
         source_path=source_path,
         locomotion_policy_path=policy_path,
+        artifact_paths=artifact_paths,
+        embodiment=embodiment,
+        embodiment_digest=embodiment_digest,
+        space_model_path=space_model,
+        space_array_path=space_array,
     )
 
 
@@ -294,6 +326,211 @@ def _check_locomotion_policy(
     return str(resolved)
 
 
+def _ride_along(
+    rel: str,
+    *,
+    field_path: str,
+    anchor: str | None,
+    what: str,
+    source_path: str | None,
+    locator: _Locator,
+) -> Path:
+    """Resolve ONE ride-along path against the request's directory, or reject.
+
+    Every v2 ride-along (SUT artifact, embodiment profile, input-space model)
+    obeys the same two rules the custom-oracle anchor already obeyed, for the
+    same reason: the request's directory is what the supervisor mounts read-only
+    into the runner, so a path outside it is not merely untrusted — over there it
+    does not exist. Sharing one resolver is deliberate (G-25: three copies of an
+    escape check drift, and the one that drifts is the one that stops checking).
+
+    ``_check_locomotion_policy`` keeps its own copy on purpose: its rejection
+    prose is pinned by tests and the whole field is deprecated by
+    ``sut.artifacts``, so it is left untouched to be deleted with v1 rather than
+    refactored twice.
+    """
+    if anchor is None:
+        raise _ride_along_reject(
+            field_path,
+            f"a submission that carries its own directory (the ride-along anchor) — {what} "
+            "is resolved NEXT TO the request document, so an anchor-less submission has "
+            "nowhere to look for it",
+            repr(rel),
+            source_path=source_path,
+            locator=locator,
+        )
+    root = Path(anchor)
+    resolved = (root / rel).resolve()
+    if not resolved.is_relative_to(root):
+        raise _ride_along_reject(
+            field_path,
+            f"a path INSIDE the request directory ({root}) — {what} rides along with the "
+            "request and only that directory reaches the runner, so '..' segments and "
+            "absolute paths cannot be read",
+            f"{rel!r} (resolved: {resolved})",
+            source_path=source_path,
+            locator=locator,
+        )
+    if not resolved.is_file():
+        raise _ride_along_reject(
+            field_path,
+            f"an existing, readable file — {what} is yours to supply and the platform "
+            "never fills one in",
+            f"{rel!r} (resolved: {resolved})",
+            source_path=source_path,
+            locator=locator,
+        )
+    return resolved
+
+
+def _ride_along_reject(
+    field_path: str,
+    expected: str,
+    got: str,
+    *,
+    source_path: str | None,
+    locator: _Locator,
+) -> ContractError:
+    """One friendly ride-along rejection, located at the offending YAML key."""
+    return _relocated(
+        ContractError(field_path=field_path, expected=expected, got=got, doc_link=_DOC_LINK),
+        source_path=source_path,
+        line_col=locator(tuple(field_path.split("."))),
+    )
+
+
+def _check_artifacts(
+    request: VerificationRequest,
+    *,
+    anchor: str | None,
+    source_path: str | None,
+    locator: _Locator,
+) -> dict[str, str]:
+    """Stage 5: resolve + digest-verify every ``sut.artifacts`` entry.
+
+    The digest is the whole point of the block. The platform cannot know what a
+    file does, so the only property it can guarantee is that the bytes the
+    verdict was computed against are the bytes the request named — which is also
+    what makes the SUT axis of a regression comparison mean something.
+    """
+    resolved: dict[str, str] = {}
+    for index, artifact in enumerate(request.sut.artifacts):
+        base = f"sut.artifacts.{index}"
+        path = _ride_along(
+            artifact.file,
+            field_path=f"{base}.file",
+            anchor=anchor,
+            what="a SUT artifact",
+            source_path=source_path,
+            locator=locator,
+        )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != artifact.sha256:
+            raise _ride_along_reject(
+                f"{base}.sha256",
+                f"the sha256 of the declared file ({artifact.file} hashes to {digest})",
+                repr(artifact.sha256),
+                source_path=source_path,
+                locator=locator,
+            )
+        resolved[artifact.file] = str(path)
+    return resolved
+
+
+def _load_embodiment(
+    request: VerificationRequest,
+    *,
+    anchor: str | None,
+    source_path: str | None,
+    locator: _Locator,
+) -> tuple[EmbodimentProfile | None, str | None]:
+    """Stage 5: load + validate the embodiment document, and digest it for identity.
+
+    The digest EXCLUDES the SUT-owned entries (``robot.onboard.artifact``) and
+    nothing else. That split is the contract's answer to "is the profile part of
+    the request's identity or part of its SUT": moving the camera is a DIFFERENT
+    TEST and must invalidate the baseline, while swapping the policy file is the
+    SAME test against a different SUT and must not. Both halves live in one
+    document because they describe one robot; only the identity projection
+    separates them.
+    """
+    if request.embodiment is None:
+        return None, None
+    path = _ride_along(
+        request.embodiment,
+        field_path="embodiment",
+        anchor=anchor,
+        what="the embodiment profile",
+        source_path=source_path,
+        locator=locator,
+    )
+    raw = _safe_parse(path.read_text(encoding="utf-8"), str(path))
+    try:
+        profile = EmbodimentProfile.model_validate(raw)
+    except ValidationError as exc:
+        raise _errors.from_validation_error(
+            exc,
+            model=EmbodimentProfile,
+            source_path=str(path),
+            locator=_Locator(path.read_text(encoding="utf-8")),
+        )[0] from exc
+    return profile, embodiment_digest(profile)
+
+
+def embodiment_digest(profile: EmbodimentProfile) -> str:
+    """sha256 of the profile's TEST-CONDITION content (SUT-owned entries removed).
+
+    Canonical JSON (sorted keys, no whitespace) so the digest depends on the
+    values and not on how the consumer laid out the YAML — reformatting a
+    document must not invalidate its baselines.
+    """
+    projection = profile.model_dump(mode="json")
+    onboard = projection.get("robot", {}).get("onboard")
+    if isinstance(onboard, dict):
+        onboard.pop("artifact", None)
+    payload = json.dumps(projection, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _check_space(
+    request: VerificationRequest,
+    *,
+    anchor: str | None,
+    source_path: str | None,
+    locator: _Locator,
+) -> tuple[str | None, str | None]:
+    """Stage 5: resolve the input-space model and the committed array beside it.
+
+    The model's SYNTAX is validated here too, at admit, because an unparseable
+    space must cost zero GPU seconds (NFR-INTAKE-003) — the alternative is
+    discovering it after the scheduler has already paid for a runner.
+    """
+    if request.space is None:
+        return None, None
+    model = _ride_along(
+        request.space.model,
+        field_path="space.model",
+        anchor=anchor,
+        what="the input-space model",
+        source_path=source_path,
+        locator=locator,
+    )
+    _pict.validate_model(model.read_text(encoding="utf-8"), source_path=str(model))
+    array = (
+        _ride_along(
+            request.space.array,
+            field_path="space.array",
+            anchor=anchor,
+            what="the committed covering array",
+            source_path=source_path,
+            locator=locator,
+        )
+        if request.space.array is not None
+        else None
+    )
+    return str(model), (str(array) if array is not None else None)
+
+
 def _policy_reject(
     field_path: str,
     expected: str,
@@ -353,10 +590,17 @@ def _check_self_contained(request: VerificationRequest, source_path: str | None)
     """REQ-INTAKE-006 triad, re-asserted independently of schema evolution:
     every request carries SUT image ref + scenario + >=1 acceptance criterion.
     (The schema's required fields make each branch unreachable today — this
-    keeps the acceptance gate explicit if the schema ever loosens.)"""
+    keeps the acceptance gate explicit if the schema ever loosens.)
+
+    "Scenario" is the SELF-CONTAINEDNESS that matters here, not any one spelling
+    of it: a v1 document names a scene the platform ships, a v2 document ships
+    the assets itself. Both answer "what world does this run in" without the
+    platform reaching outside the request, which is what the requirement is
+    about. The schema's own validator is what forbids saying neither or both.
+    """
     triad = {
         "sut.image_ref": request.sut.image_ref,
-        "scenario.scene": request.scenario.scene,
+        "scenario.scene": request.scenario.scene or request.embodiment,
         "acceptance_criteria": request.acceptance_criteria,
     }
     for path, value in triad.items():

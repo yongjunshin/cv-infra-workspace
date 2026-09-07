@@ -708,7 +708,7 @@ def test_a_declared_locomotion_policy_rides_the_same_scenario_dir_mount(
     is handed an absolute path that does not exist inside its container.
 
     The CLI decides only the MOUNT: whether the robot has a slot for a policy is
-    the runner's pre-boot cross-check (``go2_wiring.check_firmware_slot``).
+    the runner's pre-boot cross-check (``onboard_wiring.check_firmware_slot``).
     """
     stub = ConsentRecordingSupervisor("pass")
     _install_supervisor(monkeypatch, stub)

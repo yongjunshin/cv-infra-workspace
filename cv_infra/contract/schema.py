@@ -190,6 +190,25 @@ class Randint(_ForbidExtra):
         return self
 
 
+class Param(_ForbidExtra):
+    """A value supplied by the input-space covering array, not drawn here.
+
+    ``{param: start_x}`` binds this field to the PICT parameter of that name:
+    the case planner enumerates the array once per request and ``derive``
+    substitutes row *i* into every ``Param`` field. The platform coerces the
+    value to the field's type and reads no meaning into it — which axis means
+    what is the consumer's business, exactly as with a metric name.
+
+    Why this lives next to ``Uniform``/``Choice`` rather than replacing them:
+    the two answer different questions. PICT picks the CELL (it is discrete and
+    combinatorial by construction); a distribution jitters WITHIN a cell across
+    repeats. A consumer that wants both writes ``{param: ...}`` on the axis that
+    must be covered and keeps a distribution on the axis that must vary.
+    """
+
+    param: str = Field(min_length=1, examples=["start_x"])
+
+
 def _randomizable_tag(value: Any) -> str:
     """Discriminate a randomizable scalar: plain number vs distribution mapping.
 
@@ -209,6 +228,8 @@ def _randomizable_tag(value: Any) -> str:
         return "choice"
     if isinstance(value, Randint):
         return "randint"
+    if isinstance(value, Param):
+        return "param"
     return "static"
 
 
@@ -219,6 +240,7 @@ RandomizableFloat = Annotated[
         Annotated[float, Tag("static")]
         | Annotated[Uniform, Tag("uniform")]
         | Annotated[Choice, Tag("choice")]
+        | Annotated[Param, Tag("param")]
     ),
     Discriminator(_randomizable_tag),
 ]
@@ -226,7 +248,11 @@ RandomizableFloat = Annotated[
 #: 개수 축의 union. ``RandomizableFloat``과 **같은 관용구**(callable Discriminator + Tag),
 #: 같은 태그 함수 — 이 계약에는 union 스타일이 하나뿐이다.
 RandomizableCount = Annotated[
-    (Annotated[_CountInt, Tag("static")] | Annotated[Randint, Tag("randint")]),
+    (
+        Annotated[_CountInt, Tag("static")]
+        | Annotated[Randint, Tag("randint")]
+        | Annotated[Param, Tag("param")]
+    ),
     Discriminator(_randomizable_tag),
 ]
 
@@ -402,6 +428,15 @@ class DerivationMeta(_ForbidExtra):
 
     version: str = Field(min_length=1)
     index: int = Field(ge=0)
+    case: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "The covering-array row this sample came from, name -> value, recorded so a "
+            "report row and a stored result can say WHICH combination they are without "
+            "anyone re-deriving it from the substituted fields. Null on every request "
+            "that declares no input space, which is what keeps pre-v2 identity keys put."
+        ),
+    )
 
 
 class Scenario(_ForbidExtra):
@@ -412,8 +447,17 @@ class Scenario(_ForbidExtra):
     determinism (LOCKED §7-6).
     """
 
-    scene: str = Field(min_length=1, examples=["nova_carter_warehouse"])
-    robot: str = Field(min_length=1, examples=["nova_carter"])
+    scene: str | None = Field(
+        default=None,
+        min_length=1,
+        examples=["nova_carter_warehouse"],
+        description=(
+            "v1 platform scene-registry key. Superseded by the request-level "
+            "`embodiment` document, which names the assets directly and needs no "
+            "platform registration. Exactly one of the two forms must be present."
+        ),
+    )
+    robot: str | None = Field(default=None, min_length=1, examples=["nova_carter"])
     # Block-valued examples (here and in VerificationRequest below) exist so a
     # WHOLE-BLOCK-MISSING violation still gets a fixable example (DoD-P3-02
     # footnote, p3c3) — dicts render as valid YAML flow mappings.
@@ -504,6 +548,33 @@ class LocomotionPolicy(_ForbidExtra):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$", examples=[EXAMPLE_POLICY_SHA256])
 
 
+class SutArtifact(_ForbidExtra):
+    """One ride-along SUT artifact: a file next to the request, pinned by digest.
+
+    The GENERALISATION of ``locomotion_policy`` (D2, 2026-08-31). That field
+    solved the right problem — "the SUT is the SET of user artifacts the verdict
+    is on, not one image" — with a shape that cost the platform a named slot per
+    robot, and therefore platform work per new consumer. A list costs none: the
+    platform hashes what it is given, records it, and infers nothing about what
+    any entry is FOR. Which artifact feeds which mechanism is declared on the
+    consumer's side (``embodiment.robot.onboard.artifact``), where the knowledge
+    already lives.
+
+    Same ride-along rule as the custom-oracle anchor: ``file`` is relative to the
+    request document's directory and may not leave it, because that directory is
+    what the supervisor mounts read-only into the runner. Resolution and the
+    digest check happen at ADMIT (loader stage 5) — a path and a hash are facts
+    about the filesystem, not about the document's shape.
+
+    The whole ``sut`` block is excluded from the M4 identity projection, so
+    swapping an artifact is "the SAME request against a DIFFERENT SUT" — exactly
+    the comparison the regression machinery already makes, with zero change to it.
+    """
+
+    file: str = Field(min_length=1, examples=["policy.pt"])
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", examples=[EXAMPLE_POLICY_SHA256])
+
+
 class SutRef(_ForbidExtra):
     """SUT image reference (REQ-INTAKE-006 required element #1).
 
@@ -527,6 +598,15 @@ class SutRef(_ForbidExtra):
         default=None,
         pattern=r"^sha256:[0-9a-f]{64}$",
         examples=["sha256:47aff5c993dac05b1664482e44af9401073336f142cb6d4919d81b47f8f9d48a"],
+    )
+    artifacts: tuple[SutArtifact, ...] = Field(
+        default=(),
+        description=(
+            "Ride-along SUT artifacts (v2): files next to the request, each pinned by "
+            "sha256 and validated at admit. Supersedes the per-robot locomotion_policy "
+            "slot — the platform records identity and infers no meaning."
+        ),
+        examples=[[{"file": "policy.pt", "sha256": EXAMPLE_POLICY_SHA256}]],
     )
     locomotion_policy: LocomotionPolicy | None = Field(
         default=None,
@@ -745,6 +825,66 @@ AcceptanceCriterion = Annotated[
 ]
 
 
+class MissionSpec(_ForbidExtra):
+    """How the runner drives the SUT through one case.
+
+    The platform ships ``goal_pose`` — send one pose and wait — because that is
+    what every consumer so far needed, and it stays the default so no existing
+    document moves. It is also an ASSUMPTION ABOUT THE APP'S SHAPE, and a patrol
+    application does not have that shape: satisfying it cost one consumer a
+    second, foreign action server in front of its own mission interface, and its
+    scenario file says so out loud ("the goal is a verdict anchor, not a search
+    hint").
+
+    So ``kind`` also accepts a ``module:Class`` path, exactly like a custom
+    oracle: the consumer's own driver, loaded from the ride-along directory and
+    handed the case. Judgment was already the consumer's; this makes driving the
+    consumer's too, which is what a robot SW the platform has never seen requires.
+    """
+
+    kind: str = Field(default="goal_pose", min_length=1, examples=["goal_pose"])
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class SpaceBudget(_ForbidExtra):
+    """What the consumer will spend. Time is the real constraint, not case count.
+
+    ``max_order`` caps the combinatorial ambition; the planner walks DOWN from it
+    to whatever fits ``wallclock_s`` and reports the order it actually reached.
+    ``repeats`` has a floor the planner will not go under (see contract.pict):
+    with per-case flakiness in the system, cases are cut before statistics are.
+    """
+
+    wallclock_s: float = Field(gt=0, examples=[3600])
+    repeats: int = Field(default=3, ge=1, examples=[3])
+    max_cases: int | None = Field(default=None, gt=0)
+    max_order: int = Field(default=2, ge=1, le=6, examples=[2])
+
+
+class SpaceSpec(_ForbidExtra):
+    """The declared input space: a PICT model that rides along with the request.
+
+    ``model`` follows the same ride-along rule as an oracle module and a SUT
+    artifact — relative to the request document, may not leave its directory.
+    ``array`` is the previously generated covering array, also ride-along, and it
+    is NOT an optimisation: seeded regeneration is what keeps case identity
+    stable across a model edit, and without it every baseline lookup misses and
+    the regression gate goes quiet instead of red (measured: one added axis, zero
+    of fourteen prior cases survived unseeded, all fourteen survived seeded).
+    """
+
+    model: str = Field(min_length=1, examples=["verify/space.pict"])
+    budget: SpaceBudget
+    array: str | None = Field(
+        default=None,
+        description=(
+            "Committed covering array from the previous run, seeded into generation so "
+            "case identity survives a model edit. Absent = first run for this space."
+        ),
+        examples=["verify/space.array.tsv"],
+    )
+
+
 class VerificationRequest(_ForbidExtra):
     """Self-contained verification instance (REQ-INTAKE-002/006) — the wire
     shape of one consumer scenario document.
@@ -773,6 +913,63 @@ class VerificationRequest(_ForbidExtra):
         min_length=1, examples=[[{"oracle": "reached_goal"}]]
     )
     execution_settings: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    embodiment: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Ride-along embodiment profile (v2): the world and robot facts, owned by "
+            "the consumer. Replaces the platform scene registry, so a robot the "
+            "platform has never seen needs no platform change."
+        ),
+        examples=["verify/embodiment.yaml"],
+    )
+    mission: MissionSpec | None = Field(
+        default=None,
+        description=(
+            "How the runner drives the SUT. Absent = the built-in goal_pose driver, "
+            "which is what every pre-v2 request got. It is null rather than a filled "
+            "default ON PURPOSE: the M4 identity projection prunes null keys, so an "
+            "absent block leaves every existing request's identity_key — and therefore "
+            "its regression baseline — exactly where it was."
+        ),
+        examples=[{"kind": "goal_pose"}],
+    )
+    space: SpaceSpec | None = Field(
+        default=None,
+        description=(
+            "Declared input space (PICT). Absent = this document is one case, which is "
+            "every pre-v2 request."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_embodiment_form(self) -> VerificationRequest:
+        """v1 named a registered scene; v2 ships the assets. Never both, never neither.
+
+        Accepting both would leave "which one wins" to reading order, and the
+        losing half would be a block the consumer wrote that the platform
+        silently ignored — the G-25 failure this contract rejects everywhere else.
+        """
+        registry_form = self.scenario.scene is not None or self.scenario.robot is not None
+        if registry_form and self.embodiment is not None:
+            raise ValueError(
+                "a request declares EITHER scenario.scene + scenario.robot (v1 registry) "
+                "OR embodiment (v2 document) — not both; drop scenario.scene/robot to use "
+                "the embodiment profile"
+            )
+        if not registry_form and self.embodiment is None:
+            raise ValueError(
+                "a request must say what world and robot it runs: either "
+                "'embodiment: <path>.yaml' (the assets, owned by you) or the v1 pair "
+                "scenario.scene + scenario.robot"
+            )
+        if registry_form and (self.scenario.scene is None or self.scenario.robot is None):
+            missing = "scenario.scene" if self.scenario.scene is None else "scenario.robot"
+            raise ValueError(
+                f"the v1 registry form needs BOTH scenario.scene and scenario.robot "
+                f"({missing} is missing) — or use 'embodiment: <path>.yaml' instead"
+            )
+        return self
 
 
 class RequestEnvelope(_ForbidExtra):

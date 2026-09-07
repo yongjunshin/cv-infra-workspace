@@ -1072,14 +1072,14 @@ def test_the_carrier_publishes_the_same_sensor_suite_a_single_job_does():
 
 
 class _FakeSensors:
-    """A ``Go2SensorSuite``-shaped stand-in (attach/detach return report lines)."""
+    """A ``RunnerSensorSuite``-shaped stand-in (attach/detach return report lines)."""
 
     def __init__(self) -> None:
         self.attached: tuple | None = None
 
     def attach(self, node, on_step) -> list[str]:
         self.attached = (node, on_step)
-        return ["[cv-runner] go2_sensors inventory=8"]
+        return ["[cv-runner] runner_sensors inventory=8"]
 
 
 def test_a_composed_worlds_streams_are_attached_to_the_carriers_one_node(monkeypatch, capsys):
@@ -1087,11 +1087,11 @@ def test_a_composed_worlds_streams_are_attached_to_the_carriers_one_node(monkeyp
     from types import SimpleNamespace
 
     from cv_infra.contract.adapter_schema import Ros2AdapterConfig
-    from cv_infra.runner import go2_wiring
+    from cv_infra.runner import onboard_wiring
 
     subscribed: list = []
     monkeypatch.setattr(
-        go2_wiring,
+        onboard_wiring,
         "subscribe_cmd_vel",
         lambda node, cmd_vel, on_command: subscribed.append((node, cmd_vel.topic, on_command)),
     )
@@ -1103,7 +1103,7 @@ def test_a_composed_worlds_streams_are_attached_to_the_carriers_one_node(monkeyp
     batch._attach_optional_streams(adapter, sim, Ros2AdapterConfig(), sensors, policy)
 
     assert sensors.attached == (node, on_step)  # the suite publishes on the STEP hook
-    assert "go2_sensors inventory=8" in capsys.readouterr().out  # ...and says so (G-26)
+    assert "runner_sensors inventory=8" in capsys.readouterr().out  # ...and says so (G-26)
     assert subscribed == [(node, "/cmd_vel", policy.set_command)]  # ONE rclpy node
 
 
@@ -1114,10 +1114,10 @@ def test_a_carter_carrier_attaches_neither_stream(monkeypatch, capsys):
     from types import SimpleNamespace
 
     from cv_infra.contract.adapter_schema import Ros2AdapterConfig
-    from cv_infra.runner import go2_wiring
+    from cv_infra.runner import onboard_wiring
 
     monkeypatch.setattr(
-        go2_wiring,
+        onboard_wiring,
         "subscribe_cmd_vel",
         lambda *a, **k: pytest.fail("a carter carrier subscribed to /cmd_vel"),
     )

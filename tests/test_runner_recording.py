@@ -52,9 +52,9 @@ def test_the_recorders_tf_names_are_the_names_the_runner_publishes_on():
     """G-25 ② mechanical guard on a deliberate duplicate: the recorder must not
     import one robot's sensor module for two names tf2 fixes for everybody, but a
     silent divergence would record two topics nothing publishes on."""
-    from cv_infra.runner import go2_sensors
+    from cv_infra.runner import runner_sensors
 
-    assert recording.TF_TOPICS == (go2_sensors.TF_TOPIC, go2_sensors.TF_STATIC_TOPIC)
+    assert recording.TF_TOPICS == (runner_sensors.TF_TOPIC, runner_sensors.TF_STATIC_TOPIC)
 
 
 def test_bag_topics_dedupes_preserving_order():

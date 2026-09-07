@@ -342,6 +342,13 @@ def plan(
     ordered = sorted({int(o) for o in orders}, reverse=True)
     if not ordered:
         raise ValueError("orders must not be empty")
+    # PICT refuses an order larger than the parameter count ("Order cannot be
+    # larger than number of parameters"), so a 2-axis space asked for 3-wise
+    # would hard-fail on a request that is perfectly answerable. Drop those
+    # orders here: asking for more coverage than a space can hold is satisfied
+    # by giving it all of the space, not by rejecting the request.
+    width = len(_declared_parameters(model_text))
+    ordered = [o for o in ordered if o <= width] or [min(ordered[-1], width)]
     smallest: CoveringArray | None = None
     for order in ordered:
         array = generate(
@@ -390,6 +397,23 @@ def coverage_of_prefix(array: CoveringArray, keep: int, order: int) -> float:
 
 
 # --- internals ------------------------------------------------------------------------
+
+
+def _declared_parameters(model_text: str) -> list[str]:
+    """Parameter names the model declares, in order — read without invoking PICT.
+
+    Used to clamp a requested order to what the space can hold; the shape rules
+    it relies on are the ones ``validate_model`` has already enforced.
+    """
+    names: list[str] = []
+    for raw in model_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or _CONSTRAINT_START.match(line):
+            continue
+        match = _PARAM_LINE.match(line)
+        if match:
+            names.append(match.group(1).strip())
+    return names
 
 
 def _combinations(rows: Iterable[Sequence[str]], width: int, order: int) -> set[tuple]:

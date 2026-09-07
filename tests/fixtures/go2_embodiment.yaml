@@ -1,7 +1,7 @@
 # go2_embodiment.yaml — the go2 world/robot facts, as a CONSUMER document.
 #
 # This file is the proof that `runner/go2_constants.py`, the `SCENE_ASSETS`
-# `go2_warehouse` row and the go2 constants at the top of `runner/go2_sensors.py`
+# `go2_warehouse` row and the go2 constants at the top of `runner/runner_sensors.py`
 # are DATA, not code: tests/test_contract_profile.py loads this document and
 # asserts every value equals the platform constant it replaces. When the M2
 # threading lands, those platform symbols are deleted and this document — living

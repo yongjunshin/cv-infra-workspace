@@ -320,7 +320,7 @@ def test_v1_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert (job.runner_exit_code, job.infra_error) == (None, None)  # ... v4 (p4c5)
         store.record_envelope("env-1", ["r0"])  # new tables exist and accept writes
         assert store.load_envelope("env-1") is not None
-    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
+    assert _stamped_version(db) == 9  # v9 = asset_sets warm-cache ledger (additive)
 
 
 def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
@@ -344,7 +344,7 @@ def test_v2_file_upgrades_in_place_and_keeps_rows(tmp_path):
         assert job.job_spec is None
         job.job_spec = {"job_id": "v2-req:0", "sut_image_ref": "img:1"}
         store.upsert_job(job)  # the new column accepts writes
-    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
+    assert _stamped_version(db) == 9  # v9 = asset_sets warm-cache ledger (additive)
 
 
 def test_v3_file_upgrades_in_place_and_keeps_rows(tmp_path):
@@ -375,7 +375,7 @@ def test_v3_file_upgrades_in_place_and_keeps_rows(tmp_path):
     with Store(db) as reopened:
         (job,) = reopened.load_jobs()
         assert (job.runner_exit_code, job.infra_error) == (137, "runner container hard-crashed")
-    assert _stamped_version(db) == 8  # v8 = p5c15 envelopes.is_self_test/origin (additive)
+    assert _stamped_version(db) == 9  # v9 = asset_sets warm-cache ledger (additive)
 
 
 # The EXACT v7 envelopes shape as shipped by p5c2 (store.py @ 2805522) — the shape of
@@ -433,7 +433,7 @@ def test_v7_envelope_rows_upgrade_in_place_to_the_self_test_columns(tmp_path):
     with Store(db) as reopened:  # the new columns accept writes and survive a reopen
         fresh = reopened.load_envelope("env-selftest")
         assert (fresh.is_self_test, fresh.origin) == (True, "built-in-stub")
-    assert _stamped_version(db) == 8
+    assert _stamped_version(db) == 9
 
 
 def test_newer_schema_version_refuses_loudly(tmp_path):

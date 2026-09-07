@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,7 +83,15 @@ def _now_iso() -> str:
 # which is what they were. Persisted rather than kept in memory because the operational
 # projection (M6, REQ-SELFTEST-004) reads envelopes from the store, so a self-test stays
 # identifiable after a restart).
-_SCHEMA_VERSION = 8
+# v9 = the warm-cache ledger (asset_sets). ADDITIVE, no ALTER: a new table only,
+# so a v8 file upgrades by having it created. It records, per ASSET CLOSURE (the
+# union of every USD a request can open — contract/assets.py), whether anybody has
+# ever paid the cold download for it. That single ``warmed_at`` is what turns "the
+# first run for an unseen world is mysteriously slow" into a reported warm step,
+# and what makes a re-verification of the same document a hit by construction.
+# Persisted rather than kept in memory because the whole value is surviving the
+# restart between one CI run and the next.
+_SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -146,6 +155,14 @@ CREATE TABLE IF NOT EXISTS request_baselines (
 CREATE TABLE IF NOT EXISTS envelope_reports (
     envelope_id TEXT PRIMARY KEY,
     report_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS asset_sets (
+    asset_set_key TEXT PRIMARY KEY,
+    refs_json     TEXT NOT NULL,
+    engine        TEXT NOT NULL,
+    warmed_at     TEXT,
+    last_used_at  TEXT NOT NULL,
+    bytes         INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -252,6 +269,43 @@ def job_key(job: Job) -> str:
     the allocator/label job id wherever a scalar handle is needed.
     """
     return f"{job.request_id}:{job.repeat_index}"
+
+
+def _utcnow() -> str:
+    """UTC ISO-8601 stamp — the format every other timestamp column already uses."""
+    return datetime.now(UTC).isoformat()
+
+
+@dataclass(frozen=True)
+class AssetSetRow:
+    """One asset closure the deployment has been asked for.
+
+    ``warmed_at is None`` = never warmed: the first request naming these assets
+    pays the cold cost, and every later one — including a re-verification of the
+    very same document — is a hit.
+    """
+
+    asset_set_key: str
+    refs: tuple[str, ...]
+    engine: str
+    warmed_at: str | None
+    last_used_at: str
+    bytes: int
+
+    @property
+    def is_warm(self) -> bool:
+        return self.warmed_at is not None
+
+
+def _asset_set_row(row: Any) -> AssetSetRow:
+    return AssetSetRow(
+        asset_set_key=row[0],
+        refs=tuple(json.loads(row[1])),
+        engine=row[2],
+        warmed_at=row[3],
+        last_used_at=row[4],
+        bytes=row[5],
+    )
 
 
 class Store:
@@ -664,6 +718,65 @@ class Store:
         )
 
     # -- request-level regression baselines (SR-21 / C-1 — p5c1, M4 write path) --
+
+    # --- asset sets (v9) — the warm-cache ledger -----------------------------
+    def touch_asset_set(self, key: str, refs: Sequence[str], engine: str) -> AssetSetRow:
+        """Record that a request wants this asset closure, and say what is known.
+
+        Returns the row as it now stands, whose ``warmed_at`` is the ONE fact the
+        scheduler needs: ``None`` means nobody has ever paid the cold cost for
+        these assets and a warm job must run before the first case, which is
+        what turns "the first run is mysteriously slow" into a reported step.
+
+        ``last_used_at`` moves on every call, warmed or not, because it is what
+        eviction reads — a set that keeps being asked for must outlive one that
+        was warmed once and abandoned.
+        """
+        now = _utcnow()
+        with self._write_lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO asset_sets (asset_set_key, refs_json, engine, warmed_at,"
+                " last_used_at, bytes) VALUES (?, ?, ?, NULL, ?, 0)"
+                " ON CONFLICT(asset_set_key) DO UPDATE SET last_used_at = excluded.last_used_at",
+                (key, json.dumps(sorted(refs)), engine, now),
+            )
+        row = self.load_asset_set(key)
+        assert row is not None  # noqa: S101 - just inserted under the write lock
+        return row
+
+    def mark_asset_set_warmed(self, key: str, *, size_bytes: int) -> None:
+        """Stamp a set as warmed. Called by the warm job, never by a verify job:
+        a cache tier is warm when something actually filled it."""
+        with self._write_lock, self._conn:
+            self._conn.execute(
+                "UPDATE asset_sets SET warmed_at = ?, bytes = ? WHERE asset_set_key = ?",
+                (_utcnow(), int(size_bytes), key),
+            )
+
+    def load_asset_set(self, key: str) -> AssetSetRow | None:
+        row = self._conn.execute(
+            "SELECT asset_set_key, refs_json, engine, warmed_at, last_used_at, bytes"
+            " FROM asset_sets WHERE asset_set_key = ?",
+            (key,),
+        ).fetchone()
+        return None if row is None else _asset_set_row(row)
+
+    def asset_sets_by_least_recently_used(self) -> list[AssetSetRow]:
+        """Warmed sets, coldest use first — the order eviction walks.
+
+        Unwarmed sets are excluded: there is nothing on disk to reclaim, and
+        dropping the row would only lose the record that something asked for it.
+        """
+        rows = self._conn.execute(
+            "SELECT asset_set_key, refs_json, engine, warmed_at, last_used_at, bytes"
+            " FROM asset_sets WHERE warmed_at IS NOT NULL ORDER BY last_used_at ASC"
+        ).fetchall()
+        return [_asset_set_row(r) for r in rows]
+
+    def forget_asset_set(self, key: str) -> None:
+        """Drop a set's ledger row after its tier has been reclaimed."""
+        with self._write_lock, self._conn:
+            self._conn.execute("DELETE FROM asset_sets WHERE asset_set_key = ?", (key,))
 
     def upsert_baseline(self, row: BaselineRow) -> None:
         """Persist one request's regression baseline (insert or update; v6).

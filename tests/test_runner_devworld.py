@@ -5,7 +5,7 @@ scenario that boots here is one CI will accept, and a scenario CI rejects fails
 here first, at exit 2, before a GPU second is spent. That claim lives entirely in
 the CPU half tested below (argument parsing, the M1 admission gate, the policy
 slot, the loop predicate); the GPU half is the same ``sim_runtime`` /
-``go2_sensors`` / ``go2_policy`` code a job runs, verified on the workstation.
+``runner_sensors`` / ``onboard`` code a job runs, verified on the workstation.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def test_a_malformed_command_line_is_a_friendly_usage_error(argv, message):
 # --------------------------------------------------------------------------- #
 # Admission — the SAME gate a submitted job passes.
 # --------------------------------------------------------------------------- #
-def test_a_valid_go2_scenario_is_admitted_with_its_oracles_bound(tmp_path):
+def test_a_valid_go2_scenario_is_admitted_with_its_oracles_bound(tmp_path, go2_world):
     admitted = admit(str(_scenario(tmp_path)))
     assert admitted.admitted is True
     assert admitted.oracles == ("reached_goal", "no_collision")
@@ -119,7 +119,7 @@ def test_a_valid_go2_scenario_is_admitted_with_its_oracles_bound(tmp_path):
     ]
 
 
-def test_a_rejected_scenario_never_reaches_the_gpu(tmp_path):
+def test_a_rejected_scenario_never_reaches_the_gpu(tmp_path, go2_world):
     """Same rejection, same exit code as ``cv-infra run``: the dev world is not a
     softer gate, or "it worked in my dev world" would stop meaning anything."""
     bad = tmp_path / "bad.yaml"
@@ -145,12 +145,12 @@ def test_a_policy_whose_digest_does_not_match_is_rejected_at_admission(tmp_path)
 # --------------------------------------------------------------------------- #
 # Policy slot.
 # --------------------------------------------------------------------------- #
-def test_the_policy_pin_is_the_loaders_resolved_path_and_declared_digest(tmp_path):
+def test_the_policy_pin_is_the_loaders_resolved_path_and_declared_digest(tmp_path, go2_world):
     pin = policy_pin_for(admit(str(_scenario(tmp_path))))
     assert (pin.path, pin.sha256) == (str(tmp_path / "policy.pt"), POLICY_SHA)
 
 
-def test_a_go2_scenario_without_a_policy_is_refused_by_the_slot_check(tmp_path):
+def test_a_go2_scenario_without_a_policy_is_refused_by_the_slot_check(tmp_path, go2_world):
     """C2b's cross-check, reused: the go2 registry row declares a
     locomotion_policy slot, and a world booted without one stands up a robot
     whose drive gains are 0 — it lies down and every criterion then measures a
@@ -159,7 +159,7 @@ def test_a_go2_scenario_without_a_policy_is_refused_by_the_slot_check(tmp_path):
         policy_pin_for(admit(str(_scenario(tmp_path, with_policy=False))))
 
 
-def test_a_scene_that_declares_no_slot_runs_the_world_without_a_policy(tmp_path):
+def test_a_scene_that_declares_no_slot_runs_the_world_without_a_policy(tmp_path, go2_world):
     """carter-shaped scenarios still boot the dev world — they just do not walk."""
     path = tmp_path / "carter.yaml"
     path.write_text(
@@ -189,7 +189,7 @@ def test_the_loop_stops_on_ctrl_c_or_the_step_bound(steps, max_steps, stop_reque
     assert should_stop(steps, max_steps, stop_requested) is expected
 
 
-def test_the_banner_names_the_world_the_policy_and_how_to_drive_it(tmp_path):
+def test_the_banner_names_the_world_the_policy_and_how_to_drive_it(tmp_path, go2_world):
     admitted = admit(str(_scenario(tmp_path)))
     lines = banner(admitted, policy_pin_for(admitted))
     text = "\n".join(lines)
@@ -217,7 +217,9 @@ def test_main_maps_a_bad_command_line_to_exit_2(capsys):
     assert "expected exactly one scenario file" in capsys.readouterr().err
 
 
-def test_main_hands_the_admitted_request_and_the_step_bound_to_the_run(tmp_path, monkeypatch):
+def test_main_hands_the_admitted_request_and_the_step_bound_to_the_run(
+    tmp_path, monkeypatch, go2_world
+):
     seen = {}
 
     def _fake_run(admitted, pin, max_steps):
@@ -235,13 +237,13 @@ def test_main_hands_the_admitted_request_and_the_step_bound_to_the_run(tmp_path,
     }
 
 
-def test_main_reads_sys_argv_when_called_with_no_arguments(tmp_path, monkeypatch):
+def test_main_reads_sys_argv_when_called_with_no_arguments(tmp_path, monkeypatch, go2_world):
     monkeypatch.setattr(devworld, "run", lambda _admitted, _pin, _max_steps: 0)
     monkeypatch.setattr("sys.argv", ["devworld", str(_scenario(tmp_path))])
     assert main() == 0
 
 
-def test_a_world_booted_without_operator_consent_exits_3(tmp_path, monkeypatch, capsys):
+def test_a_world_booted_without_operator_consent_exits_3(tmp_path, monkeypatch, capsys, go2_world):
     """NEG-2: the EULA gate is the one platform failure the dev world translates
     instead of letting the traceback through — an operator meets it constantly."""
 

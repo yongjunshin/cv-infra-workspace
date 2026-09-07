@@ -37,6 +37,21 @@ RUN pip install --no-cache-dir uv==0.11.13 \
  && uv build --wheel --project /src --out-dir /dist \
  && uv export --frozen --no-dev --no-emit-project --project /src > /dist/requirements.txt
 
+# PICT — the covering-array generator the input-space plane shells out to
+# (cv_infra/contract/pict.py). REUSED, never reimplemented (LOCKED §3.1): MIT,
+# dependency-free C++11, one static binary. Pinned by COMMIT, not by branch or
+# tag: a floating ref would let the generator that decides WHICH CASES RUN change
+# under a rebuild, and a suite whose cases moved for no declared reason is a
+# suite whose regression history quietly stopped matching (CLAUDE §2-7).
+ARG PICT_COMMIT=0c66a8e332655cd64802e18de962dacbbe3882bd
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates build-essential \
+ && git clone --filter=blob:none https://github.com/microsoft/pict.git /tmp/pict \
+ && git -C /tmp/pict checkout "${PICT_COMMIT}" \
+ && make -C /tmp/pict -j"$(nproc)" \
+ && install -m 0755 /tmp/pict/pict /dist/pict \
+ && rm -rf /var/lib/apt/lists/* /tmp/pict
+
 # --------------------------------------------------------------------------- #
 # (2) runtime — slim python + the locked dependency closure + the cv_infra wheel.
 # --------------------------------------------------------------------------- #
@@ -45,9 +60,14 @@ FROM python:3.11-slim@sha256:c20888b6acdd1e63e1c433a185bf3ad162c0288fe484616ce06
 # Structured boot lines (`serve-config`, `runner-mounts`, `cache-seed`) are the observable
 # contract of this deployment — they must reach `docker logs` unbuffered.
 ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CV_PICT_BIN=/usr/local/bin/pict
 
 COPY --from=builder /dist /tmp/dist
+# The pinned generator, out of the build stage and onto PATH. cv_infra reads it
+# through $CV_PICT_BIN, so a deployment that wants a different build points the
+# variable at it rather than patching the image.
+RUN install -m 0755 /tmp/dist/pict /usr/local/bin/pict
 
 # --require-hashes: refuse any artifact whose bytes are not the ones uv.lock recorded
 # (reproducibility down to the wheel, CLAUDE §2-7). The cv_infra wheel itself is installed

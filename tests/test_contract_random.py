@@ -45,6 +45,7 @@ from cv_infra.contract.schema import (
     Goal,
     InitialPose,
     Obstacle,
+    Param,
     Randint,
     Scenario,
     Uniform,
@@ -188,8 +189,13 @@ def test_model_field_sets_pin_the_notation_shape():
     assert set(Uniform.model_fields) == {"uniform"}
     assert set(Choice.model_fields) == {"choice"}
     assert set(Randint.model_fields) == {"randint"}
-    assert set(DerivationMeta.model_fields) == {"version", "index"}
-    for model in (Uniform, Choice, Randint, DerivationMeta):
+    # v2: {param: name} joins the notation, and the stamp learns which covering-array
+    # row a sample came from. Both are single-key/optional by design — the sole key
+    # IS the union tag, and a null `case` prunes out of the identity projection so
+    # pre-v2 request_identity_keys do not move.
+    assert set(Param.model_fields) == {"param"}
+    assert set(DerivationMeta.model_fields) == {"version", "index", "case"}
+    for model in (Uniform, Choice, Randint, Param, DerivationMeta):
         with pytest.raises(ValidationError):  # extra="forbid" at every level
             model.model_validate({**_valid_of(model), "bogus": 1})
 
@@ -198,6 +204,7 @@ def _valid_of(model) -> dict:
     return {
         Uniform: {"uniform": [0.0, 1.0]},
         Choice: {"choice": [0.0]},
+        Param: {"param": "start_x"},
         Randint: {"randint": [0, 2]},
         DerivationMeta: {"version": "cv-derive/1", "index": 0},
     }[model]

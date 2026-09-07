@@ -2,7 +2,7 @@
 
 ``./python.sh -m cv_infra.runner.devworld <scenario.yaml>`` boots the SAME scene,
 the SAME robot, the SAME locomotion policy and the SAME sensor publishers a
-verification job would (``sim_runtime`` + ``go2_policy`` + ``go2_sensors``) — and
+verification job would (``sim_runtime`` + ``onboard`` + ``runner_sensors``) — and
 then just keeps stepping. No mission is driven, no oracle runs, nothing is
 recorded and no result is written: the developer's own app is the thing under
 test, and this is the world it talks to (plan §1-8: an app that only works
@@ -27,8 +27,6 @@ from dataclasses import dataclass
 
 from cv_infra.contract.errors import ContractError
 from cv_infra.contract.loader import AdmittedRequest, load_request
-from cv_infra.runner.go2_policy import PolicyContractError
-from cv_infra.runner.go2_wiring import PolicyPin, check_firmware_slot
 from cv_infra.runner.main import (
     EXIT_PASS,
     EXIT_PLATFORM,
@@ -39,6 +37,8 @@ from cv_infra.runner.main import (
     plan_obstacle_pool,
     sim_config_for,
 )
+from cv_infra.runner.onboard import PolicyContractError
+from cv_infra.runner.onboard_wiring import PolicyPin, check_firmware_slot
 from cv_infra.runner.sim_runtime import EulaNotAcceptedError, resolve_scene
 
 USAGE = "usage: ./python.sh -m cv_infra.runner.devworld <scenario.yaml> [--max-steps N]"
@@ -106,7 +106,7 @@ def policy_pin_for(admitted: AdmittedRequest) -> PolicyPin | None:
     The path is the LOADER's — resolved once, at the only place that knows the
     scenario's directory (blueprint §8) — so the dev world and a submitted job
     address the same file. The slot cross-check is C2b's
-    (``go2_wiring.check_firmware_slot``): a go2 world with no policy stands up a
+    (``onboard_wiring.check_firmware_slot``): a go2 world with no policy stands up a
     robot with zero drive gains that simply lies down, and a policy declared for
     a robot that runs none is a request nobody can honour. Both are bad input
     here for the same reason they are in a job — exit 2, before the boot.
@@ -177,13 +177,13 @@ def run(
     the developer's app is expected to come and go while the world stays up.
     """
     from cv_infra.runner.adapter.ros2 import Ros2Adapter
-    from cv_infra.runner.go2_sensors import sensor_suite_for
-    from cv_infra.runner.go2_wiring import attach_policy_loop, load_policy, subscribe_cmd_vel
+    from cv_infra.runner.onboard_wiring import attach_policy_loop, load_policy, subscribe_cmd_vel
     from cv_infra.runner.ros_bridge import (
         bootstrap_bridge_env,
         enable_bridge,
         reexec_for_bridge_lib,
     )
+    from cv_infra.runner.runner_sensors import sensor_suite_for
     from cv_infra.runner.sim_runtime import SimRuntime
 
     request = admitted.request

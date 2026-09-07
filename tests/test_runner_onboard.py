@@ -5,7 +5,7 @@ quaternion convention, a joint vector in the wrong order, an observation slice
 off by three, a torque model without its saturation curve. None of them raise —
 they produce a robot that walks badly, which on the workstation reads as "the
 policy is bad" and sends the next person to retrain a network that was fine.
-So the trained contract (C0 probe §3, ``go2_constants``) is asserted here term
+So the trained contract (C0 probe §3, now the consumer's profile) is asserted term
 by term, and the two collaborators that need a GPU image are FAKES:
 
 * ``torch`` — a module object injected into ``sys.modules`` (the same lever
@@ -20,40 +20,55 @@ What is NOT provable here, and is C2b's on the workstation: that this contract
 makes the real network actually walk (probe §6-11).
 """
 
+import dataclasses
 import hashlib
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import yaml
 
-from cv_infra.runner import go2_policy
-from cv_infra.runner.go2_constants import (
-    ACTION_DIM,
-    ACTION_SCALE,
-    DECIMATION,
-    DEFAULT_JOINT_POS,
-    EFFORT_LIMIT,
-    FIXED_DT,
-    JOINT_ORDER,
-    KD,
-    KP,
-    OBS_DIM,
-    OBS_LAYOUT,
-    SATURATION_EFFORT,
-    VEL_AT_EFFORT_LIM,
-    VELOCITY_LIMIT,
-)
-from cv_infra.runner.go2_policy import (
-    Go2PolicyLoop,
+from cv_infra.contract.profile import EmbodimentProfile
+from cv_infra.runner.onboard import (
+    Plant,
     PolicyContractError,
+    PolicyLoop,
     assemble_obs,
     dc_motor_torque,
     joint_pos_target,
     normalize_digest,
     quat_apply_inverse,
 )
+
+#: The trained contract these tests assert, read from the CONSUMER's document.
+#: It used to be a platform constants module; the values did not change, their
+#: owner did. Sourcing the expectations from the very file the runner is fed is
+#: what turns these into a check on the WIRING instead of on a second copy of it.
+GO2 = EmbodimentProfile.model_validate(
+    yaml.safe_load(
+        (Path(__file__).parent / "fixtures" / "go2_embodiment.yaml").read_text(encoding="utf-8")
+    )
+)
+PLANT = Plant.from_profile(GO2.robot.onboard)
+
+ACTION_DIM = PLANT.action_dim
+ACTION_SCALE = PLANT.action_scale
+DECIMATION = PLANT.decimation
+DEFAULT_JOINT_POS = PLANT.default_joint_pos
+EFFORT_LIMIT = PLANT.effort_limit
+JOINT_ORDER = PLANT.joint_order
+KD, KP = PLANT.kd, PLANT.kp
+OBS_DIM = PLANT.obs_dim
+OBS_LAYOUT = PLANT.obs_layout
+SATURATION_EFFORT = PLANT.saturation_effort
+VEL_AT_EFFORT_LIM = PLANT.vel_at_effort_lim
+VELOCITY_LIMIT = PLANT.velocity_limit
+#: The SIMULATION's step, not a fact about the robot — it stays on the platform
+#: side of the boundary (execution_settings / LOCKED determinism).
+FIXED_DT = 0.005
 
 UPRIGHT = (1.0, 0.0, 0.0, 0.0)
 #: yaw = +90 deg (w = z = sqrt(2)/2) — the robot faces world +y.
@@ -67,7 +82,7 @@ def _obs_slice(obs, name):
     return tuple(obs[start:stop])
 
 
-def _obs(**overrides):
+def _obs(*, plant=None, **overrides):
     kwargs = {
         "base_quat_wxyz": UPRIGHT,
         "base_lin_vel_w": (0.0, 0.0, 0.0),
@@ -78,7 +93,7 @@ def _obs(**overrides):
         "last_actions": ZERO12,
     }
     kwargs.update(overrides)
-    return assemble_obs(**kwargs)
+    return assemble_obs(plant=plant or PLANT, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +204,7 @@ def _loaded(monkeypatch, tmp_path, actions=((0.0,) * ACTION_DIM,)):
     policy = _FakePolicy(actions)
     torch = _fake_torch(policy)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    loop = Go2PolicyLoop(path, digest)
+    loop = PolicyLoop(PLANT, path, digest)
     loop.load()
     return loop, policy, torch
 
@@ -357,33 +372,34 @@ def test_wrong_length_joint_vectors_are_rejected_by_name():
 def test_a_layout_that_disagrees_with_the_assembly_raises_instead_of_shifting():
     """OBS_LAYOUT drives the emission, so an edited table cannot silently move
     every downstream slice — this is the guard that makes the table load-bearing."""
-    broken = tuple(
-        (name, start, stop if name != "velocity_commands" else stop + 1)
-        for name, start, stop in OBS_LAYOUT
+    broken = dataclasses.replace(
+        PLANT,
+        obs_layout=tuple(
+            (name, start, stop if name != "velocity_commands" else stop + 1)
+            for name, start, stop in OBS_LAYOUT
+        ),
     )
-    with pytest.raises(ValueError, match="OBS_LAYOUT disagrees"):
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(go2_policy, "OBS_LAYOUT", broken)
-            _obs()
+    with pytest.raises(ValueError, match="obs_layout disagrees"):
+        _obs(plant=broken)
 
 
 # --------------------------------------------------------------------------- #
 # action -> joint target.
 # --------------------------------------------------------------------------- #
 def test_zero_action_holds_the_training_stance():
-    assert joint_pos_target(ZERO12) == pytest.approx(DEFAULT_JOINT_POS)
+    assert joint_pos_target(ZERO12, plant=PLANT) == pytest.approx(DEFAULT_JOINT_POS)
 
 
 def test_action_is_scaled_by_0_25_and_ADDED_to_the_default_not_multiplied():
     raw = tuple(float(i - 6) for i in range(ACTION_DIM))
     expected = tuple(d + ACTION_SCALE * a for d, a in zip(DEFAULT_JOINT_POS, raw, strict=True))
-    assert joint_pos_target(raw) == pytest.approx(expected)
+    assert joint_pos_target(raw, plant=PLANT) == pytest.approx(expected)
     assert ACTION_SCALE == 0.25
 
 
 def test_target_rejects_a_wrong_width_action():
     with pytest.raises(ValueError, match="raw_action: expected 12"):
-        joint_pos_target((0.0,) * 6)
+        joint_pos_target((0.0,) * 6, plant=PLANT)
 
 
 # --------------------------------------------------------------------------- #
@@ -394,7 +410,7 @@ def _tau(error, speed):
     q = [0.0] * ACTION_DIM
     target = [error] + [0.0] * (ACTION_DIM - 1)
     qdot = [speed] + [0.0] * (ACTION_DIM - 1)
-    return dc_motor_torque(target, q, qdot)[0]
+    return dc_motor_torque(target, q, qdot, plant=PLANT)[0]
 
 
 def test_inside_the_linear_region_it_is_plain_pd():
@@ -435,7 +451,7 @@ def test_the_speed_clip_keeps_the_window_ordered_past_the_clip_point():
 
 def test_torque_rejects_mismatched_vectors():
     with pytest.raises(ValueError, match="qdot: expected 12"):
-        dc_motor_torque(ZERO12, ZERO12, (0.0,) * 4)
+        dc_motor_torque(ZERO12, ZERO12, (0.0,) * 4, plant=PLANT)
 
 
 # --------------------------------------------------------------------------- #
@@ -466,13 +482,13 @@ def test_a_policy_whose_bytes_are_not_the_declared_ones_is_a_contract_error(monk
     the message names BOTH digests so the operator can tell stale from tampered."""
     path, _digest = _policy_file(tmp_path)
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(_FakePolicy()))
-    loop = Go2PolicyLoop(path, "b" * 64)
+    loop = PolicyLoop(PLANT, path, "b" * 64)
     with pytest.raises(PolicyContractError, match="sha256 mismatch"):
         loop.load()
 
 
 def test_a_missing_policy_file_is_a_contract_error_not_a_crash(tmp_path):
-    loop = Go2PolicyLoop(tmp_path / "absent.pt", "c" * 64)
+    loop = PolicyLoop(PLANT, tmp_path / "absent.pt", "c" * 64)
     with pytest.raises(PolicyContractError, match="not found"):
         loop.load()
 
@@ -508,7 +524,7 @@ def test_bind_maps_by_NAME_so_a_reordered_asset_still_gets_the_right_joint(
     marked = {name: DEFAULT_JOINT_POS[i] + offsets[i] for i, name in enumerate(JOINT_ORDER)}
     art = _FakeArticulation(dof_names=shuffled, joint_pos=[marked[name] for name in shuffled])
     loop, policy, _ = _ready(monkeypatch, tmp_path, art)
-    assert "differs from the trained order" in capsys.readouterr().out  # loud, not silent
+    assert "differs from the declared order" in capsys.readouterr().out  # loud, not silent
 
     loop.on_physics_step()
     assert _obs_slice(policy.observations[0], "joint_pos") == pytest.approx(offsets)
@@ -526,7 +542,7 @@ def test_bind_stays_quiet_when_the_asset_order_is_the_measured_one(monkeypatch, 
 
 def test_bind_refuses_an_articulation_that_is_not_the_trained_joint_set(monkeypatch, tmp_path):
     wrong = (*JOINT_ORDER[:-1], "tail_joint")
-    with pytest.raises(RuntimeError, match="do not match the trained Go2 joint set"):
+    with pytest.raises(RuntimeError, match="do not match the profile's declared joint set"):
         _ready(monkeypatch, tmp_path, _FakeArticulation(dof_names=wrong))
 
 
@@ -539,7 +555,7 @@ def test_stepping_before_bind_or_before_load_says_which_one_is_missing(monkeypat
         loop.on_physics_step()
 
     path, digest = _policy_file(tmp_path)
-    unloaded = Go2PolicyLoop(path, digest)
+    unloaded = PolicyLoop(PLANT, path, digest)
     unloaded.bind(_FakeArticulation())
     with pytest.raises(RuntimeError, match="load"):
         unloaded.on_physics_step()
@@ -568,7 +584,9 @@ def test_torque_is_recomputed_from_the_CURRENT_joint_state_between_policy_steps(
     loop, _policy, _ = _ready(monkeypatch, tmp_path, art)
     loop.on_physics_step()  # policy step: target = stance (action 0)
     first = art.efforts[0]
-    assert first == pytest.approx(dc_motor_torque(DEFAULT_JOINT_POS, [0.0] * 12, ZERO12))
+    assert first == pytest.approx(
+        dc_motor_torque(DEFAULT_JOINT_POS, [0.0] * 12, ZERO12, plant=PLANT)
+    )
     assert first[0] == pytest.approx(KP * DEFAULT_JOINT_POS[0])  # hip: inside the linear region
     assert first[6] == pytest.approx(EFFORT_LIMIT)  # rear thigh: 25 N.m demand, capped
 
@@ -674,7 +692,7 @@ def test_importing_the_policy_modules_pulls_no_torch_isaac_or_numpy():
     pyproject dependency — importing this module on the host must not need it.
     Child process on purpose: this module is already imported in the session."""
     code = (
-        "import sys; import cv_infra.runner.go2_policy, cv_infra.runner.go2_constants\n"
+        "import sys; import cv_infra.runner.onboard\n"
         "roots = {'torch', 'isaacsim', 'omni', 'carb', 'pxr', 'rclpy', 'cv2', 'numpy'}\n"
         "print(sorted(m for m in sys.modules if m.split('.')[0] in roots))\n"
     )

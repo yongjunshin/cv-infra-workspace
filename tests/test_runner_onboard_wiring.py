@@ -1,6 +1,6 @@
 """CPU tests for the firmware-slot wiring (M2 C2b) — no torch, no Isaac, no ROS.
 
-``go2_policy`` (C2a) owns the control law and is tested next door; this file
+``onboard`` (C2a) owns the control law and is tested next door; this file
 covers everything AROUND it: the JOB_SPEC pin, the scene-slot cross-check, the
 pre-boot admission both entrypoints share, the physics-callback attach and the
 ``/cmd_vel`` subscription. The two collaborators that cannot exist on this host
@@ -17,8 +17,13 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from cv_infra.contract.schema import VerificationRequest
-from cv_infra.runner import go2_wiring
-from cv_infra.runner.go2_policy import PolicyContractError
+from cv_infra.runner import onboard_wiring
+from cv_infra.runner.onboard import Plant, PolicyContractError
+from tests.conftest import GO2_PROFILE
+
+#: The trained plant the fake articulation mimics — the consumer's document, not
+#: a platform constants module.
+GO2_PLANT = Plant.from_profile(GO2_PROFILE.robot.onboard)
 
 # --------------------------------------------------------------------------- #
 # Fakes / builders.
@@ -70,9 +75,9 @@ def _wire_document() -> dict:
 def _spec(path="/scn/policy.pt", sha256=POLICY_SHA) -> dict:
     spec: dict = {"job_id": "job-1"}
     if path is not None:
-        spec[go2_wiring.POLICY_PATH_KEY] = path
+        spec[onboard_wiring.POLICY_PATH_KEY] = path
     if sha256 is not None:
-        spec[go2_wiring.POLICY_SHA_KEY] = sha256
+        spec[onboard_wiring.POLICY_SHA_KEY] = sha256
     return spec
 
 
@@ -88,9 +93,7 @@ class _FakeArticulation:
     """Duck-typed ``SingleArticulation``: it only has to answer ``bind``."""
 
     def __init__(self) -> None:
-        from cv_infra.runner.go2_constants import JOINT_ORDER
-
-        self.dof_names = list(JOINT_ORDER)
+        self.dof_names = list(GO2_PLANT.joint_order)
         self.initialized = 0
         self.gains: list = []
 
@@ -146,11 +149,11 @@ def _twist(vx=0.0, vy=0.0, wz=0.0):
 # --------------------------------------------------------------------------- #
 def test_a_spec_without_the_keys_pins_nothing():
     """The carter plane: no keys, no pin, nothing happens (byte-identical path)."""
-    assert go2_wiring.policy_pin({"job_id": "job-1"}) is None
+    assert onboard_wiring.policy_pin({"job_id": "job-1"}) is None
 
 
 def test_the_two_keys_become_one_pin():
-    pin = go2_wiring.policy_pin(_spec())
+    pin = onboard_wiring.policy_pin(_spec())
     assert (pin.path, pin.sha256) == ("/scn/policy.pt", POLICY_SHA)
 
 
@@ -162,45 +165,45 @@ def test_half_a_pin_is_refused(path, sha256):
     """A path without a digest is an UNPINNED SUT artifact (D2 records both), and
     a digest without a path names nothing. Empty counts as absent (G-26)."""
     with pytest.raises(PolicyContractError) as excinfo:
-        go2_wiring.policy_pin(_spec(path=path, sha256=sha256))
+        onboard_wiring.policy_pin(_spec(path=path, sha256=sha256))
     assert "half the locomotion policy pin" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
 # scene_firmware_slots / check_firmware_slot — the D-3 cross-check.
 # --------------------------------------------------------------------------- #
-def test_the_registry_row_is_what_declares_a_slot():
-    assert go2_wiring.scene_firmware_slots("go2_warehouse") == ("locomotion_policy",)
-    assert go2_wiring.scene_firmware_slots("nova_carter_warehouse") == ()
+def test_the_registry_row_is_what_declares_a_slot(go2_world):
+    assert onboard_wiring.scene_firmware_slots("go2_warehouse") == ("onboard",)
+    assert onboard_wiring.scene_firmware_slots("nova_carter_warehouse") == ()
 
 
 def test_a_scene_this_runner_cannot_resolve_declares_no_slots():
     """A direct .usd ref (consumer scene) and an unknown NAME both answer "no
     slots" — ``load_scene`` owns the "unknown scene" message, listing the known
     ones, and pre-empting it here would replace a good error with a worse one."""
-    assert go2_wiring.scene_firmware_slots("omniverse://assets/whatever.usd") == ()
-    assert go2_wiring.scene_firmware_slots("no_such_scene") == ()
+    assert onboard_wiring.scene_firmware_slots("omniverse://assets/whatever.usd") == ()
+    assert onboard_wiring.scene_firmware_slots("no_such_scene") == ()
 
 
-def test_a_slotted_scene_without_a_policy_is_refused():
+def test_a_slotted_scene_without_a_policy_is_refused(go2_world):
     """C1 §6-3 measured the alternative: the go2 USD ships drive gains of 0, so a
     world booted with no controller lies on the floor and every criterion then
     judges a heap — a SUT-looking failure caused by a missing artifact."""
     with pytest.raises(PolicyContractError) as excinfo:
-        go2_wiring.check_firmware_slot(_request(), None)
+        onboard_wiring.check_firmware_slot(_request(), None)
     message = str(excinfo.value)
-    assert "declares the 'locomotion_policy' firmware slot" in message
+    assert "declares the 'onboard' firmware slot" in message
     assert "sut.locomotion_policy" in message
 
 
 def test_a_policy_for_a_scene_with_no_such_slot_is_refused():
-    pin = go2_wiring.PolicyPin("/scn/policy.pt", POLICY_SHA)
+    pin = onboard_wiring.PolicyPin("/scn/policy.pt", POLICY_SHA)
     with pytest.raises(PolicyContractError) as excinfo:
-        go2_wiring.check_firmware_slot(_request("nova_carter_warehouse"), pin)
-    assert "declares no 'locomotion_policy' slot" in str(excinfo.value)
+        onboard_wiring.check_firmware_slot(_request("nova_carter_warehouse"), pin)
+    assert "declares no 'onboard' slot" in str(excinfo.value)
 
 
-def test_the_one_slot_rejection_names_both_causes_including_the_plane_that_drops_it():
+def test_the_one_slot_rejection_names_both_causes_including_the_plane_that_drops_it(go2_world):
     """C2c §6-1 (their finding, C5's repair): a runner CANNOT see "the document
     declared a policy the wire dropped" — see the measurement below — so the
     branch that used to test ``request.sut.locomotion_policy`` could never fire.
@@ -210,10 +213,10 @@ def test_the_one_slot_rejection_names_both_causes_including_the_plane_that_drops
     declared = {"file": "policy.pt", "sha256": POLICY_SHA}
     for request in (_request(), _request(policy=declared)):
         with pytest.raises(PolicyContractError) as excinfo:
-            go2_wiring.check_firmware_slot(request, None)
+            onboard_wiring.check_firmware_slot(request, None)
         message = str(excinfo.value)
-        assert "declares the 'locomotion_policy' firmware slot" in message
-        assert go2_wiring.POLICY_PATH_KEY in message  # what the wire is missing
+        assert "declares the 'onboard' firmware slot" in message
+        assert onboard_wiring.POLICY_PATH_KEY in message  # what the wire is missing
         assert "build_job_spec" in message  # ...and who puts it there
         assert "sut.locomotion_policy" in message  # ...or what the document is missing
 
@@ -228,12 +231,12 @@ def test_the_runner_never_sees_a_declaration_only_the_wire_pin():
     spec = {**_wire_document(), **_spec()}
     request, _ = main.parse_request(spec)
     assert request.sut.locomotion_policy is None
-    assert go2_wiring.policy_pin(spec) == go2_wiring.PolicyPin("/scn/policy.pt", POLICY_SHA)
+    assert onboard_wiring.policy_pin(spec) == onboard_wiring.PolicyPin("/scn/policy.pt", POLICY_SHA)
 
 
 def test_a_carter_request_passes_the_cross_check_untouched():
     """Positive control: the plane that declares nothing must stay silent."""
-    go2_wiring.check_firmware_slot(_request("nova_carter_warehouse"), None)
+    onboard_wiring.check_firmware_slot(_request("nova_carter_warehouse"), None)
 
 
 # --------------------------------------------------------------------------- #
@@ -247,37 +250,39 @@ def test_a_carter_request_passes_the_cross_check_untouched():
     ],
 )
 def test_the_declared_cmd_vel_type_resolves_to_its_message_class_name(declared, expected):
-    assert go2_wiring.cmd_vel_type_name(declared) == expected
+    assert onboard_wiring.cmd_vel_type_name(declared) == expected
 
 
 def test_an_undrivable_cmd_vel_type_is_refused_before_the_boot():
     with pytest.raises(PolicyContractError) as excinfo:
-        go2_wiring.cmd_vel_type_name("std_msgs/msg/String")
+        onboard_wiring.cmd_vel_type_name("std_msgs/msg/String")
     assert "cannot drive a locomotion policy" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
 # admit_policy_pin / load_policy — the pre-boot admission both entrypoints share.
 # --------------------------------------------------------------------------- #
-def test_admission_returns_the_pin_and_validates_the_command_type():
-    pin = go2_wiring.admit_policy_pin(_spec(), _request())
+def test_admission_returns_the_pin_and_validates_the_command_type(go2_world):
+    pin = onboard_wiring.admit_policy_pin(_spec(), _request())
     assert pin.sha256 == POLICY_SHA
     with pytest.raises(PolicyContractError):
-        go2_wiring.admit_policy_pin(
+        onboard_wiring.admit_policy_pin(
             _spec(), _request(cmd_vel_type="ackermann_msgs/msg/AckermannDrive")
         )
 
 
 def test_a_request_with_no_slot_admits_to_none_and_loads_nothing():
-    assert go2_wiring.admit_policy_pin({"job_id": "j"}, _request("nova_carter_warehouse")) is None
-    assert go2_wiring.load_policy(None) is None
+    assert (
+        onboard_wiring.admit_policy_pin({"job_id": "j"}, _request("nova_carter_warehouse")) is None
+    )
+    assert onboard_wiring.load_policy(None) is None
 
 
 def test_loading_the_pin_verifies_the_bytes_and_says_so(monkeypatch, tmp_path, capsys):
     path = tmp_path / "policy.pt"
     path.write_bytes(POLICY_BYTES)
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(SimpleNamespace(eval=lambda: None)))
-    loop = go2_wiring.load_policy(go2_wiring.PolicyPin(str(path), POLICY_SHA))
+    loop = onboard_wiring.load_policy(onboard_wiring.PolicyPin(str(path), POLICY_SHA), GO2_PLANT)
     assert loop.expected_sha256 == POLICY_SHA
     out = capsys.readouterr().out
     assert "locomotion policy loaded" in out and POLICY_SHA in out
@@ -289,30 +294,30 @@ def test_a_pin_whose_file_does_not_hash_to_the_digest_never_yields_a_loop(monkey
     path.write_bytes(b"different bytes")
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(SimpleNamespace(eval=lambda: None)))
     with pytest.raises(PolicyContractError):
-        go2_wiring.load_policy(go2_wiring.PolicyPin(str(path), POLICY_SHA))
+        onboard_wiring.load_policy(onboard_wiring.PolicyPin(str(path), POLICY_SHA), GO2_PLANT)
 
 
 # --------------------------------------------------------------------------- #
 # attach_policy_loop — bind + the physics callback.
 # --------------------------------------------------------------------------- #
 def test_attach_initializes_the_view_binds_and_drives_every_physics_step(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, go2_world
 ):
     path = tmp_path / "policy.pt"
     path.write_bytes(POLICY_BYTES)
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(SimpleNamespace(eval=lambda: None)))
-    loop = go2_wiring.load_policy(go2_wiring.PolicyPin(str(path), POLICY_SHA))
+    loop = onboard_wiring.load_policy(onboard_wiring.PolicyPin(str(path), POLICY_SHA), GO2_PLANT)
     articulation = _FakeArticulation()
     sim = _FakeSim(articulation)
 
-    go2_wiring.attach_policy_loop(loop, sim)
+    onboard_wiring.attach_policy_loop(loop, sim)
 
     assert articulation.initialized == 1  # the physics handshake, once
     assert articulation.gains == [([0.0] * 12, [0.0] * 12)]  # AR-6: sim drive off
     assert sim.views == 1
     # Registered under its OWN name: the telemetry sampler shares this World.
-    callback = sim.world.callbacks[go2_wiring.POLICY_CALLBACK_NAME]
-    assert go2_wiring.POLICY_CALLBACK_NAME != "cv_infra_telemetry"
+    callback = sim.world.callbacks[onboard_wiring.POLICY_CALLBACK_NAME]
+    assert onboard_wiring.POLICY_CALLBACK_NAME != "cv_infra_telemetry"
     steps = []
     loop.on_physics_step = lambda: steps.append(1)  # the loop itself is C2a's
     callback(0.005)  # the callback ignores step_size (the loop counts STEPS)
@@ -328,7 +333,7 @@ def test_the_subscription_latches_twist_into_the_command(capsys):
     received: list = []
     cmd_vel = SimpleNamespace(topic="/cmd_vel", type="geometry_msgs/msg/Twist")
 
-    go2_wiring.subscribe_cmd_vel(
+    onboard_wiring.subscribe_cmd_vel(
         node, cmd_vel, lambda *cmd: received.append(cmd), msg_type=object, qos=1
     )
 
@@ -349,12 +354,12 @@ def test_the_two_keys_are_peeled_off_before_the_canonical_validation():
     request, adapter_config = runner_main.parse_request(spec)
     assert request.sut.locomotion_policy is None  # the PIN is not a declaration
     assert adapter_config.cmd_vel.topic == "/cmd_vel"
-    assert go2_wiring.POLICY_PATH_KEY in spec  # the caller's dict is untouched
+    assert onboard_wiring.POLICY_PATH_KEY in spec  # the caller's dict is untouched
     with pytest.raises(runner_main.BadJobSpec):
         runner_main.parse_request({**spec, "locomotion_policy_url": "http://nope"})
 
 
-def test_a_refused_slot_reaches_the_entrypoints_as_bad_input_not_a_platform_error():
+def test_a_refused_slot_reaches_the_entrypoints_as_bad_input_not_a_platform_error(go2_world):
     """Exit-2 family (usage), decided pre-boot: ``BadJobSpec`` is what both
     entrypoints already fold into exit 2, so the fold happens once, in main."""
     from cv_infra.runner import main as runner_main
@@ -364,7 +369,7 @@ def test_a_refused_slot_reaches_the_entrypoints_as_bad_input_not_a_platform_erro
         runner_main.admit_firmware_slot({"job_id": "j"}, request)
     assert "firmware slot" in str(excinfo.value)
 
-    missing = go2_wiring.PolicyPin("/nowhere/policy.pt", POLICY_SHA)
+    missing = onboard_wiring.PolicyPin("/nowhere/policy.pt", POLICY_SHA)
     with pytest.raises(runner_main.BadJobSpec) as excinfo:
         runner_main.load_firmware_slot(missing)
     assert "not found" in str(excinfo.value)
@@ -378,7 +383,7 @@ def test_a_stamped_twist_is_unwrapped_to_the_same_command():
     received: list = []
     cmd_vel = SimpleNamespace(topic="/go2/cmd_vel", type="geometry_msgs/msg/TwistStamped")
 
-    go2_wiring.subscribe_cmd_vel(
+    onboard_wiring.subscribe_cmd_vel(
         node, cmd_vel, lambda *cmd: received.append(cmd), msg_type=object, qos=1
     )
 

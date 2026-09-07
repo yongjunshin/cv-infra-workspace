@@ -4,10 +4,10 @@ Until now the platform HELD these facts. ``runner/sim_runtime.SCENE_ASSETS`` kne
 which USD to open and how high to drop the robot; ``runner/go2_constants`` held a
 consumer's TRAINING configuration (joint order, trained stance, observation
 layout, action scale, actuator model, policy MLP shape, training seed);
-``runner/go2_sensors`` held where that consumer's camera is bolted and which
+``runner/runner_sensors`` held where that consumer's camera is bolted and which
 lidar it is. Every one of those is a fact about somebody else's robot, and the
 cost of holding them was measured: **one new robot = 2,000 lines inside the
-platform** (go2_sensors 1,138 + go2_policy 458 + go2_wiring 250 + go2_constants
+platform** (runner_sensors 1,138 + onboard 458 + onboard_wiring 250 + go2_constants
 154), which is the reason a new consumer could not self-serve.
 
 This module is where those facts live instead. A consumer ships ONE profile
@@ -245,6 +245,12 @@ class RobotProfile(_ForbidExtra):
     reset_joint_pos: tuple[float, ...] = ()
     onboard: OnboardProfile | None = None
     sensors: tuple[SensorProfile, ...] = ()
+    #: Rate for the streams a runner-published world ALWAYS supplies (``/odom``
+    #: and the ``odom->base_link`` transform). Not a ``sensors`` entry because it
+    #: is not optional: a SUT cannot drive without it. A publication rate, not a
+    #: measurement — the default is the conventional one and the consumer
+    #: overrides it when its stack wants another.
+    odom_rate_hz: float = Field(default=30.0, gt=0)
     materials: MaterialProfile | None = None
 
     @model_validator(mode="after")

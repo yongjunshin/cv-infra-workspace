@@ -362,7 +362,7 @@ def test_declared_fixed_dt_drives_both_physics_and_rendering_dt():
     assert (config.physics_dt, config.rendering_dt) == (0.02, 0.02)
 
 
-def test_a_go2_scene_decimates_the_render_and_leaves_the_physics_step_alone():
+def test_a_go2_scene_decimates_the_render_and_leaves_the_physics_step_alone(go2_world):
     """B-5/AR-17: the render interval is the SCENE's property (the training cfg's
     own ``sim.render_interval`` = 4), not a consumer knob.
 
@@ -380,7 +380,7 @@ def test_a_go2_scene_decimates_the_render_and_leaves_the_physics_step_alone():
     assert config.rendering_dt == pytest.approx(0.02)  # 50 Hz render = 4 physics steps
 
 
-def test_an_undeclared_dt_on_a_decimated_scene_still_decimates():
+def test_an_undeclared_dt_on_a_decimated_scene_still_decimates(go2_world):
     """The interval multiplies whatever the physics step ends up being — a go2
     document that forgets ``fixed_dt`` is a different (wrong) plant, but its
     render decimation is still the row's, and ``emit_sim_config`` prints both."""

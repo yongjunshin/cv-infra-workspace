@@ -95,7 +95,7 @@ def test_baseline_persists_across_store_reopen(tmp_path):
     # the baseline table itself is untouched, which is what the COUNT below still shows).
     external = sqlite3.connect(str(db))
     try:
-        assert external.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert external.execute("PRAGMA user_version").fetchone()[0] == 9
         (count,) = external.execute("SELECT COUNT(*) FROM request_baselines").fetchone()
         assert count == 1
     finally:

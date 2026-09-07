@@ -43,7 +43,7 @@ def test_scene_mapping_unknown_name_is_loud():
 # --------------------------------------------------------------------------- #
 # go2 (C1, D-1): a robot-free environment the runner COMPOSES into a world.
 # --------------------------------------------------------------------------- #
-def test_go2_warehouse_composes_the_same_two_layers_the_carter_sample_does():
+def test_go2_warehouse_composes_the_same_two_layers_the_carter_sample_does(go2_world):
     """Probe A5 is the whole reason the go2 row looks like this: the carter sample
     references ``warehouse_with_forklifts`` + ``Stage/warehouse_extras``, both at
     identity, so composing the SAME pair keeps the carter occupancy map valid.
@@ -60,35 +60,40 @@ def test_go2_warehouse_composes_the_same_two_layers_the_carter_sample_does():
     assert carter.robot_spawn_prim is None and carter.firmware_slots == ()
 
 
-def test_go2_warehouse_declares_the_trained_robot_asset_and_its_slot():
+def test_go2_warehouse_declares_the_trained_robot_asset_and_its_slot(go2_world):
     go2 = sim_runtime.resolve_scene("go2_warehouse")
     # The IsaacLab-flavoured asset, i.e. the one the policy was trained against
     # (probe §3/§5) — not the /Isaac/Robots/Unitree sibling.
     assert go2.robot_usd == "/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd"
     assert go2.robot_spawn_z > 0.0  # a legged robot is DROPPED, never floor-clipped
     # D-3: the onboard artifact slot is DATA on the robot row (C2 consumes it).
-    assert go2.firmware_slots == ("locomotion_policy",)
+    # v2 names the slot generically — WHICH artifact fills it is declared on the
+    # consumer's side (``embodiment.robot.onboard.artifact``), not here.
+    assert go2.firmware_slots == ("onboard",)
 
 
-def test_the_go2_row_carries_the_trained_stance_and_the_trained_render_interval():
-    """C5: both new fields are ROBOT properties taken from the measured training
+def test_the_go2_row_carries_the_trained_stance_and_the_trained_render_interval(go2_world):
+    """C5: both fields are ROBOT properties taken from the measured training
     contract, not numbers this layer invented — and both are absent from the
-    carter row, which is what keeps its meaning byte-identical."""
-    from cv_infra.runner.go2_constants import DEFAULT_JOINT_POS, RENDER_INTERVAL
+    carter row, which is what keeps its meaning byte-identical.
 
+    v2: they come from the consumer's profile, so the expectation is read from
+    the same document the row was built from rather than from a platform copy."""
+    onboard = go2_world.robot.onboard
+    assert onboard is not None
     go2 = sim_runtime.resolve_scene("go2_warehouse")
     carter = sim_runtime.resolve_scene("nova_carter_warehouse")
     # The stance a repose restores IS the offset the policy adds its actions to.
-    assert go2.default_joint_pos == DEFAULT_JOINT_POS
+    assert go2.default_joint_pos == onboard.default_joint_pos
     assert len(go2.default_joint_pos) == 12
     # B-5/AR-17: the training cfg's own sim.render_interval, mirrored not chosen.
-    assert go2.render_interval == RENDER_INTERVAL == 4
+    assert go2.render_interval == go2_world.robot.render_interval == 4
     # carter: wheels are not a stance, and it renders every step exactly as before.
     assert carter.default_joint_pos == ()
     assert carter.render_interval == 1
 
 
-def test_scene_row_answers_with_defaults_for_a_scene_it_cannot_resolve():
+def test_scene_row_answers_with_defaults_for_a_scene_it_cannot_resolve(go2_world):
     """A caller after one ROBOT PROPERTY must not pre-empt ``load_scene``'s
     "unknown scene" error (the one that lists the known scenes where an operator
     can act on it) — so an unknown name answers like a consumer's direct .usd

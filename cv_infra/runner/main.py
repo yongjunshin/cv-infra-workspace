@@ -51,8 +51,8 @@ from cv_infra.runner.evaluate import (
     build_result_dict,
     read_field,
 )
-from cv_infra.runner.go2_policy import PolicyContractError
-from cv_infra.runner.go2_wiring import (
+from cv_infra.runner.onboard import PolicyContractError
+from cv_infra.runner.onboard_wiring import (
     POLICY_PATH_KEY,
     POLICY_SHA_KEY,
     admit_policy_pin,
@@ -221,7 +221,7 @@ def parse_request(spec: dict) -> tuple[VerificationRequest, Ros2AdapterConfig]:
     # off here for the same reason ``job_id`` is — they are addressed to the
     # RUNNER, not part of the canonical request document, and ``extra="forbid"``
     # would reject the spec otherwise. Their VALUES are read (and cross-checked
-    # against the scene's firmware slots) by ``go2_wiring.admit_policy``.
+    # against the scene's firmware slots) by ``onboard_wiring.admit_policy``.
     wire.pop(POLICY_PATH_KEY, None)
     wire.pop(POLICY_SHA_KEY, None)
     if "sut_image_ref" in wire:
@@ -421,7 +421,7 @@ def build_sensor_suite(request: VerificationRequest, criteria: dict) -> object |
     — the same measured value the telemetry binds to, never a hardcoded scene
     path (R7).
     """
-    from cv_infra.runner.go2_sensors import sensor_suite_for  # noqa: PLC0415
+    from cv_infra.runner.runner_sensors import sensor_suite_for  # noqa: PLC0415
 
     try:
         return sensor_suite_for(

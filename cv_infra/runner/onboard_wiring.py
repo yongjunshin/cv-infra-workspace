@@ -1,6 +1,6 @@
-"""Firmware-slot wiring (M2 C2b, plan D-3) — JOB_SPEC pin -> ``Go2PolicyLoop``.
+"""Firmware-slot wiring (M2 C2b, plan D-3) — JOB_SPEC pin -> ``PolicyLoop``.
 
-``go2_policy`` owns the control law; this module owns everything AROUND it, i.e.
+``onboard`` owns the control law; this module owns everything AROUND it, i.e.
 the three seams a job crosses before a policy can move a robot:
 
 1. **the wire** — the resolved policy path + digest ride the JOB_SPEC as two
@@ -16,7 +16,7 @@ the three seams a job crosses before a policy can move a robot:
    command from the SUT's ``/cmd_vel`` on the adapter's ONE rclpy node.
 
 The platform holds no policy and substitutes nothing (plan §1-1): the file the
-request shipped is hashed again here (``Go2PolicyLoop.load``) and a mismatch is a
+request shipped is hashed again here (``PolicyLoop.load``) and a mismatch is a
 rejection, never a fallback.
 
 Everything except the two ROS/Isaac constructor lines is duck-typed and
@@ -28,8 +28,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cv_infra.runner.go2_policy import Go2PolicyLoop, PolicyContractError
+from cv_infra.runner.onboard import Plant, PolicyContractError, PolicyLoop
 from cv_infra.runner.sim_runtime import resolve_scene
+
+#: The plant a loop gets when the caller supplies no profile — one joint, no
+#: observation, no actuator curve. It exists so the v1 registry path still
+#: constructs, and it is deliberately useless: nobody trained against it, so a
+#: run that reaches it fails loudly on the first observation rather than walking
+#: badly in silence.
+_NEUTRAL_PLANT = Plant(
+    joint_order=(),
+    default_joint_pos=(),
+    default_joint_vel=(),
+    obs_layout=(),
+    action_scale=1.0,
+    decimation=1,
+    gravity_direction_w=(0.0, 0.0, -1.0),
+    kp=0.0,
+    kd=0.0,
+    effort_limit=float("inf"),
+    saturation_effort=float("inf"),
+    velocity_limit=float("inf"),
+    sim_drive_stiffness=0.0,
+    sim_drive_damping=0.0,
+)
 
 #: JOB_SPEC runner-envelope keys carrying the 2nd SUT artifact (D2 2026-08-31).
 #: The path is ABSOLUTE and valid INSIDE the runner container: the supervisor
@@ -41,13 +63,13 @@ POLICY_PATH_KEY = "locomotion_policy_path"
 POLICY_SHA_KEY = "locomotion_policy_sha256"
 
 #: The firmware slot name a scene registry row declares for a robot that runs a
-#: locomotion policy onboard (``SCENE_ASSETS["go2_warehouse"].firmware_slots``).
-LOCOMOTION_SLOT = "locomotion_policy"
+#: an onboard controller (the profile's ``robot.onboard`` -> row ``firmware_slots``).
+ONBOARD_SLOT = "onboard"
 
 #: ``world.add_physics_callback`` name for the policy step. Distinct from the
 #: telemetry sampler's (``cv_infra_telemetry``): both are registered on the same
 #: World and a shared name would silently replace one with the other.
-POLICY_CALLBACK_NAME = "cv_infra_go2_policy"
+POLICY_CALLBACK_NAME = "cv_infra_onboard_policy"
 
 #: The ``interface.adapter_config.cmd_vel.type`` spellings this runner can drive
 #: a policy from. Both are the SAME twist payload — ``TwistStamped`` wraps it in
@@ -122,9 +144,9 @@ def check_firmware_slot(request: object, pin: PolicyPin | None) -> None:
     plane, not the symptom).
     """
     slots = scene_firmware_slots(request.scenario.scene)
-    if LOCOMOTION_SLOT in slots and pin is None:
+    if ONBOARD_SLOT in slots and pin is None:
         raise PolicyContractError(
-            f"scenario.scene {request.scenario.scene!r} declares the {LOCOMOTION_SLOT!r} "
+            f"scenario.scene {request.scenario.scene!r} declares the {ONBOARD_SLOT!r} "
             "firmware slot (this robot runs its locomotion policy onboard) but this "
             f"JOB_SPEC carries no {POLICY_PATH_KEY}. Either the request declares no "
             "sut.locomotion_policy — declare it as {file, sha256} next to the scenario "
@@ -132,10 +154,10 @@ def check_firmware_slot(request: object, pin: PolicyPin | None) -> None:
             "the wire (contract.job_spec.build_job_spec). The platform holds no policy "
             "and substitutes none"
         )
-    if pin is not None and LOCOMOTION_SLOT not in slots:
+    if pin is not None and ONBOARD_SLOT not in slots:
         raise PolicyContractError(
             f"the request ships sut.locomotion_policy but scenario.scene "
-            f"{request.scenario.scene!r} declares no {LOCOMOTION_SLOT!r} slot "
+            f"{request.scenario.scene!r} declares no {ONBOARD_SLOT!r} slot "
             f"(slots: {list(slots)}) — the platform infers no meaning from a policy "
             "file, it only matches declared slots (D-3)"
         )
@@ -173,25 +195,30 @@ def admit_policy_pin(spec: dict, request: object) -> PolicyPin | None:
     return pin
 
 
-def load_policy(pin: PolicyPin | None) -> Go2PolicyLoop | None:
+def load_policy(pin: PolicyPin | None, plant: Plant | None = None) -> PolicyLoop | None:
     """Build the loop and read the policy bytes (digest re-verified) — pre-boot.
 
     ``None`` in, ``None`` out: a request that declares no slot never touches
-    torch, which is what keeps the carter plane byte-identical.
+    torch, which is what keeps the wheeled plane byte-identical.
+
+    ``plant`` is the trained plant from the request's embodiment profile. It is
+    optional only so a caller that has a pin but no profile (the v1 registry
+    path) still gets a loop; that loop then runs on the neutral plant, which is
+    a plant nobody trained against — so v2 callers always pass one.
     """
     if pin is None:
         return None
-    loop = Go2PolicyLoop(pin.path, pin.sha256)
+    loop = PolicyLoop(plant if plant is not None else _NEUTRAL_PLANT, pin.path, pin.sha256)
     loop.load()
     print(
         f"[cv-runner] locomotion policy loaded: {pin.path} sha256={pin.sha256} "
-        f"(slot {LOCOMOTION_SLOT}, in-process on the sim robot — D-3)",
+        f"(slot {ONBOARD_SLOT}, in-process on the sim robot — D-3)",
         flush=True,
     )
     return loop
 
 
-def attach_policy_loop(loop: Go2PolicyLoop, sim: object) -> None:
+def attach_policy_loop(loop: PolicyLoop, sim: object) -> None:
     """Bind the loop to the robot and drive it from EVERY physics step.
 
     Call order is the MEASURED one (C2b workstation ``bind`` arm — AR-14 asked

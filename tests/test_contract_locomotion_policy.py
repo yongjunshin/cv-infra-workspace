@@ -48,8 +48,8 @@ from cv_infra.orchestrator.models import Job, JobResult, JobState, Verdict
 from cv_infra.orchestrator.store import Store
 from cv_infra.report.regression import identity_key
 from cv_infra.runner import batch as runner_batch
-from cv_infra.runner import go2_wiring
 from cv_infra.runner import main as runner_main
+from cv_infra.runner import onboard_wiring
 from tests.test_cli_run import RecordingSupervisor
 from tests.test_cli_run import _install_supervisor as install_supervisor
 
@@ -305,7 +305,7 @@ def test_changing_the_mission_still_changes_the_key():
 # --------------------------------------------------------------------------- #
 # execution plane — the producer (C2c: the assertion C2a left for the wiring)
 # --------------------------------------------------------------------------- #
-def test_the_job_spec_carries_the_resolved_policy_pin(tmp_path):
+def test_the_job_spec_carries_the_resolved_policy_pin(tmp_path, go2_world):
     """C2a declared the two key names and left the wire byte-identical; C2c wires
     the single producer, so this is the flipped assertion.
 
@@ -322,13 +322,13 @@ def test_the_job_spec_carries_the_resolved_policy_pin(tmp_path):
         admitted.request, "req-go2:0", locomotion_policy_path=admitted.locomotion_policy_path
     )
     assert [key for key in spec if "locomotion" in key] == [
-        go2_wiring.POLICY_PATH_KEY,
-        go2_wiring.POLICY_SHA_KEY,
+        onboard_wiring.POLICY_PATH_KEY,
+        onboard_wiring.POLICY_SHA_KEY,
     ]
-    assert spec[go2_wiring.POLICY_PATH_KEY] == str(tmp_path / "policy.pt")
-    assert spec[go2_wiring.POLICY_SHA_KEY] == POLICY_SHA
+    assert spec[onboard_wiring.POLICY_PATH_KEY] == str(tmp_path / "policy.pt")
+    assert spec[onboard_wiring.POLICY_SHA_KEY] == POLICY_SHA
     assert spec["sut_image_ref"] == admitted.request.sut.image_ref  # 1st artifact unmoved
-    pin = go2_wiring.policy_pin(spec)  # the runner reads back exactly what admit resolved
+    pin = onboard_wiring.policy_pin(spec)  # the runner reads back exactly what admit resolved
     assert pin.path == admitted.locomotion_policy_path and pin.sha256 == POLICY_SHA
     # G-74 in the ADD direction: the runner re-validates the whole document with
     # ``extra="forbid"``, so a new top-level wire key is safe only because that
@@ -352,7 +352,9 @@ def test_an_undeclared_policy_leaves_the_wire_byte_identical(tmp_path):
     assert not [key for key in plain if "locomotion" in key]
 
 
-def test_a_declared_policy_without_a_resolved_path_emits_nothing_and_the_runner_says_so(tmp_path):
+def test_a_declared_policy_without_a_resolved_path_emits_nothing_and_the_runner_says_so(
+    tmp_path, go2_world
+):
     """The remaining arm: a caller that holds the MODEL but not the admission
     (no path) emits neither key — and that is not a silent no-op, because the
     consumer refuses the boot naming the plane that dropped it (G-26/G-74). This
@@ -360,9 +362,9 @@ def test_a_declared_policy_without_a_resolved_path_emits_nothing_and_the_runner_
     admitted = load_request(_case(tmp_path))
     spec = build_job_spec(admitted.request, "req-go2:0")  # path NOT forwarded
     assert not [key for key in spec if "locomotion" in key]
-    with pytest.raises(go2_wiring.PolicyContractError) as excinfo:
-        go2_wiring.check_firmware_slot(admitted.request, go2_wiring.policy_pin(spec))
-    assert go2_wiring.POLICY_PATH_KEY in str(excinfo.value)
+    with pytest.raises(onboard_wiring.PolicyContractError) as excinfo:
+        onboard_wiring.check_firmware_slot(admitted.request, onboard_wiring.policy_pin(spec))
+    assert onboard_wiring.POLICY_PATH_KEY in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -446,8 +448,8 @@ def test_both_submission_planes_put_the_same_policy_pin_on_the_wire(monkeypatch,
     cli_spec = _cli_plane_spec(monkeypatch, tmp_path, scenario)
     rest_spec = _rest_plane_spec(tmp_path, scenario)
 
-    assert cli_spec[go2_wiring.POLICY_PATH_KEY] == str(scenario_dir / "policy.pt")
-    assert cli_spec[go2_wiring.POLICY_SHA_KEY] == POLICY_SHA
+    assert cli_spec[onboard_wiring.POLICY_PATH_KEY] == str(scenario_dir / "policy.pt")
+    assert cli_spec[onboard_wiring.POLICY_SHA_KEY] == POLICY_SHA
     # job_id is the one honest difference: each plane names its own job.
     assert cli_spec["job_id"] == "req-go2:0" and rest_spec["job_id"].endswith(":0")
     assert _without_job_id(cli_spec) == _without_job_id(rest_spec)
@@ -498,12 +500,12 @@ def _batch_spec(index: int, policy: dict | None) -> dict:
         ],
     }
     if policy is not None:
-        spec[go2_wiring.POLICY_PATH_KEY] = policy["path"]
-        spec[go2_wiring.POLICY_SHA_KEY] = policy["sha256"]
+        spec[onboard_wiring.POLICY_PATH_KEY] = policy["path"]
+        spec[onboard_wiring.POLICY_SHA_KEY] = policy["sha256"]
     return spec
 
 
-def test_a_carrier_rejects_samples_that_disagree_on_the_policy():
+def test_a_carrier_rejects_samples_that_disagree_on_the_policy(go2_world):
     """One carrier = one SUT: a sample judged against a different policy than
     sample 0 would run sample 0's world and wear its own verdict (pre-boot, 0 GPU s)."""
     doc = {
@@ -518,7 +520,7 @@ def test_a_carrier_rejects_samples_that_disagree_on_the_policy():
     assert "sut.locomotion_policy" in str(excinfo.value)
 
 
-def test_a_carrier_accepts_samples_that_agree_on_the_policy():
+def test_a_carrier_accepts_samples_that_agree_on_the_policy(go2_world):
     """Positive control (a row that rejects everything would pass the test above)."""
     policy = {"path": "/scn/policy.pt", "sha256": POLICY_SHA}
     doc = {"specs": [_batch_spec(i, policy) for i in range(3)]}

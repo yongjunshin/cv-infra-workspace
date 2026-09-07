@@ -25,7 +25,12 @@ from typing import Any
 
 
 def build_job_spec(
-    request: Any, job_id: str, *, locomotion_policy_path: str | None = None
+    request: Any,
+    job_id: str,
+    *,
+    locomotion_policy_path: str | None = None,
+    embodiment: Any = None,
+    artifact_paths: Any = None,
 ) -> dict[str, Any]:
     """Admitted M1 ``schema.VerificationRequest`` -> canonical JOB_SPEC dict.
 
@@ -69,11 +74,11 @@ def build_job_spec(
     (``sut.locomotion_policy``, which supplies the digest — the document is the
     single definition of what is pinned) and the resolved path. A caller with no
     path emits nothing and the runner then says so loudly rather than running a
-    declared artifact silently (``runner/go2_wiring.check_firmware_slot``);
+    declared artifact silently (``runner/onboard_wiring.check_firmware_slot``);
     an undeclared policy leaves the wire byte-identical (the carter plane).
     Flat keys, not a nested ``sut`` block, for the same reason ``sut_image_ref``
     is flat, and named verbatim after the consumer's constants
-    (``go2_wiring.POLICY_PATH_KEY`` / ``POLICY_SHA_KEY`` — pinned equal in
+    (``onboard_wiring.POLICY_PATH_KEY`` / ``POLICY_SHA_KEY`` — pinned equal in
     ``tests/test_contract_locomotion_policy.py``; the contract may not import a
     sibling, so the two literals are tied by a test instead, G-25).
 
@@ -104,4 +109,15 @@ def build_job_spec(
     )
     if runner_knobs:
         spec["execution_settings"] = runner_knobs
+    if embodiment is not None:
+        # v2: the world/robot facts ride the wire as DATA. The runner builds its
+        # scene row and its plant from this instead of looking a name up in a
+        # platform registry — which is what lets a robot the platform has never
+        # seen run without a platform change.
+        spec["embodiment"] = embodiment.model_dump(mode="json")
+    if artifact_paths:
+        # Resolved absolute paths of the ride-along SUT artifacts, keyed by the
+        # declared file name. Resolution happened once, at admit, in the only
+        # place that knows the anchor directory.
+        spec["artifact_paths"] = dict(artifact_paths)
     return spec

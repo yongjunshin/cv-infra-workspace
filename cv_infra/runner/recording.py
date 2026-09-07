@@ -48,7 +48,7 @@ BAG_SENSORS_ENV = "CV_BAG_SENSOR_TOPICS"
 # every ROS consumer (rviz replay, costmap reconstruction, "where was the robot
 # when the camera saw this") reads them by those names. They are recorded for
 # EVERY robot — carter's come from the sample scene's OmniGraph, go2's from the
-# runner's own publishers (``go2_sensors.TF_TOPIC`` / ``TF_STATIC_TOPIC``, whose
+# runner's own publishers (``runner_sensors.TF_TOPIC`` / ``TF_STATIC_TOPIC``, whose
 # spelling a test pins against this copy: G-25 ② mechanical guard on a
 # deliberate duplicate, since a recorder must not depend on one robot's module).
 TF_TOPICS = ("/tf", "/tf_static")

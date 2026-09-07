@@ -214,7 +214,7 @@ class ParsedSpec:
     adapter_config: object  # Ros2AdapterConfig
     criteria: dict
     oracles: list
-    policy: object = None  # go2_wiring.PolicyPin | None (the firmware slot, D-3)
+    policy: object = None  # onboard_wiring.PolicyPin | None (the firmware slot, D-3)
 
 
 #: What the CARRIER does exactly once, so every spec must agree on it — label ->
@@ -506,7 +506,7 @@ def _attach_optional_streams(
     sits at the C901 ceiling, and these two branches are the ones a unit test can
     still reach (everything around them needs a GPU).
     """
-    from cv_infra.runner.go2_wiring import subscribe_cmd_vel  # noqa: PLC0415
+    from cv_infra.runner.onboard_wiring import subscribe_cmd_vel  # noqa: PLC0415
 
     if sensors is not None:
         _emit(sensors.attach(adapter.node, sim.on_step))
@@ -570,7 +570,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
         install_readonly_error_counter,
         observe,
     )
-    from cv_infra.runner.go2_wiring import attach_policy_loop  # noqa: PLC0415
+    from cv_infra.runner.onboard_wiring import attach_policy_loop  # noqa: PLC0415
     from cv_infra.runner.realign import (  # noqa: PLC0415
         SutRealigner,
         realign_seed,
@@ -733,7 +733,7 @@ def run(env: dict | None = None) -> int:  # pragma: no cover - GPU path (W2/W3 m
                     # that step runs the physics callback — with a stale target it
                     # would apply sample i's last gait torque to sample i+1's robot.
                     # After the reset the loop's target IS the stance repose writes
-                    # (both are ``go2_constants.DEFAULT_JOINT_POS``), so the world
+                    # (both are the profile's ``robot.reset_joint_pos``), so the world
                     # the settle starts from is coherent by construction.
                     policy.reset()
                 sim.restage(pose, obstacle, obstacle_set=obstacle_set)
