@@ -1,4 +1,4 @@
-"""M1 input-space case-planning tests — contract/pict.py.
+"""Input-space case-planning tests — contract/pict.py.
 
 What this file pins is NOT "PICT works" (it is a reused, MIT, upstream-tested
 binary — do-not-reinvent) but the three things WE own on top of it, each of
@@ -379,7 +379,7 @@ def test_missing_binary_names_the_env_var() -> None:
 
 @needs_pict
 def test_as_dicts_and_tsv_round_trip() -> None:
-    """``as_dicts`` is what derive substitutes from; ``to_tsv`` is what /e seeds from."""
+    """``as_dicts`` is what cases.expand substitutes from; ``to_tsv`` is what /e seeds from."""
     array = pict.generate(GO2_MODEL, order=2)
     dicts = array.as_dicts()
     assert len(dicts) == len(array)
@@ -401,20 +401,19 @@ def test_an_untruncated_plan_summary_states_full_coverage() -> None:
 
 
 @needs_pict
-def test_coverage_of_a_whole_array_is_one_by_construction() -> None:
-    """``coverage`` normalises an array against the combinations THAT ARRAY realises
-    (constraints legitimately forbid the rest), so a complete array is 1.0 and the
-    honest partial number is ``coverage_of_prefix``'s job."""
-    assert pict.coverage(pict.generate(GO2_MODEL, order=2), 2) == 1.0
+def test_coverage_of_a_whole_array_is_one_and_of_a_prefix_is_the_honest_fraction() -> None:
+    """``coverage_of_prefix`` normalises against the combinations the FULL array
+    realises (constraints legitimately forbid the rest), so keeping every row is 1.0
+    and keeping half is the fraction the CI surface must print."""
+    array = pict.generate(GO2_MODEL, order=2)
+    assert pict.coverage_of_prefix(array, len(array), 2) == 1.0
+    assert 0.0 < pict.coverage_of_prefix(array, len(array) // 2, 2) < 1.0
 
 
-@pytest.mark.parametrize(
-    "fn", [pict.coverage, lambda array, order: pict.coverage_of_prefix(array, 1, order)]
-)
-def test_coverage_of_a_space_narrower_than_the_order_is_one(fn) -> None:
+def test_coverage_of_a_space_narrower_than_the_order_is_one() -> None:
     """One axis has no PAIRS to miss — 0/0 is full coverage, not a crash."""
     single = pict.CoveringArray(parameters=("a",), rows=(("1",),), order=2)
-    assert fn(single, 2) == 1.0
+    assert pict.coverage_of_prefix(single, 1, 2) == 1.0
 
 
 @needs_pict

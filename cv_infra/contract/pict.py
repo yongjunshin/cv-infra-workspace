@@ -1,4 +1,4 @@
-"""PICT covering-array case planning (M1) — the declared input space -> the case list.
+"""PICT covering-array case planning — the declared input space -> the case list.
 
 The consumer declares its input space as a Microsoft PICT model file that rides
 along with the request (same ride-along rule as a custom oracle module). This
@@ -19,7 +19,8 @@ three things PICT does not do:
   the report would still print as satisfied.
 * **achieved coverage.** PICT's ``/s`` reports its own combination count, not
   the coverage of a TRUNCATED prefix. A budget-cut suite must report what it
-  actually covered, so ``coverage`` recomputes it from the rows.
+  actually covered, so ``coverage_of_prefix`` recomputes it from the rows the
+  suite actually ran, normalised against what the FULL array realises.
 * **friendly errors.** PICT rejects with terse prose and NO line number
   ("Input Error: Parameter/value type mismatch: ..."), and it has no opinion at
   all about a parameter name that cannot become ``--<name>=<value>`` on the sim
@@ -88,7 +89,7 @@ _BRACKETED = re.compile(r"\[([^\]]+)\]")
 class PictError(ContractError):
     """A rejected input-space model (exit-2-eligible, like any stage-1..5 reject).
 
-    Adapts this module's (problem, hint, line) shape onto the M1 canonical
+    Adapts this module's (problem, hint, line) shape onto the canonical
     ``ContractError`` fields so a bad model renders through the SAME friendly
     surface as every other stage — one-liner on the CLI, inline annotation in
     CI (NFR-INTAKE-002). ``hint`` is what the document should have said, so it
@@ -125,7 +126,7 @@ class CoveringArray:
         return len(self.rows)
 
     def as_dicts(self) -> list[dict[str, str]]:
-        """Rows as ``{parameter: value}`` — the shape ``derive`` substitutes from."""
+        """Rows as ``{parameter: value}`` — the shape ``cases.expand`` substitutes from."""
         return [dict(zip(self.parameters, row, strict=True)) for row in self.rows]
 
     def to_tsv(self) -> str:
@@ -329,21 +330,6 @@ def generate(
     return _parse(proc.stdout, order=order, source_path=source_path)
 
 
-def coverage(array: CoveringArray, order: int) -> float:
-    """Fraction of the order-t combinations in ``array`` that its rows realise.
-
-    The denominator is the combination set the FULL array covers, not the
-    unconstrained cartesian one: constraints legitimately forbid combinations,
-    and counting them as misses would report a satisfiable model as incomplete.
-    So a whole array is 1.0 by construction and a truncated prefix is the honest
-    fraction of it — which is exactly the number the CI surface must print.
-    """
-    full = _combinations(array.rows, len(array.parameters), order)
-    if not full:
-        return 1.0
-    return len(_combinations(array.rows, len(array.parameters), order)) / len(full)
-
-
 def plan(
     model_text: str,
     *,
@@ -363,7 +349,7 @@ def plan(
     the worst of the failure modes available here, because the report keeps
     printing "requested k" while covering less than it claims, and nothing in CI
     is loud about it. Truncation is the honest alternative: the prefix is a real
-    partial covering array and ``coverage`` says exactly how partial.
+    partial covering array and ``coverage_of_prefix`` says exactly how partial.
 
     ``orders="auto"`` opts back into the old walk-down (``DEFAULT_ORDERS``, or
     any explicit sequence) for callers who would rather trade k than rows. That
@@ -373,8 +359,8 @@ def plan(
     suite whose verdicts are single draws. A caller that DECLARED its repeats is
     not asking to be second-guessed, so the default branch honours the number.
 
-    Cost per run comes from the caller (M3 keeps a per-SUT rolling measurement),
-    so this function stays pure and CPU-testable: no clock, no store, no probe.
+    Cost per run comes from the caller, so this function stays pure and
+    CPU-testable: no clock, no store, no probe.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")

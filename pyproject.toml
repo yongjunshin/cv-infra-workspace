@@ -88,12 +88,11 @@ show_missing = true
 precision = 1
 
 # ⚠ TEMPORARILY 95, DOWN FROM 100 — restore in M8.
-# The ratchet was 100 and every module still holds it EXCEPT cv_infra/contract/pict.py:
-# the sweep deleted the old suite, and pict.py's own test file (tests/test_contract_pict.py)
-# covers 80.8% of it — which puts the whole package at 97.1% (measured 2026-09-07).
-# pict.py is M5's milestone (three repairs + adapted tests); raising its coverage there is
-# what makes 100 reachable again, and M8 puts this line back to 100. The number is written
-# down rather than the line deleted so the debt has a size and an owner.
+# The debt this number was written for is PAID: M5's repairs + adapted tests took
+# cv_infra/contract/pict.py to 100.0% and the whole package back to 100.0% (measured
+# 2026-09-07). The line stays at 95 only because raising the ratchet is M8's assigned
+# step; until then it permits a regression the suite does not actually have, so a
+# module landing below 100 is caught by review, not by this number.
 fail_under = 95
 #
 # exclude policy = coverage's default pragma regex only. The convention
