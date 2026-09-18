@@ -193,6 +193,8 @@ def build_report(
             "sim_input_space": spec.sim_input_space,
             "sim_output_dir": spec.sim_output_dir,
             "oracle_script": spec.oracle_script,
+            "run_command": getattr(spec, "run_command", None),
+            "judge_command": getattr(spec, "judge_command", None),
             "pict_k": spec.pict_k,
             "repeats": spec.repeats,
             "budget_s": spec.budget_s,

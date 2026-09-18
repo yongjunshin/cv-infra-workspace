@@ -3,8 +3,8 @@
 Proves without docker or a GPU: the mount table (checkout ``:ro`` + the case's host
 output dir overlaid rw on the declared output dir, cache tiers seeded / single / none),
 the container env (consent passthrough, ``CV_SEED``, driver caps), the GPU device
-request present for the sim and ABSENT for the oracle, the ``python.sh`` entrypoint +
-argv + working dir, timeout -> teardown, exception -> teardown + scratch discard, the
+request present for the sim and ABSENT for the oracle, the executable entrypoint + argv
++ working dir, timeout -> teardown, exception -> teardown + scratch discard, the
 honest empty-output zip and its oversize manifest, the image present/pulled/stalled
 gate, and the ``cp -a`` seeding guards.
 """
@@ -30,7 +30,8 @@ from cv_infra.execution import (
     CHECKOUT_MOUNT,
     CONSENT_ENV_KEYS,
     DEFAULT_SIM_IMAGE,
-    PYTHON_SH,
+    EXECUTE_ENTRYPOINT,
+    EXECUTE_SCRIPT,
     ImagePullStalled,
     _assert_runner_writable,
     _cache_volumes,
@@ -115,9 +116,9 @@ def test_sim_case_call_shape_is_the_documented_contract(tmp_path):
     image, kwargs = client.run_calls[0]
     assert image == SIM_IMAGE
     # G-14: the stock image's ENTRYPOINT would swallow the arguments — override it.
-    assert kwargs["entrypoint"] == PYTHON_SH
-    assert kwargs["command"] == [SIM_SCRIPT, "--lighting=dim"]
-    assert kwargs["working_dir"] == CHECKOUT_MOUNT  # local parity with ./python.sh
+    assert kwargs["entrypoint"] == EXECUTE_ENTRYPOINT
+    assert kwargs["command"] == ["-lc", EXECUTE_SCRIPT, SIM_SCRIPT, "--lighting=dim"]
+    assert kwargs["working_dir"] == CHECKOUT_MOUNT  # local parity with ./verify/sim.py
     assert kwargs["shm_size"] == "8g"
     assert kwargs["detach"] is True
     assert kwargs["name"].endswith("-sim")
@@ -209,7 +210,12 @@ def test_oracle_reruns_the_same_image_and_argv_read_only(tmp_path):
 
     image, kwargs = client.run_calls[0]
     assert image == SIM_IMAGE  # same image: one dependency story, not two
-    assert kwargs["command"] == [ORACLE_SCRIPT, "--lighting=dim"]  # same axes as the sim
+    assert kwargs["command"] == [
+        "-lc",
+        EXECUTE_SCRIPT,
+        ORACLE_SCRIPT,
+        "--lighting=dim",
+    ]  # same axes as the sim
     assert {bind["mode"] for bind in kwargs["volumes"].values()} == {"ro"}
     assert kwargs["volumes"][str(case_out.resolve())]["bind"] == f"{CHECKOUT_MOUNT}/{OUTPUT_DIR}"
     # stdout ONLY — a chatty stderr must not be able to inject a verdict line.

@@ -1,6 +1,6 @@
 """Case execution seam — the ONLY module in the verify pipeline that touches docker.
 
-One CASE RUN = one container: ``/isaac-sim/python.sh <sim_script> --<axis>=<value> ...``
+One CASE RUN = one container: ``<sim_script> --<axis>=<value> ...``
 against the checkout, with the case's output directory overlaid rw on top of the
 read-only checkout, then the same image again (GPU-free) for the oracle. Everything
 else in the package stays docker-free, so the whole pipeline is testable on a CPU host
@@ -55,12 +55,15 @@ from typing import Any
 # Container-side seam paths. The checkout is bound read-only at CHECKOUT_MOUNT and the
 # container's working dir IS that mount, so a sim script's own relative paths
 # ("verify/out/trajectory.json") mean the same thing in CI as they do when a consumer
-# runs ``./python.sh verify/sim.py --x=1`` from their repo root (local parity).
+# runs ``./verify/sim.py --x=1`` from their repo root (local parity).
 CHECKOUT_MOUNT = "/cv/checkout"
-PYTHON_SH = "/isaac-sim/python.sh"
+RUNTIME_CASE_MOUNT = "/cv/case.json"
 
 # The stock Isaac image's ENTRYPOINT swallows ``docker run`` arguments (G-14), so the
-# case command is passed as an explicit entrypoint override + command argv.
+# case command is passed through a minimal shell wrapper. The user entrypoint itself is
+# executable and owns its interpreter via its shebang: Python, Bash, or another binary.
+EXECUTE_ENTRYPOINT = "/bin/sh"
+EXECUTE_SCRIPT = 'exec "$0" "$@"'
 DEFAULT_SIM_IMAGE = (
     "nvcr.io/nvidia/isaac-sim:5.1.0"
     "@sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54"
@@ -454,13 +457,28 @@ def _image_present(images: Any, image: str) -> bool:
     the duck-typed fake docker CLIENT. Any OTHER error (a genuine daemon fault)
     propagates rather than being read as absent.
     """
+    return _resolve_local_image_ref(images, image) is not None
+
+
+def _resolve_local_image_ref(images: Any, image: str) -> str | None:
+    """Resolve a locally built config ID while preserving registry references."""
     try:
         images.get(image)
+        return image
+    except Exception as exc:
+        if type(exc).__name__ not in ("ImageNotFound", "NotFound"):
+            raise
+    match = re.search(r"@sha256:([0-9a-f]{64})$", image)
+    if not match:
+        return None
+    local_id = f"sha256:{match.group(1)}"
+    try:
+        images.get(local_id)
     except Exception as exc:
         if type(exc).__name__ in ("ImageNotFound", "NotFound"):
-            return False
+            return None
         raise
-    return True
+    return local_id
 
 
 def _pull_with_liveness(
@@ -553,7 +571,15 @@ def _prepare_case_dir(run_dir: Path, slug: str) -> Path:
     return out_dir
 
 
-def _case_environment(operator_env: Mapping[str, str], seed: int) -> dict[str, str]:
+def _case_environment(
+    operator_env: Mapping[str, str],
+    seed: int,
+    *,
+    case: bool = False,
+    out_path: str | None = None,
+    checkout_host: Path | None = None,
+    out_host: Path | None = None,
+) -> dict[str, str]:
     """The container env: operator consent passthrough + the two keys we own.
 
     Consent (``ACCEPT_EULA`` / ``PRIVACY_CONSENT``) is passed through VERBATIM from the
@@ -566,6 +592,14 @@ def _case_environment(operator_env: Mapping[str, str], seed: int) -> dict[str, s
     environment = {key: operator_env[key] for key in CONSENT_ENV_KEYS if key in operator_env}
     environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
     environment["CV_SEED"] = str(seed)
+    if case:
+        environment["CASE"] = RUNTIME_CASE_MOUNT
+    if out_path is not None:
+        environment["OUT"] = f"{CHECKOUT_MOUNT}/{out_path}"
+    if checkout_host is not None:
+        environment["CV_CHECKOUT_HOST"] = str(Path(checkout_host).resolve())
+    if out_host is not None:
+        environment["CV_OUT_HOST"] = str(Path(out_host).resolve())
     return environment
 
 
@@ -585,6 +619,39 @@ def _case_volumes(spec: Any, case_out: Path, *, mode: str) -> dict[str, dict[str
             "mode": mode,
         },
     }
+
+
+def _runtime_volumes(
+    spec: Any, case_out: Path, case_file: Path, *, mode: str
+) -> dict[str, dict[str, str]]:
+    """Mount the checkout, case JSON, output, and Docker socket for user runners.
+
+    The socket is intentional: a runtime command may choose to compose several
+    containers. cv-infra does not inspect or understand those containers; it owns only
+    the outer command's lifetime and the collected output boundary.
+    """
+    volumes = _case_volumes(spec, case_out, mode=mode)
+    volumes[str(case_file.resolve())] = {"bind": RUNTIME_CASE_MOUNT, "mode": "ro"}
+    volumes["/var/run/docker.sock"] = {"bind": "/var/run/docker.sock", "mode": "rw"}
+    return volumes
+
+
+def _write_case_file(case: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": case.case_id,
+                "repeat": case.repeat,
+                "seed": case.seed,
+                "inputs": dict(case.axes),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _supervise_until_exit(
@@ -728,6 +795,11 @@ def run_sim_case(
     started = time.monotonic()
     try:
         out_dir = _prepare_case_dir(run_dir, slug)
+        case_file = run_dir / "cases" / slug / "case.json"
+        _write_case_file(case, case_file)
+        runtime_mode = bool(
+            getattr(spec, "runtime_mode", False) or getattr(spec, "run_command", None)
+        )
         volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, slug, spec.sim_image)
         _ensure_image_present(
             client,
@@ -736,15 +808,34 @@ def run_sim_case(
             stall_timeout_s=pull_stall_timeout_s,
             poll_interval_s=poll_interval_s,
         )
-        volumes.update(_case_volumes(spec, out_dir, mode="rw"))
+        images = getattr(client, "images", None)
+        image_ref = (
+            _resolve_local_image_ref(images, spec.sim_image) if images is not None else None
+        ) or spec.sim_image
+        volumes.update(
+            _runtime_volumes(spec, out_dir, case_file, mode="rw")
+            if runtime_mode
+            else _case_volumes(spec, out_dir, mode="rw")
+        )
         container = client.containers.run(
-            spec.sim_image,
-            entrypoint=PYTHON_SH,
-            command=list(case.argv),
+            image_ref,
+            entrypoint=EXECUTE_ENTRYPOINT,
+            command=(
+                ["-lc", spec.run_command]
+                if getattr(spec, "run_command", None)
+                else ["-lc", EXECUTE_SCRIPT, *list(case.argv)]
+            ),
             working_dir=CHECKOUT_MOUNT,
-            environment=_case_environment(operator_env, case.seed),
+            environment=_case_environment(
+                operator_env,
+                case.seed,
+                case=runtime_mode,
+                out_path=spec.sim_output_dir,
+                checkout_host=spec.checkout,
+                out_host=out_dir,
+            ),
             volumes=volumes,
-            device_requests=gpu_device_requests(),
+            **({} if runtime_mode else {"device_requests": gpu_device_requests()}),
             shm_size=spec.shm_size,
             detach=True,
             name=f"{slug}-sim",
@@ -800,13 +891,41 @@ def run_oracle(
     stdout = ""
     error: str | None = None
     try:
+        runtime_mode = bool(
+            getattr(spec, "runtime_mode", False) or getattr(spec, "judge_command", None)
+        )
+        case_file = run_dir / "cases" / slug / "case.json"
+        images = getattr(client, "images", None)
+        image_ref = (
+            _resolve_local_image_ref(images, spec.sim_image) if images is not None else None
+        ) or spec.sim_image
         container = client.containers.run(
-            spec.sim_image,
-            entrypoint=PYTHON_SH,
-            command=[spec.oracle_script, *list(case.argv)[1:]],
+            image_ref,
+            entrypoint=EXECUTE_ENTRYPOINT,
+            command=(
+                ["-lc", spec.judge_command]
+                if getattr(spec, "judge_command", None)
+                else [
+                    "-lc",
+                    EXECUTE_SCRIPT,
+                    spec.oracle_script,
+                    *list(case.argv)[1:],
+                ]
+            ),
             working_dir=CHECKOUT_MOUNT,
-            environment=_case_environment(operator_env, case.seed),
-            volumes=_case_volumes(spec, case_out, mode="ro"),
+            environment=_case_environment(
+                operator_env,
+                case.seed,
+                case=runtime_mode,
+                out_path=spec.sim_output_dir,
+                checkout_host=spec.checkout,
+                out_host=case_out,
+            ),
+            volumes=(
+                _runtime_volumes(spec, case_out, case_file, mode="ro")
+                if runtime_mode
+                else _case_volumes(spec, case_out, mode="ro")
+            ),
             detach=True,
             name=f"{slug}-oracle",
             labels={LABEL_CASE_ID: case.case_id, LABEL_SLUG: slug},

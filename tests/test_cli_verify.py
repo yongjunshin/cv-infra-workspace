@@ -133,16 +133,17 @@ def test_the_container_command_is_the_case_argv_with_the_seed_in_the_env(tmp_pat
     cli.run_verify(spec, client, environ=environ(tmp_path))
     sim_image, sim_kwargs = client.run_calls[0]
     assert sim_image == spec.sim_image
-    assert sim_kwargs["command"][0] == "verify/sim.py"
-    flags = dict(part.lstrip("-").split("=", 1) for part in sim_kwargs["command"][1:])
+    assert sim_kwargs["command"][:2] == ["-lc", 'exec "$0" "$@"']
+    assert sim_kwargs["command"][2] == "verify/sim.py"
+    flags = dict(part.lstrip("-").split("=", 1) for part in sim_kwargs["command"][3:])
     assert set(flags) == {"lighting", "speed"}
     assert flags["lighting"] in {"bright", "dim"} and flags["speed"] in {"slow", "fast"}
     assert sim_kwargs["environment"]["ACCEPT_EULA"] == "Y"
     assert sim_kwargs["environment"]["CV_SEED"].isdigit()
     # the oracle re-runs the SAME argv with the oracle script and no GPU
     _, oracle_kwargs = client.run_calls[1]
-    assert oracle_kwargs["command"][0] == "verify/oracle.py"
-    assert oracle_kwargs["command"][1:] == sim_kwargs["command"][1:]
+    assert oracle_kwargs["command"][:3] == ["-lc", 'exec "$0" "$@"', "verify/oracle.py"]
+    assert oracle_kwargs["command"][3:] == sim_kwargs["command"][3:]
     assert "device_requests" not in oracle_kwargs
 
 

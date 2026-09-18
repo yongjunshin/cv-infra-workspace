@@ -38,12 +38,30 @@ jobs:
     # 브랜치 참조 — 릴리스 태그가 서면 그것으로 바꾼다
     uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@minimal-verify
     with:
-      sim_script: verify/sim.py
+      sim_script: verify/sim.py     # executable entrypoint; Python/Bash/etc.
       sim_input_space: verify/param_space.pict
       sim_output_dir: verify/out
       sim_image: nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb…   # 다이제스트 핀(태그 불가)
       oracle_script: verify/oracle.py     # 빼면 스윕 모드(게이트하지 않음)
 ```
+
+### runtime command mode
+
+기존 `sim_script`/`oracle_script` 계약은 그대로 유지한다. 여러 사용자 컨테이너를 띄우거나
+외부 모델 서버와 통신해야 하는 앱은 `run_command`/`judge_command`를 선언할 수 있다. 이때
+인프라는 명령의 의미를 해석하지 않고, 사용자 runtime image 안에서 명령을 실행한다.
+
+- `CASE=/cv/case.json`: `case_id`, `repeat`, `seed`, `inputs`를 담은 현재 PICT 케이스
+- `OUT=/cv/checkout/<sim_output_dir>`: 케이스별 읽기/쓰기 결과 경계
+- `CV_SEED=<int>`: 재현용 seed
+- `CV_CHECKOUT_HOST`, `CV_OUT_HOST`: runtime command가 Docker Compose 등으로 호스트
+  daemon에 자식 컨테이너를 만들 때 사용할 호스트 경로
+
+runtime image는 워크플로의 `runtime_dockerfile`과 `runtime_context`로 소비자가 정의할 수
+있고, 명령은 Docker socket을 통해 자체 Compose/모델 클라이언트를 실행할 수 있다. 따라서
+ROS·모델·미션·네트워크의 의미는 전부 사용자 스크립트와 이미지가 소유한다. `judge_command`는
+결과 파일을 읽어 stdout에 flat JSON verdict 한 줄을 출력한다. Docker socket과 외부 네트워크를
+허용할지는 GPU runner 운영 정책의 책임이며, 플랫폼 계약은 그 세부사항을 고정하지 않는다.
 
 동작하는 예시는 이 저장소의 [`examples/selftest/`](examples/selftest/)(낙하 큐브 — 클라우드
 자산·ROS·로봇 0 의존)에 있고, `cv-infra selftest`가 바로 그것을 돈다.
@@ -55,10 +73,10 @@ jobs:
 
 | 워크플로 입력 | CLI 플래그 | 기본 | 뜻 |
 |---|---|---|---|
-| `sim_script` **(필수)** | `--sim-script` | — | 체크아웃 상대경로. 케이스마다 컨테이너에서 `/isaac-sim/python.sh <sim_script> --<축>=<값> ...`, env `CV_SEED=<int>` |
+| `sim_script` **(필수)** | `--sim-script` | — | 체크아웃 상대경로의 실행 가능한 entrypoint. 케이스마다 `<sim_script> --<축>=<값> ...`로 호출하며, interpreter는 파일의 shebang이 정한다. env `CV_SEED=<int>`도 전달한다 |
 | `sim_input_space` **(필수)** | `--input-space` | — | PICT 모델. 축 이름은 CLI 플래그로 안전해야 한다(`^[A-Za-z][A-Za-z0-9_-]*$`, `help`/`h` 금지) |
 | `sim_output_dir` **(필수)** | `--output-dir` | — | 체크아웃 기준 **엄격한 상대 하위경로**(절대경로·`..`·맨 `.` 모두 금지)이며 체크아웃에 **디렉터리로 존재**해야 한다 |
-| `oracle_script` | `--oracle-script` | 없음 | 있으면 **게이트 모드**, 없으면 **스윕 모드** |
+| `oracle_script` | `--oracle-script` | 없음 | 실행 가능한 판정 entrypoint. 있으면 **게이트 모드**, 없으면 **스윕 모드** |
 | `pict_k` | `--pict-k` | `2` | 커버링 배열 강도. **요구값 그대로**(조용한 하향 없음) |
 | `repeats` | `--repeats` | `1` | 케이스당 반복. 1도 그대로 존중하고 `single_sample`로 라벨한다 |
 | `budget` | `--budget-s` | 없음 | 벽시계 상한(초). 케이스 착수 **전에만** 검사 |
@@ -126,10 +144,11 @@ admit 단계에서 스크립트 텍스트에 `headless.*False` 패턴이 보이�
 
 ## 로컬 패리티
 
-CI가 케이스마다 실행하는 것은 이 한 줄이다.
+CI가 케이스마다 실행하는 것은 이 한 줄이다. `sim_script`는 실행 가능한 파일이며
+Python/Bash 등 언어와 interpreter는 파일의 shebang이 결정한다.
 
 ```
-/isaac-sim/python.sh <sim_script> --<축>=<값> ...        # working dir = 체크아웃 루트
+<sim_script> --<축>=<값> ...                              # working dir = 체크아웃 루트
 ```
 
 같은 것을 워크스테이션에서 그대로 돌릴 수 있다(저장소 루트에서, GUI 옵션):
@@ -137,9 +156,9 @@ CI가 케이스마다 실행하는 것은 이 한 줄이다.
 ```bash
 docker run --rm --gpus all -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y -e CV_SEED=7 \
   -v "$PWD:/cv/checkout" -w /cv/checkout --shm-size=8g \
-  --entrypoint /isaac-sim/python.sh \
+  --entrypoint /bin/sh \
   nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54 \
-  examples/selftest/sim.py --drop_height=1.5 --cube_scale=0.5
+  -lc 'exec "$0" "$@"' examples/selftest/sim.py --drop_height=1.5 --cube_scale=0.5
 
 python3 examples/selftest/oracle.py --drop_height=1.5 --cube_scale=0.5   # 오라클은 stdlib만
 ```
