@@ -36,7 +36,7 @@ jobs:
   verify:
     permissions: { checks: write, pull-requests: write, contents: read }
     # 브랜치 참조 — 릴리스 태그가 서면 그것으로 바꾼다
-    uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@minimal-verify
+    uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@main
     with:
       sim_script: verify/sim.py     # executable entrypoint; Python/Bash/etc.
       sim_input_space: verify/param_space.pict
