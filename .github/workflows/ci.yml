@@ -1,43 +1,22 @@
-# Platform CI — 2 tiers (M8 §3.8 / DoD-P0-04, NFR-SELFTEST-001).
+# Platform CI — one job: lint, format, import boundary, and the suite under branch
+# coverage. No GPU, no consumer repository, no docker daemon: everything the verify
+# pipeline does with containers is exercised against a duck-typed fake client, so this
+# tier is a complete signal for the code and says nothing about the GPU host.
 #
-#   1. `lint`     — `ubuntu-latest`, always: lint + format + import-lint boundary
-#                   enforcement, then the test suite under BRANCH-COVERAGE
-#                   instrumentation. No GPU, no consumer repo.
-#   2. `selftest` — `[self-hosted, cv-infra-gpu]`, OPT-IN: `cv-infra selftest`
-#                   round-trips the BUILT-IN stub through the deployed
-#                   orchestrator. Zero consumer dependency by construction — the
-#                   command takes no input at all (see the job comment for the
-#                   preconditions and for why it is gated OFF today).
-#
-# Both tiers use only this repository: the platform CI never checks out, builds
-# or reads a consumer repo (boundary rule ③ / NFR-SELFTEST-001).
-#
-# ⚠ p8c2 T0 (2026-08-30): tier 1's two coverage steps are an ADDITION, not a
-# swap. This workflow had NO pytest step before that commit — so until then the
-# platform CI had never run the suite anywhere but a developer's shell, and
-# tier 1 could not go red for a broken test. It can now, and it costs ~60 s more
-# (57 s measured locally, 1591 tests; hosted-runner cost unmeasured — §2-4).
-# They were added rather than skipped because CEO 결정 2026-08-30 ④ places the
-# branch-coverage gate in platform CI and a gate needs the suite to run.
-#
-# Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:`
-# action is version-pinned (no mutable / floating-major tags), the uv binary is
-# pinned, and deps come from the committed `uv.lock` via `uv sync --frozen`.
-# Every `uses:` below is pinned to the IMMUTABLE commit SHA of its release tag
-# (FU-3 F1, resolved 2026-07-03 via `git ls-remote --tags`; the trailing comment
-# names the tag). Do not re-float to tag refs — bump = new SHA + new tag comment.
+# Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:` is pinned
+# to the IMMUTABLE commit SHA of its release tag (the trailing comment names the tag),
+# the uv binary is pinned, deps come from the committed `uv.lock` via `uv sync --frozen`,
+# and PICT is built from a pinned commit. Do not re-float to tag refs — a bump is a new
+# SHA plus a new tag comment.
 
 name: ci
 
 on:
   push:
   pull_request:
-  # Manual trigger so tier 2 can have its FIRST run without waiting for an
-  # unrelated code push (it is still gated by `vars.CV_SELFTEST_ENABLED` below).
-  # GitHub only offers this button for the workflow file on the default branch.
   workflow_dispatch:
 
-# Least privilege: the lint tier only reads the checked-out tree.
+# Least privilege: this tier only reads the checked-out tree.
 permissions:
   contents: read
 
@@ -47,10 +26,8 @@ concurrency:
 
 jobs:
   lint:
-    # The `name:` below is deliberately NOT updated for the coverage steps: it is
-    # the check name GitHub publishes, and it may be a REQUIRED status check in
-    # branch protection (not verifiable from here — the PAT gets 403 on the
-    # protection API), where a rename shows up as a check that is "expected" and
+    # The `name:` is the check name GitHub publishes and may be a REQUIRED status check
+    # in branch protection, where a rename shows up as a check that is "expected" and
     # never arrives. Renaming it is a repo-admin change, not a CI-file edit.
     name: lint + import-boundary (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -71,6 +48,31 @@ jobs:
       - name: Sync environment (frozen — honor committed uv.lock)
         run: uv sync --frozen
 
+      # PICT is REUSED, not reimplemented (do-not-reinvent), and it ships no release
+      # binary — so CI builds the pinned commit itself and caches the result. The cache
+      # key is that commit: a different pin is a different key, never a stale hit.
+      - name: Restore PICT (pinned commit build)
+        id: pict-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
+        with:
+          path: ~/.cache/cv-infra/pict
+          key: pict-${{ runner.os }}-0c66a8e332655cd64802e18de962dacbbe3882bd
+
+      - name: Build PICT (pinned commit)
+        if: steps.pict-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/microsoft/pict "$RUNNER_TEMP/pict"
+          git -C "$RUNNER_TEMP/pict" checkout 0c66a8e332655cd64802e18de962dacbbe3882bd
+          make -C "$RUNNER_TEMP/pict"
+          mkdir -p ~/.cache/cv-infra/pict
+          cp "$RUNNER_TEMP/pict/pict" ~/.cache/cv-infra/pict/pict
+
+      # The suite skips its PICT-backed tests when this is unset, so exporting it is
+      # what makes the covering-array tests actually run here.
+      - name: Export CV_PICT_BIN
+        run: echo "CV_PICT_BIN=$HOME/.cache/cv-infra/pict/pict" >> "$GITHUB_ENV"
+
       - name: Lint (ruff)
         run: uv run ruff check .
 
@@ -80,132 +82,17 @@ jobs:
       - name: Import-boundary enforcement (import-linter)
         run: uv run lint-imports --config .importlinter
 
-      # p8c2 T0 — the suite under branch-coverage instrumentation (CEO 결정
-      # 2026-08-30 ④). Two steps, not one, so that a TEST failure and the
-      # COVERAGE verdict stay distinguishable in the run log: `coverage run`
-      # exits with pytest's own status, and only the step after it is about the
-      # number.
+      # Two steps, not one, so a TEST failure and the COVERAGE verdict stay
+      # distinguishable in the run log: `coverage run` exits with pytest's own status,
+      # and only the step after it is about the number.
       #
-      # `env -u PYTHONPATH` is a no-op on `ubuntu-latest`; it is here so this
-      # line stays BYTE-IDENTICAL to the hermetic command teams run locally
-      # (G-84) and to the one quoted in pyproject.toml's coverage block. One
-      # command in one form — nobody has to translate between planes.
-      #
-      # Every coverage flag (branch / source / show_missing / precision) comes
-      # from pyproject.toml `[tool.coverage.*]`; none is passed here, so CI and
-      # local cannot drift apart in configuration.
+      # `env -u PYTHONPATH` is a no-op on `ubuntu-latest`; it is here so this line stays
+      # BYTE-IDENTICAL to the command a developer runs locally, where a sourced ROS 2
+      # environment leaks its PYTHONPATH into the shell and breaks pytest collection.
+      # Every coverage flag comes from pyproject.toml `[tool.coverage.*]`; none is
+      # passed here, so CI and local cannot drift apart in configuration.
       - name: Test suite under branch coverage
         run: env -u PYTHONPATH uv run coverage run -m pytest -q
 
-      # REPORT ONLY today. `fail_under` is deliberately absent from pyproject
-      # (see the ⚠ there), so this step prints the percentage and CANNOT fail the
-      # build for it — turning the 100% ratchet on is one line, added by PM in
-      # pyproject after 웨이브 C/D lands. Until then this step exists to keep the
-      # gap VISIBLE on every push rather than invisible.
-      - name: Coverage report (report only — the 100% ratchet lands later)
+      - name: Coverage report (fail_under lives in pyproject.toml)
         run: env -u PYTHONPATH uv run coverage report
-
-  # --------------------------------------------------------------------------
-  # Tier 2 — platform self-test on the GPU workstation (REQ-SELFTEST-001..004,
-  # NFR-SELFTEST-001). `cv-infra selftest` submits the platform's OWN built-in
-  # stub through the ordinary UC-01 path and folds the terminal verdict into the
-  # exit code (0 pass / 1 fail / 2 the stub envelope was rejected / 3 platform or
-  # configuration problem) — the job status IS that exit code.
-  #
-  # ⚠ GATED OFF, AND IT HAS NEVER RUN — measured 2026-08-19: this job appears in
-  # 3 of the 41 CI runs in this repository's history and is `skipped` in all 3
-  # (`gh api repos/<owner>/<repo>/actions/runs/<id>/jobs`). So NFR-SELFTEST-001's
-  # CI clause still has ZERO execution evidence, and what is missing is
-  # CONFIGURATION, not code — the `if:` below is false until an operator sets the
-  # repository variable. Preconditions, each with where it stood on 2026-08-19:
-  #   (1) a self-hosted runner online with the `cv-infra-gpu` label, registered to
-  #       THIS repo — MET: `cv-infra-gh-runner.service` (etri6000-cv-infra ->
-  #       cv-infra-workspace) active/running on the deployment host, alongside the
-  #       separate repo-level runner that serves the consumer repo.
-  #   (2) a resident orchestrator reachable from that runner (`CV_INFRA_API` repo
-  #       variable, or the CLI default 127.0.0.1:8000 on the same host) — MET:
-  #       127.0.0.1:8000 listening, `GET /monitor.json` -> 200.
-  #   (3) `CV_SELFTEST_SUT_IMAGE` = a PLATFORM-INTERNAL stub SUT image ref. The
-  #       image EXISTS since p5c15 (`docker/selftest_stub/` -> build recipe in its
-  #       README; the live self-test round-trips through it) — this comment used
-  #       to say it did not, which went stale the day it was built. Unset/empty =>
-  #       the CLI refuses with exit 3 and never falls back to a consumer image
-  #       (NFR-SELFTEST-001) — a loud, honest failure, not a green run.
-  # Remaining gap = the two repo VARIABLES (`CV_SELFTEST_ENABLED=true` and
-  # `CV_SELFTEST_SUT_IMAGE=<stub ref>`), settable only by a repo admin. They are
-  # VARIABLES (not secrets), and no value for either is baked here.
-  selftest:
-    name: platform self-test (self-hosted GPU)
-    needs: lint
-    if: ${{ vars.CV_SELFTEST_ENABLED == 'true' }}
-    runs-on: [self-hosted, cv-infra-gpu]
-    # TIMEOUT LAYERING (repaired p5c20 ⑥ — the previous comment asserted an
-    # invariant the numbers did not satisfy). Three clocks, innermost first:
-    #
-    #   1. `--timeout 1800` (CLI, 30m). Starts AFTER submit and covers QUEUE WAIT
-    #      + execution (the deadline in `batch._poll_until_terminal`), so the wait
-    #      for a busy GPU is inside the CLI's budget, not outside it. Exceeded =>
-    #      honest exit 3 naming the envelope.
-    #   2. this job's selftest STEP cap, 1 minute above (1) — see there. The CLI
-    #      therefore always ends a wedged round-trip itself; the step cap is a
-    #      backstop for a CLI that stops polling altogether.
-    #   3. this job cap, which must cover SETUP + (2). Setup is on the job clock
-    #      but NOT on the CLI's — which is exactly what `35` forgot: it compared
-    #      35 > 30 and ignored everything before the step started.
-    #      45 - 31 = 14m of setup budget.
-    #
-    # The two relations are ENFORCED, not just described:
-    # tests/test_gh_wiring_static.py::test_self_test_timeout_layering_* reads these
-    # numbers out of this file (and its twin proves the predicate rejects `35`).
-    #
-    # MEASURED, this tier (run 32342573510, 2026-08-20): setup = 7m46s from job
-    # start to the selftest step — `Set up job` 1m38s + checkout/uv ~2s + `uv sync
-    # --frozen` 6m05s. The 14m budget above is 1.8x that single observation; it is
-    # a BUDGET, not an NFR (CLAUDE §2-4). WHAT HAPPENED IN THAT RUN: the consumer
-    # E2E held both k=2 slots 07:10->07:43Z, the self-test envelope queued 27m21s,
-    # and the 35m job cap fired at 07:43:09Z — 47 SECONDS BEFORE that envelope
-    # completed successfully (env-3fe4916c5498, 07:43:56Z). Product healthy, gate
-    # red: precisely what this layering exists to prevent. Not a one-off — one
-    # operational plane at k=2 means consumer E2E and platform self-test compete
-    # for the same GPU by construction, so queue waits of this size are normal.
-    # NOT REPAIRED BY LOWERING `--timeout`: that would make the CLI abandon
-    # legitimately queued work sooner, and 1800 has no CI-tier measurement behind
-    # it (step comment below) — tightening it would be fabrication (§2-4).
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-
-      - name: Install uv (pinned)
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
-        with:
-          version: "0.11.13"
-
-      # uv provisions the pinned interpreter itself (no setup-python on the
-      # self-hosted box) and installs from the committed lock — same wheel the
-      # deployment ships.
-      - name: Sync environment (frozen — honor committed uv.lock)
-        run: uv sync --frozen
-
-      # No inputs, no consumer checkout, no scenario file: the request IS the
-      # built-in stub. --trigger-source ci-cd records the provenance verbatim
-      # (REQ-INTAKE-003); the exit code is the job's status (0/1/2/3).
-      #
-      # --timeout 1800 is a PROVISIONAL CI budget, not a measured NFR value
-      # (CLAUDE §2-4): the stub's sim-time budget is 30 s, and the wall-clock cost
-      # of the same round-trip has been measured OFF CI since p5c15 (live: ~28 s
-      # warm on the deployment host, ~141 s cold on another) — never yet from a CI
-      # job, and under non-exclusive conditions, so neither number is written into
-      # an NFR or used to tighten this cap. Replace 1800 with a cost measured from
-      # THIS tier, in the same commit that records the measurement.
-      #
-      # Step cap = the CLI's own --timeout + 1m of grace (30m + 1m). This is the
-      # ONE comparison that makes the "the CLI ends it, not a cancellation"
-      # invariant true, and it is local: both numbers are on adjacent lines, so
-      # changing one without the other is caught by the static layering test.
-      - name: cv-infra selftest (built-in stub round-trip)
-        timeout-minutes: 31
-        env:
-          CV_SELFTEST_SUT_IMAGE: ${{ vars.CV_SELFTEST_SUT_IMAGE }}
-          CV_INFRA_API: ${{ vars.CV_INFRA_API }}
-        run: uv run cv-infra selftest --trigger-source ci-cd --timeout 1800

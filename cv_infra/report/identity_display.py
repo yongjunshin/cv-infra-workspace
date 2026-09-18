@@ -1,24 +1,16 @@
-"""How ``request_identity_key`` is DISPLAYED (M4, p5c20 ⑦) — one definition, all surfaces.
+"""How a ``case_id`` is DISPLAYED — one definition, every surface.
 
-The key itself is derived in ONE place (``report/regression.py::identity_key``);
-this leaf owns the other single definition: how that 71-char string is shown to a
-human. Both human surfaces import it — the CLI text table (``report/matrix.py``)
-and the GitHub markdown surfaces (``report/github.py``) — so the two can never
-drift into two different truncations (G-56: a display rule copied is a display
-rule that diverges).
+The id itself is derived in one place (``contract/cases.py::case_id_for``); this leaf
+owns the other single definition: how that 71-character string is shown to a human. It
+lives in its own module so a second surface (a future text table, another renderer)
+adopts the rule by importing it — a display rule that gets copied is a display rule
+that diverges.
 
-Deliberately **stdlib-only and dependency-free**: ``report/github.py`` rests the
-M4-09 portability negative on importing nothing but the stdlib + the M8
-``exit_codes`` leaf, and ``report/matrix.py`` pulls the M3 orchestrator models —
-so the shared rule cannot live in ``matrix.py`` without dragging that graph into
-the renderer. Hence this file.
-
-Rule: keep ``sha256:`` + the first ``ABBREVIATED_HEX`` hex digits and mark the cut
-with ``…``. Only a SUFFIX is dropped, so what a human sees stays a literal PREFIX
-of the stored key (``request_baselines.request_identity_key`` — the C-1 baseline
-PK): it can be pasted straight into a prefix lookup and can never be mistaken for
-a different key. Absence is rendered with the CALLER's existing null idiom (the
-text table's ``-``, the markdown's ``n/a``) — never a fabricated key (§2-4).
+Rule: keep ``sha256:`` plus the first ``ABBREVIATED_HEX`` hex digits and mark the cut
+with ``…``. Only a SUFFIX is dropped, so what a human sees stays a literal PREFIX of
+the stored key (the baseline's primary key): it can be pasted into a prefix lookup and
+can never be mistaken for a different case. Absence renders with the CALLER's own null
+idiom — never a fabricated id.
 """
 
 from __future__ import annotations

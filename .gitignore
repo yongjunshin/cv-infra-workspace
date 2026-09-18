@@ -26,7 +26,15 @@ dist/
 .env
 
 # --- Verification run outputs & caches (stateless: results/cache are mounted, not committed) ---
+# `.cv-infra-run/` is the CLI's default --run-dir (report.json, payloads, zips, logs):
+# run residue by construction, and CI writes it under $RUNNER_TEMP instead.
+.cv-infra-run/
 results/
 *.mcap
 *.mp4
 *.log
+
+# --- Selftest example output — the DIRECTORY is committed (the read-only checkout needs
+#     the mount point to exist; see contract/inputs.py), its CONTENTS are run residue. ---
+examples/selftest/out/*
+!examples/selftest/out/.gitkeep

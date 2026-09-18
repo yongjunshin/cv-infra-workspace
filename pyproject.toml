@@ -4,54 +4,18 @@ description = "Continuous verification infrastructure: Isaac Sim simulation gati
 readme = "README.md"
 requires-python = "==3.11.*"
 dynamic = ["version"]
-# Runtime deps — exact-pinned (CLAUDE.md §2-7). Host-side control plane only;
-# both are lazy-imported (runner image installs the wheel --no-deps and never
-# imports them — DoD-P2-12).
+# ONE runtime dependency, exact-pinned (CLAUDE.md §2-7). Everything else the verify
+# pipeline needs is the standard library: the contract is text and JSON, the report is a
+# dict, and the only thing that cannot be stdlib is talking to the docker daemon.
+# It is imported LAZILY (cv_infra/execution.py::resolve_docker_client), so the CLI's
+# --help and every rejection path work on a host without a docker daemon.
 dependencies = [
-    "docker==7.1.0",  # M3 supervisor spawn/teardown
-    "pyyaml==6.0.2",  # M8 CLI scenario loading (`cv-infra run`; --help stays dependency-free)
-    # M1 Phase-3 contract models (schema/loader/version — lazy-exported so
-    # `import cv_infra.contract` stays stdlib-only). Consumed on BOTH planes
-    # (D-4', decisions/2026-07-10-p3-consume-decisions.md): host/CLI via this
-    # pin, runner via the kit-prebundled pydantic — the wheel still installs
-    # --no-deps; docker/runner/Dockerfile's BUNDLE_SUPPLIED guard asserts the
-    # bundled version equals this pin at build time.
-    # BUNDLE-ALIGNED PIN (PM ruling, decisions/2026-07-10-p3-entry-decisions.md
-    # D-1 ruling): the image #5 kit-prebundled interpreter already ships
-    # pydantic 2.11.7 / pydantic_core 2.33.2 (T1 probe measurement,
-    # ~/cv-infra-p2-out/p3c1/probe/bundled-pydantic.txt) — the host pin matches
-    # it so contract validation semantics/error prose never skew across planes.
-    "pydantic==2.11.7",
-    # M3 scheduler NVML 2nd guard (REQ-ORCH-005, LOCKED §7.4) — lazy-imported
-    # inside PynvmlVramGauge so GPU-free hosts import cleanly. Control plane
-    # runs in the host venv only (no kit-bundle alignment concern, G-27);
-    # pinned to the current PyPI stable (2026-06-01 release).
-    "nvidia-ml-py==13.610.43",
-    # M3 REST submit surface (api.py — REQ-INTAKE-001, M3 §2.1 Reuse). Host
-    # venv only (no kit-bundle alignment concern, G-27); fastapi 0.139.0
-    # declares pydantic>=2.9.0 — compatible with the bundle-aligned 2.11.7 pin
-    # above (uv lock re-checks the constraint). uvicorn is the P5 compose
-    # server; nothing in cv_infra imports it yet (resident deployment = P5).
-    "fastapi==0.139.0",
-    "uvicorn==0.51.0",
-    # M8 batch-CLI REST client (cv_infra/cli/batch.py: submit/status/wait —
-    # REQ-INTAKE-001/003). Promoted dev -> runtime at p4c3 (pin unchanged);
-    # lazily imported via the batch module so --help stays dependency-free.
-    "httpx==0.28.1",
+    "docker==7.1.0",
 ]
 
-# Console script (cross-team contract — verbatim pin, do not change).
-# M8 implements `def main() -> int` (exit-code) at cv_infra/cli/main.py.
+# Console script (verbatim pin, do not change): `cv-infra verify ...`.
 [project.scripts]
 cv-infra = "cv_infra.cli.main:main"
-
-# Oracle plugin registry (M1 §3.6, REQ-INTAKE-007): the contract loader binds
-# acceptance-criteria oracles through this entry-point group (stdlib
-# importlib.metadata discovery — custom oracles register here from their own
-# distribution, or are addressed by an explicit "module:Class" path).
-[project.entry-points."cv_infra.oracles"]
-reached_goal = "cv_infra.oracles.reached_goal:ReachedGoalOracle"
-no_collision = "cv_infra.oracles.no_collision:NoCollisionOracle"
 
 # Dev toolchain — exact-pinned for local/CI parity (decision 2026-06-24 env-reproducibility §4).
 # uv installs this group by default on `uv sync`.
@@ -61,14 +25,9 @@ dev = [
     "black==26.5.1",
     "pytest==9.1.1",
     "import-linter==2.12",
-    # httpx moved to [project.dependencies] at p4c3 (CLI REST client).
-    # p8c2 T0 — branch-coverage instrumentation (CEO 결정 2026-08-30 ④). This is
-    # the EXACT version PM's 2026-08-30 baseline (branch 94.8%) was measured with,
-    # so the gate and the number it is calibrated against come from one tool.
-    # `[toml]` extra = coverage reads its config out of pyproject.toml below.
-    # pytest-cov is deliberately NOT added: `coverage run -m pytest` covers the
-    # whole need (도구 최소주의) and one fewer plugin is one fewer coupling to
-    # pytest's own version.
+    # Branch-coverage instrumentation. `[toml]` extra = coverage reads its config out of
+    # pyproject.toml below. pytest-cov is deliberately NOT added: `coverage run -m pytest`
+    # covers the whole need, and one fewer plugin is one fewer coupling to pytest.
     "coverage[toml]==7.16.0",
 ]
 
@@ -88,43 +47,24 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# p8c1 (CEO 결정 2026-08-30 ④) — 확장 룰 상시 채택 = 래칫. The extended half
-# (B/SIM/RET/PIE/PERF/C901) was adopted only AFTER every violation it flags was
-# fixed in production code, so `ruff check .` stays the single green/red signal
-# (CI: .github/workflows/ci.yml tier-1) and a regression cannot slip in behind a
-# growing baseline. Adding a rule family here is a cycle-level decision; silencing
-# one is too (per-file-ignores below carries its reason in writing).
+# The extended half (B/SIM/RET/PIE/PERF/C901) is a ratchet: it was adopted only after
+# every violation it flags was fixed, so `ruff check .` stays a single green/red signal
+# and a regression cannot hide behind a growing baseline. Adding a family here is a
+# deliberate call; silencing one carries its reason in writing (below).
 select = ["E", "F", "I", "W", "UP", "B", "SIM", "RET", "PIE", "PERF", "C901"]
 
 [tool.ruff.lint.mccabe]
-# 래칫: p8c1 took the codebase to radon E/D = 0 and this ceiling keeps the worst
-# shapes out, while leaving the surviving C blocks alone — C is tolerated (개선이
-# 명확할 때만 수리, karpathy: 지표 허영 churn 금지), D/E is not. ruff's own default
-# (10) would flag C blocks we deliberately kept, turning the gate into noise.
-#
-# ⚠ 실측 주의 (2026-08-30, T5) — ruff's C901 and radon's cc are DIFFERENT metrics
-# and this number is ruff's. Measured on the pre-p8c1 tree, the four monsters p8c1
-# removed scored: runner/batch.run radon E(32) = ruff 15 · supervisor.run_batch
-# D(30) = ruff 20 · supervisor.run_job D(21) = ruff 15 · runner/main.run D(21) =
-# ruff 15. So `> 15` re-admits three of the four EXACTLY at the boundary; only
-# `<= 14` blocks all of them (today's loudest surviving block is ruff 11 —
-# scripts/isaac_smoke/headless_smoke.py::run_handshake — so 14 is adoptable with a
-# margin of 3). 15 was the value CEO 결정 2026-08-30 ④ named — a PROPOSAL calibrated
-# on radon's scale before this ruff/radon divergence was measured. PM applied 14 at
-# the p8c1 merge gate to honor the ruling's stated INTENT ("E/D 재유입 차단");
-# recorded in decisions/2026-08-30-p8-quality-cycle-rulings.md ④-보정, CEO 추인
-# at gate #1. Do not raise without a ledger entry.
+# ruff's C901, which is NOT radon's cc — the number is calibrated on ruff's scale. 14
+# keeps the worst shapes out while leaving the blocks we deliberately kept alone
+# (loudest surviving block today: scripts/isaac_smoke/headless_smoke.py::run_handshake,
+# ruff 11). ruff's own default (10) would flag those, turning the gate into noise.
 max-complexity = 14
 
 [tool.ruff.lint.per-file-ignores]
-# §3-9 그물 보존 — 테스트 단언 바이트 동결(B017 등은 단언 의미를 바꾼다).
-# 실측 2026-08-30(채택 config 기준, T5): tests 발화 23건, 전부 의도적 미적용.
-# (ruff 기본 mccabe=10 기준으로는 25건 — 차이는 tests/negative/test_batch_no_residue.py
-# 의 C901 2건.) 발화 내역: SIM300 12 · PERF401 3 · B018 2 · SIM117 2 ·
-# B017 1 · B905 1 · RET501 1 · SIM102 1. 예: B017 `pytest.raises(Exception)` 은
-# 좁히는 순간 다른 명제를 단정하게 되고, SIM300 은 단언의 좌우(기대값 vs 실측값)를
-# 뒤집는다 — 리팩토링 금지 사이클에서 그물을 건드리지 않기 위한 의도적 침묵이다.
-# E/F/I/W/UP 는 tests 에도 그대로 적용된다(문법·미사용·정렬은 그물이 아니다).
+# The tests' assertions are the net; the opinion rules would rewrite what they assert.
+# B017 (`pytest.raises(Exception)`) narrowed changes the proposition; SIM300 flips a
+# comparison's expected/actual sides. E/F/I/W/UP still apply to tests — syntax, unused
+# names and import order are not assertions.
 "tests/**" = ["B", "SIM", "RET", "PIE", "PERF", "C901"]
 
 [tool.black]
@@ -132,30 +72,30 @@ line-length = 100
 target-version = ["py311"]
 
 # --------------------------------------------------------------------------- #
-# Branch coverage — p8c2 T0 (CEO 결정 2026-08-30 ④,
-# decisions/2026-08-30-p8-quality-cycle-rulings.md).
-#
-# Invoke it exactly the way CI does (.github/workflows/ci.yml tier 1):
-#   env -u PYTHONPATH uv run coverage run -m pytest -q   (G-84 — hermetic)
+# Branch coverage. Invoke it exactly the way CI does (.github/workflows/ci.yml):
+#   env -u PYTHONPATH uv run coverage run -m pytest -q
 #   env -u PYTHONPATH uv run coverage report
-# The flags live HERE and nowhere else, so a local run and the CI run cannot
-# diverge: CI passes no coverage options at all.
+# (`env -u PYTHONPATH` because a sourced ROS 2 environment leaks its PYTHONPATH into the
+# shell and breaks pytest collection — measured on the development host.)
+# The flags live HERE and nowhere else, so a local run and the CI run cannot diverge:
+# CI passes no coverage options at all.
 [tool.coverage.run]
-branch = true          # 목표는 line 이 아니라 BRANCH — 미방문 분기가 총점 뒤에 숨지 않게.
-source = ["cv_infra"]  # 제품 코드만. tests/·scripts/ 는 계측 대상이 아니다.
+branch = true          # branch, not line — an unvisited branch must not hide behind a total.
+source = ["cv_infra"]  # product code only; tests/ and scripts/ are not instrumented.
 
 [tool.coverage.report]
-show_missing = true  # 빠진 줄·분기를 리포트가 직접 지목 — 웨이브 C/D 작업 목록이 곧 이 출력.
-precision = 1        # 베이스라인 표기(94.8%)와 같은 자릿수.
+show_missing = true
+precision = 1
 
-# ⚠ fail_under 가 없는 것은 의도된 부재다. 지금 100 으로 켜면 웨이브 C/D 가 시작되기도
-# 전에 CI 가 red 가 되고, 커버리지 작업 전체가 red 위에서 진행된다(= red 가 신호를 잃는다).
-# 켜는 시점: 웨이브 C/D 가 100% 를 달성한 뒤 **PM 이** `fail_under = 100` 한 줄을 여기에
-# 추가한다 (CEO 결정 2026-08-30 ④ — 그 한 줄이 이 사이클의 래칫이다).
-# → 점화됨 (2026-08-30, PM — 웨이브 C/D 완료: 전 모듈 Miss 0 · BrPart 0 실측 후).
+# 100, restored in M8 (it was temporarily 95 through the M4 rewrite). The suite measures
+# 100.0% of statements AND branches on every module, so this is the number the code
+# actually holds — not an aspiration. A ratchet below the measured value is worse than
+# no ratchet: it silently permits the first uncovered branch, which is exactly the one
+# nobody meant to add. A module that cannot reach 100 carries per-line
+# `# pragma: no cover - <reason>` (process entry lines), never a lowered total.
 fail_under = 100
 #
-# exclude 정책 = coverage 기본 pragma 정규식만. 기존 관례 `# pragma: no cover - <사유>`
-# 48 건이 이미 그 기본 정규식에 걸리므로 추가 설정이 필요 없다. `exclude_also` 로
-# `if TYPE_CHECKING:` 같은 광역 패턴을 넣지 않는다 — 광역 제외는 공백을 조용히 지워
-# 총점만 올린다. 제외는 한 줄씩, 사유와 함께 (침묵 공백 0).
+# exclude policy = coverage's default pragma regex only. The convention
+# `# pragma: no cover - <reason>` already matches it, so no extra config is needed.
+# No `exclude_also` broad patterns: a broad exclusion silently erases gaps and only
+# raises the total. Exclusions are per line, with their reason.

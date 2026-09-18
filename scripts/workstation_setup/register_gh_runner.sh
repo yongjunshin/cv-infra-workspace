@@ -4,7 +4,8 @@
 # persist it as a systemd service.
 # Policy: decision 2026-07-03-self-hosted-runner-policy (binding) — exact-version
 # pin + tarball sha256 verification + --disableupdate; hardening applied at
-# registration time (no workflow consumes the self-hosted label until P5).
+# registration time (the label is consumed by .github/workflows/verify.yml, which
+# runs the CALLER's checked-out code here — see that file's TRUST BOUNDARY note).
 #
 # Registration TARGET is parameterized via env (decision
 # 2026-07-21-e2e-user-runner-provisioning): CV_GH_RUNNER_REPO_URL /
