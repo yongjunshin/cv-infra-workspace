@@ -107,9 +107,6 @@ class VerifySpec:
     sim_input_space: str
     sim_output_dir: str
     oracle_script: str | None
-    run_command: str | None
-    judge_command: str | None
-    runtime_mode: bool
     input_space_text: str
     pict_k: int
     repeats: int
@@ -131,7 +128,7 @@ class VerifySpec:
     @property
     def mode(self) -> str:
         """``gate`` when an oracle can judge, else ``sweep`` (runs, never gates)."""
-        return "gate" if (self.oracle_script or self.judge_command) else "sweep"
+        return "gate" if self.oracle_script else "sweep"
 
 
 def parse(
@@ -182,27 +179,6 @@ def parse(
             example="verify/oracle.py",
         )
     )
-    run_command = _optional_checkout_file(
-        args.run_command,
-        checkout,
-        flag="--run-command",
-        what="the user case runner command",
-        example="verify/run",
-    )
-    judge_command = _optional_checkout_file(
-        args.judge_command,
-        checkout,
-        flag="--judge-command",
-        what="the user case judge command",
-        example="verify/judge",
-    )
-    if judge_command and not run_command:
-        raise ContractError(
-            field_path="--judge-command",
-            expected="--run-command to be declared with the judge command",
-            got=judge_command,
-            example="--run-command verify/run --judge-command verify/judge",
-        )
     sim_output_dir = _checkout_output_dir(args.output_dir, checkout)
 
     input_space_text = (checkout / sim_input_space).read_text(encoding="utf-8")
@@ -226,9 +202,6 @@ def parse(
         sim_input_space=sim_input_space,
         sim_output_dir=sim_output_dir,
         oracle_script=oracle_script,
-        run_command=run_command,
-        judge_command=judge_command,
-        runtime_mode=args.runtime_mode,
         input_space_text=input_space_text,
         pict_k=pict_k,
         repeats=_bounded_int(args.repeats, flag="--repeats", minimum=1, example="3"),
@@ -285,9 +258,6 @@ def _parser() -> _Parser:
     parser.add_argument("--input-space")
     parser.add_argument("--output-dir")
     parser.add_argument("--oracle-script")
-    parser.add_argument("--run-command")
-    parser.add_argument("--judge-command")
-    parser.add_argument("--runtime-mode", action="store_true")
     parser.add_argument("--pict-k", default=str(DEFAULT_PICT_K))
     parser.add_argument("--repeats", default=str(DEFAULT_REPEATS))
     parser.add_argument("--budget-s")
@@ -370,15 +340,6 @@ def _checkout_file(value: str | None, checkout: Path, *, flag: str, what: str, e
             example=f"{flag} {example}",
         )
     return relative
-
-
-def _optional_checkout_file(
-    value: str | None, checkout: Path, *, flag: str, what: str, example: str
-) -> str | None:
-    """Validate an optional user command without changing the legacy script contract."""
-    if value is None or not value.strip():
-        return None
-    return _checkout_file(value, checkout, flag=flag, what=what, example=example)
 
 
 def _checkout_output_dir(value: str | None, checkout: Path) -> str:

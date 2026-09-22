@@ -45,24 +45,6 @@ jobs:
       oracle_script: verify/oracle.py     # 빼면 스윕 모드(게이트하지 않음)
 ```
 
-### runtime command mode
-
-기존 `sim_script`/`oracle_script` 계약은 그대로 유지한다. 여러 사용자 컨테이너를 띄우거나
-외부 모델 서버와 통신해야 하는 앱은 `run_command`/`judge_command`를 선언할 수 있다. 이때
-인프라는 명령의 의미를 해석하지 않고, 사용자 runtime image 안에서 명령을 실행한다.
-
-- `CASE=/cv/case.json`: `case_id`, `repeat`, `seed`, `inputs`를 담은 현재 PICT 케이스
-- `OUT=/cv/checkout/<sim_output_dir>`: 케이스별 읽기/쓰기 결과 경계
-- `CV_SEED=<int>`: 재현용 seed
-- `CV_CHECKOUT_HOST`, `CV_OUT_HOST`: runtime command가 Docker Compose 등으로 호스트
-  daemon에 자식 컨테이너를 만들 때 사용할 호스트 경로
-
-runtime image는 워크플로의 `runtime_dockerfile`과 `runtime_context`로 소비자가 정의할 수
-있고, 명령은 Docker socket을 통해 자체 Compose/모델 클라이언트를 실행할 수 있다. 따라서
-ROS·모델·미션·네트워크의 의미는 전부 사용자 스크립트와 이미지가 소유한다. `judge_command`는
-결과 파일을 읽어 stdout에 flat JSON verdict 한 줄을 출력한다. Docker socket과 외부 네트워크를
-허용할지는 GPU runner 운영 정책의 책임이며, 플랫폼 계약은 그 세부사항을 고정하지 않는다.
-
 동작하는 예시는 이 저장소의 [`examples/selftest/`](examples/selftest/)(낙하 큐브 — 클라우드
 자산·ROS·로봇 0 의존)에 있고, `cv-infra selftest`가 바로 그것을 돈다.
 

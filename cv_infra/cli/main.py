@@ -48,9 +48,7 @@ from cv_infra.report import aggregate
 USAGE = (
     "usage: cv-infra verify --sim-script <path> --input-space <path> --output-dir <path>\n"
     "                       --sim-image <name>@sha256:<64 hex>\n"
-    "                       [--oracle-script <path>] [--run-command <path>]\n"
-    "                       [--judge-command <path>]\n"
-    "                       [--pict-k K] [--repeats N]\n"
+    "                       [--oracle-script <path>] [--pict-k K] [--repeats N]\n"
     "                       [--budget-s S] [--concurrency K]\n"
     "                       [--report-only] [--update-baseline] [--run-dir DIR]\n"
     "       cv-infra selftest [any `verify` flag]\n"
@@ -270,11 +268,7 @@ def _run_once(spec: Any, case: Any, client: Any, environ: Mapping[str, str]) -> 
     rc_oracle: int | None = None
     stdout = ""
     oracle_error: str | None = None
-    if (
-        (spec.oracle_script or getattr(spec, "judge_command", None))
-        and sim.error is None
-        and sim.rc == 0
-    ):
+    if spec.oracle_script and sim.error is None and sim.rc == 0:
         rc_oracle, stdout, oracle_error = execution.run_oracle(
             spec,
             case,
@@ -307,12 +301,7 @@ def _judge(
         return verdict.CaseRunResult(lane=verdict.LANE_ERROR, error=sim.error)
     if oracle_error is not None:
         return verdict.CaseRunResult(lane=verdict.LANE_ERROR, error=oracle_error)
-    return verdict.classify(
-        sim.rc,
-        rc_oracle,
-        stdout,
-        gate=bool(spec.oracle_script or getattr(spec, "judge_command", None)),
-    )
+    return verdict.classify(sim.rc, rc_oracle, stdout, gate=bool(spec.oracle_script))
 
 
 def _discard_case_dir(out_dir: Path) -> None:
@@ -365,7 +354,7 @@ def _empty_gate_error(spec: Any, report: dict[str, Any]) -> ContractError:
         "gate with no check cannot fail (pass --report-only if that is intended)",
         got=f"{report['summary']['runs_total']} judged run(s), all keys numbers/strings/null",
         example='print(json.dumps({"fell": False, "z_final": 0.12}))',
-        source_path=spec.oracle_script or getattr(spec, "judge_command", None),
+        source_path=spec.oracle_script,
     )
 
 

@@ -141,7 +141,8 @@ def test_case_env_passes_consent_through_and_adds_seed_and_driver_caps(tmp_path)
     assert [environment[key] for key in CONSENT_ENV_KEYS] == ["Y", "Y"]
     assert environment["CV_SEED"] == "123456"
     assert environment["NVIDIA_DRIVER_CAPABILITIES"] == "all"
-    assert "HOME" not in environment  # only the two consent keys pass through
+    # EXACTLY these keys: the two consent keys pass through, and nothing else does.
+    assert set(environment) == {*CONSENT_ENV_KEYS, "NVIDIA_DRIVER_CAPABILITIES", "CV_SEED"}
 
 
 def test_case_env_omits_consent_keys_the_operator_did_not_set(tmp_path):

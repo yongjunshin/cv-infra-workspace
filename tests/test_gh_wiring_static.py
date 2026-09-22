@@ -37,8 +37,6 @@ INPUT_TO_FLAG = {
     "sim_input_space": "--input-space",
     "sim_output_dir": "--output-dir",
     "oracle_script": "--oracle-script",
-    "run_command": "--run-command",
-    "judge_command": "--judge-command",
     "pict_k": "--pict-k",
     "repeats": "--repeats",
     "budget": "--budget-s",
@@ -48,11 +46,11 @@ INPUT_TO_FLAG = {
 }
 
 #: Inputs that steer the WORKFLOW rather than the run (they reach no flag).
-WORKFLOW_ONLY_INPUTS = {"runner_label", "runtime_dockerfile", "runtime_context"}
+WORKFLOW_ONLY_INPUTS = {"runner_label"}
 
 #: Flags the workflow computes instead of exposing: where the run's files go, and the
 #: baseline update that only a non-pull-request event is allowed to make.
-OPERATIONAL_FLAGS = {"--run-dir", "--update-baseline", "--runtime-mode"}
+OPERATIONAL_FLAGS = {"--run-dir", "--update-baseline"}
 
 
 def workflow_call_inputs(text: str) -> list[str]:

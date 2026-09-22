@@ -97,22 +97,6 @@ def test_a_complete_request_becomes_a_spec_with_container_relative_paths(tmp_pat
     assert spec.warnings == ()
 
 
-def test_runtime_commands_are_optional_and_make_a_gate(tmp_path):
-    checkout = make_checkout(tmp_path)
-    (checkout / "verify" / "run").write_text("#!/bin/sh\n", encoding="utf-8")
-    (checkout / "verify" / "judge").write_text("#!/bin/sh\n", encoding="utf-8")
-    spec = parse_args(
-        tmp_path,
-        "--run-command",
-        "verify/run",
-        "--judge-command",
-        "verify/judge",
-        checkout=checkout,
-    )
-    assert spec.mode == "gate"
-    assert (spec.run_command, spec.judge_command) == ("verify/run", "verify/judge")
-
-
 def test_without_an_oracle_the_run_is_a_sweep(tmp_path):
     assert parse_args(tmp_path).mode == "sweep"
 

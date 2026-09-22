@@ -9,10 +9,7 @@
 #         sim_script: verify/sim.py
 #         sim_input_space: verify/param_space.pict
 #         sim_output_dir: verify/out
-#         sim_image: nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb…   # required digest fallback
-#         runtime_dockerfile: verify/runtime.Dockerfile                # optional user runtime
-#         run_command: verify/run                                       # optional domain-agnostic runner
-#         judge_command: verify/judge                                   # optional domain-agnostic judge
+#         sim_image: nvcr.io/nvidia/isaac-sim:5.1.0@sha256:f3563cb…   # digest, never a tag
 #         oracle_script: verify/oracle.py       # omit => sweep mode (does not gate)
 #
 # The inputs below are the CLI's flags, one for one (`cv-infra verify --help`), so the
@@ -72,19 +69,6 @@ on:
           Optional executable judge, checkout-relative. Present = GATE mode (run after the
           sim, same image and argv, no GPU; prints one flat JSON dict). Empty = SWEEP mode:
           the run collects evidence and the check is published as neutral, gating nothing.
-        required: true
-        type: string
-      run_command:
-        description: >-
-          Optional domain-agnostic case command. The runtime receives CASE, OUT and
-          SEED and may use any user-defined process or container composition.
-        required: false
-        default: ""
-        type: string
-      judge_command:
-        description: >-
-          Optional domain-agnostic judge command. It receives the same CASE and OUT and
-          prints one flat JSON verdict on stdout.
         required: false
         default: ""
         type: string
@@ -108,22 +92,13 @@ on:
         type: string
       sim_image:
         description: >-
-          Simulation or fallback runtime image, DIGEST-PINNED (`<name>@sha256:<64 hex>`).
-          A tag is refused. When runtime_dockerfile is set, this value is used only as a
-          required compatibility fallback; the workflow builds and uses the user runtime.
-          Obtain a digest with: docker inspect --format '{{index .RepoDigests 0}}'
-          <image>
+          Simulation image, DIGEST-PINNED (`<name>@sha256:<64 hex>`) — a tag is refused.
+          Declare the very image your sim script was developed against: Isaac Sim breaks
+          its Python APIs across majors and a tag can be repushed under you, so a digest
+          is what makes CI the environment you tested locally. Read it off that image
+          with: docker inspect --format '{{index .RepoDigests 0}}'
+          nvcr.io/nvidia/isaac-sim:5.1.0
         required: true
-        type: string
-      runtime_dockerfile:
-        description: "Optional Dockerfile for a user-defined runtime command image."
-        required: false
-        default: ""
-        type: string
-      runtime_context:
-        description: "Checkout-relative build context for runtime_dockerfile."
-        required: false
-        default: "."
         type: string
       concurrency:
         description: "Cases in flight at once. Every container shares one GPU; VRAM is the ceiling."
@@ -173,14 +148,10 @@ jobs:
           CV_SIM_INPUT_SPACE: ${{ inputs.sim_input_space }}
           CV_SIM_OUTPUT_DIR: ${{ inputs.sim_output_dir }}
           CV_ORACLE_SCRIPT: ${{ inputs.oracle_script }}
-          CV_RUN_COMMAND: ${{ inputs.run_command }}
-          CV_JUDGE_COMMAND: ${{ inputs.judge_command }}
           CV_PICT_K: ${{ inputs.pict_k }}
           CV_REPEATS: ${{ inputs.repeats }}
           CV_BUDGET: ${{ inputs.budget }}
           CV_SIM_IMAGE: ${{ inputs.sim_image }}
-          CV_RUNTIME_DOCKERFILE: ${{ inputs.runtime_dockerfile }}
-          CV_RUNTIME_CONTEXT: ${{ inputs.runtime_context }}
           CV_CONCURRENCY: ${{ inputs.concurrency }}
           CV_REPORT_ONLY: ${{ inputs.report_only }}
         run: |
@@ -197,15 +168,6 @@ jobs:
           run_dir="${tmp}/cv-verify"
           rm -rf "${run_dir}"
 
-          if [ -n "${CV_RUNTIME_DOCKERFILE}" ]; then
-            runtime_tag="cv-infra-runtime:${GITHUB_SHA:-local}"
-            docker build -f "${CV_RUNTIME_DOCKERFILE}" -t "${runtime_tag}" "${CV_RUNTIME_CONTEXT}"
-            runtime_id="$(docker image inspect -f '{{.Id}}' "${runtime_tag}")"
-            [ -n "${runtime_id}" ] || die "runtime image build produced no image id"
-            CV_SIM_IMAGE="${runtime_tag}@${runtime_id}"
-          fi
-          [ -n "${CV_SIM_IMAGE}" ] || die "sim_image or runtime_dockerfile is required"
-
           args=(
             --sim-script "${CV_SIM_SCRIPT}"
             --input-space "${CV_SIM_INPUT_SPACE}"
@@ -213,14 +175,9 @@ jobs:
             --pict-k "${CV_PICT_K}"
             --repeats "${CV_REPEATS}"
             --sim-image "${CV_SIM_IMAGE}"
-            --run-command "${CV_RUN_COMMAND}"
-            --judge-command "${CV_JUDGE_COMMAND}"
             --concurrency "${CV_CONCURRENCY}"
             --run-dir "${run_dir}"
           )
-          if [ -n "${CV_RUNTIME_DOCKERFILE}" ]; then
-            args+=(--runtime-mode)
-          fi
           if [ -n "${CV_ORACLE_SCRIPT}" ]; then
             args+=(--oracle-script "${CV_ORACLE_SCRIPT}")
           fi
