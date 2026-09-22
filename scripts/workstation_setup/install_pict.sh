@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-# The pin (CLAUDE.md §2-7). Bumping it = new commit here AND in ci.yml, in one change.
+# The pin (CLAUDE.md §2-3). Bumping it = new commit here AND in ci.yml, in one change.
 readonly CV_PICT_REPO="https://github.com/microsoft/pict"
 readonly CV_PICT_COMMIT="0c66a8e332655cd64802e18de962dacbbe3882bd"
 # Under $HOME on purpose: no sudo, and the same path CI's cache uses, so an operator

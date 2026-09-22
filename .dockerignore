@@ -1,7 +1,7 @@
-# .dockerignore — keep the runner build context slim and stateless (M5 §3.1 D-O).
+# .dockerignore — keep the runner build context slim and stateless.
 # The builder stage does `COPY . /src`; only pyproject.toml + uv.lock + README.md +
 # cv_infra/ are actually needed for the wheel build. Everything volatile, secret or
-# team-external stays OUT of the context (never baked into any layer; LOCKED §15).
+# team-external stays OUT of the context (never baked into any layer).
 
 # --- VCS / local env / secrets ---
 .git

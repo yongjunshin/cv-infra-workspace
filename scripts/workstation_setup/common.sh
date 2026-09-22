@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # shellcheck disable=SC2034  # pins are consumed by the scripts that source this lib
-# common.sh — shared version pins + helpers for cv-infra workstation provisioning (M5 / Phase 1).
+# common.sh — shared version pins + helpers for cv-infra workstation provisioning.
 #
 # Sourced by: install_docker.sh, install_nvidia_toolkit.sh, test_gpu_passthrough.sh,
 #             pull_isaac.sh, provision.sh. Not meant to be executed on its own.
 #
-# Reproducibility (CLAUDE.md §2-7; decision 2026-06-24-env-reproducibility-pinning):
+# Reproducibility (CLAUDE.md §2-3; decided 2026-06-24):
 #   - ALL version/image pins live HERE — single source of truth, no per-script drift.
 #   - A pin that cannot be satisfied is a HARD, LOUD failure (no silent fallback).
 #   - The apt patch versions + image @sha256 digests below were CONFIRMED/LOCKED at the
@@ -25,9 +25,9 @@ _CV_INFRA_COMMON_LOADED=1
 # PINS — single source of truth
 # ---------------------------------------------------------------------------
 
-# Host platform. Supported OS is a SET, not one machine's distro (decision
-# 2026-08-19-p5c17-os-set-pin-set-and-host-purity, D-1). Everything that actually
-# DEPENDS on the codename is the three apt version strings below, so supporting a
+# Host platform. Supported OS is a SET, not one machine's distro (decided 2026-08-19).
+# Everything that actually DEPENDS on the codename is the three apt version strings
+# below, so supporting a
 # release = adding a row to that table + a member here; consumers are untouched.
 # provision.sh preflight asserts membership and refuses to run outside the set.
 readonly CV_REQUIRE_OS_ID="ubuntu"
@@ -49,13 +49,13 @@ if [[ -r /etc/os-release ]]; then
 fi
 readonly CV_HOST_CODENAME
 
-# NVIDIA driver floor (NFR-DEPLOY-005, DoD-P1-01; R580 branch, Isaac 5.1 floor).
+# NVIDIA driver floor (R580 branch, Isaac 5.1 floor).
 # Provisioning NEVER installs or upgrades the driver — it ASSERTS this floor only.
 readonly CV_DRIVER_FLOOR="580.65.06"
 
 # Docker CE (official apt repo) — the PREFERRED pin, i.e. what we INSTALL when we
 # install. Three of the five strings embed the distro codename, so they are a TABLE
-# keyed by the live codename (D-1). Same upstream versions on both rows: measured
+# keyed by the live codename. Same upstream versions on both rows: measured
 # 2026-08-19 with `apt-cache madison` on the jammy host, the noble row's versions are
 # offered for jammy too — the barrier was the suffix, never availability.
 case "$CV_HOST_CODENAME" in
@@ -91,15 +91,15 @@ readonly CV_CONTAINERD_VERSION="1.7.27-1"                             # confirme
 readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # confirmed 2026-06-26
 
 # --- VERIFIED version SETS (assert mode) -----------------------------------------
-# Decision 2026-08-19-p5c17-os-set-pin-set-and-host-purity, D-2: provisioning does NOT
+# Assert mode (decided 2026-08-19): provisioning does NOT
 # drag an already-working host DOWN to the preferred pin. If the INSTALLED version is
 # an element of the set below, the install step is SKIPPED and only asserted (loudly).
 # Anything else -> the preferred pin above is installed (previous behaviour).
 #
 # ★ These are SETS, never floors. `dpkg --compare-versions ... ge` would admit every
-# future version, which is exactly the shape G-12 caught (a floor-only "R580+" assert
+# future version, which is exactly the known failure shape (a floor-only "R580+" assert
 # admitted R595 and Isaac's RTX renderer segfaulted). A set has an upper bound by
-# construction, and every element carries the evidence that put it there (G-24).
+# construction, and every element carries the evidence that put it there.
 # Keep the sets SMALL — each element is a stack we promise still works.
 #
 # The membership KEY is the docker-ce version. The companion packages (containerd.io /
@@ -108,43 +108,41 @@ readonly CV_NVIDIA_TOOLKIT_VERSION="1.17.8-1"                         # confirme
 # whole stack as installed. install_docker.sh prints the companions in assert mode so
 # an audit can see exactly what was accepted.
 readonly CV_DOCKER_CE_VERIFIED=(
-  "5:28.3.3-1~ubuntu.24.04~noble"   # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
-  # VERIFIED 2026-08-19 by p5c17 T4: the full C-2 walkthrough (①provision → ②consent →
+  "5:28.3.3-1~ubuntu.24.04~noble"   # verified: etri6000, every GPU cycle 2026-06-26..2026-08-18
+  # VERIFIED 2026-08-19: the full deployment walkthrough (①provision → ②consent →
   # ③compose up --build → ④selftest exit 0) ran green on CEO local RTX 4080 / ubuntu jammy
   # with this STACK AS INSTALLED — docker-ce 5:29.7.2-1~ubuntu.22.04~jammy · docker-ce-cli
   # 5:29.7.2-1~ubuntu.22.04~jammy · containerd.io 2.3.3-1~ubuntu.22.04~jammy · docker-buildx-plugin
   # 0.36.1-1~ubuntu.22.04~jammy · docker-compose-plugin 5.4.0-1~ubuntu.22.04~jammy (Compose v5,
   # three majors past the preferred pin — the project's FIRST Compose v5 run, no schema change
-  # needed). Evidence: agent-comms/reports/deployment-2026-08-19-p5c17-T4-c2-walkthrough.md;
-  # raw logs on that host at ~/cv-infra-p5c17-t4-evidence/.
+  # needed). Raw logs on that host at ~/cv-infra-p5c17-t4-evidence/.
   "5:29.7.2-1~ubuntu.22.04~jammy"
 )
 readonly CV_NVIDIA_TOOLKIT_VERIFIED=(
-  "1.17.8-1"                        # verified: etri6000, every GPU cycle P1..p5c16 (evidence: implementation-plan/nfr-measurement-notes.md)
-  # VERIFIED 2026-08-19 by p5c17 T4 (same walkthrough, same host): nvidia-container-toolkit
+  "1.17.8-1"                        # verified: etri6000, every GPU cycle 2026-06-26..2026-08-18
+  # VERIFIED 2026-08-19 (same walkthrough, same host): nvidia-container-toolkit
   # 1.19.1-1 with -base / libnvidia-container-tools / libnvidia-container1 all 1.19.1-1,
   # driver 580.178.04 open KMD. GPU passthrough smoke exit 0 and a live Isaac Sim 5.1.0 job
   # (runner + stub SUT on a per-job bridge) ran to verdict=pass on it.
-  # Evidence: agent-comms/reports/deployment-2026-08-19-p5c17-T4-c2-walkthrough.md.
   "1.19.1-1"
 )
 
-# GPU-passthrough smoke image (DoD-P1-02). CUDA 12.8+ covers Blackwell; the in-container
+# GPU-passthrough smoke image. CUDA 12.8+ covers Blackwell; the in-container
 # nvidia-smi is injected from the HOST driver, so any recent CUDA base suffices for the
 # smoke. Tag + @sha256 digest LOCKED 2026-06-26 at first pull (RepoDigest of the manifest
 # list; resolves to the amd64 platform on this host). Env-overridable for a re-lock.
 readonly CV_CUDA_TEST_IMAGE="nvidia/cuda:12.8.1-base-ubuntu24.04"
 readonly CV_CUDA_TEST_DIGEST="${CV_CUDA_TEST_DIGEST:-sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2}"
 
-# Isaac Sim base (LOCKED — CLAUDE.md §5, REQ-DEPLOY-005). The 5.1.0 tag IS the locked
+# Isaac Sim base (LOCKED — CLAUDE.md §3). The 5.1.0 tag IS the locked
 # pin; the @sha256 digest is additional hardening LOCKED 2026-06-26 at first anonymous
-# NGC pull (DoD-P1-03; RepoDigest of the manifest list). Env-overridable for a re-lock.
+# NGC pull (RepoDigest of the manifest list). Env-overridable for a re-lock.
 readonly CV_ISAAC_IMAGE="nvcr.io/nvidia/isaac-sim:5.1.0"
 readonly CV_ISAAC_DIGEST="${CV_ISAAC_DIGEST:-sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54}"
 
-# Isaac host-side cache scaffold (DoD-P1-03 "cache mount dirs"). Lives under $HOME
+# Isaac host-side cache scaffold ("cache mount dirs"). Lives under $HOME
 # (no sudo). The exact in-container mount targets are finalized with the runner image
-# (Phase 2; 5.1.0 cache layout = [VERIFY], M5 §3.6 / R2).
+# (5.1.0 cache layout = [VERIFY]).
 readonly CV_ISAAC_CACHE_ROOT="${CV_ISAAC_CACHE_ROOT:-$HOME/docker/isaac-sim}"
 
 # ---------------------------------------------------------------------------
@@ -153,7 +151,7 @@ readonly CV_ISAAC_CACHE_ROOT="${CV_ISAAC_CACHE_ROOT:-$HOME/docker/isaac-sim}"
 
 # Non-interactive sudo. The /etc/sudoers.d/cv-infra NOPASSWD drop-in authorizes a
 # fixed binary set; `-n` makes any UN-authorized sudo call fail FAST and LOUD instead
-# of hanging on a password prompt (G-06: no TTY in non-interactive SSH / agent context).
+# of hanging on a password prompt (no TTY in non-interactive SSH / agent context).
 readonly CV_SUDO=(sudo -n)
 
 log()  { printf '[cv-infra][%s] %s\n' "${CV_STEP:-provision}" "$*"; }
@@ -161,7 +159,7 @@ warn() { printf '[cv-infra][%s][WARN] %s\n' "${CV_STEP:-provision}" "$*" >&2; }
 err()  { printf '[cv-infra][%s][ERROR] %s\n' "${CV_STEP:-provision}" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-# Is the live host codename one of the supported ones? (D-1 — the assert itself lives
+# Is the live host codename one of the supported ones? (the assert itself lives
 # in provision.sh preflight; install_docker.sh calls it too, since it can run alone.)
 require_supported_codename() {
   local c
@@ -171,9 +169,9 @@ require_supported_codename() {
   die "Unsupported codename '${CV_HOST_CODENAME:-?}' — these scripts support: ${CV_SUPPORTED_OS_CODENAMES[*]}. Adding one = a row in the codename pin table of common.sh (the apt versions must be OFFERED there — check with 'apt-cache madison docker-ce')."
 }
 
-# Exact-string membership in a verified version SET (D-2). NOT a floor comparison:
+# Exact-string membership in a verified version SET. NOT a floor comparison:
 # `dpkg --compare-versions ... ge` admits every future version and that is the exact
-# shape G-12 caught. Callers pass the set expanded: version_in_set "$v" "${SET[@]}".
+# shape that let R595 in. Callers pass the set expanded: version_in_set "$v" "${SET[@]}".
 version_in_set() {
   local want="$1" v
   shift
@@ -224,11 +222,10 @@ require_apt_pkg_version() {
 }
 
 # ---------------------------------------------------------------------------
-# --- P1-07 self-hosted runner pins (M8) ---
+# --- self-hosted runner pins ---
 # ---------------------------------------------------------------------------
-# Consumed by register_gh_runner.sh only (DoD-P1-07; decision
-# 2026-07-03-self-hosted-runner-policy — binding). Appended by M8/DX; the M5
-# provisioning pins above are untouched.
+# Consumed by register_gh_runner.sh only (runner policy decided 2026-07-03).
+# Appended later; the provisioning pins above are untouched.
 #
 # Pin refresh is ACCEPTED MAINTENANCE: GitHub may refuse jobs from runners more
 # than ~30 days behind the minimum version (self-update is disabled via
@@ -240,21 +237,20 @@ readonly CV_GH_RUNNER_VERSION="2.335.1"       # pinned 2026-07-03 (then-latest o
 # (`<!-- BEGIN SHA linux-x64 -->` marker) — an UPSTREAM-stated checksum, not a
 # first-download measurement. Mismatch at install time = hard die.
 readonly CV_GH_RUNNER_TARBALL_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
-# Registration TARGET params (decision 2026-07-21-e2e-user-runner-provisioning:
+# Registration TARGET params (decided 2026-07-21:
 # a SECOND same-machine repo-level runner for cv-infra-user). Env-overridable,
 # defaulting to the original WORKSPACE runner — a plain no-env re-run is
 # byte-identical to the pre-parameterization behavior (idempotent no-op on the
 # existing runner). The version/sha256 pins above and the label set below are
 # deliberately NOT parameters: every runner on this host runs the same pinned
-# binary with the same `cv-infra-gpu` label (decision 2026-07-03 §2/§3 hardening
+# binary with the same `cv-infra-gpu` label (the 2026-07-03 hardening
 # applies identically to each registration).
-readonly CV_GH_RUNNER_REPO_URL="${CV_GH_RUNNER_REPO_URL:-https://github.com/yongjunshin/cv-infra-workspace}"  # repo-level target (decision §1)
-# Runner name = LIVE HOST identity + role, derived at run time (DoD-P5-09: no machine
+readonly CV_GH_RUNNER_REPO_URL="${CV_GH_RUNNER_REPO_URL:-https://github.com/yongjunshin/cv-infra-workspace}"  # repo-level target
+# Runner name = LIVE HOST identity + role, derived at run time (no machine
 # hardcoded into the deployment). Provisioning a second host used to silently propose
 # the first host's runner name; GitHub runner names are per-repo unique, so that is a
 # portability defect, not cosmetics. On the original workstation this is byte-identical
-# to the previous literal (`hostname` there is measured as `etri6000` — decision
-# 2026-07-07-workstation-access-ssh-first-alpacon-fallback §"동일 호스트 실측 확증"),
+# to the previous literal (`hostname` there was measured as `etri6000` on 2026-07-07),
 # and register_gh_runner.sh skips an already-configured runner anyway (.runner marker).
 readonly CV_GH_RUNNER_NAME="${CV_GH_RUNNER_NAME:-$(hostname -s)-cv-infra}"
 readonly CV_GH_RUNNER_LABELS="cv-infra-gpu"   # effective label set: [self-hosted, Linux, X64, cv-infra-gpu]
@@ -262,9 +258,9 @@ readonly CV_GH_RUNNER_HOME="${CV_GH_RUNNER_HOME:-$HOME/cv-infra-gh-runner}"
 readonly CV_GH_RUNNER_SERVICE="${CV_GH_RUNNER_SERVICE:-cv-infra-gh-runner}"
 
 # ---------------------------------------------------------------------------
-# --- driver R580 realignment pins (M5) ---
+# --- driver R580 realignment pins ---
 # ---------------------------------------------------------------------------
-# Decision 2026-07-03-driver-r580-realignment (binding): Isaac Sim 5.1.0
+# Realignment decided 2026-07-03: Isaac Sim 5.1.0
 # (kit 107.3.3) deterministically segfaults in the RTX renderer on the R595
 # branch (known NVIDIA issue, no workaround; certified branch = R580 LTSB).
 # The provisioning preflight therefore asserts BRANCH == CV_DRIVER_BRANCH in
@@ -275,24 +271,25 @@ readonly CV_DRIVER_TARGET_STAGE1="580.159.03-0ubuntu0.24.04.1" # Ubuntu noble ar
 readonly CV_DRIVER_TARGET_STAGE2="580.65.06-0ubuntu1"          # NVIDIA CUDA ubuntu2404 repo (DKMS) — fallback ONLY if stage 1 still crashes RTX
 
 # ---------------------------------------------------------------------------
-# --- P1-04/05 isaac smoke + DDS pins (M2) ---
+# --- isaac smoke + DDS pins ---
 # ---------------------------------------------------------------------------
 # Sourced by scripts/isaac_smoke/run_smoke.sh. Same rules as
 # above: pins live here only; env-overridable defaults follow the CV_ISAAC_DIGEST
 # 2-stage pattern (pull by exact tag once -> lock @sha256 here -> reference by digest).
 
-# ros:jazzy DDS-handshake peer image (DoD-P1-05). Exact tag pin; @sha256 digest
+# ros:jazzy DDS-handshake peer image. Exact tag pin; @sha256 digest
 # LOCKED 2026-07-03 from the first pull's RepoDigests on etri6000 (manifest-list
 # digest; same 2-stage pattern as CV_ISAAC_DIGEST). Env-overridable for a re-lock.
 readonly CV_ROS_JAZZY_IMAGE="ros:jazzy"
 readonly CV_ROS_JAZZY_DIGEST="${CV_ROS_JAZZY_DIGEST:-sha256:31daab66eef9139933379fb67159449944f4e2dcf2e22c2d12cc715f29873e0f}"
 
-# Smoke/handshake runtime knobs (DoD-P1-04/05).
-readonly CV_SMOKE_NET="${CV_SMOKE_NET:-cv-smoke-net}"        # dedicated bridge net (non-host, R8)
+# Smoke/handshake runtime knobs.
+readonly CV_SMOKE_NET="${CV_SMOKE_NET:-cv-smoke-net}"        # dedicated bridge net (non-host)
 readonly CV_SMOKE_DOMAIN_ID="${CV_SMOKE_DOMAIN_ID:-42}"      # fixed ROS_DOMAIN_ID (safe range 0..101)
 # Kit/Isaac needs a real /dev/shm (docker default 64m is too small for Kit workloads).
 # This is separate from the DDS SHM *transport*, which stays disabled via the UDPv4
-# profile (R8). Value [VERIFY]: measured in-run usage is recorded by run_smoke.sh.
+# profile (DDS SHM may not work across containers). Value [VERIFY]: measured in-run
+# usage is recorded by run_smoke.sh.
 readonly CV_SMOKE_SHM_SIZE="${CV_SMOKE_SHM_SIZE:-1g}"
 readonly CV_SMOKE_TIMEOUT_S="${CV_SMOKE_TIMEOUT_S:-2400}"    # smoke wall guard (cold shader compile)
 readonly CV_HANDSHAKE_BOOT_TIMEOUT_S="${CV_HANDSHAKE_BOOT_TIMEOUT_S:-1200}"
@@ -300,20 +297,20 @@ readonly CV_HANDSHAKE_WAIT_S="${CV_HANDSHAKE_WAIT_S:-240}"   # in-sim wall wait 
 readonly CV_HANDSHAKE_ECHO_TIMEOUT_S="${CV_HANDSHAKE_ECHO_TIMEOUT_S:-60}"
 
 # ---------------------------------------------------------------------------
-# --- P5 EULA consent gate (M5 §3.7) ---
+# --- EULA consent gate ---
 # ---------------------------------------------------------------------------
 # Sourced by scripts/consent/{accept_eula.sh,check_consent.sh}. Same rule as above:
 # the paths/URLs live HERE only, so the writer and the gate can never drift apart.
 #
-# The consent RECORD (identity + timestamp, REQ-DEPLOY-010) is the host-side audit
+# The consent RECORD (identity + timestamp) is the host-side audit
 # + gate artifact, deliberately SEPARATE from the runtime .env: the record answers
 # "did an operator consent, who, when", while the runtime boot gate's single source
-# of truth stays the env the runner receives (M5 §3.7 D-O/F7). It lives under $HOME
+# of truth stays the env the runner receives. It lives under $HOME
 # (no sudo, survives re-deploys of the repo checkout).
 readonly CV_CONSENT_RECORD="${CV_CONSENT_RECORD:-$HOME/.cv-infra/eula-consent.json}"
 readonly CV_CONSENT_RECORD_SCHEMA="cv-infra/eula-consent/v1"
 
-# What the operator is asked to accept. The license URL is the one the P1 smoke
+# What the operator is asked to accept. The license URL is the one the smoke
 # wrapper already shows (single wording across the deployment).
 readonly CV_EULA_URL="https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/"
 # NVIDIA privacy policy (stable official URL). The Omniverse/Kit data-collection

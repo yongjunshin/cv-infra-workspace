@@ -163,7 +163,7 @@ def test_an_absolute_checkout_needs_no_base_directory(tmp_path):
 
 
 def test_the_spec_carries_every_field_the_execution_seam_reads(tmp_path):
-    """The duck-typed surface ``cv_infra.execution`` documents (M1 landed first)."""
+    """The duck-typed surface ``cv_infra.execution`` documents (the seam landed first)."""
     spec = parse_args(tmp_path, "--oracle-script", "verify/oracle.py")
 
     for name in (

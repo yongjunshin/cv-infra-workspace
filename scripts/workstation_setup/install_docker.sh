@@ -29,7 +29,7 @@ main() {
   if [[ "$installed" == "$CV_DOCKER_CE_VERSION" ]]; then
     log "docker-ce $CV_DOCKER_CE_VERSION already installed (= the preferred pin) — (re)asserting group + service only"
   elif version_in_set "$installed" "${CV_DOCKER_CE_VERIFIED[@]}"; then
-    # D-2 assert mode: an already-working host is NOT dragged down to the preferred
+    # Assert mode: an already-working host is NOT dragged down to the preferred
     # pin. Loud on purpose — the accepted stack must be visible in the log, because
     # only the docker-ce string was compared and the companions ride along.
     log "ASSERT MODE: installed docker-ce $installed is an element of the VERIFIED set — NOT installing, NOT downgrading (preferred pin here would be $CV_DOCKER_CE_VERSION)"
@@ -90,8 +90,8 @@ main() {
     log "SKIP (already true, checked): '$me' is already in the docker group — no 'usermod -aG', no sudo"
   else
     log "adding '$me' to the docker group (effective next login)"
-    # NOTE: /usr/sbin/usermod was REMOVED from the sudo whitelist by decision
-    # 2026-07-07-fu6-sudo-scope-reduction, so this branch fails loudly by design and
+    # NOTE: /usr/sbin/usermod was REMOVED from the sudo whitelist on 2026-07-07,
+    # so this branch fails loudly by design and
     # is an operator action in an interactive terminal. It is now only REACHED when
     # the group is genuinely missing.
     "${CV_SUDO[@]}" usermod -aG docker "$me"

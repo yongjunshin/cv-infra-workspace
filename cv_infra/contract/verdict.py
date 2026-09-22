@@ -23,7 +23,7 @@ silently dropped value: flat dict only, because a nested verdict has no obvious
 baseline key and would be compared against nothing.
 
 Three lanes, from the run's exit codes alone (never from the sim's own exit status —
-G-62: ``SimulationApp.close()`` exits 0 whatever happened, and the stock ``python.sh``
+``SimulationApp.close()`` exits 0 whatever happened, and the stock ``python.sh``
 squashes non-zero to 1, so ``rc_sim`` only ever separates "died badly" from "ran"):
 ``rc_sim`` bad -> ERROR, ``rc_oracle`` bad -> ERROR, otherwise parse the stdout.
 """

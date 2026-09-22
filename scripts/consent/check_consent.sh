@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check_consent.sh — the EULA consent GATE (M5 §3.7; REQ-DEPLOY-010/011, NFR-DEPLOY-004).
+# check_consent.sh — the EULA consent GATE.
 #
 # Answers exactly one question, read-only: has an operator recorded consent on THIS host?
 #
@@ -9,9 +9,9 @@
 #   exit 2 — usage error
 #
 # It never accepts, never writes, never repairs. Consent is created only by an operator
-# running accept_eula.sh (LOCKED §8: no auto-acceptance, and CI may not bypass this).
+# running accept_eula.sh (no auto-acceptance, and CI may not bypass this).
 #
-# Two gates, one boundary (M5 §3.7 D-O/F7) — do NOT collapse them into one:
+# Two gates, one boundary — do NOT collapse them into one:
 #   * THIS record = "did an operator consent, who, when" — host-side audit + gate.
 #   * The runtime ENV that the run receives = the gate cv-infra actually honors
 #     (ACCEPT_EULA/PRIVACY_CONSENT absent -> cv_infra/contract/inputs.py refuses the run
@@ -43,7 +43,7 @@ require_cmd python3
 
 if [[ ! -f "$CV_CONSENT_RECORD" ]]; then
   err "no NVIDIA Isaac Sim consent record on this host: $CV_CONSENT_RECORD"
-  err "This deployment never accepts the license on your behalf (NEG-2 / LOCKED §8)."
+  err "This deployment never accepts the license on your behalf."
   err "Fix:  bash $SCRIPT_DIR/accept_eula.sh"
   exit 3
 fi

@@ -1,16 +1,16 @@
-# Workstation Provisioning (M5 / Phase 1)
+# Workstation Provisioning
 
 Idempotent, version-pinned scripts that provision a GPU host (supported OS = the
 codename **set** in `common.sh`: Ubuntu `noble` / `jammy`) with **Docker CE + NVIDIA
-Container Toolkit**, then prove GPU passthrough (DoD-P1-02) and pull the Isaac Sim
-base image (DoD-P1-03).
+Container Toolkit**, then prove GPU passthrough and pull the Isaac Sim
+base image.
 
 > **The GPU driver is never touched by provisioning.** The driver (**R580 branch**,
 > open kernel module) is a prerequisite, asserted against a floor **and the branch**
 > (floor-only admitted R595, which segfaults Isaac 5.1.0 — see
 > [Driver branch realignment](#driver-branch-realignment-r580)). Provisioning
 > installs the container stack on top; the ONE sanctioned driver-touching script is
-> `realign_driver_r580.sh` (decision `2026-07-03-driver-r580-realignment`).
+> `realign_driver_r580.sh` (decided 2026-07-03).
 >
 > **Author stage vs. execution stage.** Authoring these files changes nothing on the
 > host. Actual installation runs only after the CEO installs the sudo drop-in
@@ -42,9 +42,9 @@ Try `bash scripts/workstation_setup/provision.sh` first and read the `SKIP (alre
 true, checked)` lines.
 
 If something IS missing: the provisioning scripts run over **non-interactive SSH**,
-which cannot answer a sudo password prompt (G-06). So an operator installs a **NOPASSWD
-drop-in** once, in their own terminal (decision `2026-07-07-fu6-sudo-scope-reduction`,
-option B — supersedes `2026-06-25-workstation-sudo-nopasswd`). The committed file is a
+which cannot answer a sudo password prompt. So an operator installs a **NOPASSWD
+drop-in** once, in their own terminal (standing scope decided 2026-07-07 — supersedes
+the 2026-06-25 first-provisioning-only scope). The committed file is a
 **template**: its user field is the placeholder `cv_infra_operator`, substituted with
 the account that will run provisioning **on this host** (it used to be one machine's
 account literal). Run **on the host, in your own terminal**:
@@ -61,8 +61,8 @@ sudo visudo -cf /etc/sudoers.d/cv-infra && echo "drop-in OK"
 `visudo -cf` must print `... parsed OK` (and `drop-in OK`). The drop-in authorizes
 exactly four binaries for that one user; see [sudo 1:1 mapping](#sudo-11-mapping).
 
-**Lifetime (P2+): STANDING** — the Phase-1 "removable / teardown" clause is
-superseded by decision `2026-07-07-fu6-sudo-scope-reduction`. Scope changes require
+**Lifetime: STANDING** — the original (2026-06-25) "removable / teardown" clause is
+superseded by the 2026-07-07 decision. Scope changes require
 a superseding decision; updates ship through the whitelisted channel itself
 (validate first, then replace):
 
@@ -87,11 +87,11 @@ bash scripts/workstation_setup/provision.sh
 
 | Step | Script | What it does | Gate |
 |---|---|---|---|
-| preflight | (inline) | assert OS ID, codename ∈ supported **set**, arch=amd64, driver >= floor **and on the R580 branch** (read-only) | DoD-P1-01 (driver) |
+| preflight | (inline) | assert OS ID, codename ∈ supported **set**, arch=amd64, driver >= floor **and on the R580 branch** (read-only) | driver floor + branch |
 | 1 | `install_docker.sh` | pinned Docker CE via official apt repo (or **assert mode**, below); enable service; add the invoking user to the docker group — **each privileged action is skipped when a read-only check shows it is already done** | — |
 | 2 | `install_nvidia_toolkit.sh` | pinned NVIDIA Container Toolkit (or **assert mode**); `nvidia-ctk runtime configure` + restart docker **only if the daemon does not already report the `nvidia` runtime** | — |
-| 3 | `test_gpu_passthrough.sh` | `docker run --rm --gpus all <cuda> nvidia-smi` -> exit 0 | **DoD-P1-02** |
-| 4 | `pull_isaac.sh` | `docker pull nvcr.io/nvidia/isaac-sim:5.1.0` (+ host cache scaffold) | **DoD-P1-03** |
+| 3 | `test_gpu_passthrough.sh` | `docker run --rm --gpus all <cuda> nvidia-smi` -> exit 0 | **GPU passthrough** |
+| 4 | `pull_isaac.sh` | `docker pull nvcr.io/nvidia/isaac-sim:5.1.0` (+ host cache scaffold) | **Isaac image pulled** |
 
 Individual steps can also be run on their own (e.g. `bash scripts/workstation_setup/test_gpu_passthrough.sh`).
 
@@ -100,23 +100,23 @@ Individual steps can also be run on their own (e.g. `bash scripts/workstation_se
 ## Pins (single source of truth = `common.sh`)
 
 All version/image pins live in `common.sh`. A pin that the repo does not offer is a
-**hard, loud failure** — no silent drift (reproducibility: CLAUDE.md §2-7).
+**hard, loud failure** — no silent drift (reproducibility: CLAUDE.md §2-3).
 
 | Pin | Value | Rationale |
 |---|---|---|
-| Driver floor | `580.65.06` (asserted) | Isaac 5.1 floor (NFR-DEPLOY-005). Open kernel module. |
-| Driver branch | `580` (asserted, floor AND ceiling) | Isaac 5.1.0 certified branch; R595 segfaults the RTX renderer (decision `2026-07-03-driver-r580-realignment`). |
+| Driver floor | `580.65.06` (asserted) | Isaac 5.1 floor. Open kernel module. |
+| Driver branch | `580` (asserted, floor AND ceiling) | Isaac 5.1.0 certified branch; R595 segfaults the RTX renderer (decided 2026-07-03). |
 | Driver target (stage 1) | `580.159.03-0ubuntu0.24.04.1` (installed 2026-07-03) | Ubuntu noble archive; prebuilt signed per-kernel open modules. Held by the apt pin file, which is a **template**: `realign_driver_r580.sh` stamps the build it installs into `@CV_DRIVER_TARGET_UPSTREAM@` (two hosts run two different R580 builds). |
 | Driver target (stage 2, fallback only) | `580.65.06-0ubuntu1` | NVIDIA CUDA ubuntu2404 repo (DKMS); only if stage 1 still crashes RTX. |
-| Supported OS codenames | `noble` `jammy` (set) | The only codename-dependent thing is the three apt strings below, so support = one table row (decision `2026-08-19-p5c17-os-set-pin-set-and-host-purity`, D-1). |
+| Supported OS codenames | `noble` `jammy` (set) | The only codename-dependent thing is the three apt strings below, so support = one table row (decided 2026-08-19). |
 | Docker CE | `5:28.3.3-1~ubuntu.24.04~noble` / `5:28.3.3-1~ubuntu.22.04~jammy` | Preferred pin, per codename. noble confirmed 2026-06-26 (installed); jammy offer confirmed 2026-08-19 (`apt-cache madison`). |
 | containerd.io | `1.7.27-1` (confirmed 2026-06-26) | Pinned alongside Docker CE. Codename-independent **at this version** — the 2.x line is not (see `common.sh`). |
-| docker-buildx-plugin | `0.26.1-1~ubuntu.24.04~noble` / `0.26.1-1~ubuntu.22.04~jammy` | Pinned (needed for image builds, Phase 2). |
-| docker-compose-plugin | `2.39.2-1~ubuntu.24.04~noble` / `2.39.2-1~ubuntu.22.04~jammy` | Pinned (control plane `compose`, Phase 4). |
+| docker-buildx-plugin | `0.26.1-1~ubuntu.24.04~noble` / `0.26.1-1~ubuntu.22.04~jammy` | Pinned (needed for image builds). |
+| docker-compose-plugin | `2.39.2-1~ubuntu.24.04~noble` / `2.39.2-1~ubuntu.22.04~jammy` | Pinned (control plane `compose`). |
 | NVIDIA Container Toolkit | `1.17.8-1` (confirmed 2026-06-26) | All 4 toolkit pkgs pinned to one version (NVIDIA-recommended). |
-| **Verified** docker-ce / toolkit **sets** | `CV_DOCKER_CE_VERIFIED` · `CV_NVIDIA_TOOLKIT_VERIFIED` | Assert mode (D-2): an installed version that is an **element of the set** is accepted as is — no downgrade to the preferred pin. Enumerated **sets, never floors** (a floor is what let R595 in — G-12); each element carries its evidence (G-24). |
+| **Verified** docker-ce / toolkit **sets** | `CV_DOCKER_CE_VERIFIED` · `CV_NVIDIA_TOOLKIT_VERIFIED` | Assert mode: an installed version that is an **element of the set** is accepted as is — no downgrade to the preferred pin. Enumerated **sets, never floors** (a floor is what let R595 in); each element carries its evidence. |
 | CUDA smoke image | `nvidia/cuda:12.8.1-base-ubuntu24.04` @ digest (locked 2026-06-26) | CUDA 12.8+ covers Blackwell; `nvidia-smi` comes from the host driver. |
-| Isaac Sim base | `nvcr.io/nvidia/isaac-sim:5.1.0` @ digest (LOCKED tag; digest locked 2026-06-26) | CLAUDE.md §5, REQ-DEPLOY-005. Tag is the locked pin; digest is extra hardening. |
+| Isaac Sim base | `nvcr.io/nvidia/isaac-sim:5.1.0` @ digest (LOCKED tag; digest locked 2026-06-26) | CLAUDE.md §3. Tag is the locked pin; digest is extra hardening. |
 
 ### Pin confirmation (execution stage, 2026-06-26 on `etri6000`)
 
@@ -161,11 +161,11 @@ warning (this is the only way to bootstrap a digest pin — not a silent fallbac
 > Moving tags (a rolling `latest`-style tag, or a git-branch image ref) are forbidden
 > project-wide; these scripts use exact tags/versions only.
 
-### NGC pull fallback (DoD-P1-03)
+### NGC pull fallback
 
 `pull_isaac.sh` attempts an **anonymous** NGC pull. If NGC requires authentication
-(rate-limit / org terms; R13), it stops and prints the fallback — run in **your own
-terminal** (interactive password, G-06):
+(rate-limit / org terms), it stops and prints the fallback — run in **your own
+terminal** (interactive password):
 
 ```bash
 sudo docker login nvcr.io      # username: $oauthtoken   password: <NGC API key>
@@ -182,8 +182,8 @@ segfaults during RTX renderer startup (`librtx.scenedb.plugin.so`, ~50ms after
 "app ready") on driver 595.71.05 — confirmed upstream as a known issue with **no
 workaround**; the fix is the R580 branch Isaac 5.1.0 was certified against
 (official test driver 580.65.06; R580 = LTSB, EOL 2028-06, vs R595 EOL 2027-03).
-R595 support starts with Isaac 6.0 / kit 109, which LOCKED #1 forbids. Binding
-record: `agent-comms/decisions/2026-07-03-driver-r580-realignment.md`. Lesson
+R595 support starts with Isaac 6.0 / kit 109, which the Isaac Sim 5.1.0 pin
+(CLAUDE.md §3) forbids. Lesson
 codified here: the old floor-only assert (`>= 580.65.06`) admitted 595 — the
 preflight now asserts **floor + branch (major == 580)**.
 
@@ -199,8 +199,9 @@ Stage 1 (executed 2026-07-03) replaces the 595-server set with the Ubuntu-archiv
 `nvidia-utils-580`, `nvidia-kernel-common-580`, `nvidia-firmware-580-*` + prebuilt
 signed `linux-modules-nvidia-580-open-<kver>` for **every installed generic
 kernel** — GRUB boots the newest installed kernel, not necessarily the running
-one) in a single guarded apt transaction (`--no-install-recommends`, G-11; a
-dry-run refuses any removal outside the 595 set), then deploys the apt pin file:
+one) in a single guarded apt transaction (`--no-install-recommends`, so no unrelated
+packages; a dry-run refuses any removal outside the 595 set), then deploys the apt
+pin file:
 
 - **Pin file** (canonical copy: `apt-preferences-cv-infra-nvidia-r580` — a
   **template**, deployed to `/etc/apt/preferences.d/cv-infra-nvidia-r580` with
@@ -209,14 +210,13 @@ dry-run refuses any removal outside the 595 set), then deploys the apt pin file:
   (priority 1001) and hard-blocks `*nvidia*590*` / `*nvidia*595*` / `*nvidia*610*`
   (priority -1) so `apt upgrade`/unattended-upgrades can never re-ascend. The blocks
   are by package **name**, so every newer branch needs its own stanza — R590 was
-  missing until p5c17 measured it in apt on the second host.
+  missing until it was measured in apt on the second host (2026-08-19).
   Check with `apt-cache policy libnvidia-compute-580`.
 - The deterministic acceptance test is the stock warmup of the pinned Isaac image
   completing without the RTX segfault (consent env is **runtime-injected by the
-  operator** per decision `2026-07-03-p1-eula-runtime-consent` — never committed).
+  operator**, as decided 2026-07-03 — never committed).
 
-**Rollback:** the pre-change package set is recorded in the realignment report
-(cycle `2026-07-03-phase1-boot-skeletons`) and printed by the script's dpkg
+**Rollback:** the pre-change package set is printed by the script's dpkg
 snapshot. To roll back: remove `/etc/apt/preferences.d/cv-infra-nvidia-r580`
 (root), reinstall the recorded 595 versions, reboot. (Do NOT roll back casually —
 595 re-breaks Isaac.)
@@ -261,8 +261,8 @@ itself.
 ## sudo 1:1 mapping
 
 `sudoers.d-cv-infra` whitelists exactly the binaries the scripts call via `sudo -n`
-(P2+ **standing** scope — decision `2026-07-07-fu6-sudo-scope-reduction`, option B).
-Since p5c17 every one of these invocations is **preceded by a read-only check** and is
+(**standing** scope, decided 2026-07-07).
+Since 2026-08-19 every one of these invocations is **preceded by a read-only check** and is
 skipped when its result already holds, so the table below is the *maximum* surface, not
 what a given run uses:
 
@@ -273,24 +273,24 @@ what a given run uses:
 | `/usr/bin/systemctl` | `install_docker.sh`, `install_nvidia_toolkit.sh`, `realign_driver_r580.sh`, `register_gh_runner.sh` | `systemctl enable --now docker`; `systemctl restart docker`; realign: `systemctl reboot` (only with `--reboot`); runner: `stop` / `daemon-reload` / `enable --now` |
 | `/usr/bin/docker` | `test_gpu_passthrough.sh`, `pull_isaac.sh`, `isaac_smoke/run_smoke.sh` | `docker run --rm --gpus all ...`; `docker image inspect ...`; `docker pull ...`; smoke `docker run/network/logs/rm ...` |
 
-**Removed at P2 (FU-6)**: `/usr/sbin/usermod` (`usermod -aG docker etri`) and
+**Removed 2026-07-07**: `/usr/sbin/usermod` (`usermod -aG docker etri`) and
 `/usr/bin/nvidia-ctk` (`nvidia-ctk runtime configure --runtime=docker`) — one-shot
-provisioning verbs with no P2+ recurrence. Consequence: a full `provision.sh` re-run
+provisioning verbs that maintenance never repeats. Consequence: a full `provision.sh` re-run
 now fails loud at those two invocations; on a re-provision they are operator actions
-in an interactive terminal (G-06 pattern).
+in an interactive terminal (sudo needs a TTY for the password).
 
 `curl` / `gpg` are **not** whitelisted: keys are downloaded as the user and placed with
 `install`. Arguments are unconstrained (accepted standing scope — see the drop-in header).
 
 ---
 
-## Self-hosted GitHub Actions runner (M8 / DoD-P1-07)
+## Self-hosted GitHub Actions runner
 
 `register_gh_runner.sh` registers this workstation as a **repo-level** self-hosted
-runner for `cv-infra-workspace` (decision `2026-07-03-self-hosted-runner-policy` —
-binding), labels `[self-hosted, cv-infra-gpu]`, persisted as the systemd service
+runner for `cv-infra-workspace` (runner policy decided 2026-07-03),
+labels `[self-hosted, cv-infra-gpu]`, persisted as the systemd service
 **`cv-infra-gh-runner`**. Pins (runner version + official tarball sha256) live in
-`common.sh` (→ *P1-07 self-hosted runner pins*). Self-update is disabled
+`common.sh` (→ *self-hosted runner pins*). Self-update is disabled
 (`--disableupdate`); GitHub's `./svc.sh` is **not** used (its sudo calls fall outside
 the `/etc/sudoers.d/cv-infra` whitelist — this script only needs whitelisted
 `sudo -n install` / `sudo -n systemctl`).
@@ -319,9 +319,9 @@ gh api repos/yongjunshin/cv-infra-workspace/actions/runners \
 ssh cv-infra-ws 'systemctl is-active cv-infra-gh-runner && systemctl is-enabled cv-infra-gh-runner'
 ```
 
-### Second runner (`cv-infra-user`, P5 consumer E2E)
+### Second runner (`cv-infra-user`, consumer E2E)
 
-Decision `2026-07-21-e2e-user-runner-provisioning`: the same machine also serves
+Decided 2026-07-21: the same machine also serves
 the consumer repo via a **second repo-level runner** — own home, own systemd
 unit, same pinned binary, same `cv-infra-gpu` label, same 2026-07-03 hardening.
 The registration target is env-parameterized (defaults = the workspace runner
@@ -347,16 +347,17 @@ gh api -X POST repos/yongjunshin/cv-infra-user/actions/runners/registration-toke
 
 `$(hostname -s)` expands on the **remote** host (same single-quoted string as the
 `$HOME` above), so the two runners are named after the machine that runs them
-instead of after ours — DoD-P5-09, no machine hardcoded into the deployment. On the
+instead of after ours — no machine hardcoded into the deployment. On the
 original workstation it resolves to the names the live runners already carry
-(`etri6000-cv-infra` / `etri6000-cv-infra-user`; that host's `hostname` is measured
-as `etri6000` — decision `2026-07-07-workstation-access-ssh-first-alpacon-fallback`),
+(`etri6000-cv-infra` / `etri6000-cv-infra-user`; that host's `hostname` was measured
+as `etri6000` on 2026-07-07),
 so a re-run there is a no-op either way (`.runner` marker short-circuits it).
 
 CI jobs find the host-plane `cv-infra` CLI via the runner's `.path` file. The
 loading mechanism is the unit's `ExecStart=<home>/bin/runsvc.sh`, which exports
 `.path` as the service PATH at **service start** (`run.sh` does NOT load
-`.path` — dead file, exit 127 in jobs; F1 root cause). `.env` is read by the
+`.path` — dead file, exit 127 in jobs; root cause of the 2026-07-21 runner PATH
+blocker). `.env` is read by the
 runner process itself; PATH is all the CLI needs (console-script shebangs point
 into the venv). Prepend the host venv bin **in every runner home**, then
 restart the services (idempotent — skip if already present):

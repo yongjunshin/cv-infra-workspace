@@ -9,10 +9,10 @@ paths, resolve the binary) rather than discovered a container later.
 Two exception classes, because the developer's next action differs:
 
 * ``ContractError`` (exit 2) — the REQUEST is wrong. Friendly field/expected/got with a
-  fixable example, so the message names the flag to change (NFR-INTAKE-001).
+  fixable example, so the message names the flag to change.
 * ``InfraError`` (exit 3) — the RUNNER is wrong: operator consent env is absent, or the
   pinned PICT binary is not installed. Blaming the consumer's document for either would
-  send a developer to fix a file that is not broken (D-I, exit 3 is never a SUT verdict).
+  send a developer to fix a file that is not broken (exit 3 is never a SUT verdict).
 
 Order is a decision, not an accident: consent is checked BEFORE anything else (Isaac
 Sim's EULA/telemetry consent is the operator's, never baked into this repository, so a
@@ -206,7 +206,7 @@ def parse(
     sim_output_dir = _checkout_output_dir(args.output_dir, checkout)
 
     input_space_text = (checkout / sim_input_space).read_text(encoding="utf-8")
-    # validate_model owns the whole model shape, axis names included (M5).
+    # validate_model owns the whole model shape, axis names included.
     pict.validate_model(input_space_text, source_path=sim_input_space)
     axes = pict._declared_parameters(input_space_text)
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# run_smoke.sh — DoD-P1-04 host-side wrapper (M2, walking skeleton #1).
+# run_smoke.sh — host-side wrapper for the Isaac headless boot smoke.
 #
 # Boots headless_smoke.py --mode smoke inside the pinned isaac-sim:5.1.0 BASE image
 # (no custom image build) on a dedicated non-host bridge network, livestream off
 # (we bypass the runheadless.sh streaming entrypoint with --entrypoint python.sh),
 # then asserts:
-#   * container exit 0                                        (REQ-EXEC-001)
+#   * container exit 0                                        (clean headless boot)
 #   * nvidia-smi shows the container's process occupying GPU  (PID evidence)
-#   * >=1 off-screen render-product frame, NON-black          (D-A / R19)
-#   * PhysX stepped (falling cube)                            (R5 diagnostics logged)
+#   * >=1 off-screen render-product frame, NON-black          (RTX graphics capability)
+#   * PhysX stepped (falling cube)                            (perf diagnostics logged)
 #
-# EULA (decision 2026-07-03-p1-eula-runtime-consent, NEG-2): this wrapper REFUSES to
+# EULA (runtime consent, decided 2026-07-03): this wrapper REFUSES to
 # start without explicit operator consent (CV_EULA_CONSENT=yes). The acceptance env is
 # synthesized from that input at run time — no committed file carries the literal.
 #
@@ -26,12 +26,12 @@ require_cmd docker
 require_cmd nvidia-smi
 
 # ---------------------------------------------------------------------------
-# EULA runtime consent gate (NEG-2; LOCKED #8) — refuse without operator input.
+# EULA runtime consent gate — refuse without operator input.
 # ---------------------------------------------------------------------------
 if [[ "${CV_EULA_CONSENT:-}" != "yes" ]]; then
   err "NVIDIA Isaac Sim EULA consent is REQUIRED before Isaac Sim may boot."
   err "License: https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/"
-  err "This gate never auto-accepts (NEG-2); consent is a per-run operator input."
+  err "This gate never auto-accepts; consent is a per-run operator input."
   die  "Re-run with:  CV_EULA_CONSENT=yes $0"
 fi
 # Synthesize the runtime-only acceptance env from the operator's consent ("yes" -> "Y").
@@ -52,8 +52,8 @@ RUN_DIR="$OUT_ROOT/$RUN_ID"
 mkdir -p "$RUN_DIR/container" "$RUN_DIR/host"
 
 # The 5.1.0 image runs as uid 1234 (user isaac-sim, HOME=/isaac-sim — MEASURED
-# 2026-07-03 on etri6000; NOT root//root/.cache as the pre-measurement R2 note
-# guessed). Mounted dirs must be writable by uid 1234; chown via the already-pinned
+# 2026-07-03 on etri6000; NOT root//root/.cache as the pre-measurement guess
+# had it). Mounted dirs must be writable by uid 1234; chown via the already-pinned
 # image itself (no extra image, sudo docker is the whitelisted path).
 chown_for_container() {
   "${CV_SUDO[@]}" docker run --rm --user 0 --entrypoint bash \
@@ -71,7 +71,7 @@ log "preparing cache scaffold + output dir ownership for container uid 1234"
   -c "mkdir -p /cv-fix/cache/home/ov /cv-fix/cache/home/pip /cv-fix/cache/home/warp /cv-fix/cache/home/nvidia/GLCache && chown -R 1234:1234 /cv-fix"
 chown_for_container "$RUN_DIR/container"
 
-# Cache mounts follow the MEASURED 5.1.0 layout (uid 1234, HOME=/isaac-sim; R2).
+# Cache mounts follow the MEASURED 5.1.0 layout (uid 1234, HOME=/isaac-sim).
 CACHE_MOUNTS=(
   -v "$CV_ISAAC_CACHE_ROOT/cache/kit:/isaac-sim/kit/cache:rw"
   -v "$CV_ISAAC_CACHE_ROOT/cache/home:/isaac-sim/.cache:rw"
@@ -82,7 +82,7 @@ CACHE_MOUNTS=(
 )
 
 # Dedicated bridge network (idempotent). Non-host networking from the very first
-# smoke (R8): host networking is forbidden project-wide.
+# smoke: host networking is forbidden project-wide.
 if ! "${CV_SUDO[@]}" docker network inspect "$CV_SMOKE_NET" >/dev/null 2>&1; then
   log "creating dedicated bridge network $CV_SMOKE_NET"
   "${CV_SUDO[@]}" docker network create --driver bridge "$CV_SMOKE_NET" >/dev/null
@@ -94,7 +94,7 @@ fi
 CNAME="cv-smoke-isaac"
 "${CV_SUDO[@]}" docker rm -f "$CNAME" >/dev/null 2>&1 || true
 
-log "DoD-P1-04 -> booting headless smoke in $IMG (network=$CV_SMOKE_NET, shm-size=$CV_SMOKE_SHM_SIZE, timeout=${CV_SMOKE_TIMEOUT_S}s)"
+log "booting headless smoke in $IMG (network=$CV_SMOKE_NET, shm-size=$CV_SMOKE_SHM_SIZE, timeout=${CV_SMOKE_TIMEOUT_S}s)"
 START_TS=$SECONDS
 "${CV_SUDO[@]}" docker run -d --name "$CNAME" \
   --network "$CV_SMOKE_NET" \
@@ -108,7 +108,7 @@ START_TS=$SECONDS
   --entrypoint /isaac-sim/python.sh \
   "$IMG" /cv/smoke/headless_smoke.py --mode smoke --out /cv/out >/dev/null
 
-# R19 evidence: the effective NVIDIA_DRIVER_CAPABILITIES env of the running container.
+# Evidence: the effective NVIDIA_DRIVER_CAPABILITIES env of the running container.
 "${CV_SUDO[@]}" docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CNAME" \
   | grep -E '^NVIDIA_' > "$RUN_DIR/host/container_nvidia_env.txt" || true
 
@@ -155,7 +155,7 @@ WALL_S=$((SECONDS - START_TS))
 "${CV_SUDO[@]}" docker rm "$CNAME" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-# Gate assertions (DoD-P1-04)
+# Gate assertions
 # ---------------------------------------------------------------------------
 LOG_FILE="$RUN_DIR/host/container.log"
 fail=0
@@ -165,15 +165,15 @@ grep -q "CV_SMOKE_PHYSX_OK"  "$LOG_FILE" || { err "missing CV_SMOKE_PHYSX_OK (ph
 compgen -G "$RUN_DIR/container/frame_0001.*" >/dev/null || { err "no frame file produced in $RUN_DIR/container"; fail=1; }
 [[ -n "$PID_MATCHED" && -s "$GPU_EVIDENCE" ]] || { err "no nvidia-smi PID evidence captured"; fail=1; }
 
-# R5 diagnostics surface (informational, not gating): PhysX fallback / perf lines.
+# Diagnostics surface (informational, not gating): PhysX fallback / perf lines.
 grep -E "CV_SMOKE_PERF|SimulationApp headless boot took" "$LOG_FILE" || true
 grep -iE "fall.?back|tiled.?camera" "$LOG_FILE" > "$RUN_DIR/host/physx_warnings.txt" || true
 
 if ((fail)); then
-  die "DoD-P1-04 smoke FAILED — see $RUN_DIR (log: $LOG_FILE)"
+  die "headless smoke FAILED — see $RUN_DIR (log: $LOG_FILE)"
 fi
 
 date -Is > "$OUT_ROOT/last_smoke_pass"
 echo "$RUN_DIR" >> "$OUT_ROOT/last_smoke_pass"
-log "DoD-P1-04 smoke PASS — exit 0, GPU pid $PID_MATCHED, non-black frame, wall ${WALL_S}s"
+log "headless smoke PASS — exit 0, GPU pid $PID_MATCHED, non-black frame, wall ${WALL_S}s"
 log "evidence: $RUN_DIR (container.log, nvidia_smi_evidence.txt, frame_0001.*, shm_usage.txt)"

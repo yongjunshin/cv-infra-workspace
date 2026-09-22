@@ -167,7 +167,7 @@ def make_checkout(tmp_path: Path) -> Path:
 
 
 def make_spec(checkout: Path, **overrides):
-    """The duck-typed VerifySpec surface ``cv_infra.execution`` reads (M2 fills it in)."""
+    """The duck-typed VerifySpec surface ``cv_infra.execution`` reads (the contract fills it in)."""
     fields = {
         "checkout": checkout,
         "sim_output_dir": OUTPUT_DIR,
@@ -183,7 +183,7 @@ def make_spec(checkout: Path, **overrides):
 
 
 def make_case(case_index: int = 3, axes: dict[str, str] | None = None, repeat: int = 0):
-    """The duck-typed CaseRun surface (M2's ``contract.cases`` owns the real derivation)."""
+    """The duck-typed CaseRun surface (``contract.cases`` owns the real derivation)."""
     axes = {"lighting": "dim"} if axes is None else axes
     case_id = "sha256:" + hashlib.sha256(repr(sorted(axes.items())).encode()).hexdigest()
     return SimpleNamespace(

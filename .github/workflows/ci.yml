@@ -3,7 +3,7 @@
 # pipeline does with containers is exercised against a duck-typed fake client, so this
 # tier is a complete signal for the code and says nothing about the GPU host.
 #
-# Reproducibility (decision 2026-06-24 env-reproducibility §5): every `uses:` is pinned
+# Reproducibility (CLAUDE.md §2-3, since 2026-06-24): every `uses:` is pinned
 # to the IMMUTABLE commit SHA of its release tag (the trailing comment names the tag),
 # the uv binary is pinned, deps come from the committed `uv.lock` via `uv sync --frozen`,
 # and PICT is built from a pinned commit. Do not re-float to tag refs — a bump is a new

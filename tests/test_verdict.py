@@ -89,7 +89,7 @@ def test_a_bad_sim_rc_is_an_error_and_never_a_verdict():
     result = classify(1, 0, '{"fell": false}', True)
 
     assert result.lane == LANE_ERROR and "sim exited rc=1" in result.error
-    assert result.checks == {}  # G-62: the sim's exit status cannot carry pass/fail
+    assert result.checks == {}  # the sim's exit status cannot carry pass/fail
 
 
 def test_a_sim_that_never_exited_names_the_timeout():

@@ -6,7 +6,7 @@ which silently degrades the gate if it drifts:
 
 * (1) **seeding keeps a suite's history alive.** The measured failure mode: edit
   the model by one line and every case id changes, so every baseline lookup
-  misses, so every regression check SKIPS (C-1 / NFR-REPORT-002 — absent
+  misses, so every regression check SKIPS (absent
   baseline is normal, never a failure). The gate goes quiet instead of red.
   Both halves are asserted: unseeded regeneration loses the old rows, seeded
   regeneration keeps all of them.
@@ -135,7 +135,7 @@ def test_plan_generates_exactly_the_requested_order() -> None:
 
 @needs_pict
 def test_plan_truncates_rows_rather_than_downgrading_the_requested_order() -> None:
-    """The M5 repair. Same workload, a 1 h budget: 3-wise no longer fits, and the OLD
+    """The repair. Same workload, a 1 h budget: 3-wise no longer fits, and the OLD
     behaviour quietly returned a full pairwise array — a report that says "3-wise" while
     covering pairs only. Now the order stands and the array is cut, which ``coverage``
     reports as the fraction it is."""

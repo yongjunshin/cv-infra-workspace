@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""headless_smoke.py — Phase 1 in-container smoke for Isaac Sim 5.1.0 (M2).
+"""headless_smoke.py — in-container smoke for Isaac Sim 5.1.0.
 
 Run INSIDE the isaac-sim:5.1.0 container via the bundled interpreter:
 
@@ -8,20 +8,19 @@ Run INSIDE the isaac-sim:5.1.0 container via the bundled interpreter:
 
 Modes (`smoke` is dispatched by the run_smoke.sh host wrapper; `handshake` is a
 hand-driven ROS 2 probe — its wrapper was removed with the two-container SUT model):
-  smoke      DoD-P1-04 (REQ-EXEC-001): boot SimulationApp({"headless": True}),
+  smoke      boot SimulationApp({"headless": True}),
              step PhysX (falling cube), capture >=1 off-screen render-product frame
-             to a file and assert it is NON-black (pixel mean AND std > 0 — R19/D-A),
-             log step-time/FPS (R5 diagnostics), clean close, exit 0.
-  handshake  DoD-P1-05 (REQ-EXEC-004/REQ-ORCH-008 substrate, R8): enable
-             isaacsim.ros2.bridge, publish /clock while playing, subscribe /cmd_vel
-             and exit 0 once the expected Twist (sent from a separate ros:jazzy
+             to a file and assert it is NON-black (pixel mean AND std > 0),
+             log step-time/FPS (perf diagnostics), clean close, exit 0.
+  handshake  enable isaacsim.ros2.bridge, publish /clock while playing, subscribe
+             /cmd_vel and exit 0 once the expected Twist (sent from a separate ros:jazzy
              container across the docker bridge network) is observed in-process.
 
 Hard rules honored here:
   * SimulationApp({"headless": True}) is instantiated BEFORE any omni.*/isaacsim.*
-    import (LOCKED §7.7). All Isaac imports live inside functions, after boot.
+    import (Isaac Sim requirement). All Isaac imports live inside functions, after boot.
   * EULA boot guard: refuses to start Isaac when the runtime-injected consent env
-    is absent (decision 2026-07-03-p1-eula-runtime-consent; NEG-2). No acceptance
+    is absent (runtime consent, decided 2026-07-03). No acceptance
     literal is committed anywhere — the wrapper synthesizes it from operator input.
   * Exit codes follow the 0/1/2/3 contract slots: 0=pass, 1=assertion/test failure,
     2=bad usage (argparse), 3=platform/boot problem (EULA missing, bridge missing).
@@ -33,7 +32,7 @@ Markers (stable grep surface for the host wrappers):
   CV_HANDSHAKE_PASS / CV_HANDSHAKE_TIMEOUT
 """
 
-# stdlib only before SimulationApp (LOCKED §7.7) — no omni.*/isaacsim.*/numpy here.
+# stdlib only before SimulationApp — no omni.*/isaacsim.*/numpy here.
 import argparse
 import os
 import sys
@@ -49,14 +48,14 @@ def log(msg: str) -> None:
 
 
 def eula_boot_guard() -> None:
-    """Refuse to boot Isaac without runtime operator consent (NEG-2; LOCKED §8).
+    """Refuse to boot Isaac without runtime operator consent.
 
     The wrapper derives this env from CV_EULA_CONSENT at run time; nothing is baked
     into any committed file or image layer.
     """
     if not os.environ.get("ACCEPT_EULA"):
         log("ERROR: NVIDIA Isaac Sim EULA has not been accepted for this run.")
-        log("Boot refused (NEG-2). Provide operator consent via the host wrapper:")
+        log("Boot refused. Provide operator consent via the host wrapper:")
         log("    CV_EULA_CONSENT=yes ./run_smoke.sh")
         sys.exit(EXIT_PLATFORM)
 
@@ -95,7 +94,7 @@ def write_frame(arr, out_dir: str) -> str:
 
 
 def run_smoke(simulation_app, args) -> int:
-    # Isaac imports are legal only after SimulationApp instantiation (LOCKED §7.7).
+    # Isaac imports are legal only after SimulationApp instantiation.
     import numpy as np
     import omni.replicator.core as rep
     import omni.usd
@@ -126,7 +125,7 @@ def run_smoke(simulation_app, args) -> int:
     except Exception as exc:
         log(f"WARN set_camera_view failed ({exc}); keeping default camera")
 
-    # Off-screen render product + RGB annotator (D-A / R19: prove RTX 'graphics'
+    # Off-screen render product + RGB annotator (prove RTX 'graphics'
     # capability with an actual rendered frame, not just nvidia-smi compute).
     render_product = rep.create.render_product("/OmniverseKit_Persp", (1280, 720))
     rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
@@ -141,7 +140,7 @@ def run_smoke(simulation_app, args) -> int:
     for _ in range(8):
         world.step(render=True)
 
-    # Timed step loop — R5 diagnostics (FPS / step time; PhysX fallback warnings go
+    # Timed step loop — diagnostics (FPS / step time; PhysX fallback warnings go
     # to this container log via carb logging and are grepped by the wrapper).
     t0 = time.monotonic()
     for _ in range(args.steps):
@@ -198,7 +197,7 @@ def run_handshake(simulation_app, args) -> int:
     import omni.timeline
     from isaacsim.core.utils.extensions import enable_extension
 
-    # Surface the env the wrapper injected (R8/R16 diagnostics + [VERIFY] record).
+    # Surface the env the wrapper injected (ROS/DDS env diagnostics + [VERIFY] record).
     for key in (
         "ROS_DISTRO",
         "RMW_IMPLEMENTATION",
@@ -291,7 +290,7 @@ def main() -> int:
     eula_boot_guard()
     args = parse_args()
 
-    # LOCKED §7.7: instantiate SimulationApp FIRST — before any omni.*/isaacsim.* import.
+    # Instantiate SimulationApp FIRST — before any omni.*/isaacsim.* import.
     from isaacsim import SimulationApp
 
     boot_t0 = time.monotonic()

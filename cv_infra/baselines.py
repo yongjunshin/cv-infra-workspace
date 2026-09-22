@@ -23,7 +23,7 @@ Four rules, each with the reason it is that way and not the obvious alternative:
   never be the reason a run cannot report. Absent baseline = ``no_baseline`` = skip,
   which is also the honest first-run state.
 
-Write discipline is ``orchestrator/store.py``'s (removed in the M4 cleanup; see git
+Write discipline is ``orchestrator/store.py``'s (since removed; see git
 history — the two shorthand ``store.py`` mentions below are that same file): one
 connection, one lock, WAL + ``busy_timeout`` so concurrent cases wait out a lock
 instead of erroring, and ``PRAGMA user_version`` so a file written by a NEWER build

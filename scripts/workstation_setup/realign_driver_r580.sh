@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# realign_driver_r580.sh — realign the workstation NVIDIA driver R595 -> R580 (M5).
+# realign_driver_r580.sh — realign the workstation NVIDIA driver R595 -> R580.
 #
-# Executes decision 2026-07-03-driver-r580-realignment (binding): Isaac Sim 5.1.0
+# Executes the 2026-07-03 realignment decision: Isaac Sim 5.1.0
 # (kit 107.3.3) deterministically segfaults in the RTX renderer on R595; the
 # certified branch is R580 (LTSB). Stages:
 #
@@ -223,7 +223,7 @@ setup_cuda_repo() {
 
 finish() {
   if [[ "$DO_REBOOT" -eq 1 ]]; then
-    log "rebooting NOW (approved: decision 2026-07-03-driver-r580-realignment) — the new module loads on boot"
+    log "rebooting NOW (approved: 2026-07-03 realignment decision) — the new module loads on boot"
     exec "${CV_SUDO[@]}" systemctl reboot
   fi
   # Only demand a reboot if the LIVE driver differs from the target (a converged

@@ -4,7 +4,7 @@ description = "Continuous verification infrastructure: Isaac Sim simulation gati
 readme = "README.md"
 requires-python = "==3.11.*"
 dynamic = ["version"]
-# ONE runtime dependency, exact-pinned (CLAUDE.md §2-7). Everything else the verify
+# ONE runtime dependency, exact-pinned (CLAUDE.md §2-3). Everything else the verify
 # pipeline needs is the standard library: the contract is text and JSON, the report is a
 # dict, and the only thing that cannot be stdlib is talking to the docker daemon.
 # It is imported LAZILY (cv_infra/execution.py::resolve_docker_client), so the CLI's
@@ -17,7 +17,7 @@ dependencies = [
 [project.scripts]
 cv-infra = "cv_infra.cli.main:main"
 
-# Dev toolchain — exact-pinned for local/CI parity (decision 2026-06-24 env-reproducibility §4).
+# Dev toolchain — exact-pinned for local/CI parity (CLAUDE.md §2-3, since 2026-06-24).
 # uv installs this group by default on `uv sync`.
 [dependency-groups]
 dev = [
@@ -87,7 +87,7 @@ source = ["cv_infra"]  # product code only; tests/ and scripts/ are not instrume
 show_missing = true
 precision = 1
 
-# 100, restored in M8 (it was temporarily 95 through the M4 rewrite). The suite measures
+# 100, restored (it was temporarily 95 through an earlier rewrite). The suite measures
 # 100.0% of statements AND branches on every module, so this is the number the code
 # actually holds — not an aspiration. A ratchet below the measured value is worse than
 # no ratchet: it silently permits the first uncovered branch, which is exactly the one

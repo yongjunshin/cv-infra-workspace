@@ -7,7 +7,7 @@ budget. It is the ONLY place that knows what a covering array is; everything
 downstream (fan-out, identity, rollup, report) sees a plain list of cases and is
 unchanged.
 
-**do-not-reinvent** (LOCKED §3.1): PICT itself is REUSED, never reimplemented —
+**do-not-reinvent** (CLAUDE.md §3): PICT itself is REUSED, never reimplemented —
 it is MIT-licensed, dependency-free C++11, and builds to a single ~380 KB binary
 that the images pin by commit. This module shells out to it and owns only the
 three things PICT does not do:
@@ -25,7 +25,7 @@ three things PICT does not do:
   ("Input Error: Parameter/value type mismatch: ..."), and it has no opinion at
   all about a parameter name that cannot become ``--<name>=<value>`` on the sim
   script's command line. The request surface owes the file/line/column
-  treatment every other stage gives (NFR-INTAKE-002), so ``validate_model``
+  treatment every other stage gives, so ``validate_model``
   pre-checks the shape and locates PICT's own complaint.
 
 MEASURED anchors for the numbers in these docstrings (2026-09-07, the go2 patrol
@@ -67,7 +67,7 @@ PICT_BIN_ENV = "CV_PICT_BIN"
 DEFAULT_ORDERS: tuple[int, ...] = (3, 2)
 
 #: Repeats floor for the ``orders="auto"`` branch ONLY. This project MEASURED
-#: flakiness 0.333 on the batch path (QA 2026-09-01: one document 1/3 then 3/3
+#: flakiness 0.333 on the batch path (2026-09-01: one document 1/3 then 3/3
 #: sixteen minutes apart on the same image and host), so a suite that spends its
 #: whole budget on distinct cases run ONCE is a row of coin flips. When the caller
 #: hands ``plan`` a budget to reduce against, cases are cut before repeats fall
@@ -92,7 +92,7 @@ class PictError(ContractError):
     Adapts this module's (problem, hint, line) shape onto the canonical
     ``ContractError`` fields so a bad model renders through the SAME friendly
     surface as every other stage — one-liner on the CLI, inline annotation in
-    CI (NFR-INTAKE-002). ``hint`` is what the document should have said, so it
+    CI. ``hint`` is what the document should have said, so it
     lands in ``expected``; ``problem`` is what it did say, so it lands in ``got``.
     """
 
@@ -306,7 +306,7 @@ def generate(
     rows of which **zero** matched the previous 14 on their shared columns; with
     the previous array seeded, all 14 survived and the new axis still got
     covered. A baseline keyed on a case that no longer exists is an absent
-    baseline, and an absent baseline SKIPS (C-1, NFR-REPORT-002) — i.e. without
+    baseline, and an absent baseline SKIPS (normal, never a failure) — i.e. without
     seeding the gate goes quiet on every model edit instead of failing loudly.
     """
     validate_model(model_text, source_path=source_path)

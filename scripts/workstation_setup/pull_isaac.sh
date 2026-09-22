@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pull_isaac.sh — DoD-P1-03: pull the pinned Isaac Sim base image (anonymous NGC pull,
+# pull_isaac.sh — pull the pinned Isaac Sim base image (anonymous NGC pull,
 # with a clear `docker login` fallback) and prepare the host-side cache scaffold.
 # Idempotent: skips the pull if the image is already present locally.
 set -euo pipefail
@@ -25,7 +25,7 @@ main() {
   if [[ -n "$CV_ISAAC_DIGEST" ]]; then
     img="${CV_ISAAC_IMAGE%:*}@${CV_ISAAC_DIGEST}"
   else
-    warn "Isaac image digest not locked yet — using the LOCKED tag pin '$CV_ISAAC_IMAGE' (CLAUDE.md §5)."
+    warn "Isaac image digest not locked yet — using the LOCKED tag pin '$CV_ISAAC_IMAGE' (CLAUDE.md §3)."
     warn "Lock CV_ISAAC_DIGEST after first pull for digest-level hardening (see README → Locking digests)."
   fi
 
@@ -38,12 +38,12 @@ main() {
     return 0
   fi
 
-  log "DoD-P1-03 -> docker pull $img (anonymous NGC pull)"
+  log "Isaac image pull -> docker pull $img (anonymous NGC pull)"
   if cv_docker pull "$img"; then
     log "Isaac image pulled OK"
   else
-    err "Anonymous NGC pull failed for $img (NGC may require auth — rate-limit / org terms; R13)."
-    err "FALLBACK — run in YOUR own terminal (interactive password prompt; G-06):"
+    err "Anonymous NGC pull failed for $img (NGC may require auth — rate-limit / org terms)."
+    err "FALLBACK — run in YOUR own terminal (interactive password prompt):"
     err "    sudo docker login nvcr.io        # username: \$oauthtoken    password: <NGC API key>"
     err "Then re-run:  bash scripts/workstation_setup/pull_isaac.sh"
     die "Isaac pull requires authentication — see the fallback above (no silent retry)."

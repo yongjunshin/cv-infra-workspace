@@ -4,7 +4,7 @@
 # Owns the disk-cache tree the case containers mount (CV_ISAAC_CACHE_ROOT). Two
 # idempotent modes:
 #
-#   provision   create the 6-way cache subtree + chown 1234:1234 (G-15). EMPTY tree.
+#   provision   create the 6-way cache subtree + chown 1234:1234 (Isaac's uid). EMPTY tree.
 #               -> the "cold-fresh" condition (assets + shaders + compute all cold).
 #               (default)
 #   strip-gpu   from a warmed tree, delete only the GPU-DERIVED caches (Kit shader +
@@ -27,15 +27,15 @@
 # The platform deliberately does NOT create or chown it (it refuses loudly on a missing
 # subtree, printing this very command) — that is THIS script's job.
 #
-# sudo (G-15): none — file perms go through a docker root helper (--user 0), not host sudo.
+# sudo: none — file perms go through a docker root helper (--user 0), not host sudo.
 #
 # Usage: bash warm_cache.sh <cache-root-abs>/<digest12> [provision|strip-gpu]
 set -euo pipefail
 
 export CV_STEP=measure-warm
 # Capture the operator's EXPLICIT cache root BEFORE sourcing common.sh — the sourced
-# workstation_setup SoT gives CV_ISAAC_CACHE_ROOT a P1-smoke DEFAULT, which must NOT
-# silently stand in for the intended measurement tree. D-1: root = arg OR explicit env.
+# workstation_setup SoT gives CV_ISAAC_CACHE_ROOT a smoke-test DEFAULT, which must NOT
+# silently stand in for the intended measurement tree. Rule: root = arg OR explicit env.
 _OPERATOR_CACHE_ROOT="${CV_ISAAC_CACHE_ROOT:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/measure/common.sh
@@ -52,7 +52,7 @@ MODE="${2:-provision}"
   || die "cache root required: pass <cache-root-abs> or set CV_ISAAC_CACHE_ROOT. usage: $0 <cache-root-abs> [provision|strip-gpu]"
 case "$CACHE_ROOT" in
   /*) : ;;
-  *) die "cache root must be a HOST ABSOLUTE path (sibling-container safety, D-O): $CACHE_ROOT" ;;
+  *) die "cache root must be a HOST ABSOLUTE path (sibling-container safety): $CACHE_ROOT" ;;
 esac
 case "$MODE" in
   provision | strip-gpu) : ;;
@@ -66,8 +66,8 @@ strip_gpu_cache() {
   # Remove GPU-DERIVED caches only (they regenerate per GPU): Kit RTX/shader cache
   # (cache/kit), ComputeCache (cache/computecache), and the GL shader cache nested under
   # the asset mount (.cache/nvidia). KEEP the portable asset closure (.cache/ov). Root
-  # helper: the dirs are uid-1234 0700, so a host `rm` would be denied (G-15). Idempotent.
-  # NOTE (Wave 2): confirm via `measure_du_bytes` before/after that only GPU-derived
+  # helper: the dirs are uid-1234 0700, so a host `rm` would be denied. Idempotent.
+  # NOTE: confirm via `measure_du_bytes` before/after that only GPU-derived
   # bytes drop and the next run reloads the same prim count with LOW received bytes.
   log "stripping GPU-derived caches (Kit shader + ComputeCache + GLCache); keeping asset cache"
   docker run --rm --user 0 --network none --entrypoint bash \

@@ -27,7 +27,7 @@ Evidence lands under `~/cv-infra-p1-smoke/out/<run-id>/`
 (`container.log`, `nvidia_smi_evidence.txt`, `frame_0001.*`, `clock_echo.txt`,
 `cmd_vel_info.txt`, `*_dev_shm.txt`, ...).
 
-## EULA (NEG-2, decision 2026-07-03-p1-eula-runtime-consent)
+## EULA (runtime consent, decided 2026-07-03)
 
 No committed file contains the acceptance literal (repo grep = 0). The wrappers
 **refuse to boot** without the per-run operator input `CV_EULA_CONSENT=yes`; the
@@ -37,13 +37,14 @@ runtime env is synthesized from that input and injected with `-e` for that run o
 ## Measured layout notes (2026-07-03, etri6000, isaac-sim:5.1.0 @ locked digest)
 
 * The 5.1.0 image runs as **uid 1234 `isaac-sim`, HOME=`/isaac-sim`** (NOT root /
-  `/root/.cache` as the pre-measurement R2 note guessed). Cache mounts follow the
+  `/root/.cache` as the pre-measurement guess had it). Cache mounts follow the
   measured home; host scaffold dirs are chown-ed to 1234 via the pinned image itself.
 * Entrypoint is `runheadless.sh` -> `license.sh` (checks `$ACCEPT_EULA`) -> streaming.
   The wrappers bypass it with `--entrypoint`, so **livestream is off** by construction
   and the EULA gate is enforced by our wrapper + in-script guard instead.
 * `NVIDIA_DRIVER_CAPABILITIES=all` is baked into the image env; the wrapper still
-  passes it explicitly (R19) and records the effective container env as evidence.
+  passes it explicitly (the `--gpus all` default omits `graphics`) and records the
+  effective container env as evidence.
 
 ## [VERIFY] results
 

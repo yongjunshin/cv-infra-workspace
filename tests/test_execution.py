@@ -115,7 +115,7 @@ def test_sim_case_call_shape_is_the_documented_contract(tmp_path):
 
     image, kwargs = client.run_calls[0]
     assert image == SIM_IMAGE
-    # G-14: the stock image's ENTRYPOINT would swallow the arguments — override it.
+    # The stock image's ENTRYPOINT would swallow the arguments — override it.
     assert kwargs["entrypoint"] == EXECUTE_ENTRYPOINT
     assert kwargs["command"] == ["-lc", EXECUTE_SCRIPT, SIM_SCRIPT, "--lighting=dim"]
     assert kwargs["working_dir"] == CHECKOUT_MOUNT  # local parity with ./verify/sim.py
@@ -358,7 +358,7 @@ def test_a_case_that_never_exits_is_killed_at_the_deadline(tmp_path):
 
 
 def test_an_exit_code_is_reported_but_never_read_as_a_verdict(tmp_path):
-    """G-62: after boot the sim's status cannot carry pass/fail — rc only separates
+    """After boot the sim's status cannot carry pass/fail — rc only separates
     "died badly" (ERROR lane) from "ran to completion" (ask the oracle)."""
     client = FakeClient(queued=[FakeContainer(exit_code=1)])
 

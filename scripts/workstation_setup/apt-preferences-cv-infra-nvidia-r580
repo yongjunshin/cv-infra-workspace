@@ -1,4 +1,4 @@
-# cv-infra — NVIDIA driver branch pin (decision 2026-07-03-driver-r580-realignment).
+# cv-infra — NVIDIA driver branch pin (decided 2026-07-03).
 #
 # WHY: Isaac Sim 5.1.0 (kit 107.3.3) deterministically segfaults in the RTX
 # renderer (librtx.scenedb.plugin.so, ~50ms after "app ready") on the R595
@@ -22,7 +22,7 @@
 # What must be pinned is the BRANCH (the ceiling below), not one machine's patch
 # level — and the exact build the operator installed must still be held, so the
 # placeholder keeps a hard hold without ever becoming an unbounded `580*` (an
-# unbounded hold is a floor without a ceiling *inside* the branch — G-12's shape).
+# unbounded hold is a floor without a ceiling *inside* the branch — what let R595 in).
 #
 # NOTE: per-kernel module packages (linux-modules-nvidia-580-open-<kver>) carry
 # KERNEL version numbers, so stanza 1 deliberately does not version-hold them —
@@ -32,7 +32,7 @@
 # newer branch needs its own stanza — a branch that has no stanza is not blocked.
 # R590 was missing here and is visible in apt on the jammy host today (measured
 # 2026-08-19: `apt-cache search --names-only '^nvidia-driver-[0-9]+'`), i.e. the
-# G-12 surface had reopened silently. When a new branch number appears upstream,
+# ceiling gap had reopened silently. When a new branch number appears upstream,
 # add a stanza. (Un-blocking one requires evidence that Isaac 5.1.0 runs on it.)
 
 # 1) Hold all R580 userspace components at the build this host was realigned to.

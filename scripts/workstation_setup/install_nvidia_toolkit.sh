@@ -28,7 +28,7 @@ main() {
   if [[ "$installed" == "$CV_NVIDIA_TOOLKIT_VERSION" ]]; then
     log "nvidia-container-toolkit $CV_NVIDIA_TOOLKIT_VERSION already installed (= the preferred pin) — re-asserting docker runtime config"
   elif version_in_set "$installed" "${CV_NVIDIA_TOOLKIT_VERIFIED[@]}"; then
-    # D-2 assert mode (see common.sh): an element of the verified SET is accepted as
+    # Assert mode (see common.sh): an element of the verified SET is accepted as
     # is — no downgrade to the preferred pin. Loud, and it prints the whole quartet.
     log "ASSERT MODE: installed nvidia-container-toolkit $installed is an element of the VERIFIED set — NOT installing, NOT downgrading (preferred pin here would be $CV_NVIDIA_TOOLKIT_VERSION)"
     local p v
@@ -86,8 +86,8 @@ main() {
     log "SKIP (already true, checked): docker reports the 'nvidia' runtime — no 'nvidia-ctk runtime configure', no 'systemctl restart docker', no sudo"
   else
     log "wiring NVIDIA runtime into docker (nvidia-ctk) + restarting docker"
-    # NOTE: /usr/bin/nvidia-ctk was REMOVED from the sudo whitelist by decision
-    # 2026-07-07-fu6-sudo-scope-reduction — this branch is an operator action in an
+    # NOTE: /usr/bin/nvidia-ctk was REMOVED from the sudo whitelist on 2026-07-07 —
+    # this branch is an operator action in an
     # interactive terminal, and it is now only REACHED when the runtime is missing.
     "${CV_SUDO[@]}" nvidia-ctk runtime configure --runtime=docker
     "${CV_SUDO[@]}" systemctl restart docker

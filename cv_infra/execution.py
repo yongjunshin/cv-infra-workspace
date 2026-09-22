@@ -7,30 +7,29 @@ else in the package stays docker-free, so the whole pipeline is testable on a CP
 with a duck-typed fake client (the idiom the orchestrator seam already relied on).
 
 Most of the docker-facing machinery here is LIFTED from
-``cv_infra/orchestrator/supervisor.py`` (removed in the M4 cleanup; see git history) —
+``cv_infra/orchestrator/supervisor.py`` (since removed; see git history) —
 cache CoW seeding, the image-present gate with its pull-liveness watchdog, the
 supervision loop, the finally-teardown — because those blocks encode measurements, not
 opinions:
 
 * ``:ro`` on a Kit/CUDA cache does not make it read-only, it turns it OFF (measured
   47 s -> 1.05 s per robot spawn); hence the per-case ``cp -a`` copy-on-write seed
-  bound ``rw``, with an ownership guard so a non-preserving copy is loud (G-34/G-15).
+  bound ``rw``, with an ownership guard so a non-preserving copy is loud.
 * dockerd creates a missing bind source as root, and the stock Isaac image runs as
-  uid 1234 — every host path bound here is pre-created and made world-writable first
-  (G-15).
+  uid 1234 — every host path bound here is pre-created and made world-writable first.
 * an implicit ``containers.run`` pull can hang forever; the image is made present
   BEFORE the container starts, under a progress-liveness watchdog.
-* the sim's EXIT CODE cannot carry pass/fail (G-62: ``SimulationApp.close()`` exits
+* the sim's EXIT CODE cannot carry pass/fail (``SimulationApp.close()`` exits
   the process with status 0, and the stock ``python.sh`` squashes non-zero to 1) — so
   ``rc`` is only ever read as "did the process die badly" (ERROR lane). The verdict
   comes from the oracle's stdout, never from here.
 
-Assumptions surfaced (M1 lands before the contract modules exist): ``spec`` and
+Assumptions surfaced (written before the contract modules existed): ``spec`` and
 ``case`` are DUCK-TYPED. ``spec`` must carry ``checkout``, ``sim_output_dir``,
 ``sim_image``, ``oracle_script``, ``case_timeout_s``, ``oracle_timeout_s``,
 ``shm_size`` and ``max_zip_mb``; ``case`` must carry ``case_index``, ``case_id``,
 ``repeat``, ``seed`` and ``argv`` (``argv[0]`` = the sim script). Those are exactly the
-fields ``contract.inputs.VerifySpec`` / ``contract.cases.CaseRun`` grow in M2 — this
+fields ``contract.inputs.VerifySpec`` / ``contract.cases.CaseRun`` grew later — this
 module deliberately does not import them, so the contract layer stays the lowest layer.
 """
 
@@ -59,7 +58,7 @@ from typing import Any
 CHECKOUT_MOUNT = "/cv/checkout"
 RUNTIME_CASE_MOUNT = "/cv/case.json"
 
-# The stock Isaac image's ENTRYPOINT swallows ``docker run`` arguments (G-14), so the
+# The stock Isaac image's ENTRYPOINT swallows ``docker run`` arguments, so the
 # case command is passed through a minimal shell wrapper. The user entrypoint itself is
 # executable and owns its interpreter via its shebang: Python, Bash, or another binary.
 EXECUTE_ENTRYPOINT = "/bin/sh"
@@ -290,7 +289,7 @@ def _cache_volumes(
     resolved = Path(root).resolve() / _image_namespace(sim_image)
     if not resolved.is_dir():
         # Neither silently cold (the failure everyone believes is a warm run) nor created
-        # here: the tree has to be owned by uid 1234 for the container to write it (G-15),
+        # here: the tree has to be owned by uid 1234 for the container to write it,
         # and this process is not root. Name the exact command instead.
         raise ValueError(
             f"cache subtree {resolved} does not exist or is not a directory — this image's"
@@ -336,7 +335,7 @@ def _seeded_cache_volumes(
     for subpath, container_path in CACHE_SCRATCH_MOUNTS:
         host_dir = case_scratch / subpath
         host_dir.mkdir(parents=True, exist_ok=True)
-        host_dir.chmod(0o777)  # the stock image runs non-root (uid 1234) — G-15
+        host_dir.chmod(0o777)  # the stock image runs non-root (uid 1234)
         volumes[str(host_dir)] = {"bind": container_path, "mode": "rw"}
     return volumes, case_scratch
 
@@ -406,7 +405,7 @@ def _seed_cache_tiers(slug: str, base_root: Path, case_scratch: Path) -> None:
 
 
 def _assert_runner_writable(source: Path, destination: Path) -> None:
-    """Loud guard: the seeded tier must be writable by the same uid as the base (G-15).
+    """Loud guard: the seeded tier must be writable by the same uid as the base (uid 1234).
 
     ``cp -a`` preserves ownership only for a privileged copier; GNU cp already exits
     non-zero otherwise, but a non-GNU ``cp`` might not — and a copy the container
@@ -563,7 +562,7 @@ def _prepare_case_dir(run_dir: Path, slug: str) -> Path:
 
     Every host path that gets bind-mounted is pre-created here — dockerd would create
     a missing bind source as root, and the stock Isaac image runs non-root (uid 1234),
-    so the dir is made world-writable (G-15). Precise chown is host provisioning's job.
+    so the dir is made world-writable. Precise chown is host provisioning's job.
     """
     out_dir = Path(run_dir) / "cases" / slug / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -778,7 +777,7 @@ def run_sim_case(
     The output zip is produced on EVERY path — including the failing ones, where its
     emptiness is itself the evidence.
 
-    ``rc`` is reported but never read as pass/fail (G-62): after boot, the sim's exit
+    ``rc`` is reported but never read as pass/fail: after boot, the sim's exit
     status cannot travel out of the container. It only separates "died badly" (ERROR)
     from "ran to completion" (ask the oracle).
     """

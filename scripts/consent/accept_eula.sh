@@ -11,7 +11,7 @@
 #      operator loads into the runner's environment (`cv-infra verify` refuses to run
 #      without ACCEPT_EULA and PRIVACY_CONSENT set — it never reads this file itself)
 #
-# NEG-2 / LOCKED §8: no acceptance value is committed anywhere in this repository. The
+# No acceptance value is committed anywhere in this repository. The
 # value written in step 4 is DERIVED at run time from what the operator typed (same idiom
 # as scripts/isaac_smoke/run_smoke.sh) — this file contains no acceptance literal, and CI
 # may not synthesize one to skip the step.
@@ -52,7 +52,7 @@ done
 require_cmd python3
 
 # ---------------------------------------------------------------------------
-# 1. Present what is being accepted (REQ-DEPLOY-008)
+# 1. Present what is being accepted
 # ---------------------------------------------------------------------------
 cat <<PRESENT
 
@@ -76,18 +76,18 @@ cat <<PRESENT
 PRESENT
 
 # ---------------------------------------------------------------------------
-# 2. Explicit operator decision (REQ-DEPLOY-009, NFR-DEPLOY-004)
+# 2. Explicit operator decision
 # ---------------------------------------------------------------------------
 CONSENT_CHANNEL="interactive"
 CONSENT_INPUT="${CV_EULA_CONSENT:-}"
 
 if [[ -n "$CONSENT_INPUT" ]]; then
   # Non-interactive path: an operator supplying the consent input on the command line
-  # IS an explicit decision (decision 2026-07-03-p1-eula-runtime-consent), but it must
-  # name who is deciding — an anonymous automated "yes" is exactly what NEG-2 forbids.
+  # IS an explicit decision (settled 2026-07-03), but it must
+  # name who is deciding — an anonymous automated "yes" is exactly what this gate forbids.
   CONSENT_CHANNEL="non-interactive-env"
   if [[ -z "$IDENTITY" ]]; then
-    err "non-interactive consent needs an operator identity to record (REQ-DEPLOY-010)."
+    err "non-interactive consent needs an operator identity to record."
     err "Re-run with:  CV_CONSENT_IDENTITY='<who you are>' CV_EULA_CONSENT=... $0"
     exit 3
   fi
@@ -101,7 +101,7 @@ elif [[ -t 0 ]]; then
   fi
 else
   err "no terminal to ask for consent on, and no consent input was supplied."
-  err "This script never assumes acceptance (LOCKED §8). For a non-interactive host:"
+  err "This script never assumes acceptance. For a non-interactive host:"
   err "  CV_CONSENT_IDENTITY='<who you are>' CV_EULA_CONSENT=<the affirmative word> $0"
   exit 3
 fi
@@ -112,10 +112,10 @@ if [[ "${CONSENT_INPUT,,}" != "yes" ]]; then
   exit 3
 fi
 IDENTITY="$(printf '%s' "$IDENTITY" | tr -d '[:cntrl:]')"
-[[ -n "${IDENTITY// /}" ]] || { err "operator identity must not be empty (REQ-DEPLOY-010)"; exit 3; }
+[[ -n "${IDENTITY// /}" ]] || { err "operator identity must not be empty"; exit 3; }
 
 # ---------------------------------------------------------------------------
-# 3. Record the consent — identity + timestamp (REQ-DEPLOY-010)
+# 3. Record the consent — identity + timestamp
 # ---------------------------------------------------------------------------
 CONSENTED_AT="$(date -Is)"      # ISO-8601 with UTC offset (the gate parses it back)
 mkdir -p "$(dirname "$CV_CONSENT_RECORD")"
@@ -160,7 +160,7 @@ PY
 log "consent recorded -> $CV_CONSENT_RECORD"
 
 # ---------------------------------------------------------------------------
-# 4. ONLY NOW: derive the runtime acceptance env (M5 §3.7 step 4)
+# 4. ONLY NOW: derive the runtime acceptance env
 # ---------------------------------------------------------------------------
 # Derived from what the operator typed ("yes" -> "Y"), exactly like run_smoke.sh does for
 # a single run. The runtime ENV — not this record — is what every boot guard honors; the
@@ -190,7 +190,7 @@ if command -v git >/dev/null 2>&1 \
    && git -C "$(dirname "$ENV_FILE")" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
    && ! git -C "$(dirname "$ENV_FILE")" check-ignore -q "$ENV_FILE"; then
   warn "$ENV_FILE is inside a git work tree but NOT git-ignored — it now holds an"
-  warn "acceptance value. Add it to .gitignore before committing anything (NEG-2)."
+  warn "acceptance value. Add it to .gitignore before committing anything."
 fi
 
 # ---------------------------------------------------------------------------

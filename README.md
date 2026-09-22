@@ -116,7 +116,7 @@ CLI 전용 운영 플래그: `--checkout`(기본 `.`) · `--run-dir`(기본 `./.
 3개의 레인: `rc_sim != 0` → **ERROR**(회귀 판정에서 제외) · `rc_oracle != 0` → **ERROR** ·
 그 외 → dict 파싱.
 
-## ⚠ sim 스크립트의 exit code는 판정을 실을 수 없다 (G-62)
+## ⚠ sim 스크립트의 exit code는 판정을 실을 수 없다
 
 > **`SimulationApp.close()`는 프로세스를 status 0으로 끝낸다.** 그 뒤의 `sys.exit(1)`은
 > 실행되지 않는다. 게다가 stock 이미지의 `python.sh`는 비0 종료를 전부 `1`로 뭉갠다.

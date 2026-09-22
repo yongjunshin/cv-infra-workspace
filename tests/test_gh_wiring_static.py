@@ -7,7 +7,7 @@ production, where the feedback loop is a pushed commit and a self-hosted runner:
   input nobody passes on is silently ignored, and a flag nobody exposes is unreachable;
 * CI builds PICT from the pinned commit, and the pin agrees with the one the workstation
   installer uses (two PICTs = two different case arrays for one input space);
-* every ``uses:`` is an immutable commit SHA (CLAUDE.md §2-7) — a tag ref can move under
+* every ``uses:`` is an immutable commit SHA (CLAUDE.md §2-3) — a tag ref can move under
   a green build.
 
 The workflows are read as TEXT: there is no YAML parser in the dependency set (one

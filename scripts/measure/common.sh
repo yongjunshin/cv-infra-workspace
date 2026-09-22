@@ -5,11 +5,11 @@
 #
 # Sourced by: warm_cache.sh. Not meant to be executed on its own.
 #
-# Reproducibility (CLAUDE.md §2-7): rather than REDEFINE what the provisioning SoT
+# Reproducibility (CLAUDE.md §2-3): rather than REDEFINE what the provisioning SoT
 # already owns, this lib SOURCES scripts/workstation_setup/common.sh and reuses its
 # log/err/die/require_cmd helpers and its image/cache pins, adding only what the cache
 # scripts need on top. It deliberately does NOT use CV_SUDO from there: this harness runs
-# sudo-free (G-15 file-perm work goes through a docker root helper, --user 0).
+# sudo-free (the uid-1234 file-perm work goes through a docker root helper, --user 0).
 
 # Idempotent source guard (readonly pins must not be re-declared on re-source).
 [[ -z "${_CV_MEASURE_COMMON_LOADED:-}" ]] || return 0
@@ -30,7 +30,7 @@ source "$_CV_MEASURE_DIR/../workstation_setup/common.sh"
 readonly CV_MEASURE_IMAGE="${CV_MEASURE_IMAGE:-$CV_ISAAC_IMAGE@$CV_ISAAC_DIGEST}"
 
 # ---------------------------------------------------------------------------
-# EULA RUNTIME CONSENT GATE (NEG-2; LOCKED §8)
+# EULA RUNTIME CONSENT GATE
 # ---------------------------------------------------------------------------
 # Every script that BOOTS Isaac calls this FIRST. Refuses without per-run operator
 # input (exit 3); synthesizes the acceptance env from that input at run time. No
@@ -49,7 +49,7 @@ measure_eula_gate() {
   [[ "$_boots" == "boot" ]] || return 0
 
   if [[ "${CV_EULA_CONSENT:-}" != "yes" ]]; then
-    err "NVIDIA Isaac Sim EULA consent is REQUIRED before Isaac Sim may boot (NEG-2)."
+    err "NVIDIA Isaac Sim EULA consent is REQUIRED before Isaac Sim may boot."
     err "License: https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/"
     err "This gate never auto-accepts; consent is a per-run operator input."
     err "Re-run with:  CV_EULA_CONSENT=yes <script> ..."
@@ -61,7 +61,7 @@ measure_eula_gate() {
 }
 
 # ---------------------------------------------------------------------------
-# CACHE-TREE PROVISIONING (G-15 — docker root helper, no host sudo)
+# CACHE-TREE PROVISIONING (uid-1234 tree — docker root helper, no host sudo)
 # ---------------------------------------------------------------------------
 
 # The host-side subpaths of the 6-way cache tree. The in-container targets they are
@@ -70,13 +70,13 @@ measure_eula_gate() {
 CV_MEASURE_CACHE_SUBPATHS=(cache/kit cache/home cache/computecache logs data documents)
 
 # Create the 6-way cache subtree under $1 and chown it to uid 1234 (isaac-sim), via the
-# image itself as a root helper (--user 0). Idempotent. G-15: docker would otherwise
+# image itself as a root helper (--user 0). Idempotent. Docker would otherwise
 # create missing mount PARENTS as root, and the uid-1234 app cannot mkdir siblings. The
 # execution seam deliberately does NOT do this (it refuses loudly on a missing root) —
 # host provisioning is this script's job.
 measure_provision_tree() {
   local root="$1" img="${2:-$CV_MEASURE_IMAGE}"
-  log "provisioning cache tree + chown 1234:1234 under $root (G-15 root helper)"
+  log "provisioning cache tree + chown 1234:1234 under $root (docker root helper)"
   docker run --rm --user 0 --network none --entrypoint bash \
     -v "$root":/cv-fix "$img" -c '
       set -e

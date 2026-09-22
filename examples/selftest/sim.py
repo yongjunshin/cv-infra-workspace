@@ -19,7 +19,7 @@ incidental is actually the contract:
   writes to the same place locally (``./python.sh examples/selftest/sim.py`` from the
   repo root) and under CI, which is what makes a local reproduction meaningful.
 * **The trajectory is written BEFORE ``simulation_app.close()``.** ``close()`` ends the
-  process (status 0, always — G-62), so anything after it never runs. That same fact is
+  process (status 0, always), so anything after it never runs. That same fact is
   why the exit code carries no verdict here: the ORACLE judges the file this writes.
 * **``--gui`` defaults off.** The case container has no display, so a GUI boot hangs or
   dies; the flag exists for a developer at a workstation, and CI simply never passes it.
@@ -31,7 +31,7 @@ Local parity (from the repository root, GUI optional):
     ./python.sh examples/selftest/sim.py --drop_height=1.5 --cube_scale=0.5 [--gui]
 """
 
-# stdlib only down here — see the module docstring (LOCKED: no omni.*/isaacsim.* yet).
+# stdlib only down here — see the module docstring (no omni.*/isaacsim.* yet).
 import argparse
 import json
 import os
@@ -126,7 +126,7 @@ def main() -> int:
         traceback.print_exc()
         rc = 1
     finally:
-        # G-62: this ends the process with status 0 — nothing below runs, and the exit
+        # This ends the process with status 0 — nothing below runs, and the exit
         # code cannot carry a verdict (rc above is honesty, not a channel). The oracle
         # judges the file, not this status.
         simulation_app.close()

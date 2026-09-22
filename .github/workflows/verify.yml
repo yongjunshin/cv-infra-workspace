@@ -3,7 +3,7 @@
 #   jobs:
 #     verify:                              # job-level `uses:` — no runs-on/steps here
 #       permissions: { checks: write, pull-requests: write, contents: read }
-#       uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@minimal-verify
+#       uses: yongjunshin/cv-infra-workspace/.github/workflows/verify.yml@main
 #       #     ^ branch ref until a v2 release tag exists; then pin to the tag (README §consumer)
 #       with:
 #         sim_script: verify/sim.py
@@ -38,7 +38,7 @@
 # scripts/workstation_setup/install_pict.sh) and `ACCEPT_EULA` / `PRIVACY_CONSENT` in the
 # runner service environment. Each missing piece is a named exit 3, never a silent pass.
 #
-# PINS (CLAUDE.md §2-7): every `uses:` is an immutable commit SHA (the trailing comment
+# PINS (CLAUDE.md §2-3): every `uses:` is an immutable commit SHA (the trailing comment
 # names the tag it belonged to). A bump is a new SHA plus a new comment — never a tag or
 # branch ref, which can move under us.
 

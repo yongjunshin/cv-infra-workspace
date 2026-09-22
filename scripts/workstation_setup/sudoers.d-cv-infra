@@ -1,22 +1,22 @@
-# cv-infra — unattended maintenance NOPASSWD drop-in (P2+, STANDING)
+# cv-infra — unattended maintenance NOPASSWD drop-in (STANDING)
 # ===========================================================================
 # Install target : /etc/sudoers.d/cv-infra   (mode 0440, owner root:root)
 # Authorized user: cv_infra_operator  <- ★ PLACEHOLDER. Substitute it at INSTALL time
 #                  with the account that runs provisioning on THAT host (README
 #                  Step A does it with one `sed`). It used to be the literal `etri`,
 #                  which is the SSH account on the first workstation and a WRONG
-#                  value on every other host (DoD-P5-09: no deployment-target
+#                  value on every other host (no deployment-target
 #                  identity hardcoded into scripts/). The placeholder is a legal
 #                  sudoers username token on purpose, so a file that reaches
 #                  /etc/sudoers.d unsubstituted still PARSES (a syntax error there
 #                  can lock an operator out of sudo entirely) while granting nothing
 #                  — the first `sudo -n` then fails loudly, which is the safe order.
-# Scope          : decision 2026-07-07-fu6-sudo-scope-reduction (option B) —
-#                  SUPERSEDES 2026-06-25 (option A, "Phase 1 ONLY / removable").
+# Scope          : standing maintenance scope, decided 2026-07-07 —
+#                  SUPERSEDES 2026-06-25 (first provisioning ONLY, removable).
 #                  Unattended agents keep needing a non-interactive sudo channel
-#                  (no TTY for a password, GOTCHAS G-06) for RECURRING P2+
-#                  maintenance, not just one-shot Phase-1 provisioning.
-# Lifetime       : standing (P2+). Scope changes require a superseding decision;
+#                  (no TTY for a password) for RECURRING
+#                  maintenance, not just one-shot first provisioning.
+# Lifetime       : standing. Scope changes require a superseding decision;
 #                  updates ship through the whitelisted channel itself:
 #                      sudo -n install -m 0440 -o root -g root <new> /etc/sudoers.d/cv-infra
 #
@@ -35,12 +35,12 @@
 #   /usr/bin/docker    GPU passthrough smoke, pinned image pulls, smoke runs —
 #                      sessions where the docker group is not (yet) effective
 #
-# REMOVED vs Phase 1 (FU-6 — one-shot provisioning verbs, no P2+ recurrence):
+# REMOVED vs the 2026-06-25 set (one-shot provisioning verbs, never recurring):
 #   /usr/sbin/usermod    (was: usermod -aG docker etri — done; group persists)
 #   /usr/bin/nvidia-ctk  (was: nvidia-ctk runtime configure — daemon.json set)
 # Consequence: a FULL provision.sh re-run stops at those two steps IF they still
 # have work to do; they become operator actions in an interactive terminal
-# (accepted by the decision). Since p5c17 both call sites first CHECK whether the
+# (accepted by the decision). Since 2026-08-19 both call sites first CHECK whether the
 # state they create already holds (group membership / registered nvidia runtime)
 # and skip loudly when it does — so an already-correct host never reaches them.
 #

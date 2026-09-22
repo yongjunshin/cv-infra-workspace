@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# register_gh_runner.sh — DoD-P1-07: register this workstation as a self-hosted
+# register_gh_runner.sh — register this workstation as a self-hosted
 # GitHub Actions runner (repo-level, labels [self-hosted, cv-infra-gpu]) and
 # persist it as a systemd service.
-# Policy: decision 2026-07-03-self-hosted-runner-policy (binding) — exact-version
+# Policy (decided 2026-07-03): exact-version
 # pin + tarball sha256 verification + --disableupdate; hardening applied at
 # registration time (the label is consumed by .github/workflows/verify.yml, which
 # runs the CALLER's checked-out code here — see that file's TRUST BOUNDARY note).
 #
-# Registration TARGET is parameterized via env (decision
-# 2026-07-21-e2e-user-runner-provisioning): CV_GH_RUNNER_REPO_URL /
+# Registration TARGET is parameterized via env (decided
+# 2026-07-21): CV_GH_RUNNER_REPO_URL /
 # CV_GH_RUNNER_NAME / CV_GH_RUNNER_HOME / CV_GH_RUNNER_SERVICE, all defaulting
 # in common.sh to the original cv-infra-workspace runner — a plain no-env run
 # is exactly the pre-parameterization behavior. Second-runner example
@@ -31,7 +31,7 @@
 # runner-home `.path` file into the job plane and forwards SIGTERM/SIGINT to the
 # listener. ExecStart=run.sh does NEITHER — `.path` never reaches jobs
 # (`cv-infra: command not found`, exit 127) and stops orphan the listener
-# (F1 root cause, questions/user-2026-07-21-runner-path-blocker option A).
+# (root cause of the 2026-07-21 runner PATH blocker).
 set -euo pipefail
 
 export CV_STEP=runner
