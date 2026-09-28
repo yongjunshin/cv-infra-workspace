@@ -232,11 +232,14 @@ require_apt_pkg_version() {
 # --disableupdate). Refresh = re-resolve the latest release
 # (`gh api repos/actions/runner/releases/latest`), bump the two pins below, and
 # re-run register_gh_runner.sh (idempotent). See README → runner pin refresh.
-readonly CV_GH_RUNNER_VERSION="2.335.1"       # pinned 2026-07-03 (then-latest official release)
-# Official linux-x64 tarball sha256 published in the v2.335.1 release notes
+# Refreshed 2026-09-28 from 2.335.1 (pinned 2026-07-03), after GitHub began refusing it:
+# the runner service looped on "Runner version v2.335.1 is deprecated and cannot receive
+# messages" and every queued job waited on an offline runner.
+readonly CV_GH_RUNNER_VERSION="2.337.0"       # pinned 2026-09-28 (then-latest official release)
+# Official linux-x64 tarball sha256 published in the v2.337.0 release notes
 # (`<!-- BEGIN SHA linux-x64 -->` marker) — an UPSTREAM-stated checksum, not a
 # first-download measurement. Mismatch at install time = hard die.
-readonly CV_GH_RUNNER_TARBALL_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+readonly CV_GH_RUNNER_TARBALL_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
 # Registration TARGET params (decided 2026-07-21:
 # a SECOND same-machine repo-level runner for cv-infra-user). Env-overridable,
 # defaulting to the original WORKSPACE runner — a plain no-env re-run is
