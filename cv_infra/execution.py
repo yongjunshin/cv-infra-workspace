@@ -35,6 +35,7 @@ module deliberately does not import them, so the contract layer stays the lowest
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -94,6 +95,26 @@ CACHE_SCRATCH_MOUNTS: tuple[tuple[str, str], ...] = (
 )
 CACHE_MOUNTS: tuple[tuple[str, str], ...] = CACHE_BASE_MOUNTS + CACHE_SCRATCH_MOUNTS
 
+# CACHE SLOTS (base root alone, no scratch root). Two Isaac instances must not share one
+# Kit cache tree — it holds per-instance lock files (``kit/DerivedDataCache/
+# app_instance_lock0`` — seen in the provisioned tree). So every run LEASES a slot for
+# its lifetime: slot 0 is the provisioned ``<root>/<digest12>`` itself (a serial run is
+# exactly what it was), slot k>=1 is ``<root>/<digest12>.slots/<k>``, copied ONCE from
+# slot 0's warm tiers and then kept — it stays warm for every later run. The lease is an
+# ``flock`` on ``<root>/<digest12>.slot<k>.lock``, so it also holds across two CLI
+# processes (two jobs on two runners of one host) and dies with a crashed process.
+#
+# The copy runs INSIDE the case image as its own user (uid 1234), because the warm tree
+# is uid 1234's ``0700`` and the CLI is not root (measured: the host-side ``cp -a`` of the
+# scratch mode fails exactly there). MEASURED 2026-10-01: ~1.5 GB per slot, 8 slots in
+# 5 s.
+MAX_CACHE_SLOTS = 32
+SLOT_READY_MARKER = ".cv-infra-slot-ready"
+SLOT_COPY_TIMEOUT_S = 600.0
+SLOT_COPY_SCRIPT = (
+    'for tier in "$@"; do rm -rf "/dst/$tier" && cp -a "/src/$tier" "/dst/$tier" || exit 1; done'
+)
+
 # Operator consent is an INPUT, never a literal in this repo: the two env keys are
 # passed through verbatim from the operator environment (the CLI refuses to run
 # without them, so this module never has to decide what consent means).
@@ -107,6 +128,16 @@ LABEL_SLUG = "cv-infra.slug"
 # The watchdog kill's marker: producer = ``_supervise_until_exit``, consumer = the
 # verdict lane fold (a marker-prefixed error is a TIMEOUT, not an unknown fault).
 CASE_TIMEOUT_MARKER = "case timeout:"
+
+# A GPU fault inside one case. MEASURED 2026-10-01 (5 carter cases in flight): Kit's
+# Vulkan backend logged ``VkResult: ERROR_DEVICE_LOST`` 30 s into one case and then hung
+# — it never exits — until the 1800 s case timeout; the other cases ran on, unaffected.
+# So the sim's own log is watched while it runs, and that line ends the case at once
+# with this marker (consumer: the CLI retries such a run once and backs off concurrency).
+GPU_LOST_MARKER = "gpu device lost:"
+GPU_LOST_SIGNATURE = b"ERROR_DEVICE_LOST"
+GPU_WATCH_PERIOD_S = 10.0
+GPU_WATCH_TAIL_LINES = 200
 
 _TEARDOWN_STOP_TIMEOUT_S = 10  # graceful stop window before force-remove
 _EXIT_CODE_WAIT_S = 30  # API wait on an already-exited container (returns immediately)
@@ -156,10 +187,9 @@ def slug_for(key: str) -> str:
     ``key`` is slugged to docker's allowed charset and suffixed with a short stable
     hash of the FULL key, so distinct keys that slug identically (case ids share a
     ``sha256:`` prefix — they always do) still get distinct names. Used for the
-    container name, the case's host output dir, its cache scratch dir, its log and its
-    zip, so all five of a case's names line up in a listing. Body is the orchestrator's
-    ``network_name_for`` with a ``cvc-`` (case) prefix; NO network is created here —
-    one container per case needs no private network.
+    container name, the case's private network, its host output dir, its cache scratch
+    dir, its log and its zip, so all of a case's names line up in a listing. Body is the
+    orchestrator's ``network_name_for`` with a ``cvc-`` (case) prefix.
     """
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", key).strip("-.")[:24] or "case"
     suffix = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
@@ -244,14 +274,114 @@ def _image_namespace(sim_image: str) -> str:
     return match.group(1)
 
 
+@dataclass
+class CacheLease:
+    """A held cache slot: its tree, its index, and the open lock that holds it."""
+
+    path: Path
+    slot: int
+    lock_fd: int
+
+    def release(self) -> None:
+        """Best effort, like every teardown step: closing the fd drops the flock."""
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.lock_fd)
+
+
+def _lease_cache_slot(
+    client: Any, sim_image: str, base: Path, *, poll_interval_s: float
+) -> CacheLease:
+    """The lowest free slot, provisioned if it is new (see CACHE SLOTS above)."""
+    namespace = base.name
+    for slot in range(MAX_CACHE_SLOTS):
+        lock_path = base.parent / f"{namespace}.slot{slot}.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        lease = CacheLease(
+            base if slot == 0 else base.parent / f"{namespace}.slots" / str(slot), slot, fd
+        )
+        try:
+            if slot:
+                _provision_slot(client, sim_image, base, lease, poll_interval_s=poll_interval_s)
+        except Exception:
+            lease.release()
+            raise
+        return lease
+    raise RuntimeError(
+        f"all {MAX_CACHE_SLOTS} cache slots of {base} are leased — more Isaac instances"
+        " than this host can hold are running against one image"
+    )
+
+
+def _provision_slot(
+    client: Any, sim_image: str, base: Path, lease: CacheLease, *, poll_interval_s: float
+) -> None:
+    """Make slot k a warm copy of slot 0 — once. A slot without its ready marker (new,
+    or a copy that died half-way) is (re)copied; the copy replaces each tier whole."""
+    slot_dir = lease.path
+    for subpath in ("cache", *(sub for sub, _ in CACHE_SCRATCH_MOUNTS)):
+        (slot_dir / subpath).mkdir(parents=True, exist_ok=True)
+        (slot_dir / subpath).chmod(0o777)  # the image runs non-root (uid 1234)
+    marker = slot_dir / SLOT_READY_MARKER
+    if marker.is_file():
+        return
+    tiers = [subpath.split("/", 1)[1] for subpath, _ in CACHE_BASE_MOUNTS]  # "cache/kit" -> "kit"
+    started = time.monotonic()
+    container = None
+    try:
+        container = client.containers.run(
+            sim_image,
+            entrypoint="/bin/sh",
+            command=["-c", SLOT_COPY_SCRIPT, "cv-slot-copy", *tiers],
+            volumes={
+                str(base / "cache"): {"bind": "/src", "mode": "ro"},
+                str(slot_dir / "cache"): {"bind": "/dst", "mode": "rw"},
+            },
+            detach=True,
+            name=f"cv-cache-{base.name}-slot{lease.slot}",
+            labels={LABEL_SLUG: f"cache-slot-{lease.slot}"},
+        )
+        rc, error = _supervise_until_exit(
+            container, timeout_s=SLOT_COPY_TIMEOUT_S, poll_interval_s=poll_interval_s
+        )
+    finally:
+        _teardown((container,))
+    if error is not None or rc != 0:
+        raise RuntimeError(
+            f"cache slot {lease.slot} copy into {slot_dir} failed ({error or f'exit {rc}'})"
+            " — a slot that is not a warm copy would run all-cold while measured as warm"
+        )
+    marker.write_text(
+        f"copied from {base} in {time.monotonic() - started:.1f}s\n", encoding="utf-8"
+    )
+    line = json.dumps(
+        {
+            "slot": lease.slot,
+            "path": str(slot_dir),
+            "seconds": round(time.monotonic() - started, 3),
+        },
+        sort_keys=True,
+    )
+    print(f"[cv-infra] cache-slot {line}", file=sys.stderr, flush=True)
+
+
 def _cache_volumes(
     cache_root: str | os.PathLike[str] | None,
     cache_scratch_root: str | os.PathLike[str] | None,
     slug: str,
     sim_image: str,
-) -> tuple[dict[str, dict[str, str]], Path | None]:
-    """Resolve cache roots to docker ``volumes`` binds — single-tier or per-case seeded.
-    Returns ``(volumes, per-case scratch | None)``.
+    *,
+    client: Any = None,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+) -> tuple[dict[str, dict[str, str]], Path | None, CacheLease | None]:
+    """Resolve cache roots to docker ``volumes`` binds — slotted or per-case seeded.
+    Returns ``(volumes, per-case scratch | None, held slot | None)``.
 
     Effective roots = the arguments (win) or ``$CV_ISAAC_CACHE_ROOT`` /
     ``$CV_ISAAC_CACHE_SCRATCH_ROOT``; when neither is set there are ZERO cache mounts
@@ -261,8 +391,8 @@ def _cache_volumes(
     ``<cache_root>/<digest12>`` (see ``_image_namespace``). The scratch root is not —
     its children are already per-case slugs, and nothing warm is shared there.
 
-    * base root alone -> one layer: all six binds ``rw`` from the base. Fine for
-      ``concurrency=1``; two concurrent cases would share the same lock files.
+    * base root alone -> a LEASED SLOT (see CACHE SLOTS above): all six binds ``rw``
+      from the slot this run holds — slot 0 (the base itself) when nothing else runs.
     * base + scratch roots -> per-case seeding: the three warm cache SETS
       (``CACHE_BASE_MOUNTS``) are COPIED into ``<scratch_root>/<slug>/<same subpath>``
       and bound **rw** from there; the three always-written runtime dirs
@@ -284,7 +414,7 @@ def _cache_volumes(
             " cache would silently run all-cold; give both roots or neither"
         )
     if not root:
-        return {}, None
+        return {}, None, None
     resolved = Path(root).resolve() / _image_namespace(sim_image)
     if not resolved.is_dir():
         # Neither silently cold (the failure everyone believes is a warm run) nor created
@@ -297,17 +427,20 @@ def _cache_volumes(
             " the CLI must not, it is not root)"
         )
     if scratch_root is None:
-        return {
-            str(resolved / subpath): {"bind": container_path, "mode": "rw"}
+        lease = _lease_cache_slot(client, sim_image, resolved, poll_interval_s=poll_interval_s)
+        volumes = {
+            str(lease.path / subpath): {"bind": container_path, "mode": "rw"}
             for subpath, container_path in CACHE_MOUNTS
-        }, None
+        }
+        return volumes, None, lease
     scratch_resolved = Path(scratch_root).resolve()
     if not scratch_resolved.is_dir():
         raise ValueError(
             f"cache_scratch_root {scratch_resolved} does not exist or is not a directory "
             f"(the scratch ROOT is host provisioning's job; per-case dirs are created here)"
         )
-    return _seeded_cache_volumes(slug, resolved, scratch_resolved)
+    volumes, scratch = _seeded_cache_volumes(slug, resolved, scratch_resolved)
+    return volumes, scratch, None
 
 
 def _seeded_cache_volumes(
@@ -589,15 +722,17 @@ def _case_volumes(spec: Any, case_out: Path, *, mode: str) -> dict[str, dict[str
 
 
 def _supervise_until_exit(
-    container: Any, *, timeout_s: float, poll_interval_s: float
+    container: Any, *, timeout_s: float, poll_interval_s: float, watch_gpu: bool = False
 ) -> tuple[int | None, str | None]:
-    """Wait for the container to exit, or kill the case on the wall-clock deadline.
+    """Wait for the container to exit, or kill the case on the wall-clock deadline —
+    or, with ``watch_gpu``, as soon as its log says the GPU device was lost.
 
     Returns ``(exit_code, error)`` — exactly one side is set. On timeout the kill
     itself happens in the caller's finally-teardown (stop + force-remove), so there is
     one place that removes containers, not two.
     """
     deadline = time.monotonic() + timeout_s
+    next_watch = time.monotonic()
     while True:
         container.reload()
         if container.status == "exited":
@@ -607,7 +742,24 @@ def _supervise_until_exit(
                 f"{CASE_TIMEOUT_MARKER} container still running after {timeout_s}s"
                 " (teardown kills it)"
             )
+        if watch_gpu and time.monotonic() >= next_watch:
+            next_watch = time.monotonic() + GPU_WATCH_PERIOD_S
+            if GPU_LOST_SIGNATURE in _log_tail(container):
+                return None, (
+                    f"{GPU_LOST_MARKER} the renderer reported "
+                    f"{GPU_LOST_SIGNATURE.decode()} — Kit hangs after that, so the case"
+                    " was ended at once instead of at its timeout"
+                )
         time.sleep(poll_interval_s)
+
+
+def _log_tail(container: Any) -> bytes:
+    """The last lines of a RUNNING container's log — best effort: a log read that fails
+    mid-run is not a reason to end the case (the final collection still reports it)."""
+    try:
+        return container.logs(tail=GPU_WATCH_TAIL_LINES)
+    except Exception:
+        return b""
 
 
 def _exit_code(container: Any) -> int:
@@ -619,8 +771,8 @@ def _teardown(containers: tuple[Any, ...]) -> None:
     """Best-effort stop/remove of every spawned container — no leftover on any path.
 
     Every step is attempted regardless of earlier failures; failures are surfaced on
-    stderr but never raised (teardown must not mask the case outcome). No network to
-    remove: one container per case needs no private network.
+    stderr but never raised (teardown must not mask the case outcome). The case's
+    private network goes in ``_remove_network``, after its container.
     """
     for container in containers:
         if container is None:
@@ -633,6 +785,35 @@ def _teardown(containers: tuple[Any, ...]) -> None:
             container.remove(force=True)
         except Exception as exc:
             print(f"[cv-infra] teardown remove failed: {exc!r}", file=sys.stderr)
+
+
+def _create_network(client: Any, slug: str, case_id: str) -> Any:
+    """The case's OWN bridge network. Concurrent cases on docker's default bridge share
+    one broadcast domain, so a sim that speaks multicast discovery (ROS 2 / DDS) would
+    hear its neighbour case on the same domain id. A private bridge still routes out
+    (asset downloads) and resolves names; it only stops cases from seeing each other."""
+    return client.networks.create(
+        f"{slug}-net", driver="bridge", labels={LABEL_CASE_ID: case_id, LABEL_SLUG: slug}
+    )
+
+
+def _remove_network(network: Any) -> None:
+    """Best effort, after the container is gone (a network with an endpoint refuses)."""
+    if network is None:
+        return
+    try:
+        network.remove()
+    except Exception as exc:
+        print(f"[cv-infra] teardown network remove failed: {exc!r}", file=sys.stderr)
+
+
+def _release_lease(lease: CacheLease | None) -> None:
+    if lease is None:
+        return
+    try:
+        lease.release()
+    except Exception as exc:
+        print(f"[cv-infra] cache slot release failed: {exc!r}", file=sys.stderr)
 
 
 def _discard_scratch(scratch_dir: Path | None) -> None:
@@ -723,13 +904,14 @@ def run_sim_case(
     zip_path = run_dir / "zips" / f"{slug}.zip"
     out_dir = run_dir / "cases" / slug / "out"
     container = None
+    network = None
     scratch_dir = None
+    lease = None
     rc: int | None = None
     error: str | None = None
     started = time.monotonic()
     try:
         out_dir = _prepare_case_dir(run_dir, slug)
-        volumes, scratch_dir = _cache_volumes(cache_root, cache_scratch_root, slug, spec.sim_image)
         _ensure_image_present(
             client,
             spec.sim_image,
@@ -737,7 +919,17 @@ def run_sim_case(
             stall_timeout_s=pull_stall_timeout_s,
             poll_interval_s=poll_interval_s,
         )
+        # After the image gate: a new cache slot is copied by a container of this image.
+        volumes, scratch_dir, lease = _cache_volumes(
+            cache_root,
+            cache_scratch_root,
+            slug,
+            spec.sim_image,
+            client=client,
+            poll_interval_s=poll_interval_s,
+        )
         volumes.update(_case_volumes(spec, out_dir, mode="rw"))
+        network = _create_network(client, slug, case.case_id)
         container = client.containers.run(
             spec.sim_image,
             entrypoint=EXECUTE_ENTRYPOINT,
@@ -750,15 +942,21 @@ def run_sim_case(
             detach=True,
             name=f"{slug}-sim",
             labels={LABEL_CASE_ID: case.case_id, LABEL_SLUG: slug},
+            network=network.name,
         )
         rc, error = _supervise_until_exit(
-            container, timeout_s=spec.case_timeout_s, poll_interval_s=poll_interval_s
+            container,
+            timeout_s=spec.case_timeout_s,
+            poll_interval_s=poll_interval_s,
+            watch_gpu=True,
         )
         _write_logs(container, log_path)
     except Exception as exc:  # infra boundary: this case ERRORs, the run continues
         error = f"{type(exc).__name__}: {exc}"
     finally:
         _teardown((container,))
+        _remove_network(network)
+        _release_lease(lease)
         _discard_scratch(scratch_dir)
     zipped = zip_output(out_dir, zip_path, int(spec.max_zip_mb) * 1024 * 1024)
     return SimExecution(

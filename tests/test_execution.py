@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from cv_infra import execution as execution_module
 from cv_infra.execution import (
     CACHE_BASE_MOUNTS,
     CACHE_MOUNTS,
@@ -32,6 +33,8 @@ from cv_infra.execution import (
     DEFAULT_SIM_IMAGE,
     EXECUTE_ENTRYPOINT,
     EXECUTE_SCRIPT,
+    GPU_LOST_MARKER,
+    SLOT_READY_MARKER,
     ImagePullStalled,
     _assert_runner_writable,
     _cache_volumes,
@@ -39,7 +42,9 @@ from cv_infra.execution import (
     _ensure_image_present,
     _image_namespace,
     _image_present,
+    _lease_cache_slot,
     _pull_with_liveness,
+    _release_lease,
     _teardown,
     gpu_device_requests,
     resolve_docker_client,
@@ -452,9 +457,11 @@ def test_a_single_tier_cache_binds_all_six_dirs_rw_under_the_image_namespace(tmp
     monkeypatch.setenv(CACHE_ROOT_ENV, str(base))
     monkeypatch.delenv(CACHE_SCRATCH_ROOT_ENV, raising=False)
 
-    volumes, scratch = _cache_volumes(None, None, "cvc-x", SIM_IMAGE)
+    volumes, scratch, lease = _cache_volumes(None, None, "cvc-x", SIM_IMAGE)
+    lease.release()
 
     assert scratch is None
+    assert lease.slot == 0  # nothing else holds the base: a serial run uses it as it is
     assert len(volumes) == len(CACHE_MOUNTS)
     assert {bind["mode"] for bind in volumes.values()} == {"rw"}  # :ro turns caches OFF
     # Kit/CUDA caches belong to one Isaac BUILD — a second image gets its own subtree.
@@ -482,7 +489,8 @@ def test_the_seeded_runtime_dirs_are_world_writable(tmp_path):
     """dockerd would create a missing bind source as root; the image runs as uid 1234."""
     base, scratch_root = _warm_cache(tmp_path)
 
-    volumes, scratch = _cache_volumes(base, scratch_root, "cvc-x", SIM_IMAGE)
+    volumes, scratch, lease = _cache_volumes(base, scratch_root, "cvc-x", SIM_IMAGE)
+    assert lease is None  # the scratch mode seeds per case; it leases no slot
     try:
         for subpath, _bind in CACHE_SCRATCH_MOUNTS:
             mode = (scratch / subpath).stat().st_mode
@@ -756,3 +764,149 @@ def test_without_an_injected_client_the_sdk_is_imported_lazily(monkeypatch):
 
 def test_the_default_image_is_the_pinned_stock_digest():
     assert DEFAULT_SIM_IMAGE.startswith("nvcr.io/nvidia/isaac-sim:5.1.0@sha256:")
+
+
+# --------------------------------------------------------------------------- #
+# cache slots: one Isaac instance per cache tree, however many run at once
+# --------------------------------------------------------------------------- #
+
+
+def _slot_base(tmp_path):
+    root, _scratch = _warm_cache(tmp_path)
+    return root, root / SIM_IMAGE_DIGEST12
+
+
+def test_a_lone_run_leases_the_base_itself_and_a_concurrent_one_gets_a_warm_copy(tmp_path, capsys):
+    root, base = _slot_base(tmp_path)
+    client = FakeClient(statuses=("exited",))
+
+    first = _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0)
+    second = _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0)
+
+    assert (first.slot, first.path) == (0, base)  # serial = exactly what it always was
+    assert (second.slot, second.path) == (1, root / f"{SIM_IMAGE_DIGEST12}.slots" / "1")
+    image, kwargs = client.run_calls[0]  # the copy runs IN the image, as its own user
+    assert image == SIM_IMAGE and kwargs["entrypoint"] == "/bin/sh"
+    assert kwargs["command"][-3:] == ["kit", "home", "computecache"]
+    assert kwargs["volumes"] == {
+        str(base / "cache"): {"bind": "/src", "mode": "ro"},
+        str(second.path / "cache"): {"bind": "/dst", "mode": "rw"},
+    }
+    assert (second.path / SLOT_READY_MARKER).is_file()
+    for subpath, _bind in CACHE_SCRATCH_MOUNTS:
+        assert (second.path / subpath).stat().st_mode & stat.S_IWOTH
+    assert "[cv-infra] cache-slot" in capsys.readouterr().err
+    assert client.started[0].remove_calls == 1  # the copy container is torn down
+
+    first.release()
+    again = _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0)
+    assert again.slot == 0  # a released slot is the first one handed out again
+    again.release()
+    second.release()
+
+
+def test_a_ready_slot_is_never_copied_twice(tmp_path):
+    _root, base = _slot_base(tmp_path)
+    client = FakeClient(statuses=("exited",))
+    hold = _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0)
+    _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0).release()
+    _lease_cache_slot(client, SIM_IMAGE, base, poll_interval_s=0.0).release()
+    assert len(client.run_calls) == 1  # it stays warm across runs
+    hold.release()
+
+
+def test_a_failed_slot_copy_is_loud_and_frees_the_slot(tmp_path):
+    _root, base = _slot_base(tmp_path)
+    hold = _lease_cache_slot(FakeClient(), SIM_IMAGE, base, poll_interval_s=0.0)
+    with pytest.raises(RuntimeError, match="cache slot 1 copy .* failed .*exit 1"):
+        _lease_cache_slot(
+            FakeClient(statuses=("exited",), exit_code=1), SIM_IMAGE, base, poll_interval_s=0.0
+        )
+    retry = _lease_cache_slot(
+        FakeClient(statuses=("exited",)), SIM_IMAGE, base, poll_interval_s=0.0
+    )
+    assert retry.slot == 1  # the failed attempt did not keep the slot
+    retry.release()
+    hold.release()
+
+
+def test_every_slot_leased_is_an_error_not_a_shared_tree(tmp_path, monkeypatch):
+    _root, base = _slot_base(tmp_path)
+    monkeypatch.setattr(execution_module, "MAX_CACHE_SLOTS", 1)
+    hold = _lease_cache_slot(FakeClient(), SIM_IMAGE, base, poll_interval_s=0.0)
+    with pytest.raises(RuntimeError, match="all 1 cache slots"):
+        _lease_cache_slot(FakeClient(), SIM_IMAGE, base, poll_interval_s=0.0)
+    hold.release()
+
+
+def test_a_case_releases_its_slot_when_it_ends(tmp_path):
+    root, base = _slot_base(tmp_path)
+    run_case(tmp_path, FakeClient(), cache_root=root)
+    after = _lease_cache_slot(FakeClient(), SIM_IMAGE, base, poll_interval_s=0.0)
+    assert after.slot == 0
+    after.release()
+
+
+def test_a_slot_release_fault_is_reported_not_raised(capsys):
+    def broken():
+        raise OSError("bad fd")
+
+    _release_lease(types.SimpleNamespace(release=broken))
+    assert "cache slot release failed" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# per-case network: concurrent cases do not share a broadcast domain
+# --------------------------------------------------------------------------- #
+
+
+def test_every_case_runs_on_its_own_network_and_leaves_none_behind(tmp_path):
+    client = FakeClient()
+    case = make_case()
+    run_case(tmp_path, client, case=case)
+
+    network = client.networks.created[0]
+    slug = slug_for(run_key(case))
+    assert network.name == f"{slug}-net"
+    assert network.kwargs["driver"] == "bridge"
+    assert network.kwargs["labels"]["cv-infra.slug"] == slug
+    assert client.run_calls[0][1]["network"] == network.name
+    assert network.remove_calls == 1
+
+
+def test_a_network_that_will_not_go_is_reported_not_raised(tmp_path, capsys):
+    client = FakeClient()
+    client.networks.remove_error = RuntimeError("endpoint still attached")
+    execution = run_case(tmp_path, client)
+    assert execution.error is None
+    assert "network remove failed" in capsys.readouterr().err
+
+
+def test_a_network_that_cannot_be_made_is_the_case_error(tmp_path):
+    client = FakeClient()
+    client.networks.raise_on_create = RuntimeError("address pools exhausted")
+    execution = run_case(tmp_path, client)
+    assert "address pools exhausted" in execution.error
+    assert client.run_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# a lost GPU ends the case at once (Kit would hang until the timeout)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_lost_gpu_ends_the_case_at_once_instead_of_at_its_timeout(tmp_path):
+    lost = FakeContainer(statuses=("running",), logs=b"...\n[Error] VkResult: ERROR_DEVICE_LOST\n")
+    client = FakeClient(queued=[lost])
+
+    execution = run_case(tmp_path, client)
+
+    assert execution.error.startswith(GPU_LOST_MARKER)
+    assert execution.rc is None
+    assert lost.remove_calls == 1  # teardown still kills it
+
+
+def test_a_running_case_whose_log_cannot_be_read_is_not_ended_for_it(tmp_path):
+    container = FakeContainer(statuses=("running", "exited"), logs_error=OSError("closed"))
+    execution = run_case(tmp_path, FakeClient(queued=[container]))
+    assert execution.rc == 0

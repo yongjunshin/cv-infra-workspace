@@ -87,7 +87,7 @@ def test_a_complete_request_becomes_a_spec_with_container_relative_paths(tmp_pat
     assert spec.oracle_script == "verify/oracle.py"
     assert spec.checkout == (tmp_path / "checkout").resolve()
     assert spec.input_space_text == MODEL  # the bytes admit validated, not a re-read
-    assert (spec.pict_k, spec.repeats, spec.concurrency) == (2, 3, 1)
+    assert (spec.pict_k, spec.repeats, spec.concurrency) == (2, 3, "auto")
     assert spec.budget_s is None and spec.report_only is False
     assert spec.update_baseline is False and spec.checkout_sha is None
     assert spec.sim_image == inputs.DEFAULT_SIM_IMAGE  # what BASE_ARGS asked for

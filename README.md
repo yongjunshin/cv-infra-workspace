@@ -63,7 +63,7 @@ jobs:
 | `repeats` | `--repeats` | `1` | 케이스당 반복. 1도 그대로 존중하고 `single_sample`로 라벨한다 |
 | `budget` | `--budget-s` | 없음 | 벽시계 상한(초). 케이스 착수 **전에만** 검사 |
 | `sim_image` **(필수)** | `--sim-image` | — | **다이제스트 핀 필수**(`<name>@sha256:<64 hex>` — 태그는 거절). 소비자가 자기 스크립트를 개발한 바로 그 이미지를 선언한다(아래 §이미지 패리티). 다이제스트 얻는 법: `docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/isaac-sim:5.1.0` |
-| `concurrency` | `--concurrency` | `1` | 동시 케이스 수. 전 컨테이너가 GPU 하나를 시분할하므로 상한은 VRAM |
+| `concurrency` | `--concurrency` | `auto` | 동시에 도는 케이스 수. `auto`는 호스트 GPU를 지켜보며 여유가 있는 동안 늘린다(아래 §동시 실행). 정수 K는 정확히 K개 |
 | `report_only` | `--report-only` | `false` | bool 키가 없는 verdict(지표·메모만)를 거절 대신 허용 |
 | `runner_label` | — | `cv-infra-gpu` | GPU 워크스테이션을 고르는 러너 라벨 |
 | (워크플로가 계산) | `--update-baseline` | `false` | **non-PR 이벤트에서만** 전달된다(아래 §베이스라인) |
@@ -206,13 +206,69 @@ pull 0초).
 - 콜드 런 한 케이스가 **59.4초**로 튀었다(`app ready` 이후 약 45초 정체). 웜 두 번에서 재현되지
   않았고 원인을 귀속하지 못했다 — 케이스당 상한을 예산으로 잡을 때 참고할 것(`--case-timeout-s`
   기본 1800초라 위험 구간은 아니다).
-- **concurrency > 1은 측정되지 않았다.** 위 스크래치 제약 때문에 k=1로만 돌렸다. VRAM 여유
-  (~90 GiB)로는 산술상 여러 케이스가 들어가지만 그건 추정이지 측정이 아니다.
+- (이 실측 당시 concurrency > 1은 측정되지 않았다 — 2026-10-01 측정은 아래 §동시 실행.)
 
 증거: 컨테이너 내부 로그가 자기 GPU 표(`NVIDIA RTX PRO 6000 Blackwell … 97887 MB`,
 `Driver Version: 580.159.03`)와 Warp/CUDA 초기화를 찍었고, 자유낙하 z의 2계 차분이
 0.002725 m = 9.81·(1/60)²로 정확히 일치했으며, 여섯 케이스 모두 `z_final == cube_scale/2`
 (정지 시 반높이)로 끝났다.
+
+## 동시 실행 (`concurrency: auto`, 기본)
+
+모든 케이스 컨테이너는 **GPU 하나를 시분할**한다. 몇 개를 동시에 돌려야 처리량이 오르는지는 플랫폼이
+아니라 **워크로드**(장면이 GPU를 얼마나 쓰나)가 정하므로, `auto`는 숫자를 정하지 않고 **호스트를 보며
+결정한다**(`cv_infra/scheduler.py`).
+
+**실측(2026-10-01, etri6000 — RTX PRO 6000 96 GB · 32코어 · 125 GB, carter 케이스를 고정 N으로):**
+
+| N | 케이스당 벽시계 | GPU 사용률 평균 | GPU 메모리 피크 | load1 |
+|---|---|---|---|---|
+| 1 | 44.5 s | 30 % | 13.8 GB | 6.3 |
+| 2 | 34.0 s | 51 % | 20.2 GB | 7.8 |
+| 4 | **26.3 s** | 62 % | 32.9 GB | 8.1 |
+| 8 | 25.4 s | 68 % | 58.6 GB | 13.7 |
+
+(GPU 메모리 중 7.4 GB는 다른 프로세스 몫.) 병목은 **GPU 연산**이다 — 메모리·RAM·CPU는 N=8에서도
+여유가 크다(케이스당 GPU ~6.4 GB, RAM ~5 GB). 평균 사용률이 ~60 %를 넘으면 처리량이 더 오르지 않는다.
+
+**정책.** 스케줄러는 "이 호스트가 받아 준 동시 수"를 **레벨**로 기억한다.
+
+- **레벨 올리기**에는 증거가 필요하다: 마지막 착수 뒤 20 s(새 케이스의 부하가 보일 때까지), 최근 30 s
+  평균 GPU 사용률 < 60 %, 그리고 지금까지 본 **케이스당 최대 GPU·RAM 사용량 × 1.25**가 여유 안에 들어갈 것.
+- **레벨까지 다시 채우기**(케이스가 끝나 빈자리)는 메모리 확인만 하고 즉시 착수한다. 짧은 케이스에서
+  매 착수마다 20 s를 기다리면 동시 수가 (케이스 길이 ÷ 20 s)에 묶인다(실측: ~40 s 케이스가 2–3에 묶였다).
+- 프로브가 없으면(`nvidia-smi` 없음 등) 증거가 없으므로 **한 번에 하나**. 느려질 뿐 과적은 없다.
+- 예산(`budget`)은 여전히 **케이스 착수 시점에** 읽고, 케이스는 배열 순서로 착수하므로 실행된 것은
+  항상 배열의 접두부다(보고되는 커버리지 의미 그대로).
+- 보고서 `summary.peak_concurrency`가 실제로 도달한 최대 동시 수다. stderr에 `[cv-infra] scheduler
+  {"event": "grow", ...}` 한 줄씩 남는다.
+
+**동시 실행을 안전하게 만드는 세 가지:**
+
+1. **캐시 슬롯.** Kit 캐시 트리에는 인스턴스별 잠금 파일이 있어 두 인스턴스가 한 트리를 같이 쓰면 안
+   된다. 케이스는 실행 동안 슬롯 하나를 **빌린다**(`flock`, 다른 러너의 CLI 프로세스와도 배타). 슬롯 0
+   = 기존 `<root>/<digest12>` 그대로(직렬이면 예전과 똑같다), 슬롯 k = `<root>/<digest12>.slots/<k>` —
+   처음 필요할 때 **그 이미지 컨테이너 안에서 uid 1234로** 슬롯 0의 웜 티어를 한 번 복사하고(호스트
+   계정은 uid 1234의 `0700` 트리를 못 읽으므로), 이후 계속 웜 상태로 재사용한다. 실측: 슬롯 하나 1.2 s,
+   약 1.5 GB.
+2. **케이스별 네트워크.** 기본 bridge에서 동시 케이스들은 한 브로드캐스트 도메인을 공유한다 — ROS 2/DDS
+   처럼 멀티캐스트로 서로를 찾는 sim은 같은 도메인 ID의 옆 케이스를 듣게 된다. 그래서 sim 컨테이너마다
+   전용 bridge 네트워크(`<slug>-net`)를 만들고 끝나면 지운다. 외부로는 그대로 나가므로(자산 다운로드)
+   케이스끼리만 서로 안 보인다.
+3. **GPU 장치 손실 처리.** 실측(2026-10-01, 5개 동시): 한 케이스의 Kit이 장면 로딩 중
+   `VkResult: ERROR_DEVICE_LOST`를 찍고 **종료하지 않은 채 1800 s 타임아웃까지 멈췄다**(나머지는 정상).
+   이제 실행 중인 sim 로그를 10 s마다 보고 그 줄이 나오면 즉시 끝내며, 이는 로봇의 결과가 아니라 인프라
+   결함이므로 **같은 시드로 한 번 더** 돌린다(`runs[].gpu_retries`). 스케줄러는 레벨을 하나 내리고 그
+   런 동안 다시 올리지 않는다. 두 번째도 잃으면 ERROR로 남는다.
+
+**라이브 결과(2026-10-02, 같은 호스트, `auto`):**
+
+| 소비자 | 직렬(CI, `concurrency 1`) | `auto` | 도달 동시 수 | 판정 |
+|---|---|---|---|---|
+| carter 28 케이스 | 30.7 min | **10.0 min** | 5 | 직렬과 동일(26 pass · 2 fail) |
+| go2 15 케이스(ROS 2 + nav2 + YOLO) | 36–40 min | **15.0 min** | 5 | 직렬과 같은 분포, ERROR 0, 결정적인 케이스의 미션 시간도 직렬과 같음(15.4 s vs 15.5 s) — 케이스 간 간섭 없음 |
+
+`concurrency: K`(정수)는 예전 의미 그대로 — 정확히 K개, 프로브 없음, GPU 손실에도 K 유지.
 
 ## exit 계약
 
@@ -270,8 +326,8 @@ logs/<case>.sim.log         # 케이스별 컨테이너 로그
 | 드라이버 R580 + Docker CE + NVIDIA Container Toolkit + 이미지 pull | [`scripts/workstation_setup/`](scripts/workstation_setup/README.md) (`provision.sh` · `realign_driver_r580.sh` · `pull_isaac.sh` · `test_gpu_passthrough.sh`) |
 | NVIDIA EULA·텔레메트리 동의 | `bash scripts/consent/accept_eula.sh` → 기록 + `ACCEPT_EULA`/`PRIVACY_CONSENT`를 러너 서비스 환경에 로드. 상태 확인 = `scripts/consent/check_consent.sh` |
 | PICT 바이너리 | `bash scripts/workstation_setup/install_pict.sh` (핀 커밋 clone+make, `export CV_PICT_BIN=…` 줄을 출력) |
-| Omniverse 캐시 트리 (**이미지별**) | `bash scripts/measure/warm_cache.sh <cache-root>/<digest12> provision` 로 그 이미지의 6-way 트리 생성(+uid 1234 소유). `<digest12>` = `sim_image` 다이제스트의 앞 12 hex — Kit 셰이더·CUDA 컴퓨트·자산 캐시는 Isaac 빌드에 묶이므로 한 트리를 이미지끼리 공유하면 캐시가 아니라 오염이다. 서브트리가 없으면 조용히 콜드로 돌지 않고 **이 명령을 그대로 찍으며 멈춘다**(CLI는 uid 1234로 chown할 수 없으므로 만들지 않는다). 첫 런이 그 캐시를 채운다(케이스별 CoW 스크래치이므로 공유 베이스는 건드리지 않는다) |
-| 캐시 스크래치 루트 (**선택 — 대개 켜지 말 것**) | 켜면(`CV_ISAAC_CACHE_SCRATCH_ROOT`) 케이스마다 웜 베이스를 `cp -a`로 복사해 쓴다. **실측(2026-09-07): CLI를 uid 1234가 아닌 계정으로 돌리면 동작하지 않는다** — 베이스의 uid-1234 `0700` 디렉터리를 읽지 못해 `cp -a`가 죽고, 설령 복사돼도 소유권 보존 가드가 거부한다(둘 다 시끄럽게 실패하고 스크래치를 폐기하므로 조용한 콜드 런은 없다). **root 권한을 가진 CLI 신원이 아니면 unset으로 두고 concurrency=1로 돌린다.** 켤 거라면 루트는 운영자가 직접 만든다(`mkdir -p` + uid 1234 쓰기 가능) — 어떤 스크립트도 만들지 않는다 |
+| Omniverse 캐시 트리 (**이미지별**) | `bash scripts/measure/warm_cache.sh <cache-root>/<digest12> provision` 로 그 이미지의 6-way 트리 생성(+uid 1234 소유). `<digest12>` = `sim_image` 다이제스트의 앞 12 hex — Kit 셰이더·CUDA 컴퓨트·자산 캐시는 Isaac 빌드에 묶이므로 한 트리를 이미지끼리 공유하면 캐시가 아니라 오염이다. 서브트리가 없으면 조용히 콜드로 돌지 않고 **이 명령을 그대로 찍으며 멈춘다**(CLI는 uid 1234로 chown할 수 없으므로 만들지 않는다). 첫 런이 그 캐시를 채운다. 동시 실행용 슬롯(`<digest12>.slots/<k>`)과 잠금 파일(`<digest12>.slot<k>.lock`)은 CLI가 캐시 루트 아래에 스스로 만든다(§동시 실행) — 캐시 루트는 CLI 계정이 쓸 수 있어야 한다 |
+| 캐시 스크래치 루트 (**선택 — 대개 켜지 말 것**) | 켜면(`CV_ISAAC_CACHE_SCRATCH_ROOT`) 케이스마다 웜 베이스를 `cp -a`로 복사해 쓴다. **실측(2026-09-07): CLI를 uid 1234가 아닌 계정으로 돌리면 동작하지 않는다** — 베이스의 uid-1234 `0700` 디렉터리를 읽지 못해 `cp -a`가 죽고, 설령 복사돼도 소유권 보존 가드가 거부한다(둘 다 시끄럽게 실패하고 스크래치를 폐기하므로 조용한 콜드 런은 없다). **root 권한을 가진 CLI 신원이 아니면 unset으로 둔다** — 동시 실행은 기본 슬롯 방식(§동시 실행)이 처리한다. 켤 거라면 루트는 운영자가 직접 만든다(`mkdir -p` + uid 1234 쓰기 가능) — 어떤 스크립트도 만들지 않는다 |
 | GitHub self-hosted 러너 (`cv-infra-gpu` 라벨) | `bash scripts/workstation_setup/register_gh_runner.sh` |
 | `cv-infra` 콘솔 스크립트 + `import cv_infra` 가능한 python(같은 venv) | 이 저장소를 체크아웃해 `uv sync --frozen` |
 

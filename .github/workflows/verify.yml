@@ -101,10 +101,13 @@ on:
         required: true
         type: string
       concurrency:
-        description: "Cases in flight at once. Every container shares one GPU; VRAM is the ceiling."
+        description: >-
+          Cases in flight at once. `auto` (default): the platform starts one, watches the
+          host GPU, and admits more while it still has room (cv_infra/scheduler.py). An
+          integer K holds exactly K.
         required: false
-        default: 1
-        type: number
+        default: "auto"
+        type: string
       report_only:
         description: "Accept a verdict with no boolean key (metrics/notes only) instead of refusing it."
         required: false

@@ -17,6 +17,7 @@ import types
 
 import pytest
 
+from cv_infra import scheduler
 from cv_infra.cli import main as cli
 from cv_infra.contract import inputs, pict
 from tests.conftest import FakeClient, FakeContainer
@@ -203,6 +204,45 @@ def test_an_oracle_that_dies_mid_collection_errors_that_case_too(tmp_path):
     assert "stream closed" in report_of(tmp_path)["matrix"][0]["runs"][0]["error"]
 
 
+def _lost_gpu():
+    return FakeContainer(statuses=("running",), logs=b"VkResult: ERROR_DEVICE_LOST\n")
+
+
+@needs_pict
+def test_a_run_that_lost_its_gpu_is_run_once_more_and_judged_on_the_second_try(tmp_path):
+    queued = [_lost_gpu()]  # the very first sim run loses its GPU; everything else is clean
+    for _ in range(CASES):
+        queued.append(FakeContainer(statuses=("exited",)))  # sim
+        queued.append(FakeContainer(statuses=("exited",), stdout_logs=PASSING))  # oracle
+    backed_off = []
+    governor = scheduler.FixedGovernor(1)
+    governor.back_off = lambda: backed_off.append(True)
+    spec = spec_for(tmp_path)
+    array = pict.generate(spec.input_space_text, order=spec.pict_k, pict_bin=spec.pict_bin)
+
+    ran, _cut, _peak = cli._run_cases(
+        spec, cli._cases_of(array, spec), FakeClient(queued=queued), environ(tmp_path), governor
+    )
+
+    first = ran[0].runs[0]
+    assert first.gpu_retries == 1
+    assert first.result.lane == "ok"
+    assert backed_off == [True]  # the scheduler was told
+
+
+@needs_pict
+def test_a_run_that_loses_its_gpu_twice_is_an_error_that_says_so(tmp_path):
+    queued = [_lost_gpu(), _lost_gpu()]
+    for _ in range(CASES):
+        queued.append(FakeContainer(statuses=("exited",)))
+        queued.append(FakeContainer(statuses=("exited",), stdout_logs=PASSING))
+    spec = spec_for(tmp_path)
+    cli.run_verify(spec, FakeClient(queued=queued), environ=environ(tmp_path))
+    run = report_of(tmp_path)["matrix"][0]["runs"][0]
+    assert run["gpu_retries"] == 1
+    assert run["error"].startswith("gpu device lost:")
+
+
 @needs_pict
 def test_a_gate_whose_verdict_holds_no_boolean_is_refused_with_an_annotation(tmp_path):
     spec = spec_for(tmp_path)
@@ -269,6 +309,26 @@ def test_the_budget_cuts_whole_cases_off_the_end_and_reports_the_coverage_kept(
     assert report["summary"]["coverage"]["truncated_after_case"] == 1
     assert 0.0 < report["summary"]["coverage"]["achieved"] < 1.0
     assert len(report["matrix"]) == 2
+
+
+@needs_pict
+def test_a_fixed_concurrency_runs_that_many_cases_at_once_and_says_so(tmp_path):
+    spec = spec_for(tmp_path, concurrency=2)
+    assert cli.run_verify(spec, client_for(), environ=environ(tmp_path)) == 0
+    report = report_of(tmp_path)
+    assert report["inputs"]["concurrency"] == 2
+    assert 1 <= report["summary"]["peak_concurrency"] <= 2
+    assert report["summary"]["cases_run"] == CASES
+
+
+@needs_pict
+def test_auto_concurrency_with_no_host_evidence_runs_one_case_at_a_time(tmp_path):
+    """The default. The test host's probe reports nothing (conftest), so: serial."""
+    spec = spec_for(tmp_path)
+    assert cli.run_verify(spec, client_for(), environ=environ(tmp_path)) == 0
+    report = report_of(tmp_path)
+    assert report["inputs"]["concurrency"] == "auto"
+    assert report["summary"]["peak_concurrency"] == 1
 
 
 @needs_pict

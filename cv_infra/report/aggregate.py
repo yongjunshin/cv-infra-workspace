@@ -63,6 +63,7 @@ class RunRecord:
     zip: str | None = None
     log: str | None = None
     zip_truncated: bool = False
+    gpu_retries: int = 0  # a run whose GPU was lost is run again once (cli._run_once)
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,9 @@ class PlanInfo:
     cut the tail, ``-1`` when the budget was already spent before the first case, and
     ``None`` when nothing was cut — "everything was cut" and "nothing was cut" are
     different facts, and a reader of a 0-case run needs to be told which one it was.
+
+    ``peak_concurrency`` is the most cases that were in flight at once — under
+    ``--concurrency auto`` the number the scheduler found the host could take.
     """
 
     requested_k: int
@@ -95,6 +99,7 @@ class PlanInfo:
     cases_run: int
     coverage_achieved: float = 1.0
     truncated_after_case: int | None = None
+    peak_concurrency: int = 1
 
 
 @dataclass(frozen=True)
@@ -217,6 +222,7 @@ def build_report(
                 "achieved": plan.coverage_achieved,
                 "truncated_after_case": plan.truncated_after_case,
             },
+            "peak_concurrency": plan.peak_concurrency,
         },
         "matrix": rows,
         "baseline": {
@@ -300,6 +306,7 @@ def _run_entry(run: RunRecord) -> dict[str, Any]:
         "wall_s": round(run.wall_s, 3),
         "zip": run.zip,
         "log": run.log,
+        "gpu_retries": run.gpu_retries,
         "error": run.result.error,
         "verdict": run.result.verdict,
     }

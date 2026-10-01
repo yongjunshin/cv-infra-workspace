@@ -20,8 +20,9 @@ have gone the other way:
   from it — so the JSON, the process status and the CI conclusion cannot disagree, and
   a human can reproduce the verdict from the artifact alone.
 
-Parallelism is one thread per CASE (``concurrency``), each running that case's repeats
-in sequence: one container at a time per worker, all of them time-sharing the GPU.
+Parallelism is per CASE, each running that case's repeats in sequence. How many cases
+are in flight is ``cv_infra.scheduler``'s call: ``--concurrency auto`` (the default)
+admits cases while the host's GPU still has room, ``--concurrency K`` holds exactly K.
 """
 
 from __future__ import annotations
@@ -32,12 +33,12 @@ import shutil
 import sys
 import time
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from itertools import groupby
 from pathlib import Path
 from typing import Any
 
-from cv_infra import baselines, execution
+from cv_infra import baselines, execution, scheduler
 from cv_infra.cli import publish_glue
 from cv_infra.cli.exit_codes import EXIT_CONTRACT, EXIT_INFRA, EXIT_PASS
 from cv_infra.contract import cases as case_expansion
@@ -49,7 +50,7 @@ USAGE = (
     "usage: cv-infra verify --sim-script <path> --input-space <path> --output-dir <path>\n"
     "                       --sim-image <name>@sha256:<64 hex>\n"
     "                       [--oracle-script <path>] [--pict-k K] [--repeats N]\n"
-    "                       [--budget-s S] [--concurrency K]\n"
+    "                       [--budget-s S] [--concurrency auto|K]\n"
     "                       [--report-only] [--update-baseline] [--run-dir DIR]\n"
     "       cv-infra selftest [any `verify` flag]\n"
     "\n"
@@ -177,13 +178,14 @@ def run_verify(
         return EXIT_INFRA
 
     plan_cases = _cases_of(array, spec)
-    ran, truncated_after = _run_cases(spec, plan_cases, client, environ)
+    ran, truncated_after, peak = _run_cases(spec, plan_cases, client, environ)
     plan = aggregate.PlanInfo(
         requested_k=spec.pict_k,
         cases_planned=len(plan_cases),
         cases_run=len(ran),
         coverage_achieved=pict.coverage_of_prefix(array, len(ran), spec.pict_k),
         truncated_after_case=truncated_after,
+        peak_concurrency=peak,
     )
 
     observations = aggregate.observations(ran)
@@ -217,42 +219,49 @@ def _cases_of(array: Any, spec: Any) -> list[list[Any]]:
     return [list(group) for _, group in groupby(runs, key=lambda run: run.case_index)]
 
 
-def _run_cases(
-    spec: Any, plan_cases: Sequence[Sequence[Any]], client: Any, environ: Mapping[str, str]
-) -> tuple[list[aggregate.CaseRecord], int | None]:
-    """Run the cases (``concurrency`` at a time) until the budget runs out.
+def _governor(spec: Any) -> scheduler.FixedGovernor | scheduler.AdaptiveGovernor:
+    if spec.concurrency == inputs.CONCURRENCY_AUTO:
+        return scheduler.AdaptiveGovernor()
+    return scheduler.FixedGovernor(spec.concurrency)
 
-    Returns the cases that RAN plus the index of the last one (``-1`` when the budget
-    was gone before the first case even started — distinct from ``None``, "nothing was
-    cut", so the report can say WHY zero cases ran). The deadline is read at the top of
-    each case's task, i.e. at the moment
-    that case would start: workers take the queue in array order, so what runs is the
-    array's prefix — which is what makes the reported coverage meaningful.
+
+def _run_cases(
+    spec: Any,
+    plan_cases: Sequence[Sequence[Any]],
+    client: Any,
+    environ: Mapping[str, str],
+    governor: Any = None,
+) -> tuple[list[aggregate.CaseRecord], int | None, int]:
+    """Run the cases (as many at once as the governor allows) until the budget runs out.
+
+    Returns the cases that RAN, the index of the last one (``-1`` when the budget was
+    gone before the first case even started — distinct from ``None``, "nothing was
+    cut", so the report can say WHY zero cases ran), and the most cases that were in
+    flight at once. The deadline is read at the moment each case would START, and cases
+    start in array order, so what runs is the array's prefix — which is what makes the
+    reported coverage meaningful.
     """
     deadline = None if spec.budget_s is None else time.monotonic() + spec.budget_s
-
-    def run_one(case_runs: Sequence[Any]) -> aggregate.CaseRecord | None:
-        if deadline is not None and time.monotonic() >= deadline:
-            return None
-        return _run_case(spec, case_runs, client, environ)
-
-    # Imported here, not at module scope: `cv-infra --help` and every rejection path
-    # must stay free of thread machinery they never use.
-    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415 - see above
-
-    with ThreadPoolExecutor(max_workers=spec.concurrency) as pool:
-        records = list(pool.map(run_one, plan_cases))
-    ran = [record for record in records if record is not None]
-    if len(ran) == len(plan_cases):
-        return ran, None
-    return ran, len(ran) - 1
+    governor = governor or _governor(spec)
+    done = scheduler.dispatch(
+        plan_cases,
+        lambda case_runs: _run_case(spec, case_runs, client, environ, governor.back_off),
+        governor,
+        deadline=deadline,
+        deadline_clock=time.monotonic,
+    )
+    return done.results, (len(done.results) - 1 if done.truncated else None), done.peak
 
 
 def _run_case(
-    spec: Any, case_runs: Sequence[Any], client: Any, environ: Mapping[str, str]
+    spec: Any,
+    case_runs: Sequence[Any],
+    client: Any,
+    environ: Mapping[str, str],
+    on_gpu_lost: Callable[[], None] = lambda: None,
 ) -> aggregate.CaseRecord:
     """One case: its repeats, in order, each sim + oracle + verdict."""
-    runs = [_run_once(spec, case, client, environ) for case in case_runs]
+    runs = [_run_once(spec, case, client, environ, on_gpu_lost) for case in case_runs]
     first = case_runs[0]
     return aggregate.CaseRecord(
         case_id=first.case_id,
@@ -262,9 +271,31 @@ def _run_case(
     )
 
 
-def _run_once(spec: Any, case: Any, client: Any, environ: Mapping[str, str]) -> aggregate.RunRecord:
-    """One case+repeat: the sim container, then (in gate mode) the oracle container."""
+def _run_once(
+    spec: Any,
+    case: Any,
+    client: Any,
+    environ: Mapping[str, str],
+    on_gpu_lost: Callable[[], None] = lambda: None,
+) -> aggregate.RunRecord:
+    """One case+repeat: the sim container, then (in gate mode) the oracle container.
+
+    A run whose GPU device was lost is an INFRASTRUCTURE fault, not the robot's result:
+    the scheduler is told (fewer cases in flight from now on) and the run is repeated
+    ONCE, same seed. A second loss stays an ERROR — the report says it happened twice.
+    """
     sim = execution.run_sim_case(spec, case, client, run_dir=spec.run_dir, operator_env=environ)
+    gpu_retries = 0
+    if sim.error is not None and sim.error.startswith(execution.GPU_LOST_MARKER):
+        on_gpu_lost()
+        print(
+            f"[cv-infra] gpu-lost {case.case_id} r{case.repeat}: running it once more",
+            file=sys.stderr,
+            flush=True,
+        )
+        _discard_case_dir(sim.out_dir)
+        sim = execution.run_sim_case(spec, case, client, run_dir=spec.run_dir, operator_env=environ)
+        gpu_retries = 1
     rc_oracle: int | None = None
     stdout = ""
     oracle_error: str | None = None
@@ -288,6 +319,7 @@ def _run_once(spec: Any, case: Any, client: Any, environ: Mapping[str, str]) -> 
         zip=_run_relative(sim.zip_path, spec.run_dir),
         log=_run_relative(sim.log_path, spec.run_dir),
         zip_truncated=sim.zip_truncated,
+        gpu_retries=gpu_retries,
     )
 
 

@@ -56,7 +56,10 @@ DEFAULT_CHECKOUT = "."
 DEFAULT_RUN_DIR = "./.cv-infra-run"
 DEFAULT_PICT_K = 2
 DEFAULT_REPEATS = 1
-DEFAULT_CONCURRENCY = 1
+#: ``auto`` = the scheduler admits cases while the host has room (cv_infra.scheduler);
+#: an integer K holds exactly K in flight.
+CONCURRENCY_AUTO = "auto"
+DEFAULT_CONCURRENCY = CONCURRENCY_AUTO
 DEFAULT_CASE_TIMEOUT_S = 1800.0
 DEFAULT_ORACLE_TIMEOUT_S = 300.0
 DEFAULT_SHM_SIZE = "8g"
@@ -112,7 +115,7 @@ class VerifySpec:
     repeats: int
     budget_s: float | None
     sim_image: str
-    concurrency: int
+    concurrency: int | str
     report_only: bool
     update_baseline: bool
     run_dir: Path
@@ -211,7 +214,11 @@ def parse(
             else _bounded_float(args.budget_s, flag="--budget-s", example="10800")
         ),
         sim_image=_digest_pinned_image(args.sim_image),
-        concurrency=_bounded_int(args.concurrency, flag="--concurrency", minimum=1, example="2"),
+        concurrency=(
+            CONCURRENCY_AUTO
+            if args.concurrency == CONCURRENCY_AUTO
+            else _bounded_int(args.concurrency, flag="--concurrency", minimum=1, example="auto")
+        ),
         report_only=args.report_only,
         update_baseline=args.update_baseline,
         run_dir=_resolve_under(base, args.run_dir),

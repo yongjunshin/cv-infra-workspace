@@ -20,6 +20,19 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from cv_infra import scheduler
+
+
+@pytest.fixture(autouse=True)
+def _no_host_probe(monkeypatch):
+    """``--concurrency auto`` (the default) must not read THIS machine's GPU in a test:
+    the probe reports nothing, so the adaptive governor runs serially. Scheduler tests
+    inject their own probe."""
+    monkeypatch.setattr(scheduler, "probe_host", lambda *args, **kwargs: None)
+
+
 #: Digest-pinned, like every admitted image: the execution seam names this image's
 #: cache subtree after the first 12 hex chars of the digest.
 SIM_IMAGE_DIGEST12 = "ab12cd34ef56"
@@ -69,7 +82,7 @@ class FakeContainer:
     def wait(self, timeout=None):
         return {"StatusCode": self._exit_code}
 
-    def logs(self, stdout=True, stderr=True):
+    def logs(self, stdout=True, stderr=True, tail=None):
         self.log_calls.append((stdout, stderr))
         if self._logs_error is not None:
             raise self._logs_error
@@ -132,6 +145,37 @@ class _FakeContainers:
         return container
 
 
+class FakeNetwork:
+    """A created network: ``remove()`` is counted (and can be scripted to fail)."""
+
+    def __init__(self, name, kwargs, remove_error=None):
+        self.name = name
+        self.kwargs = kwargs
+        self.remove_calls = 0
+        self._remove_error = remove_error
+
+    def remove(self):
+        self.remove_calls += 1
+        if self._remove_error is not None:
+            raise self._remove_error
+
+
+class _FakeNetworks:
+    """``client.networks.create`` — every case gets its own bridge."""
+
+    def __init__(self):
+        self.created = []
+        self.raise_on_create = None
+        self.remove_error = None
+
+    def create(self, name, **kwargs):
+        if self.raise_on_create is not None:
+            raise self.raise_on_create
+        network = FakeNetwork(name, kwargs, remove_error=self.remove_error)
+        self.created.append(network)
+        return network
+
+
 class FakeClient:
     """Duck-typed docker client — the only docker surface the execution seam touches.
 
@@ -152,6 +196,7 @@ class FakeClient:
         # its containers once here instead of queueing two per case by hand.
         self.container = container
         self.containers = _FakeContainers(self)
+        self.networks = _FakeNetworks()
         if present is not None:
             self.images = _FakeImages(present)
             self.api = _FakeApi()
