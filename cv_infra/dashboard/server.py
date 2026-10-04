@@ -142,9 +142,12 @@ def series(samples: list[dict], *, since: float, until: float, buckets: int) -> 
     """Bucket samples into at most ``buckets`` points.
 
     Per bucket: GPU utilisation and load are means, memory is the peak, ``running`` is
-    the SUM over runs of each run's peak in-flight count (several runs can share the
-    host), ``level`` is the highest scheduler level any run held. Empty buckets are
-    left out — a gap is drawn as a gap."""
+    the SUM over runs of each run's LAST in-flight count in the bucket — what was in
+    flight together at (about) one moment; summing each run's bucket PEAK instead
+    overstated it whenever two runs peaked at different times in one wide bucket (seen:
+    "9" for two runs whose peaks were 4 and 5 minutes apart). ``level`` is the highest
+    scheduler level any run held. Empty buckets are left out — a gap is drawn as a gap.
+    ``samples`` must be in time order (``Store.samples`` returns them so)."""
     width = max((until - since) / max(buckets, 1), 1e-9)
     grouped: dict[int, list[dict]] = defaultdict(list)
     for sample in samples:
@@ -155,7 +158,7 @@ def series(samples: list[dict], *, since: float, until: float, buckets: int) -> 
         per_run: dict[str, int] = {}
         for row in rows:
             if row["run_id"] is not None and row["running"] is not None:
-                per_run[row["run_id"]] = max(per_run.get(row["run_id"], 0), row["running"])
+                per_run[row["run_id"]] = row["running"]  # time order: the last one wins
         used_ram = [
             row["ram_total_mib"] - row["ram_available_mib"]
             for row in rows

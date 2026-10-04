@@ -94,7 +94,7 @@ def test_series_buckets_sum_concurrent_runs_and_keep_gaps():
     ]
     points = server.series(samples, since=NOW, until=NOW + 100, buckets=10)
     assert len(points) == 2  # the empty buckets in between are a gap, not zeros
-    assert points[0]["running"] == 4  # a's peak 3 + b's 1
+    assert points[0]["running"] == 4  # a's latest 3 + b's latest 1
     assert points[0]["level"] == 3 and points[0]["gpu_util_pct"] == 50.0
     assert points[1]["running"] == 0 and points[1]["ram_used_mib"] is None
     assert points[1]["gpu_util_pct"] is None
@@ -226,3 +226,15 @@ def test_the_lens_never_writes_the_history(app):
     ):
         get(app, path)
     assert app.db_path.read_bytes() == before
+
+
+def test_concurrent_runs_are_summed_at_one_moment_not_at_their_separate_peaks():
+    """Two runs whose peaks fall at different times in one wide bucket: the sum of their
+    peaks (5 + 4) never happened; what was in flight together at the end was 1 + 4."""
+    samples = [
+        sample_row(NOW + 1, run_id="a", running=5),
+        sample_row(NOW + 2, run_id="b", running=4),
+        sample_row(NOW + 3, run_id="a", running=1),
+    ]
+    (point,) = server.series(samples, since=NOW, until=NOW + 10, buckets=1)
+    assert point["running"] == 5

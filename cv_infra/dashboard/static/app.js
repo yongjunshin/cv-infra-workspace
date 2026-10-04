@@ -248,11 +248,24 @@ function hostGauges(host) {
   </div>`;
 }
 function seriesOf(points, key, scale = 1) { return points.map((p) => [p.t, p[key] == null ? null : p[key] * scale]); }
-function resourceStats(points, since, until) {
+// Occupancy = the share of the WINDOW during which at least one verify run was in
+// flight, from the runs' own start/end (the union of their spans). Samples exist only
+// while runs run, so a share of sampled time would always read 100%.
+function busyShare(spans, since, until) {
+  const cut = spans.map((s) => [Math.max(s.start, since), Math.min(s.end, until)]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+  let total = 0, end = -Infinity;
+  for (const [a, b] of cut) {
+    if (b <= end) continue;
+    total += b - Math.max(a, end);
+    end = b;
+  }
+  return until > since ? total / (until - since) : null;
+}
+function resourceStats(points, since, until, spans = []) {
   const busy = points.filter((p) => p.running > 0);
   const util = points.filter((p) => p.gpu_util_pct != null);
   return {
-    occupancy: points.length ? busy.length / points.length : null,
+    occupancy: busyShare(spans, since, until),
     gpuMean: util.length ? util.reduce((a, p) => a + p.gpu_util_pct, 0) / util.length : null,
     gpuBusyMean: busy.length ? busy.reduce((a, p) => a + (p.gpu_util_pct || 0), 0) / busy.length : null,
     runningMean: busy.length ? busy.reduce((a, p) => a + p.running, 0) / busy.length : null,
@@ -279,13 +292,13 @@ pages.overview = {
   },
   async update() {
     const [o, s] = await Promise.all([api(`/api/overview?window=${windowS}`), api(`/api/series?window=${windowS}&buckets=240`)]);
-    const k = o.kpi, st = resourceStats(s.points, s.since, s.until);
+    const k = o.kpi, st = resourceStats(s.points, s.since, s.until, s.runs);
     $("#kpis").innerHTML = [
       kpi("검증 요청", k.runs, `완료 ${k.runs_done} · 실행 중 ${o.active.length}${k.runs_stale ? ` · 중단 ${k.runs_stale}` : ""}`),
       kpi("작업 통과", k.runs_done ? `${k.runs_passed}/${k.runs_done}` : "—", k.runs_done ? fmtPct(k.runs_passed / k.runs_done) : ""),
       kpi("케이스 통과율", fmtPct(k.case_pass_rate, 1), `✓ ${k.cases.pass} · ✗ ${k.cases.fail} · ! ${k.cases.error}`),
       kpi("평균 소요", fmtDur(k.mean_duration_s), `실행 시간 합 ${fmtDur(k.busy_s)}`),
-      kpi("점유율", fmtPct(st.occupancy), "관측 구간 중 케이스가 돈 시간"),
+      kpi("가동률", fmtPct(st.occupancy, 1), "기간 중 검증 작업이 돈 시간"),
       kpi("최대 병렬", Math.max(k.peak_concurrency || 0, st.runningPeak) || "—", st.runningMean ? `가동 중 평균 ${fmtNum(st.runningMean, 1)} (모든 작업 합)` : ""),
     ].join("");
     $("#host").innerHTML = hostGauges(o.host);
@@ -348,9 +361,9 @@ pages.resources = {
   unmount() { clearInterval(this.liveTimer); },
   async update() {
     const s = await api(`/api/series?window=${windowS}`);
-    const st = resourceStats(s.points, s.since, s.until);
+    const st = resourceStats(s.points, s.since, s.until, s.runs);
     $("#stats").innerHTML = [
-      kpi("점유율", fmtPct(st.occupancy), "관측 구간 중 케이스가 돈 시간"),
+      kpi("가동률", fmtPct(st.occupancy, 1), "기간 중 검증 작업이 돈 시간"),
       kpi("평균 GPU 사용률", st.gpuMean == null ? "—" : `${fmtNum(st.gpuMean, 0)}%`, st.gpuBusyMean == null ? "" : `가동 중 ${fmtNum(st.gpuBusyMean, 0)}%`),
       kpi("최대 동시 실행", st.runningPeak || "—", st.runningMean ? `가동 중 평균 ${fmtNum(st.runningMean, 1)}` : ""),
       kpi("GPU 메모리 피크", fmtGB(st.gpuMemPeak || null)),
