@@ -66,7 +66,7 @@ function niceTicks(max, count = 4, integer = false) {
 }
 function timeTicks(x0, x1, count = 6) {
   const span = x1 - x0;
-  const steps = [60, 300, 600, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+  const steps = [5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
   const step = steps.find((s) => span / s <= count) || 604800;
   const out = [];
   const offset = new Date().getTimezoneOffset() * 60;
@@ -77,11 +77,14 @@ function timeTicks(x0, x1, count = 6) {
 function tickLabel(t, daily, span) {
   const d = new Date(t * 1000);
   if (daily || span > 3 * 86400) return `${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
+  if (span < 600) return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // series: [{name, color, values: [[t, v|null]], step, area, dash}]
-function lineChart(el, { series, x0, x1, height = 180, yMax, yFmt = (v) => fmtNum(v, 0), spans = [], integer = false }) {
+// gaps: a jump of more than 3x the usual sample spacing breaks the line (no data there);
+// the live chart turns that off — its spacing is the browser's timer, not the data's.
+function lineChart(el, { series, x0, x1, height = 180, yMax, yFmt = (v) => fmtNum(v, 0), spans = [], integer = false, gaps = true }) {
   const width = Math.max(el.clientWidth, 280);
   const m = { l: 46, r: 12, t: 8, b: 22 };
   const w = width - m.l - m.r, h = height - m.t - m.b;
@@ -89,7 +92,7 @@ function lineChart(el, { series, x0, x1, height = 180, yMax, yFmt = (v) => fmtNu
   const top = yMax ?? Math.max(1, ...all) * (integer ? 1 : 1.1);
   const ticks = niceTicks(top, 4, integer);
   const yTop = ticks[ticks.length - 1];
-  const X = (t) => m.l + ((t - x0) / Math.max(x1 - x0, 1)) * w;
+  const X = (t) => m.l + ((t - x0) / Math.max(x1 - x0, 1e-6)) * w;
   const Y = (v) => m.t + h - (v / yTop) * h;
   const { ticks: xt, daily } = timeTicks(x0, x1);
   let svg = `<svg viewBox="0 0 ${width} ${height}" height="${height}">`;
@@ -101,7 +104,7 @@ function lineChart(el, { series, x0, x1, height = 180, yMax, yFmt = (v) => fmtNu
   svg += `<g class="axis">${ticks.map((v) => `<text x="${m.l - 6}" y="${Y(v) + 4}" text-anchor="end">${esc(yFmt(v))}</text>`).join("")}`;
   svg += xt.map((t) => `<text x="${X(t)}" y="${height - 6}" text-anchor="middle">${tickLabel(t, daily, x1 - x0)}</text>`).join("") + `</g>`;
   for (const s of series) {
-    const gap = medianGap(s.values) * 3;
+    const gap = gaps ? medianGap(s.values) * 3 : Infinity;
     let d = "", prev = null, area = "", segStart = null;
     for (const [t, v] of s.values) {
       if (v == null || (prev && t - prev[0] > gap)) {
@@ -165,7 +168,7 @@ function stackedBars(el, { days, height = 180 }) {
   const totals = days.map((d) => d.pass + d.fail + d.error);
   const ticks = niceTicks(Math.max(1, ...totals), 4, true);
   const top = ticks[ticks.length - 1];
-  const bw = w / Math.max(days.length, 1);
+  const bw = Math.min(w / Math.max(days.length, 1), 64);
   const Y = (v) => m.t + h - (v / top) * h;
   const colors = { pass: css("--pass"), fail: css("--fail"), error: css("--error") };
   let svg = `<svg viewBox="0 0 ${width} ${height}" height="${height}">`;
@@ -207,7 +210,7 @@ function timeline(el, { cases, x0, x1 }) {
   const rowH = 18, width = Math.max(el.clientWidth, 280);
   const m = { l: 46, r: 12, t: 6, b: 22 };
   const w = width - m.l - m.r, height = m.t + lanes.length * rowH + m.b;
-  const X = (t) => m.l + ((t - x0) / Math.max(x1 - x0, 1)) * w;
+  const X = (t) => m.l + ((t - x0) / Math.max(x1 - x0, 1e-6)) * w;
   const colors = { pass: css("--pass"), fail: css("--fail"), error: css("--error"), ran: css("--run") };
   const { ticks, daily } = timeTicks(x0, x1);
   let svg = `<svg viewBox="0 0 ${width} ${height}" height="${height}"><g class="grid">${ticks.map((t) => `<line x1="${X(t)}" x2="${X(t)}" y1="${m.t}" y2="${height - m.b}"/>`).join("")}</g>`;
@@ -316,7 +319,7 @@ function drawLive() {
   const el = $("#c-live");
   if (!el || liveBuf.length < 2) return;
   const pct = (a, b) => liveBuf.map((p) => [p.t, p[a] != null && p[b] ? (100 * p[a]) / p[b] : null]);
-  lineChart(el, { x0: liveBuf[0].t, x1: liveBuf[liveBuf.length - 1].t, height: 190, yMax: 100, yFmt: (v) => `${fmtNum(v, 0)}%`, series: [
+  lineChart(el, { x0: liveBuf[0].t, x1: liveBuf[liveBuf.length - 1].t, height: 190, yMax: 100, gaps: false, yFmt: (v) => `${fmtNum(v, 0)}%`, series: [
     { name: "GPU 사용률", color: css("--gpu"), values: liveBuf.map((p) => [p.t, p.gpu_util_pct]) },
     { name: "GPU 메모리", color: css("--mem"), values: pct("gpu_used_mib", "gpu_total_mib") },
     { name: "RAM", color: css("--ram"), values: liveBuf.map((p) => [p.t, p.ram_total_mib && p.ram_available_mib != null ? 100 * (1 - p.ram_available_mib / p.ram_total_mib) : null]) },
