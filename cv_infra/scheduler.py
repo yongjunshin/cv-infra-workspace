@@ -235,6 +235,14 @@ class AdaptiveGovernor:
         )
 
 
+@dataclass
+class Live:
+    """What is in flight right now — read by anyone watching the run (the dashboard
+    sampler); written only by ``dispatch``."""
+
+    running: int = 0
+
+
 @dataclass(frozen=True)
 class Dispatched:
     """What the dispatcher ran: one result per STARTED item, in item order, the most
@@ -254,6 +262,7 @@ def dispatch(
     clock: Callable[[], float] = time.monotonic,
     deadline_clock: Callable[[], float] | None = None,
     tick_s: float = TICK_S,
+    live: Live | None = None,
 ) -> Dispatched:
     """Start ``items`` in order as the governor allows; stop STARTING at ``deadline``.
 
@@ -265,6 +274,7 @@ def dispatch(
     must not be folded into a result.
     """
     deadline_clock = deadline_clock or clock
+    live = live or Live()
     futures: list[Future[Any]] = []
     running: set[Future[Any]] = set()
     peak = 0
@@ -272,6 +282,7 @@ def dispatch(
     with ThreadPoolExecutor(max_workers=governor.max_parallel) as pool:
         while True:  # leaves when nothing is running and nothing more will start
             running = {future for future in running if not future.done()}
+            live.running = len(running)
             if len(futures) < len(items) and not truncated:
                 now = clock()
                 governor.observe(now)
@@ -282,6 +293,7 @@ def dispatch(
                     future = pool.submit(run_one, items[len(futures)])
                     futures.append(future)
                     running.add(future)
+                    live.running = len(running)
                     peak = max(peak, len(running))
                     continue
             if not running:

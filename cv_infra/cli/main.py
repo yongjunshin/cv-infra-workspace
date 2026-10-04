@@ -27,6 +27,7 @@ admits cases while the host's GPU still has room, ``--concurrency K`` holds exac
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -38,7 +39,7 @@ from itertools import groupby
 from pathlib import Path
 from typing import Any
 
-from cv_infra import baselines, execution, scheduler
+from cv_infra import baselines, execution, history, scheduler
 from cv_infra.cli import publish_glue
 from cv_infra.cli.exit_codes import EXIT_CONTRACT, EXIT_INFRA, EXIT_PASS
 from cv_infra.contract import cases as case_expansion
@@ -53,6 +54,7 @@ USAGE = (
     "                       [--budget-s S] [--concurrency auto|K]\n"
     "                       [--report-only] [--update-baseline] [--run-dir DIR]\n"
     "       cv-infra selftest [any `verify` flag]\n"
+    "       cv-infra dashboard [--host H] [--port P] [--db PATH]\n"
     "\n"
     "exit: 0 pass · 1 a check failed or regressed · 2 the request was refused"
     " · 3 the platform could not judge"
@@ -87,7 +89,7 @@ SELFTEST_PRESET: tuple[str, ...] = (
     f"{SELFTEST_DIR}/oracle.py",
 )
 
-COMMANDS = ("verify", "selftest")
+COMMANDS = ("verify", "selftest", "dashboard")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -101,6 +103,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args[0] == "selftest":
             return selftest(args[1:], os.environ)
+        if args[0] == "dashboard":
+            return dashboard(args[1:], os.environ)
         return verify(args[1:], os.environ)
     except Exception:  # noqa: BLE001 - see the docstring: a platform fault is exit 3
         traceback.print_exc()
@@ -178,7 +182,8 @@ def run_verify(
         return EXIT_INFRA
 
     plan_cases = _cases_of(array, spec)
-    ran, truncated_after, peak = _run_cases(spec, plan_cases, client, environ)
+    recorder = history.RunRecorder.begin(spec, environ, planned=len(plan_cases))
+    ran, truncated_after, peak = _run_cases(spec, plan_cases, client, environ, recorder=recorder)
     plan = aggregate.PlanInfo(
         requested_k=spec.pict_k,
         cases_planned=len(plan_cases),
@@ -197,6 +202,7 @@ def run_verify(
     )
     report = aggregate.build_report(spec, plan, ran, outcome, baseline_updated=updated)
     _write_run_dir(spec.run_dir, report)
+    recorder.finish(report)
 
     code = report["summary"]["exit_code"]
     if code == EXIT_CONTRACT:  # the only post-run rejection: a gate that asserts nothing
@@ -231,6 +237,7 @@ def _run_cases(
     client: Any,
     environ: Mapping[str, str],
     governor: Any = None,
+    recorder: history.RunRecorder | None = None,
 ) -> tuple[list[aggregate.CaseRecord], int | None, int]:
     """Run the cases (as many at once as the governor allows) until the budget runs out.
 
@@ -239,17 +246,24 @@ def _run_cases(
     cut", so the report can say WHY zero cases ran), and the most cases that were in
     flight at once. The deadline is read at the moment each case would START, and cases
     start in array order, so what runs is the array's prefix — which is what makes the
-    reported coverage meaningful.
+    reported coverage meaningful. The run history (``recorder``) hears every case run as
+    it ends and samples the host while the cases run.
     """
     deadline = None if spec.budget_s is None else time.monotonic() + spec.budget_s
     governor = governor or _governor(spec)
-    done = scheduler.dispatch(
-        plan_cases,
-        lambda case_runs: _run_case(spec, case_runs, client, environ, governor.back_off),
-        governor,
-        deadline=deadline,
-        deadline_clock=time.monotonic,
-    )
+    recorder = recorder or history.RunRecorder(None)
+    live = scheduler.Live()
+    with recorder.sampling(live, governor):
+        done = scheduler.dispatch(
+            plan_cases,
+            lambda case_runs: _run_case(
+                spec, case_runs, client, environ, governor.back_off, recorder
+            ),
+            governor,
+            deadline=deadline,
+            deadline_clock=time.monotonic,
+            live=live,
+        )
     return done.results, (len(done.results) - 1 if done.truncated else None), done.peak
 
 
@@ -259,9 +273,16 @@ def _run_case(
     client: Any,
     environ: Mapping[str, str],
     on_gpu_lost: Callable[[], None] = lambda: None,
+    recorder: history.RunRecorder | None = None,
 ) -> aggregate.CaseRecord:
     """One case: its repeats, in order, each sim + oracle + verdict."""
-    runs = [_run_once(spec, case, client, environ, on_gpu_lost) for case in case_runs]
+    recorder = recorder or history.RunRecorder(None)
+    runs = []
+    for case in case_runs:
+        started = recorder.clock()
+        run = _run_once(spec, case, client, environ, on_gpu_lost)
+        recorder.case_run(case, run, started, recorder.clock())
+        runs.append(run)
     first = case_runs[0]
     return aggregate.CaseRecord(
         case_id=first.case_id,
@@ -269,6 +290,26 @@ def _run_case(
         repeats_planned=spec.repeats,
         runs=tuple(runs),
     )
+
+
+def dashboard(argv: Sequence[str], environ: Mapping[str, str]) -> int:
+    """Serve the operator dashboard — a read-only view of this host's run history and of
+    the host itself — until Ctrl-C. Start it when you want to look; the history does not
+    depend on it."""
+    import argparse  # noqa: PLC0415 - only this command needs a parser of its own
+
+    from cv_infra.dashboard import server  # noqa: PLC0415 - verify never needs the server
+
+    parser = argparse.ArgumentParser(prog="cv-infra dashboard")
+    parser.add_argument("--host", default=server.DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=server.DEFAULT_PORT)
+    parser.add_argument("--db", default=None)
+    args = parser.parse_args(list(argv))
+    baseline_db = environ.get(inputs.BASELINE_DB_ENV) or inputs.DEFAULT_BASELINE_DB
+    db = Path(args.db).expanduser() if args.db else history.default_path(environ, baseline_db)
+    with contextlib.suppress(KeyboardInterrupt):  # Ctrl-C is how an operator stops it
+        server.serve(db, host=args.host, port=args.port)
+    return EXIT_PASS
 
 
 def _run_once(
